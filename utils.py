@@ -303,7 +303,8 @@ def get_output_tokens(stats_each_round):
     output_token_ids = []
     for round_id in range(len(stats_each_round)):
         accepted_len = stats_each_round[round_id]["accepted_len"]
-        draft_proposal = stats_each_round[round_id]["~draft_proposal"]
+        # Tự động lấy mảng rỗng nếu không tìm thấy key '~draft_proposal'
+        draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
         output_token_ids.extend(draft_proposal[:accepted_len])
 
         if stats_each_round[round_id]["bonus_token"] is not None:
@@ -325,7 +326,8 @@ def print_sd_trajectory(pickled_data, tokenizer):
     stats_each_round = pickled_data["stats_each_round"]
     output_str = ""
     for round_id in range(len(stats_each_round)):
-        draft_proposal = stats_each_round[round_id]["~draft_proposal"]
+        # Tự động lấy mảng rỗng nếu không tìm thấy key '~draft_proposal'
+        draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
         # target_tokens = stats_each_round[round_id]["target_tokens"]
         accepted_len = stats_each_round[round_id]["accepted_len"]
         proposal_len = len(draft_proposal)
