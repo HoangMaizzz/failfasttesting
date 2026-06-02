@@ -10,15 +10,19 @@ def get_boolean_decision_from_stats_each_round(stats_each_round):
     for round_id, round_info in enumerate(stats_each_round):
         accepted_len = round_info["accepted_len"]
 
-        spec_len = len(round_info["~draft_proposal"])
-        
+        if "~draft_proposal" in round_info and round_info["~draft_proposal"] is not None:
+            spec_len = len(round_info["~draft_proposal"])
+        else:
+            spec_len = round_info.get("spec_len", 0)
+
         if accepted_len == spec_len:
             # print(f"Round {round_id} accepted all tokens!")
             decisions.extend([True] * (spec_len + 1))  # all accepted plus one bonus token
         else:
             # print(f"Round {round_id} accepted {accepted_len} tokens.")
             decisions.extend([True] * accepted_len)
-            decisions.append(False)  # first rejected token
+            if spec_len > accepted_len:
+                decisions.append(False)  # first rejected token
         
     # last_round = stats_each_round[-1]
     # last_round_prefix_len = last_round["prefix_len"]
@@ -38,8 +42,15 @@ def visualize_acc_rate_over_time(stats_each_round, spec_len, acceptance_rate, fi
     
     # bottom: acceptance rate at each round
     prefix_lens = [x.get("prefix_len", 0) + x["accepted_len"] for x in stats_each_round]
-    acc_rates = [x["accepted_len"] / len(x["~draft_proposal"]) for x in stats_each_round]
-    # spec_len = len(stats_each_round[0]["~draft_proposal"])
+    acc_rates = []
+    for x in stats_each_round:
+        round_spec_len = x.get("spec_len")
+        if round_spec_len is None and "~draft_proposal" in x and x["~draft_proposal"] is not None:
+            round_spec_len = len(x["~draft_proposal"])
+        if not round_spec_len:
+            acc_rates.append(0.0)
+        else:
+            acc_rates.append(x["accepted_len"] / round_spec_len)
     decisions = get_boolean_decision_from_stats_each_round(stats_each_round)
     
     # print(f"prefix_lens: {prefix_lens}")
