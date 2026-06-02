@@ -21,8 +21,8 @@ from pathlib import Path
 # CONFIGURATION - Modify these paths as needed
 # ====================================================================================
 
-WORKSPACE = Path("d:/LLM lab/failfast").resolve()
-DLLM_DIR = Path("/data2/USERNAME/Fast_dLLM_v2_1.5B").resolve()
+WORKSPACE = Path("/content/failfasttesting").resolve()
+DLLM_DIR = Path("/content/Fast_dLLM_v2_1.5B").resolve()
 HF_CACHE = Path.home() / ".cache" / "huggingface" / "hub"
 
 # HuggingFace model names

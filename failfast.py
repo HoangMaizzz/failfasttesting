@@ -361,7 +361,7 @@ parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-
                     help="Name of the verifier / target AR model to use")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
                     help="Name of the AR drafter model to use for AR-AR mode")
-parser.add_argument("--dllm_dir", type=str, default="/data2/USERNAME/Fast_dLLM_v2_1.5B", 
+parser.add_argument("--dllm_dir", type=str, default="/content/Fast_dLLM_v2_1.5B", 
                     help="Dir to the dLLM weights and (modified) modeling.py")
 parser.add_argument("--num_questions", type=int, default=1,
                     help="Number of questions to run profiling on")
@@ -491,6 +491,39 @@ if not args.read_pickle:
         device_map={"": 0}
     )
     dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
+
+    # --- ADVANCED MONKEY PATCH FOR ROPE INIT ---
+    def custom_rope_init_fn(config, device, **kwargs):
+        import torch
+        # Calculate dimension per head
+        dim = config.hidden_size // config.num_attention_heads
+        base = getattr(config, 'rope_theta', 100000.0)
+
+        # Force float32 to prevent underflow/hallucination on older custom models
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        attention_scaling = 1.0
+
+        return inv_freq, attention_scaling
+
+    try:
+        import transformers.modeling_rope_utils as rope_utils
+        if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS'):
+            rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
+            rope_utils.ROPE_INIT_FUNCTIONS['linear'] = custom_rope_init_fn
+        
+        # Ghi đè trực tiếp các hàm nếu thư viện gọi thẳng
+        if hasattr(rope_utils, '_compute_linear_scaling_rope_parameters'):
+            rope_utils._compute_linear_scaling_rope_parameters = custom_rope_init_fn
+        if hasattr(rope_utils, '_compute_default_rope_parameters'):
+            rope_utils._compute_default_rope_parameters = custom_rope_init_fn
+            
+        import logging
+        logging.info("Successfully monkey-patched ROPE_INIT_FUNCTIONS and internal functions with custom float32 function.")
+    except Exception as e:
+        import logging
+        logging.warning(f"Could not apply advanced RoPE patch: {e}")
+    # -------------------------------------------
+
     dllm = AutoModelForCausalLM.from_pretrained(
         args.dllm_dir if args.dllm_dir is not None else dllm_name,
         torch_dtype=torch.bfloat16,

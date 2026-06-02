@@ -37,7 +37,7 @@ def visualize_acc_rate_over_time(stats_each_round, spec_len, acceptance_rate, fi
                                     sharex=True)
     
     # bottom: acceptance rate at each round
-    prefix_lens = [x["prefix_len"] + x["accepted_len"] for x in stats_each_round]
+    prefix_lens = [x.get("prefix_len", 0) + x["accepted_len"] for x in stats_each_round]
     acc_rates = [x["accepted_len"] / len(x["~draft_proposal"]) for x in stats_each_round]
     # spec_len = len(stats_each_round[0]["~draft_proposal"])
     decisions = get_boolean_decision_from_stats_each_round(stats_each_round)
