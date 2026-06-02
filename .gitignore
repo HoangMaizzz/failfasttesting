@@ -1,0 +1,6 @@
+/logs
+*.pyc
+outputs/
+slurm_logs/
+figures/
+.DS_Store
