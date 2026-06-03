@@ -538,7 +538,8 @@ if not args.read_pickle:
                 args.dllm_dir if args.dllm_dir is not None else dllm_name,
                 torch_dtype="auto",
                 device_map={"": 0},
-                trust_remote_code=True
+                trust_remote_code=True,
+                local_files_only=True
             )
         except Exception as e:
             msg = str(e).lower()
