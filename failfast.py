@@ -512,11 +512,15 @@ if not args.read_pickle:
     dllm = None
     dllm_tokenizer = target_tokenizer
     if args.mode == "dllm_ar" or args.run_dllm_sf:
-        # --- BẬT KHIÊN CÁCH LY CHO RIÊNG FAST_DLLM ---
-        has_patched = False
         import transformers.modeling_rope_utils as rope_utils
-
-        # 1. Bật khiên RoPE
+        import transformers.modeling_utils as modeling_utils
+        
+        # --- 1. LƯU LẠI BẢN GỐC (Để lát trả lại cho Qwen 3B) ---
+        has_patched_rope = False
+        original_tied_weights_fn = modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys
+        
+        # --- 2. BẬT KHIÊN CÁCH LY (Cho riêng con dLLM già cỗi) ---
+        # Khiên RoPE
         if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in rope_utils.ROPE_INIT_FUNCTIONS:
             def custom_rope_init_fn(config, device, **kwargs):
                 import torch
@@ -524,22 +528,27 @@ if not args.read_pickle:
                 base = getattr(config, 'rope_theta', 1000000.0)
                 inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
                 return inv_freq, 1.0
-
             rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
-            has_patched = True
+            has_patched_rope = True
+            
+        # Khiên Tied Weights (Ép trả về dictionary rỗng để chặn lỗi .keys())
+        modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = lambda self, all_submodels=False: {}
 
-        # 2. Bật khiên Tied Weights (Cứu sống dLLM)
-        original_tied_weights_fn = transformers.modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys
-        transformers.modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = lambda self, all_submodels=False: {}
-
+        # --- 3. NẠP MÔ HÌNH DLLM TỪ THƯ MỤC CỤC BỘ ---
         try:
             dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
+            dllm_path = args.dllm_dir if args.dllm_dir is not None else dllm_name
+            
+            # Cờ local_files_only chặn triệt để bóng ma cache từ HuggingFace
+            is_local = (args.dllm_dir is not None)
+            
+            logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
-                args.dllm_dir if args.dllm_dir is not None else dllm_name,
+                dllm_path,
                 torch_dtype="auto",
                 device_map={"": 0},
                 trust_remote_code=True,
-                local_files_only=True
+                local_files_only=is_local
             )
         except Exception as e:
             msg = str(e).lower()
@@ -548,14 +557,10 @@ if not args.read_pickle:
                 sys.exit(1)
             raise
         finally:
-            # --- TẮT KHIÊN CÁCH LY, TRẢ LẠI SỰ TRONG SẠCH CHO HỆ THỐNG ---
-            # 1. Tắt khiên RoPE
-            if has_patched and 'default' in rope_utils.ROPE_INIT_FUNCTIONS:
+            # --- 4. TẮT KHIÊN CÁCH LY (Cực kỳ quan trọng để hệ thống trở lại bình thường) ---
+            if has_patched_rope and 'default' in rope_utils.ROPE_INIT_FUNCTIONS:
                 del rope_utils.ROPE_INIT_FUNCTIONS['default']
-            
-            # 2. Tắt khiên Tied Weights (Để Qwen 3B không bị ngáo)
-            transformers.modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = original_tied_weights_fn
-            # -----------------------------------------------------------
+            modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = original_tied_weights_fn
 
     # NOTE: drafter and target should probably share the same tokenizer?
     # dllm_tokenizer = AutoTokenizer.from_pretrained(dllm_name, trust_remote_code=True)
