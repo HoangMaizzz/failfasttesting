@@ -418,7 +418,7 @@ parser.add_argument("--drafter_thresholds", type=float, nargs="+",  # one or mor
                     help="Threshold for confidence-adaptive decoding of the dLLM drafter model (e.g., --drafter_thresholds 0.1 0.5 0.9 runs a sweep of the three)")
 parser.add_argument("--log_level",
                     type=str,
-                    default="INFO",
+                    default="DEBUG",
                     choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                     help="Set the logging level")
 parser.add_argument("--sweep_lowconf_threshold", type=float, nargs="+",
@@ -698,6 +698,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     logging.debug(f"--- [{drafter_name}_{freq_scheme}] Speculation round {num_speculation_rounds} ---")
 
                     # A. PROPOSE: Get next n speculative tokens from draft model based on current accepted prefix
+                    print(f"\n⏳ [TRẠM GÁC 1] Vòng {num_speculation_rounds}: Drafter 1.5B đang bắt đầu rặn chữ nháp...")
                     draft_start = time.perf_counter()
                     if draft_type == "ar":
                         if freq_scheme == "sf":
@@ -777,6 +778,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                         # break
                     
                     # B. Verify proposed tokens
+                    print(f"⏳ [TRẠM GÁC 2] Drafter xong, Verifier 7B đang ngấu nghiến KV Cache và nhân ma trận MLP... (Đoạn này dễ kẹt nhất!)")
                     prefix_len = len(current_token_ids)
                     combined_ids = current_token_ids + draft_proposal
                     # Fix 4: Ensure tensor is on correct device to prevent device mismatch
