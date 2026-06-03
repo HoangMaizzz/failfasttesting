@@ -397,7 +397,7 @@ parser.add_argument("--mode", type=str, choices=["verifier_ar", "ar_ar", "dllm_a
                     help="Run mode: verifier_ar=only verifier AR baseline, ar_ar=AR drafter + AR verifier, dllm_ar=dLLM drafter + AR verifier")
 parser.add_argument("--target_model_name", type=str, default=None, 
                     help="Legacy target model name; if unset, --verifier_model_name is used")
-parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct",
+parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct",
                     help="Name of the verifier / target AR model to use")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
                     help="Name of the AR drafter model to use for AR-AR mode")
@@ -456,7 +456,7 @@ args, _ = parser.parse_known_args()
 # args.small_block_size = 16
 # args.run_dllm_sf = True
 # args.read_pickle = True  # XXX: read trajectory from pickle as well in future debugging
-# args.target_model_name = "Qwen/Qwen2.5-7B-Instruct"  # for easier debugging
+# args.target_model_name = "Qwen/Qwen2.5-3B-Instruct"  # for easier debugging
 # args.sweep_lowconf_threshold = [0.4]
 # args.sweep_max_spec_len = [96]
 # args.sweep_incr_len = [16]
@@ -497,6 +497,7 @@ args.latency = {  # all in ms
     "vLLM_A6000": {
         "draft_fwd_pass": 6.1,
         "target_tpt": {
+            "Qwen2.5-3B-Instruct": 7.2,
             "Qwen2.5-7B-Instruct": 13.5,
             "Qwen2.5-14B-Instruct": 24.7,
             "Qwen2.5-32B-Instruct": 52.6,
