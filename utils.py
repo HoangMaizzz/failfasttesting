@@ -352,7 +352,11 @@ def print_sd_trajectory(pickled_data, tokenizer):
             target_token = stats_each_round[round_id]["final_token"]
         elif accepted_len == proposal_len:  # get the bonus token
             target_token = stats_each_round[round_id]["bonus_token"]
-        str_this_round += f"{Colors.GREEN}{tokenizer.decode([target_token], skip_special_tokens=False)}{Colors.RESET}"
+        try:
+            if target_token is not None:
+                str_this_round += f"{Colors.GREEN}{tokenizer.decode([target_token], skip_special_tokens=False)}{Colors.RESET}"
+        except UnboundLocalError:
+            pass  # Âm thầm bỏ qua nếu biến target_token chưa được tạo
         
         output_str += str_this_round
     logging.info(output_str)
