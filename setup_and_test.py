@@ -251,7 +251,6 @@ def run_tests():
         "--spec_len", str(SPEC_LEN),
         "--verifier_model_name", VERIFIER_MODEL,
         "--drafter_model_name", DRAFTER_MODEL,
-        "--dllm_dir", str(DLLM_DIR),
         "--overwrite",
         "--log_level", "INFO",
         "--drafter_thresholds", "0.05",

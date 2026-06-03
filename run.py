@@ -35,7 +35,6 @@ def main():
     
     VERIFIER_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     DRAFTER_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
-    DLLM_DIR = "/data2/USERNAME/Fast_dLLM_v2_1.5B"
     
     DRAFTER_THRESHOLDS = [0.05]  # dLLM confidence threshold
     SWEEP_LOWCONF_THRESHOLD = [0.45]  # FailFast confidence threshold (tau)
@@ -56,7 +55,6 @@ def main():
         f"--output_dir", OUTPUT_DIR,
         f"--verifier_model_name", VERIFIER_MODEL,
         f"--drafter_model_name", DRAFTER_MODEL,
-        f"--dllm_dir", DLLM_DIR,
         "--overwrite",
         "--log_level", "INFO",
     ]
@@ -117,7 +115,7 @@ def main():
     print(f"  Spec length: {SPEC_LEN}")
     print(f"  Verifier model: {VERIFIER_MODEL}")
     print(f"  Drafter model: {DRAFTER_MODEL}")
-    print(f"  dLLM dir: {DLLM_DIR}")
+    print(f"  dLLM repo: Efficient-Large-Model/Fast_dLLM_v2_1.5B")
     print(f"  Precision: torch.bfloat16 (for L4 GPU)")
     print(f"  Device map: {{\\\"\\\" : 0}} (single GPU)")
     print("\n" + "="*80)

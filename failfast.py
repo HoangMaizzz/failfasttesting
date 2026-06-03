@@ -361,8 +361,8 @@ parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-
                     help="Name of the verifier / target AR model to use")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
                     help="Name of the AR drafter model to use for AR-AR mode")
-parser.add_argument("--dllm_dir", type=str, default="/content/Fast_dLLM_v2_1.5B", 
-                    help="Dir to the dLLM weights and (modified) modeling.py")
+parser.add_argument("--dllm_dir", type=str, default=None, 
+                    help="Optional local dir or Hugging Face repo for dLLM weights and modified modeling.py. If unset, loads Efficient-Large-Model/Fast_dLLM_v2_1.5B from Hugging Face.")
 parser.add_argument("--num_questions", type=int, default=1,
                     help="Number of questions to run profiling on")
 parser.add_argument("--max_new_tokens", type=int, default=1024,
