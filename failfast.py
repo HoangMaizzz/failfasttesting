@@ -478,26 +478,6 @@ args.latency = {  # all in ms
 target_tokenizer = AutoTokenizer.from_pretrained(args.target_model_name)
 args.target_tokenizer = target_tokenizer
 
-# --- BẢN VÁ NHẸ: Trả lại key 'default' cho thư viện mới để Fast_dLLM không bị crash ---
-try:
-    import transformers.modeling_rope_utils as rope_utils
-    def custom_rope_init_fn(config, device, **kwargs):
-        import torch
-        dim = config.hidden_size // config.num_attention_heads
-        base = getattr(config, 'rope_theta', 100000.0)
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-        return inv_freq, 1.0
-
-    if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS'):
-        rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
-        rope_utils.ROPE_INIT_FUNCTIONS['linear'] = custom_rope_init_fn
-    import logging
-    logging.info("Đã vá thành công lỗi KeyError 'default' cho Fast_dLLM!")
-except Exception as e:
-    import logging
-    logging.warning(f"Không thể vá lỗi RoPE: {e}")
-# ------------------------------------------------------------------------------------
-
 # Fix 6: Time tracking hook for model forward passes
 _original_forward_dict = {}
 
@@ -531,6 +511,20 @@ if not args.read_pickle:
         raise
     dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
 
+    # --- BẬT KHIÊN CÁCH LY CHO RIÊNG FAST_DLLM ---
+    has_patched = False
+    import transformers.modeling_rope_utils as rope_utils
+    if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in rope_utils.ROPE_INIT_FUNCTIONS:
+        def custom_rope_init_fn(config, device, **kwargs):
+            import torch
+            dim = config.hidden_size // config.num_attention_heads
+            base = getattr(config, 'rope_theta', 1000000.0) # Qwen thường dùng base 1 triệu
+            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+            return inv_freq, 1.0
+        
+        rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
+        has_patched = True
+
     try:
         dllm = AutoModelForCausalLM.from_pretrained(
             args.dllm_dir if args.dllm_dir is not None else dllm_name,
@@ -541,9 +535,14 @@ if not args.read_pickle:
     except Exception as e:
         msg = str(e).lower()
         if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
-            logging.error(f"{Colors.RED}CUDA OutOfMemory while loading dLLM {args.dllm_dir or dllm_name}: {e}{Colors.RESET}")
+            logging.error(f"{Colors.RED}CUDA OutOfMemory while loading dLLM: {e}{Colors.RESET}")
             sys.exit(1)
         raise
+    finally:
+        # --- TẮT KHIÊN CÁCH LY, TRẢ LẠI SỰ TRONG SẠCH CHO THƯ VIỆN ---
+        if has_patched and 'default' in rope_utils.ROPE_INIT_FUNCTIONS:
+            del rope_utils.ROPE_INIT_FUNCTIONS['default']
+
     # NOTE: drafter and target should probably share the same tokenizer?
     # dllm_tokenizer = AutoTokenizer.from_pretrained(dllm_name, trust_remote_code=True)
     dllm_tokenizer = target_tokenizer
