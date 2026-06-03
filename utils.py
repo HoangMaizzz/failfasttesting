@@ -307,7 +307,7 @@ def get_output_tokens(stats_each_round):
         draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
         output_token_ids.extend(draft_proposal[:accepted_len])
 
-        if stats_each_round[round_id]["bonus_token"] is not None:
+        if stats_each_round[round_id].get("bonus_token") is not None:
             output_token_ids.append(stats_each_round[round_id]["bonus_token"])
         else:
             output_token_ids.append(stats_each_round[round_id]["final_token"])
