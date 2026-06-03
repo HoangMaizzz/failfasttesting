@@ -13,6 +13,42 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Safe RoPE patch for Qwen2-style models: compute in float32 but return original dtype.
+try:
+    import transformers.models.qwen2.modeling_qwen2 as qwen2_module
+
+    def safe_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+        """
+        Bản vá RoPE an toàn: Tính toán bằng float32 để tránh tràn số,
+        nhưng ép kiểu về lại dtype ban đầu để không làm hỏng SDPA.
+        """
+        orig_dtype = q.dtype
+        q_fp32 = q.to(torch.float32)
+        k_fp32 = k.to(torch.float32)
+
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+        cos_fp32 = cos.to(torch.float32)
+        sin_fp32 = sin.to(torch.float32)
+
+        def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        q_embed = (q_fp32 * cos_fp32) + (rotate_half(q_fp32) * sin_fp32)
+        k_embed = (k_fp32 * cos_fp32) + (rotate_half(k_fp32) * sin_fp32)
+
+        return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+
+    def apply_safe_rope_patch():
+        qwen2_module.apply_rotary_pos_emb = safe_apply_rotary_pos_emb
+        print(f"\n[INFO] Đã kích hoạt bản vá RoPE an toàn. Sẵn sàng chạy với SDPA!\n")
+
+    apply_safe_rope_patch()
+except Exception as e:
+    print(f"[WARN] Không thể áp dụng bản vá RoPE an toàn: {e}")
+
 transformers.logging.set_verbosity_error()
 
 # Fix 1: Handle tied weights crash in transformers library
