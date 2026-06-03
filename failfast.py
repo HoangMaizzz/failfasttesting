@@ -13,6 +13,12 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Suppress noisy HF/HTTP logs when DEBUG logging is enabled
+logging.getLogger("transformers").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
 # Ensure PYTORCH_CUDA_ALLOC_CONF (expandable_segments) is not forcing CPU spill behavior here
 import os
 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
@@ -718,6 +724,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             spec_len = len(draft_proposal)
                             logging.debug(f"[Round {num_speculation_rounds}] AR drafter proposed {spec_len} tokens: {draft_proposal}")
                             logging.debug(f"[Round {num_speculation_rounds}] AR drafter confidences: {[round(r, 2) for r in confidences]}")
+                        draft_text = target_tokenizer.decode(draft_proposal, skip_special_tokens=True)
+                        print(f"\n🤖 [DRAFTER 1.5B NHÁP]: '{draft_text}'", flush=True)
                         num_forward_passes = spec_len  # 1 fwd pass per token for AR drafter
                     elif draft_type == "dllm":
                         if freq_scheme == "sf":  # static frequency
@@ -765,6 +773,9 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                                                         )
                             prev_prefill_output = prefill_output
                             spec_len = actual_spec_len  # update spec_len to the actual number of tokens proposed
+                    if draft_type == "dllm":
+                        draft_text = target_tokenizer.decode(draft_proposal, skip_special_tokens=True)
+                        print(f"\n⚡ [dLLM 1.5B NHÁP]: '{draft_text}'", flush=True)
                     draft_time = time.perf_counter() - draft_start
                     draft_time_total += draft_time
                     total_num_forward_passes += num_forward_passes
@@ -779,7 +790,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                         # break
                     
                     # B. Verify proposed tokens
-                    print(f"⏳ [TRẠM GÁC 2] Drafter xong, Verifier 7B đang ngấu nghiến KV Cache và nhân ma trận MLP... (Đoạn này dễ kẹt nhất!)")
+                    print(f"⏳ [TRẠM GÁC 2] Drafter xong, Verifier 3B đang ngấu nghiến KV Cache và nhân ma trận MLP... (Đoạn này dễ kẹt nhất!)")
                     prefix_len = len(current_token_ids)
                     combined_ids = current_token_ids + draft_proposal
                     # Fix 4: Ensure tensor is on correct device to prevent device mismatch
