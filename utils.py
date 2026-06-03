@@ -328,57 +328,65 @@ def print_sd_trajectory(pickled_data, target_tokenizer):
     tokenizer = target_tokenizer
 
     if not stats_each_round:
-        print("Không có dữ liệu trajectory để hiển thị.")
+        print("Không có dữ liệu stats_each_round.")
         return
 
-    is_ar_only = "target_tokens" in stats_each_round[0] and "~draft_proposal" not in stats_each_round[0]
+    # Xác định xem đây là Speculative Decoding (có nháp) hay AR Only
+    is_speculative = "~draft_proposal" in stats_each_round[0] or "final_token" in stats_each_round[0]
 
-    # === TRƯỜNG HỢP 1: IN AR ONLY (VERIFIER_AR) ===
-    if is_ar_only:
-        all_tokens = []
-        for round_data in stats_each_round:
-            if "target_tokens" in round_data:
-                all_tokens.extend(round_data["target_tokens"])
+    # === TRƯỜNG HỢP 1: IN SPECULATIVE DECODING (XANH ĐỎ) ===
+    if is_speculative:
+        output_str = ""
+        for round_id in range(len(stats_each_round)):
+            str_this_round = ""
+            draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
+            accepted_len = stats_each_round[round_id].get("accepted_len", len(draft_proposal))
+            proposal_len = len(draft_proposal)
 
+            if accepted_len > 0 and proposal_len > 0:
+                accepted_draft = draft_proposal[:accepted_len]
+                str_this_round += f"{tokenizer.decode(accepted_draft, skip_special_tokens=False)}"
+
+            rejected_draft = draft_proposal[accepted_len:]
+            if rejected_draft:
+                str_this_round += f"{Colors.RED}{Colors.STRIKETHROUGH}{tokenizer.decode(rejected_draft, skip_special_tokens=False)}{Colors.RESET}"
+
+            target_token = None
+            if accepted_len < proposal_len:
+                target_token = stats_each_round[round_id].get("final_token")
+            elif accepted_len == proposal_len:
+                target_token = stats_each_round[round_id].get("bonus_token")
+
+            if target_token is not None:
+                try:
+                    str_this_round += f"{Colors.GREEN}{tokenizer.decode([target_token], skip_special_tokens=False)}{Colors.RESET}"
+                except Exception:
+                    pass
+
+            output_str += str_this_round
+
+        print(output_str)
+        return
+
+    # === TRƯỜNG HỢP 2: IN AR ONLY ===
+    all_tokens = []
+    for round_data in stats_each_round:
+        if "target_tokens" in round_data and isinstance(round_data["target_tokens"], list):
+            all_tokens.extend(round_data["target_tokens"])
+            break
+
+        for key, value in round_data.items():
+            if isinstance(value, list) and value and isinstance(value[0], int):
+                all_tokens.extend(value)
+                break
         if all_tokens:
-            final_text = tokenizer.decode(all_tokens, skip_special_tokens=True)
-            print(f"{final_text}")
-        else:
-            print("Không có token nào được sinh ra.")
-        return
+            break
 
-    # === TRƯỜNG HỢP 2: IN SPECULATIVE DECODING (XANH ĐỎ) ===
-    output_str = ""
-    for round_id in range(len(stats_each_round)):
-        str_this_round = ""
-
-        draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
-        accepted_len = stats_each_round[round_id].get("accepted_len", len(draft_proposal))
-        proposal_len = len(draft_proposal)
-
-        if accepted_len > 0 and proposal_len > 0:
-            accepted_draft = draft_proposal[:accepted_len]
-            str_this_round += f"{tokenizer.decode(accepted_draft, skip_special_tokens=False)}"
-
-        rejected_draft = draft_proposal[accepted_len:]
-        if rejected_draft:
-            str_this_round += f"{Colors.RED}{Colors.STRIKETHROUGH}{tokenizer.decode(rejected_draft, skip_special_tokens=False)}{Colors.RESET}"
-
-        target_token = None
-        if accepted_len < proposal_len:
-            target_token = stats_each_round[round_id].get("final_token")
-        elif accepted_len == proposal_len:
-            target_token = stats_each_round[round_id].get("bonus_token")
-
-        if target_token is not None:
-            try:
-                str_this_round += f"{Colors.GREEN}{tokenizer.decode([target_token], skip_special_tokens=False)}{Colors.RESET}"
-            except Exception:
-                pass
-
-        output_str += str_this_round
-
-    print(output_str)
+    if all_tokens:
+        final_text = tokenizer.decode(all_tokens, skip_special_tokens=True)
+        print(final_text)
+    else:
+        print(f"⚠️ Radar không tìm thấy token! Các biến hiện có trong round 0 là: {list(stats_each_round[0].keys())}")
 
 
 def calculate_spec_decoding_speedup(alpha, gamma, c):
