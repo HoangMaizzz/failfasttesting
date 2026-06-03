@@ -529,7 +529,8 @@ if not args.read_pickle:
         target_model = AutoModelForCausalLM.from_pretrained(
             args.target_model_name,
             torch_dtype=torch.bfloat16,
-            device_map={"": 0}
+            device_map={"": 0},
+            attn_implementation="flash_attention_2"
         )
     except Exception as e:
         # Detect CUDA OOM and exit gracefully with a clear message
@@ -577,6 +578,7 @@ if not args.read_pickle:
             args.dllm_dir if args.dllm_dir is not None else dllm_name,
             torch_dtype=torch.bfloat16,
             device_map={"": 0},
+            attn_implementation="flash_attention_2",
             trust_remote_code=True
         )
     except Exception as e:
@@ -593,7 +595,8 @@ if not args.read_pickle:
             draft_model = AutoModelForCausalLM.from_pretrained(
                 args.drafter_model_name,
                 torch_dtype=torch.bfloat16,
-                device_map={"": 0}
+                device_map={"": 0},
+                attn_implementation="flash_attention_2"
             )
         except Exception as e:
             msg = str(e).lower()
