@@ -478,6 +478,26 @@ args.latency = {  # all in ms
 target_tokenizer = AutoTokenizer.from_pretrained(args.target_model_name)
 args.target_tokenizer = target_tokenizer
 
+# --- BẢN VÁ NHẸ: Trả lại key 'default' cho thư viện mới để Fast_dLLM không bị crash ---
+try:
+    import transformers.modeling_rope_utils as rope_utils
+    def custom_rope_init_fn(config, device, **kwargs):
+        import torch
+        dim = config.hidden_size // config.num_attention_heads
+        base = getattr(config, 'rope_theta', 100000.0)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+        return inv_freq, 1.0
+
+    if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS'):
+        rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
+        rope_utils.ROPE_INIT_FUNCTIONS['linear'] = custom_rope_init_fn
+    import logging
+    logging.info("Đã vá thành công lỗi KeyError 'default' cho Fast_dLLM!")
+except Exception as e:
+    import logging
+    logging.warning(f"Không thể vá lỗi RoPE: {e}")
+# ------------------------------------------------------------------------------------
+
 # Fix 6: Time tracking hook for model forward passes
 _original_forward_dict = {}
 
