@@ -23,42 +23,6 @@ logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 import os
 os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
-# Safe RoPE patch for Qwen2-style models: compute in float32 but return original dtype.
-try:
-    import transformers.models.qwen2.modeling_qwen2 as qwen2_module
-
-    def safe_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-        """
-        Bản vá RoPE an toàn: Tính toán bằng float32 để tránh tràn số,
-        nhưng ép kiểu về lại dtype ban đầu để không làm hỏng SDPA.
-        """
-        orig_dtype = q.dtype
-        q_fp32 = q.to(torch.float32)
-        k_fp32 = k.to(torch.float32)
-
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
-        cos_fp32 = cos.to(torch.float32)
-        sin_fp32 = sin.to(torch.float32)
-
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        q_embed = (q_fp32 * cos_fp32) + (rotate_half(q_fp32) * sin_fp32)
-        k_embed = (k_fp32 * cos_fp32) + (rotate_half(k_fp32) * sin_fp32)
-
-        return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
-
-    def apply_safe_rope_patch():
-        qwen2_module.apply_rotary_pos_emb = safe_apply_rotary_pos_emb
-        print(f"\n[INFO] Đã kích hoạt bản vá RoPE an toàn. Sẵn sàng chạy với SDPA!\n")
-
-    apply_safe_rope_patch()
-except Exception as e:
-    print(f"[WARN] Không thể áp dụng bản vá RoPE an toàn: {e}")
-
 transformers.logging.set_verbosity_error()
 
 # Fix 1: Handle tied weights crash in transformers library
@@ -535,7 +499,7 @@ if not args.read_pickle:
     try:
         target_model = AutoModelForCausalLM.from_pretrained(
             args.target_model_name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype="auto",
             device_map={"": 0}
         )
     except Exception as e:
@@ -547,42 +511,10 @@ if not args.read_pickle:
         raise
     dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
 
-    # --- ADVANCED MONKEY PATCH FOR ROPE INIT ---
-    def custom_rope_init_fn(config, device, **kwargs):
-        import torch
-        # Calculate dimension per head
-        dim = config.hidden_size // config.num_attention_heads
-        base = getattr(config, 'rope_theta', 100000.0)
-
-        # Force float32 to prevent underflow/hallucination on older custom models
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-        attention_scaling = 1.0
-
-        return inv_freq, attention_scaling
-
-    try:
-        import transformers.modeling_rope_utils as rope_utils
-        if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS'):
-            rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
-            rope_utils.ROPE_INIT_FUNCTIONS['linear'] = custom_rope_init_fn
-        
-        # Ghi đè trực tiếp các hàm nếu thư viện gọi thẳng
-        if hasattr(rope_utils, '_compute_linear_scaling_rope_parameters'):
-            rope_utils._compute_linear_scaling_rope_parameters = custom_rope_init_fn
-        if hasattr(rope_utils, '_compute_default_rope_parameters'):
-            rope_utils._compute_default_rope_parameters = custom_rope_init_fn
-            
-        import logging
-        logging.info("Successfully monkey-patched ROPE_INIT_FUNCTIONS and internal functions with custom float32 function.")
-    except Exception as e:
-        import logging
-        logging.warning(f"Could not apply advanced RoPE patch: {e}")
-    # -------------------------------------------
-
     try:
         dllm = AutoModelForCausalLM.from_pretrained(
             args.dllm_dir if args.dllm_dir is not None else dllm_name,
-            torch_dtype=torch.bfloat16,
+            torch_dtype="auto",
             device_map={"": 0},
             trust_remote_code=True
         )
@@ -599,7 +531,7 @@ if not args.read_pickle:
         try:
             draft_model = AutoModelForCausalLM.from_pretrained(
                 args.drafter_model_name,
-                torch_dtype=torch.bfloat16,
+                torch_dtype="auto",
                 device_map={"": 0}
             )
         except Exception as e:
