@@ -25,9 +25,6 @@ os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 transformers.logging.set_verbosity_error()
 
-# Fix 1: Handle tied weights crash in transformers library
-transformers.modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = lambda self, all_submodels=False: {}
-
 sys.path.insert(1, os.path.dirname(os.getcwd()))
 from plotting import (
     visualize_acc_rate_over_time,
@@ -511,37 +508,40 @@ if not args.read_pickle:
         raise
     dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
 
-    # --- BẬT KHIÊN CÁCH LY CHO RIÊNG FAST_DLLM ---
-    has_patched = False
-    import transformers.modeling_rope_utils as rope_utils
-    if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in rope_utils.ROPE_INIT_FUNCTIONS:
-        def custom_rope_init_fn(config, device, **kwargs):
-            import torch
-            dim = config.hidden_size // config.num_attention_heads
-            base = getattr(config, 'rope_theta', 1000000.0) # Qwen thường dùng base 1 triệu
-            inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
-            return inv_freq, 1.0
-        
-        rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
-        has_patched = True
+    dllm = None
+    dllm_tokenizer = target_tokenizer
+    if args.mode == "dllm_ar" or args.run_dllm_sf:
+        # --- BẬT KHIÊN CÁCH LY CHO RIÊNG FAST_DLLM ---
+        has_patched = False
+        import transformers.modeling_rope_utils as rope_utils
+        if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in rope_utils.ROPE_INIT_FUNCTIONS:
+            def custom_rope_init_fn(config, device, **kwargs):
+                import torch
+                dim = config.hidden_size // config.num_attention_heads
+                base = getattr(config, 'rope_theta', 1000000.0) # Qwen thường dùng base 1 triệu
+                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
+                return inv_freq, 1.0
+            
+            rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
+            has_patched = True
 
-    try:
-        dllm = AutoModelForCausalLM.from_pretrained(
-            args.dllm_dir if args.dllm_dir is not None else dllm_name,
-            torch_dtype="auto",
-            device_map={"": 0},
-            trust_remote_code=True
-        )
-    except Exception as e:
-        msg = str(e).lower()
-        if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
-            logging.error(f"{Colors.RED}CUDA OutOfMemory while loading dLLM: {e}{Colors.RESET}")
-            sys.exit(1)
-        raise
-    finally:
-        # --- TẮT KHIÊN CÁCH LY, TRẢ LẠI SỰ TRONG SẠCH CHO THƯ VIỆN ---
-        if has_patched and 'default' in rope_utils.ROPE_INIT_FUNCTIONS:
-            del rope_utils.ROPE_INIT_FUNCTIONS['default']
+        try:
+            dllm = AutoModelForCausalLM.from_pretrained(
+                args.dllm_dir if args.dllm_dir is not None else dllm_name,
+                torch_dtype="auto",
+                device_map={"": 0},
+                trust_remote_code=True
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
+                logging.error(f"{Colors.RED}CUDA OutOfMemory while loading dLLM: {e}{Colors.RESET}")
+                sys.exit(1)
+            raise
+        finally:
+            # --- TẮT KHIÊN CÁCH LY, TRẢ LẠI SỰ TRONG SẠCH CHO THƯ VIỆN ---
+            if has_patched and 'default' in rope_utils.ROPE_INIT_FUNCTIONS:
+                del rope_utils.ROPE_INIT_FUNCTIONS['default']
 
     # NOTE: drafter and target should probably share the same tokenizer?
     # dllm_tokenizer = AutoTokenizer.from_pretrained(dllm_name, trust_remote_code=True)
