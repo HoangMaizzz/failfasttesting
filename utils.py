@@ -322,45 +322,64 @@ def get_output_tokens(stats_each_round):
     return output_token_ids
 
 
-def print_sd_trajectory(pickled_data, tokenizer):
-    logging.info(f"{Colors.BOLD}--- Input ---{Colors.RESET}")
-    input_text = tokenizer.decode(pickled_data["orig_model_inputs"], skip_special_tokens=False)
-    num_input_tokens = len(pickled_data["orig_model_inputs"])
-    logging.info(input_text)
-    logging.info(f"{Colors.BOLD}--- Output ---{Colors.RESET}")
-    output_tokens = get_output_tokens(pickled_data["stats_each_round"])
-    output_text = tokenizer.decode(output_tokens, skip_special_tokens=False)  # missing draft tokens in the last round
-    logging.info(output_text)
-    logging.info(f"{Colors.BOLD}--- Trajectory ---{Colors.RESET}")
-    stats_each_round = pickled_data["stats_each_round"]
+def print_sd_trajectory(pickled_data, target_tokenizer):
+    print(f"\n{Colors.CYAN}--- Trajectory ---{Colors.RESET}")
+    stats_each_round = pickled_data.get("stats_each_round", [])
+    tokenizer = target_tokenizer
+
+    if not stats_each_round:
+        print("Không có dữ liệu trajectory để hiển thị.")
+        return
+
+    is_ar_only = "target_tokens" in stats_each_round[0] and "~draft_proposal" not in stats_each_round[0]
+
+    # === TRƯỜNG HỢP 1: IN AR ONLY (VERIFIER_AR) ===
+    if is_ar_only:
+        all_tokens = []
+        for round_data in stats_each_round:
+            if "target_tokens" in round_data:
+                all_tokens.extend(round_data["target_tokens"])
+
+        if all_tokens:
+            final_text = tokenizer.decode(all_tokens, skip_special_tokens=True)
+            print(f"{final_text}")
+        else:
+            print("Không có token nào được sinh ra.")
+        return
+
+    # === TRƯỜNG HỢP 2: IN SPECULATIVE DECODING (XANH ĐỎ) ===
     output_str = ""
     for round_id in range(len(stats_each_round)):
-        # Tự động lấy mảng rỗng nếu không tìm thấy key '~draft_proposal'
-        draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
-        # target_tokens = stats_each_round[round_id]["target_tokens"]
-        accepted_len = stats_each_round[round_id]["accepted_len"]
-        proposal_len = len(draft_proposal)
         str_this_round = ""
-        
-        draft_accepted = draft_proposal[:accepted_len]
-        draft_rejected = draft_proposal[accepted_len:]
-        
-        str_this_round += f"{tokenizer.decode(draft_accepted, skip_special_tokens=False)}"
-        str_this_round += f"{Colors.RED}{Colors.STRIKETHROUGH}{tokenizer.decode(draft_rejected, skip_special_tokens=False)}{Colors.RESET}"
-                
+
+        draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
+        accepted_len = stats_each_round[round_id].get("accepted_len", len(draft_proposal))
+        proposal_len = len(draft_proposal)
+
+        if accepted_len > 0 and proposal_len > 0:
+            accepted_draft = draft_proposal[:accepted_len]
+            str_this_round += f"{tokenizer.decode(accepted_draft, skip_special_tokens=False)}"
+
+        rejected_draft = draft_proposal[accepted_len:]
+        if rejected_draft:
+            str_this_round += f"{Colors.RED}{Colors.STRIKETHROUGH}{tokenizer.decode(rejected_draft, skip_special_tokens=False)}{Colors.RESET}"
+
+        target_token = None
         if accepted_len < proposal_len:
-            target_token = stats_each_round[round_id]["final_token"]
-        elif accepted_len == proposal_len:  # get the bonus token
-            target_token = stats_each_round[round_id]["bonus_token"]
-        try:
-            if target_token is not None:
+            target_token = stats_each_round[round_id].get("final_token")
+        elif accepted_len == proposal_len:
+            target_token = stats_each_round[round_id].get("bonus_token")
+
+        if target_token is not None:
+            try:
                 str_this_round += f"{Colors.GREEN}{tokenizer.decode([target_token], skip_special_tokens=False)}{Colors.RESET}"
-        except UnboundLocalError:
-            pass  # Âm thầm bỏ qua nếu biến target_token chưa được tạo
-        
+            except Exception:
+                pass
+
         output_str += str_this_round
-    logging.info(output_str)
-        
+
+    print(output_str)
+
 
 def calculate_spec_decoding_speedup(alpha, gamma, c):
     """Calculate the speculative decoding speedup.
