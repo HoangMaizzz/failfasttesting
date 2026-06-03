@@ -302,16 +302,25 @@ def join_outputs(output, output_to_append):
 def get_output_tokens(stats_each_round):
     output_token_ids = []
     for round_id in range(len(stats_each_round)):
-        accepted_len = stats_each_round[round_id]["accepted_len"]
-        # Tự động lấy mảng rỗng nếu không tìm thấy key '~draft_proposal'
+        # 1. Lấy bản nháp (nếu có)
         draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
-        output_token_ids.extend(draft_proposal[:accepted_len])
+        accepted_len = stats_each_round[round_id].get("accepted_len", len(draft_proposal))
 
-        if stats_each_round[round_id].get("bonus_token") is not None:
-            output_token_ids.append(stats_each_round[round_id]["bonus_token"])
-        else:
-            output_token_ids.append(stats_each_round[round_id]["final_token"])
+        if accepted_len > 0 and len(draft_proposal) > 0:
+            output_token_ids.extend(draft_proposal[:accepted_len])
+
+        # 2. Lấy bonus token (nếu có)
+        bonus_token = stats_each_round[round_id].get("bonus_token")
+        if bonus_token is not None:
+            output_token_ids.append(bonus_token)
+
+        # 3. Lấy final token (nếu có)
+        final_token = stats_each_round[round_id].get("final_token")
+        if final_token is not None:
+            output_token_ids.append(final_token)
+
     return output_token_ids
+
 
 def print_sd_trajectory(pickled_data, tokenizer):
     logging.info(f"{Colors.BOLD}--- Input ---{Colors.RESET}")
