@@ -13,6 +13,10 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Ensure PYTORCH_CUDA_ALLOC_CONF (expandable_segments) is not forcing CPU spill behavior here
+import os
+os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
 # Safe RoPE patch for Qwen2-style models: compute in float32 but return original dtype.
 try:
     import transformers.models.qwen2.modeling_qwen2 as qwen2_module
@@ -521,11 +525,19 @@ times_dict = {"draft": [], "verify": []}
 if not args.read_pickle:
     logging.info(f"{Colors.BOLD}=== Loading target model: {args.target_model_name} ==={Colors.RESET}")
     # Fix 3: Use bfloat16 and device_map={"":0} to leverage L4 and prevent OOM
-    target_model = AutoModelForCausalLM.from_pretrained(
-        args.target_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map={"": 0}
-    )
+    try:
+        target_model = AutoModelForCausalLM.from_pretrained(
+            args.target_model_name,
+            torch_dtype=torch.bfloat16,
+            device_map={"": 0}
+        )
+    except Exception as e:
+        # Detect CUDA OOM and exit gracefully with a clear message
+        msg = str(e).lower()
+        if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
+            logging.error(f"{Colors.RED}CUDA OutOfMemory while loading target model {args.target_model_name}: {e}{Colors.RESET}")
+            sys.exit(1)
+        raise
     dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
 
     # --- ADVANCED MONKEY PATCH FOR ROPE INIT ---
@@ -560,21 +572,35 @@ if not args.read_pickle:
         logging.warning(f"Could not apply advanced RoPE patch: {e}")
     # -------------------------------------------
 
-    dllm = AutoModelForCausalLM.from_pretrained(
-        args.dllm_dir if args.dllm_dir is not None else dllm_name,
-        torch_dtype=torch.bfloat16,
-        device_map={"": 0},
-        trust_remote_code=True
-    )
+    try:
+        dllm = AutoModelForCausalLM.from_pretrained(
+            args.dllm_dir if args.dllm_dir is not None else dllm_name,
+            torch_dtype=torch.bfloat16,
+            device_map={"": 0},
+            trust_remote_code=True
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
+            logging.error(f"{Colors.RED}CUDA OutOfMemory while loading dLLM {args.dllm_dir or dllm_name}: {e}{Colors.RESET}")
+            sys.exit(1)
+        raise
     # NOTE: drafter and target should probably share the same tokenizer?
     # dllm_tokenizer = AutoTokenizer.from_pretrained(dllm_name, trust_remote_code=True)
     dllm_tokenizer = target_tokenizer
     if args.mode == "ar_ar":
-        draft_model = AutoModelForCausalLM.from_pretrained(
-            args.drafter_model_name,
-            torch_dtype=torch.bfloat16,
-            device_map={"": 0}
-        )
+        try:
+            draft_model = AutoModelForCausalLM.from_pretrained(
+                args.drafter_model_name,
+                torch_dtype=torch.bfloat16,
+                device_map={"": 0}
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
+                logging.error(f"{Colors.RED}CUDA OutOfMemory while loading drafter model {args.drafter_model_name}: {e}{Colors.RESET}")
+                sys.exit(1)
+            raise
         draft_tokenizer = target_tokenizer
 
 # %%
