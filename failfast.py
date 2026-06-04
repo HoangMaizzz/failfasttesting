@@ -556,9 +556,8 @@ if not args.read_pickle:
                 local_files_only=True # Ép 100% không cho lên mạng tải
             )
             
-            # 🚀 THÊM 3 DÒNG NÀY ĐỂ ÉP TÁC GIẢ DÙNG TUPLE CỔ ĐIỂN, CHỐNG LỖI DYNAMIC CACHE
-            if getattr(dllm.config, "tie_word_embeddings", False):
-                dllm.lm_head.weight = dllm.model.embed_tokens.weight
+            # 🚀 FIX TẬN GỐC GIBBERISH: Nối thẳng não bộ mà KHÔNG CẦN check lệnh if!
+            dllm.lm_head.weight = dllm.model.embed_tokens.weight
 
         except Exception as e:
             msg = str(e).lower()
@@ -913,11 +912,11 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
         if (args.overwrite and not args.read_pickle) or (not os.path.exists(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"))):
             with open(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"), "wb") as f:
                 pickle.dump(pickled_data, f)
-                logging.info(f"Saved pickled data to {os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle")}")
+                logging.info(f"Saved pickled data to {os.path.join(output_dir_pickles, f'{args.max_new_tokens}.pickle')}")
             with open(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.txt"), "w") as f:
                 pp = pprint.PrettyPrinter(width=1000, stream=f)  # large enough to fit list
                 pp.pprint(pickled_data)
         else:
-            logging.info(f"Skipping save for pickled data to {os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle")}")
+            logging.info(f"Skipping save for pickled data to {os.path.join(output_dir_pickles, f'{args.max_new_tokens}.pickle')}")
 
 # %%
