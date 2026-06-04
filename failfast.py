@@ -322,7 +322,7 @@ parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gsm8k"
 parser.add_argument("--output_dir", type=str, default="/data2/USERNAME/failfast")
 parser.add_argument("--mode", type=str, choices=["verifier_ar", "ar_ar", "dllm_ar"], default="dllm_ar")
 parser.add_argument("--target_model_name", type=str, default=None)
-parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
+parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--num_questions", type=int, default=1)
