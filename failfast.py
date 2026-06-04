@@ -542,6 +542,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             if args.mode == "verifier_ar":
                 draft_model = None
                 logging.info(f"{Colors.BOLD}=== [Problem {problem_id}] Running verifier-only AR generation ({args.target_model_name}) ==={Colors.RESET}")
+                
+                from transformers import TextStreamer
+                streamer = TextStreamer(target_tokenizer, skip_prompt=True, skip_special_tokens=True)
+                
+                print(f"\n⏳ BẮT ĐẦU AR-ONLY GENERATION (Live Stream):", flush=True)
+
                 verify_start = time.perf_counter()
                 generated_ids = target_model.generate(
                     **orig_model_inputs,
@@ -550,6 +556,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     temperature=TEMPERATURE,
                     pad_token_id=target_model.config.eos_token_id,
                     eos_token_id=target_model.config.eos_token_id,
+                    streamer=streamer
                 )
                 verify_time_total = time.perf_counter() - verify_start
                 current_token_ids = generated_ids[0][orig_model_inputs['input_ids'].shape[1]:].tolist()
