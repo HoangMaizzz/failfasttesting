@@ -21,6 +21,9 @@ os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 transformers.logging.set_verbosity_error()
 
+# 🚀 BẬT SAMPLING VÀ RESIDUAL SAMPLING CHO AR-AR
+TEMPERATURE = 0.6 
+
 sys.path.insert(1, os.path.dirname(os.getcwd()))
 from plotting import (
     visualize_acc_rate_over_time,
@@ -45,7 +48,8 @@ def get_target_token_ids(model, tokenizer, messages, max_new_tokens):
     generated_ids = model.generate(
         **model_inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=False,
+        do_sample=True, # 🚀 Đã đổi sang Sampling
+        temperature=TEMPERATURE,
         pad_token_id=model.config.eos_token_id,
         eos_token_id=model.config.eos_token_id,
     )
@@ -55,7 +59,7 @@ def get_target_token_ids(model, tokenizer, messages, max_new_tokens):
     
     return generated_ids[0].tolist(), model_inputs
 
-def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n):
+def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n, temperature=TEMPERATURE):
     new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
 
@@ -64,16 +68,26 @@ def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n):
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
 
-    generated_ids = model.generate(
+    generate_output = model.generate(
         **new_model_inputs,
         max_new_tokens=n,
-        do_sample=False,
+        do_sample=True, # 🚀 Đã đổi sang Sampling
+        temperature=temperature,
+        output_scores=True,
+        return_dict_in_generate=True,
         pad_token_id=model.config.eos_token_id,
         eos_token_id=model.config.eos_token_id,
     )
-    generated_ids = generated_ids[0][len(new_model_inputs["input_ids"][0]):]
+    generated_ids = generate_output.sequences[0][len(new_model_inputs["input_ids"][0]):].tolist()
     
-    return generated_ids.tolist()
+    # 🚀 LẤY BẢNG XÁC SUẤT CỦA AR DRAFTER ĐỂ LÀM RESIDUAL SAMPLING
+    drafter_probs = []
+    for scores in generate_output.scores:
+        # scores đã được chia cho temperature từ LogitsWarper của Generate, nên chỉ cần Softmax
+        probs = torch.softmax(scores[0], dim=-1)
+        drafter_probs.append(probs)
+        
+    return generated_ids, drafter_probs
 
 def get_next_tokens_ar(
     model,
@@ -83,6 +97,7 @@ def get_next_tokens_ar(
     lowconf_threshold,
     max_spec_len,
     incr_len,
+    temperature=TEMPERATURE
 ):
     if incr_len is None or incr_len <= 0:
         raise ValueError(f"incr_len must be a positive int, got {incr_len}")
@@ -98,6 +113,7 @@ def get_next_tokens_ar(
     device = orig_model_inputs["input_ids"].device
     drafted = []
     confidences = []
+    drafter_probs_list = []
 
     current_tokens = torch.tensor(token_ids_so_far, device=device, dtype=torch.long).unsqueeze(0)
     current_mask = torch.ones_like(current_tokens, dtype=torch.long)
@@ -113,21 +129,23 @@ def get_next_tokens_ar(
             generate_output = model.generate(
                 **current_inputs,
                 max_new_tokens=chunk_size,
-                do_sample=False,
+                do_sample=True, # 🚀 Đã đổi sang Sampling
+                temperature=temperature,
                 output_scores=True,
                 return_dict_in_generate=True,
                 pad_token_id=model.config.eos_token_id,
                 eos_token_id=model.config.eos_token_id,
             )
             
-            generated_ids = generate_output.sequences[0][len(current_inputs["input_ids"][0]):]
-            generated_ids = generated_ids.tolist()
-            
+            generated_ids = generate_output.sequences[0][len(current_inputs["input_ids"][0]):].tolist()
             scores = generate_output.scores
+            
             found_lowconf = False
             for i, (token_id, score_logits) in enumerate(zip(generated_ids, scores)):
-                probs = torch.softmax(score_logits, dim=-1)
-                conf = probs[0, token_id].item()
+                probs = torch.softmax(score_logits[0], dim=-1)
+                drafter_probs_list.append(probs)
+                
+                conf = probs[token_id].item()
                 drafted.append(token_id)
                 confidences.append(conf)
                 
@@ -135,7 +153,7 @@ def get_next_tokens_ar(
                     found_lowconf = True
             
             if found_lowconf:
-                return drafted, confidences
+                return drafted, confidences, drafter_probs_list
             
             if len(drafted) < cap:
                 new_tokens = torch.tensor(generated_ids, device=device, dtype=torch.long).unsqueeze(0)
@@ -145,7 +163,7 @@ def get_next_tokens_ar(
                     'attention_mask': torch.cat([current_inputs['attention_mask'], new_mask], dim=1)
                 }
 
-    return drafted, confidences
+    return drafted, confidences, drafter_probs_list
 
 def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_len, output_seqlen, small_block_size, threshold, is_drafter, prev_prefill_output=None):
     num_tokens_in_prompt = orig_model_inputs.input_ids.shape[1]
@@ -396,7 +414,6 @@ if not args.read_pickle:
             logging.error(f"{Colors.RED}CUDA OutOfMemory while loading target model {args.target_model_name}: {e}{Colors.RESET}")
             sys.exit(1)
         raise
-    dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
 
     dllm = None
     dllm_tokenizer = target_tokenizer
@@ -529,7 +546,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 generated_ids = target_model.generate(
                     **orig_model_inputs,
                     max_new_tokens=num_target_tokens,
-                    do_sample=False,
+                    do_sample=True, # 🚀 Bật Sampling
+                    temperature=TEMPERATURE,
                     pad_token_id=target_model.config.eos_token_id,
                     eos_token_id=target_model.config.eos_token_id,
                 )
@@ -557,10 +575,10 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     draft_start = time.perf_counter()
                     if draft_type == "ar":
                         if freq_scheme == "sf":
-                            draft_proposal = get_next_n_tokens_ar(draft_model, orig_model_inputs, current_token_ids, n=args.spec_len)
+                            draft_proposal, drafter_probs = get_next_n_tokens_ar(draft_model, orig_model_inputs, current_token_ids, n=args.spec_len, temperature=TEMPERATURE)
                             spec_len = args.spec_len
                         else:
-                            draft_proposal, confidences = get_next_tokens_ar(
+                            draft_proposal, confidences, drafter_probs = get_next_tokens_ar(
                                 draft_model,
                                 orig_model_inputs,
                                 current_token_ids,
@@ -568,6 +586,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 lowconf_threshold=lowconf_threshold,
                                 max_spec_len=max_spec_len,
                                 incr_len=incr_len,
+                                temperature=TEMPERATURE
                             )
                             spec_len = len(draft_proposal)
                         
@@ -649,33 +668,80 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     start_index = orig_model_inputs['input_ids'].shape[1] + prefix_len - 1
                     end_index = start_index + len(draft_proposal)
                     verify_logits = outputs.logits[0, start_index:end_index]
-                    target_tokens = torch.argmax(verify_logits, dim=-1).tolist()
                     
                     # ---------------------------------------------------------
-                    # C. ACCEPT/REJECT: IN CHI TIẾT TỪNG TOKEN ĐỂ THEO DÕI
+                    # 🚀 BƯỚC C. ACCEPT/REJECT (CÓ TÍCH HỢP RESIDUAL SAMPLING)
                     # ---------------------------------------------------------
                     accepted_len = 0
                     bonus_token = None
+                    target_tokens = [] # Dành cho logging tương thích cũ
                     
                     print(f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
                     for i in range(len(draft_proposal)):
-                        target_pred = torch.argmax(verify_logits[i, :], dim=-1).item()
-                        is_match = (draft_proposal[i] == target_pred)
-                        
-                        draft_word = target_tokenizer.decode([draft_proposal[i]])
-                        target_word = target_tokenizer.decode([target_pred])
-                        status = "✅ NHẬN" if is_match else "❌ GẠCH BỎ"
-                        print(f"   Vị trí {i}: Đoán [{draft_word!r}] | Sửa thành [{target_word!r}] -> {status}", flush=True)
+                        if draft_type == "ar":
+                            # === TOÁN HỌC RESIDUAL SAMPLING CHO AR-AR ===
+                            p_drafter = drafter_probs[i]
+                            # verify_logits là raw logit, cần chia cho TEMPERATURE
+                            p_target = torch.softmax(verify_logits[i, :] / TEMPERATURE, dim=-1)
+                            
+                            draft_token_id = draft_proposal[i]
+                            p_d = p_drafter[draft_token_id].item()
+                            p_t = p_target[draft_token_id].item()
+                            
+                            # Tính tỉ lệ chấp nhận (Q/P)
+                            acceptance_prob = min(1.0, p_t / p_d) if p_d > 0 else 1.0
+                            r = torch.rand(1).item()
+                            is_match = (r < acceptance_prob)
+                            
+                            draft_word = target_tokenizer.decode([draft_token_id])
+                            status = f"✅ NHẬN (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)" if is_match else f"❌ GẠCH BỎ (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)"
+                            print(f"   Vị trí {i}: Drafter đoán [{draft_word!r}] -> {status}", flush=True)
+                            
+                            target_tokens.append(draft_token_id if is_match else torch.argmax(p_target).item())
 
-                        if is_match:
-                            accepted_len += 1
+                            if is_match:
+                                accepted_len += 1
+                            else:
+                                # Nếu bị gạch, bốc thăm chữ mới dựa trên xác suất thặng dư (Q - P)
+                                residual_probs = torch.clamp(p_target - p_drafter, min=0.0)
+                                residual_sum = residual_probs.sum()
+                                if residual_sum > 0:
+                                    residual_probs = residual_probs / residual_sum
+                                    final_token = torch.multinomial(residual_probs, 1).item()
+                                else:
+                                    final_token = torch.argmax(p_target).item()
+                                    
+                                target_word = target_tokenizer.decode([final_token])
+                                print(f"   👉 Dừng duyệt! Dùng Residual Sampling bốc được chữ thay thế: [{target_word!r}]", flush=True)
+                                break
+                                
                         else:
-                            final_token = target_pred
-                            print(f"   👉 Dừng duyệt tại đây! Chốt sửa lỗi thành: [{target_word!r}]", flush=True)
-                            break
+                            # === DLLM VẪN DÙNG EXACT MATCH (Do bản chất Distillation argmax) ===
+                            target_pred = torch.argmax(verify_logits[i, :], dim=-1).item()
+                            is_match = (draft_proposal[i] == target_pred)
+                            
+                            draft_word = target_tokenizer.decode([draft_proposal[i]])
+                            target_word = target_tokenizer.decode([target_pred])
+                            status = "✅ NHẬN" if is_match else "❌ GẠCH BỎ"
+                            print(f"   Vị trí {i}: Đoán [{draft_word!r}] | Sửa thành [{target_word!r}] -> {status}", flush=True)
+                            
+                            target_tokens.append(target_pred)
+
+                            if is_match:
+                                accepted_len += 1
+                            else:
+                                final_token = target_pred
+                                print(f"   👉 Dừng duyệt tại đây! Chốt sửa lỗi thành: [{target_word!r}]", flush=True)
+                                break
                     else:
+                        # NẾU TOÀN BỘ NHÁP ĐƯỢC CHẤP NHẬN -> TẶNG KÈM 1 CHỮ BONUS
                         final_token_logits = outputs.logits[0, -1, :]
-                        final_token = torch.argmax(final_token_logits, dim=-1).item()
+                        if draft_type == "ar":
+                            final_probs = torch.softmax(final_token_logits / TEMPERATURE, dim=-1)
+                            final_token = torch.multinomial(final_probs, 1).item()
+                        else:
+                            final_token = torch.argmax(final_token_logits, dim=-1).item()
+                            
                         bonus_token = final_token
                         bonus_word = target_tokenizer.decode([final_token])
                         print(f"   👉 Trúng phóc 100%! Verifier tặng kèm 1 token bonus: [{bonus_word!r}]", flush=True)
