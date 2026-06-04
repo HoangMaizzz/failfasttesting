@@ -691,6 +691,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             # verify_logits là raw logit, cần chia cho TEMPERATURE
                             p_target = torch.softmax(verify_logits[i, :] / TEMPERATURE, dim=-1)
                             
+                            # 🚀 FIX LỖI LỆCH TỪ ĐIỂN: Bơm thêm số 0 vào mảng nhỏ hơn để cân bằng size
+                            if p_drafter.size(-1) < p_target.size(-1):
+                                p_drafter = torch.nn.functional.pad(p_drafter, (0, p_target.size(-1) - p_drafter.size(-1)), value=0.0)
+                            elif p_target.size(-1) < p_drafter.size(-1):
+                                p_target = torch.nn.functional.pad(p_target, (0, p_drafter.size(-1) - p_target.size(-1)), value=0.0)
+                            
                             draft_token_id = draft_proposal[i]
                             p_d = p_drafter[draft_token_id].item()
                             p_t = p_target[draft_token_id].item()
