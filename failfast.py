@@ -13,13 +13,7 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-try:
-    from transformers.cache_utils import DynamicCache
-    if hasattr(DynamicCache, "to_tuple"):
-        DynamicCache.__getitem__ = lambda self, idx: self.to_tuple()[idx]
-        DynamicCache.__len__ = lambda self: len(self.to_tuple())
-except ImportError:
-    pass
+
 
 # Suppress noisy HF/HTTP logs when DEBUG logging is enabled
 logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -563,9 +557,6 @@ if not args.read_pickle:
             )
             
             # 🚀 THÊM 3 DÒNG NÀY ĐỂ ÉP TÁC GIẢ DÙNG TUPLE CỔ ĐIỂN, CHỐNG LỖI DYNAMIC CACHE
-            dllm.config.use_legacy_cache = True
-            if hasattr(dllm, "generation_config"):
-                dllm.generation_config.use_legacy_cache = True
 
         except Exception as e:
             msg = str(e).lower()
