@@ -536,11 +536,14 @@ if not args.read_pickle:
 
         # --- 3. NẠP MÔ HÌNH DLLM TỪ THƯ MỤC CỤC BỘ ---
         try:
-            dllm_name = "Efficient-Large-Model/Fast_dLLM_v2_1.5B"
-            dllm_path = args.dllm_dir if args.dllm_dir is not None else dllm_name
+            # 🚀 LỆNH TIÊU DIỆT BỘ NHỚ ĐÊM: Ép HF quên hết code cũ
+            import shutil, os
+            hf_cache_dir = "/root/.cache/huggingface/modules"
+            if os.path.exists(hf_cache_dir):
+                shutil.rmtree(hf_cache_dir)
             
-            # Cờ local_files_only chặn triệt để bóng ma cache từ HuggingFace
-            is_local = (args.dllm_dir is not None)
+            # 🚀 ĐÓNG ĐINH ĐƯỜNG DẪN: Không dùng args.dllm_dir nữa!
+            dllm_path = "/content/failfasttesting/Fast_dLLM_v2_1.5B"
             
             logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
@@ -548,7 +551,7 @@ if not args.read_pickle:
                 torch_dtype="auto",
                 device_map={"": 0},
                 trust_remote_code=True,
-                local_files_only=is_local
+                local_files_only=True # Ép 100% không cho lên mạng tải
             )
         except Exception as e:
             msg = str(e).lower()
