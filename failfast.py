@@ -557,6 +557,8 @@ if not args.read_pickle:
             )
             
             # 🚀 THÊM 3 DÒNG NÀY ĐỂ ÉP TÁC GIẢ DÙNG TUPLE CỔ ĐIỂN, CHỐNG LỖI DYNAMIC CACHE
+            if getattr(dllm.config, "tie_word_embeddings", False):
+                dllm.lm_head.weight = dllm.model.embed_tokens.weight
 
         except Exception as e:
             msg = str(e).lower()
