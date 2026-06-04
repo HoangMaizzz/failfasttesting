@@ -13,6 +13,16 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from transformers.cache_utils import DynamicCache
+    # Dạy DynamicCache cách trả về dữ liệu khi bị gọi bằng ngoặc vuông [...]
+    DynamicCache.__getitem__ = lambda self, idx: (self.key_cache[idx], self.value_cache[idx])
+    DynamicCache.__len__ = lambda self: len(self.key_cache)
+    DynamicCache.__iter__ = lambda self: iter(zip(self.key_cache, self.value_cache))
+    DynamicCache.__bool__ = lambda self: len(self.key_cache) > 0
+except ImportError:
+    pass
+
 # Suppress noisy HF/HTTP logs when DEBUG logging is enabled
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
