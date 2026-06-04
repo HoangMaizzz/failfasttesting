@@ -50,6 +50,8 @@ def get_target_token_ids(model, tokenizer, messages, max_new_tokens):
         max_new_tokens=max_new_tokens,
         do_sample=True, # 🚀 Đã đổi sang Sampling
         temperature=TEMPERATURE,
+        top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
+        top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
         pad_token_id=model.config.eos_token_id,
         eos_token_id=model.config.eos_token_id,
     )
@@ -73,6 +75,8 @@ def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n, temperat
         max_new_tokens=n,
         do_sample=True, # 🚀 Đã đổi sang Sampling
         temperature=temperature,
+        top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
+        top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
         output_scores=True,
         return_dict_in_generate=True,
         pad_token_id=model.config.eos_token_id,
@@ -131,6 +135,8 @@ def get_next_tokens_ar(
                 max_new_tokens=chunk_size,
                 do_sample=True, # 🚀 Đã đổi sang Sampling
                 temperature=temperature,
+                top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
+                top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
                 output_scores=True,
                 return_dict_in_generate=True,
                 pad_token_id=model.config.eos_token_id,
@@ -554,6 +560,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     max_new_tokens=num_target_tokens,
                     do_sample=True, # 🚀 Bật Sampling
                     temperature=TEMPERATURE,
+                    top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
+                    top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
                     pad_token_id=target_model.config.eos_token_id,
                     eos_token_id=target_model.config.eos_token_id,
                     streamer=streamer
