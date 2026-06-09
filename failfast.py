@@ -456,7 +456,8 @@ if not args.read_pickle:
                 torch_dtype="auto",
                 device_map={"": 0},
                 trust_remote_code=True,
-                local_files_only=True
+                local_files_only=True,
+                attn_implementation="sdpa"
             )
             
             dllm.lm_head.weight = dllm.model.embed_tokens.weight
