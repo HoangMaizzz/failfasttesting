@@ -428,7 +428,7 @@ if not args.read_pickle:
         import transformers.modeling_utils as modeling_utils
         
         has_patched_rope = False
-        original_tied_weights_fn = modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys
+        original_tied_weights_fn = getattr(modeling_utils.PreTrainedModel, 'get_expanded_tied_weights_keys', None)
         
         if hasattr(rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in rope_utils.ROPE_INIT_FUNCTIONS:
             def custom_rope_init_fn(config, device, **kwargs):
@@ -440,7 +440,8 @@ if not args.read_pickle:
             rope_utils.ROPE_INIT_FUNCTIONS['default'] = custom_rope_init_fn
             has_patched_rope = True
             
-        modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = lambda self, all_submodels=False: {}
+        if hasattr(modeling_utils.PreTrainedModel, 'get_expanded_tied_weights_keys'):
+            modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = lambda self, all_submodels=False: {}
 
         try:
             import shutil, os
@@ -471,7 +472,8 @@ if not args.read_pickle:
         finally:
             if has_patched_rope and 'default' in rope_utils.ROPE_INIT_FUNCTIONS:
                 del rope_utils.ROPE_INIT_FUNCTIONS['default']
-            modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = original_tied_weights_fn
+            if hasattr(modeling_utils.PreTrainedModel, 'get_expanded_tied_weights_keys') and original_tied_weights_fn is not None:
+                modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = original_tied_weights_fn
 
     dllm_tokenizer = target_tokenizer
     if args.mode == "ar_ar":
