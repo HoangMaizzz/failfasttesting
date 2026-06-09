@@ -1,6 +1,7 @@
 import os
 import sys
 import copy
+import csv
 import time
 import torch
 import pickle
@@ -370,6 +371,84 @@ def apply_mode_settings(args):
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
+BENCHMARK_MODES = ("verifier_ar", "ar_ar", "dllm_ar")
+BENCHMARK_CSV_COLUMNS = [
+    "problem_id",
+    "mode",
+    "actual_total_time",
+    "theo_total_time",
+    "actual_draft_time",
+    "theo_draft_time",
+    "actual_verify_time",
+    "theo_verify_time",
+    "actual_draft_verify_ratio",
+    "theo_draft_verify_ratio",
+    "acceptance_rate_percent",
+    "actual_speedup_vs_AR",
+    "theo_speedup_vs_AR",
+]
+
+def safe_div(numerator, denominator):
+    return numerator / denominator if denominator else 0.0
+
+def build_benchmark_drafter_configs(args):
+    return {
+        "verifier_ar": ("verifier_ar", None, "none", None, None, None),
+        "ar_ar": ("ar", None, "sf", None, None, None),
+        "dllm_ar": (
+            "dllm",
+            args.drafter_thresholds[0],
+            "df",
+            args.sweep_lowconf_threshold[0],
+            args.sweep_max_spec_len[0],
+            args.sweep_incr_len[0],
+        ),
+    }
+
+def build_benchmark_row(
+    args,
+    problem_id,
+    mode,
+    draft_time_total,
+    verify_time_total,
+    total_num_forward_passes,
+    num_speculation_rounds,
+    accepted_tokens,
+    drafted_tokens,
+):
+    latency = args.latency["vLLM_A6000"]
+    actual_draft_time = draft_time_total
+    actual_verify_time = verify_time_total
+    actual_total_time = actual_draft_time + actual_verify_time
+    theo_draft_time = total_num_forward_passes * latency["draft_fwd_pass"]
+    theo_verify_time = num_speculation_rounds * latency["target_tpt"][args.target_model_name_clean]
+    theo_total_time = theo_draft_time + theo_verify_time
+    return {
+        "problem_id": problem_id,
+        "mode": mode,
+        "actual_total_time": actual_total_time,
+        "theo_total_time": theo_total_time,
+        "actual_draft_time": actual_draft_time,
+        "theo_draft_time": theo_draft_time,
+        "actual_verify_time": actual_verify_time,
+        "theo_verify_time": theo_verify_time,
+        "actual_draft_verify_ratio": safe_div(actual_draft_time, actual_verify_time),
+        "theo_draft_verify_ratio": safe_div(theo_draft_time, theo_verify_time),
+        "acceptance_rate_percent": safe_div(accepted_tokens, drafted_tokens) * 100.0,
+        "actual_speedup_vs_AR": None,
+        "theo_speedup_vs_AR": None,
+    }
+
+def append_benchmark_rows(args, rows):
+    os.makedirs(args.output_dir, exist_ok=True)
+    csv_path = os.path.join(args.output_dir, "benchmark_results.csv")
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=BENCHMARK_CSV_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
 apply_mode_settings(args)
 args.target_model_name_clean = args.target_model_name.split("/", 1)[1]
 logging.basicConfig(
@@ -378,7 +457,7 @@ logging.basicConfig(
     datefmt="%m%d %H:%M:%S",
 )
 
-construct_drafter_configs(args)
+args.benchmark_drafter_configs = build_benchmark_drafter_configs(args)
 populate_dataset(args)
 
 args.latency = {
@@ -423,7 +502,7 @@ if not args.read_pickle:
 
     dllm = None
     dllm_tokenizer = target_tokenizer
-    if args.mode == "dllm_ar" or args.run_dllm_sf:
+    if any(config[0] == "dllm" for config in args.benchmark_drafter_configs.values()):
         import transformers.modeling_rope_utils as rope_utils
         import transformers.modeling_utils as modeling_utils
         
@@ -476,7 +555,7 @@ if not args.read_pickle:
                 modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = original_tied_weights_fn
 
     dllm_tokenizer = target_tokenizer
-    if args.mode == "ar_ar":
+    if any(config[0] == "ar" for config in args.benchmark_drafter_configs.values()):
         try:
             draft_model = AutoModelForCausalLM.from_pretrained(
                 args.drafter_model_name,
@@ -503,12 +582,16 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
         add_generation_prompt=True
     )
     if not args.read_pickle:
-        orig_model_inputs = target_tokenizer([text], return_tensors="pt").to(target_model.device)
+        base_orig_model_inputs = target_tokenizer([text], return_tensors="pt").to(target_model.device)
         num_target_tokens = args.max_new_tokens
 
+    problem_benchmark_rows = []
     ar_drafter_speedup = {k: None for k in args.latency.keys()}
-    for drafter_config in args.drafter_configs:
+    for benchmark_mode in BENCHMARK_MODES:
+        args.mode = benchmark_mode
+        apply_mode_settings(args)
         transformers.set_seed(42)
+        drafter_config = args.benchmark_drafter_configs[benchmark_mode]
         draft_type, drafter_threshold, freq_scheme, lowconf_threshold, max_spec_len, incr_len = drafter_config
         drafter_name = format_drafter_name(args, drafter_config)
         
@@ -527,7 +610,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             num_speculation_rounds = pickled_data["num_speculation_rounds"]
             total_num_forward_passes = pickled_data["total_num_forward_passes"]
             current_token_ids = get_output_tokens(pickled_data["stats_each_round"])
+            if draft_type == "verifier_ar" and not current_token_ids and pickled_data["stats_each_round"]:
+                current_token_ids = pickled_data["stats_each_round"][0].get("target_tokens", [])
+            draft_time_total = sum(x.get("draft_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
+            verify_time_total = sum(x.get("verify_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
         else:
+            orig_model_inputs = {key: value.clone() for key, value in base_orig_model_inputs.items()}
             logging.info(f"{Colors.BOLD}=== [Problem {problem_id}] Running drafter: {drafter_name} ==={Colors.RESET}")
             accepted_tokens = 0
             rejected_tokens = 0
@@ -549,7 +637,6 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 position=1, leave=True, dynamic_ncols=False, file=sys.stdout)
 
             if args.mode == "verifier_ar":
-                draft_model = None
                 logging.info(f"{Colors.BOLD}=== [Problem {problem_id}] Running verifier-only AR generation ({args.target_model_name}) ==={Colors.RESET}")
                 
                 from transformers import TextStreamer
@@ -571,12 +658,15 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 )
                 verify_time_total = time.perf_counter() - verify_start
                 current_token_ids = generated_ids[0][orig_model_inputs['input_ids'].shape[1]:].tolist()
-                num_speculation_rounds = 1
-                total_num_forward_passes = len(current_token_ids)
+                accepted_tokens = len(current_token_ids)
+                drafted_tokens = accepted_tokens
+                num_speculation_rounds = accepted_tokens
+                total_num_forward_passes = 0
                 pickled_data["stats_each_round"].append({
                     "mode": "verifier_ar",
-                    "spec_len": num_target_tokens,
-                    "accepted_len": num_target_tokens,
+                    "target_tokens": current_token_ids,
+                    "spec_len": drafted_tokens,
+                    "accepted_len": accepted_tokens,
                     "acceptance_rate": 1.0,
                     "num_forward_passes": total_num_forward_passes,
                     "draft_time_ms": 0.0,
@@ -807,32 +897,38 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             if is_interactive():
                 inner_bar.close()
 
-        drafted_tokens = sum([x["spec_len"] for x in pickled_data["stats_each_round"]])
-        acceptance_rate = accepted_tokens / drafted_tokens
-        avg_spec_len = sum([x["spec_len"] for x in pickled_data["stats_each_round"]]) / num_speculation_rounds
-        avg_acc_len = sum([x["accepted_len"] for x in pickled_data["stats_each_round"]]) / num_speculation_rounds
-        max_spec_len = max([x["spec_len"] for x in pickled_data["stats_each_round"]])
-        max_acc_len = max([x["accepted_len"] for x in pickled_data["stats_each_round"]])
+        stats_each_round = pickled_data["stats_each_round"]
+        drafted_tokens = sum(x["spec_len"] for x in stats_each_round)
+        accepted_tokens = sum(x["accepted_len"] for x in stats_each_round)
+        rejected_tokens = drafted_tokens - accepted_tokens
+        acceptance_rate = safe_div(accepted_tokens, drafted_tokens)
+        if draft_type == "verifier_ar":
+            total_num_forward_passes = 0
+            num_speculation_rounds = drafted_tokens
+        avg_spec_len = safe_div(drafted_tokens, num_speculation_rounds)
+        avg_acc_len = safe_div(accepted_tokens, num_speculation_rounds)
+        max_spec_len = max((x["spec_len"] for x in stats_each_round), default=0)
+        max_acc_len = max((x["accepted_len"] for x in stats_each_round), default=0)
 
         logging.info(f"{Colors.BOLD}--- [Problem {problem_id}, {drafter_name}] Statistics ---{Colors.RESET}")
         logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Acceptance rate: {acceptance_rate * 100:.1f}% ({accepted_tokens}/{drafted_tokens}){Colors.RESET}")
         logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Accepted/speculated: avg {avg_acc_len:.2f}/{avg_spec_len:.2f}, max {max_acc_len}/{max_spec_len}{Colors.RESET}")
         
         total_output_tokens = len(current_token_ids)
-        logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Avg fwd passes/round: {total_num_forward_passes / num_speculation_rounds:.2f} ({total_num_forward_passes}/{num_speculation_rounds}) (total output tokens: {total_output_tokens}){Colors.RESET}")
+        logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Avg fwd passes/round: {safe_div(total_num_forward_passes, num_speculation_rounds):.2f} ({total_num_forward_passes}/{num_speculation_rounds}) (total output tokens: {total_output_tokens}){Colors.RESET}")
         logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Total draft time: {draft_time_total * 1000.0:.1f}ms, total verify time: {verify_time_total * 1000.0:.1f}ms{Colors.RESET}")
         for hardware in args.latency.keys():
             latency_draft = total_num_forward_passes * args.latency[hardware]["draft_fwd_pass"]
             latency_target = num_speculation_rounds * args.latency[hardware]["target_tpt"][args.target_model_name_clean]
             total_tpt = latency_draft + latency_target
-            avg_tpt = total_tpt / total_output_tokens
-            speedup = args.latency[hardware]["target_tpt"][args.target_model_name_clean] / avg_tpt
-            logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] [{hardware}] Speedup: {speedup:.2f}x (Drafter ratio {latency_draft / total_tpt * 100:.1f}% ({latency_draft:.1f}ms/{total_tpt:.1f}ms); Avg TPT of SD: {avg_tpt:.2f}ms) (num output tokens: {total_output_tokens}){Colors.RESET}")
+            avg_tpt = safe_div(total_tpt, total_output_tokens)
+            speedup = safe_div(args.latency[hardware]["target_tpt"][args.target_model_name_clean], avg_tpt)
+            logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] [{hardware}] Speedup: {speedup:.2f}x (Drafter ratio {safe_div(latency_draft, total_tpt) * 100:.1f}% ({latency_draft:.1f}ms/{total_tpt:.1f}ms); Avg TPT of SD: {avg_tpt:.2f}ms) (num output tokens: {total_output_tokens}){Colors.RESET}")
             
             if draft_type == "ar" and ar_drafter_speedup[hardware] is None:
                 ar_drafter_speedup[hardware] = speedup
             if ar_drafter_speedup[hardware] is not None:
-                logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] [{hardware}] Win over AR drafter: {speedup / ar_drafter_speedup[hardware]:.3f}x.{Colors.RESET}")
+                logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] [{hardware}] Win over AR drafter: {safe_div(speedup, ar_drafter_speedup[hardware]):.3f}x.{Colors.RESET}")
 
         stats_each_round = pickled_data["stats_each_round"]
         if args.overwrite:
@@ -859,3 +955,25 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 pp.pprint(pickled_data)
         else:
             logging.info(f"Skipping save for pickled data to {os.path.join(output_dir_pickles, f'{args.max_new_tokens}.pickle')}")
+
+        problem_benchmark_rows.append(build_benchmark_row(
+            args,
+            problem_id,
+            benchmark_mode,
+            draft_time_total,
+            verify_time_total,
+            total_num_forward_passes,
+            num_speculation_rounds,
+            accepted_tokens,
+            drafted_tokens,
+        ))
+
+    baseline_row = next(row for row in problem_benchmark_rows if row["mode"] == "verifier_ar")
+    for row in problem_benchmark_rows:
+        if row["mode"] == "verifier_ar":
+            row["actual_speedup_vs_AR"] = 1.0
+            row["theo_speedup_vs_AR"] = 1.0
+        else:
+            row["actual_speedup_vs_AR"] = safe_div(baseline_row["actual_total_time"], row["actual_total_time"])
+            row["theo_speedup_vs_AR"] = safe_div(baseline_row["theo_total_time"], row["theo_total_time"])
+    append_benchmark_rows(args, problem_benchmark_rows)
