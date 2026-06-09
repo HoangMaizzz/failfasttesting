@@ -173,7 +173,7 @@ def get_next_tokens_ar(
     return drafted, confidences, drafter_probs_list
 
 def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_len, output_seqlen, small_block_size, threshold, is_drafter, prev_prefill_output=None):
-    num_tokens_in_prompt = orig_model_inputs.input_ids.shape[1]
+    num_tokens_in_prompt = orig_model_inputs['input_ids'].shape[1]
     new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
 
@@ -235,7 +235,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
                         incr_len=None,
                         last_round_rejected=None,
     ):
-    num_tokens_in_prompt = orig_model_inputs.input_ids.shape[1]
+    num_tokens_in_prompt = orig_model_inputs['input_ids'].shape[1]
     new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
 
@@ -528,7 +528,7 @@ if not args.read_pickle:
             if os.path.exists(hf_cache_dir):
                 shutil.rmtree(hf_cache_dir)
             
-            dllm_path = "/content/failfasttesting/Fast_dLLM_v2_1.5B"
+            dllm_path = "/content/failfasttesting/Fast_dLLM_v2_1_5B"
             
             logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
