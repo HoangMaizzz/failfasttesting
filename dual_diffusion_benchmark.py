@@ -63,6 +63,7 @@ def parse_args():
     parser.add_argument("--max_cycles", type=int, default=512)
     parser.add_argument("--drafter_mask_id", type=int, default=151665)
     parser.add_argument("--verifier_mask_id", type=int, default=126336)
+    parser.add_argument("--allow_vocab_projection", action="store_true")
     parser.add_argument("--disable_reusing_drafter_kvs", action="store_true")
     parser.add_argument("--allow_remote_drafter", action="store_true")
     return parser.parse_args()
@@ -177,6 +178,26 @@ def build_draft_to_verify_projection(drafter_model, drafter_tokenizer, verifier_
 
     torch.save(projection, cache_path)
     return projection
+
+
+def enforce_kl_vocab_compatibility(args, drafter_model, drafter_tokenizer, verifier_model, verifier_tokenizer):
+    draft_vocab_size = getattr(drafter_model.config, "vocab_size", len(drafter_tokenizer))
+    verify_vocab_size = getattr(verifier_model.config, "vocab_size", len(verifier_tokenizer))
+    same_vocab_size = draft_vocab_size == verify_vocab_size
+    same_tokenizer_class = drafter_tokenizer.__class__ == verifier_tokenizer.__class__
+    if same_vocab_size and same_tokenizer_class:
+        return
+    if args.allow_vocab_projection:
+        logging.warning(
+            "Using experimental decoded-token vocab projection. KL scores are not strict DDSD KL because drafter and verifier vocabularies differ."
+        )
+        return
+    raise ValueError(
+        "Strict DDSD KL requires comparable drafter/verifier probability spaces. "
+        f"Drafter vocab={draft_vocab_size} tokenizer={drafter_tokenizer.__class__.__name__}; "
+        f"verifier vocab={verify_vocab_size} tokenizer={verifier_tokenizer.__class__.__name__}. "
+        "Use models with the same tokenizer/vocabulary, or pass --allow_vocab_projection only for a non-strict diagnostic run."
+    )
 
 
 def map_draft_tokens_to_verify_tokens(draft_tokens, drafter_tokenizer, verifier_tokenizer):
@@ -661,6 +682,7 @@ def main():
     dataset = load_dataset("openai/gsm8k", "main")["test"]
     drafter_model, drafter_tokenizer = load_drafter(args)
     verifier_model, verifier_tokenizer = load_verifier(args)
+    enforce_kl_vocab_compatibility(args, drafter_model, drafter_tokenizer, verifier_model, verifier_tokenizer)
     projection = build_draft_to_verify_projection(
         drafter_model,
         drafter_tokenizer,
