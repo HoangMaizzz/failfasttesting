@@ -20,21 +20,22 @@ class Colors:
     RESET = "\033[0m"
 
 
-def load_failfast_get_next_tokens_dllm():
+def load_failfast_dllm_helpers():
     failfast_path = Path(__file__).with_name("failfast.py")
     tree = ast.parse(failfast_path.read_text(encoding="utf-8"))
-    node = next(
+    names = {"get_next_n_tokens_dllm", "get_next_tokens_dllm"}
+    nodes = [
         item for item in tree.body
-        if isinstance(item, ast.FunctionDef) and item.name == "get_next_tokens_dllm"
-    )
+        if isinstance(item, ast.FunctionDef) and item.name in names
+    ]
     namespace = {"torch": torch, "logging": logging, "Colors": Colors}
-    module = ast.Module(body=[node], type_ignores=[])
+    module = ast.Module(body=nodes, type_ignores=[])
     ast.fix_missing_locations(module)
     exec(compile(module, str(failfast_path), "exec"), namespace)
-    return namespace["get_next_tokens_dllm"]
+    return namespace["get_next_n_tokens_dllm"], namespace["get_next_tokens_dllm"]
 
 
-get_next_tokens_dllm = load_failfast_get_next_tokens_dllm()
+get_next_n_tokens_dllm, get_next_tokens_dllm = load_failfast_dllm_helpers()
 
 
 def parse_args():
@@ -43,6 +44,7 @@ def parse_args():
     parser.add_argument("--num_questions", type=int, default=100)
     parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--drafter_mode", type=str, default="fixed", choices=["fixed", "failfast"])
     parser.add_argument("--spec_len", type=int, default=10)
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--small_block_size", type=int, default=8)
@@ -57,6 +59,7 @@ def parse_args():
     parser.add_argument("--drafter_model_path", type=str, default="/content/failfasttesting/Fast_dLLM_v2_1_5B")
     parser.add_argument("--verifier_model_name", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--theoretical_tflops", type=float, default=150.0)
+    parser.add_argument("--max_remask_retries", type=int, default=3)
     parser.add_argument("--disable_reusing_drafter_kvs", action="store_true")
     parser.add_argument("--allow_remote_drafter", action="store_true")
     return parser.parse_args()
@@ -224,7 +227,7 @@ def project_verify_probs_to_draft_vocab(verify_probs, draft_vocab_size, projecti
     return projected / projected.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-def ddsd_kl_verify(draft_logits, verify_logits, draft_tokens, aligned, threshold, temperature, projection):
+def ddsd_kl_verify(draft_logits, verify_logits, aligned, threshold, temperature, projection):
     draft_logits = draft_logits.float() / temperature
     verify_logits = verify_logits.float() / temperature
     log_p_draft = F.log_softmax(draft_logits, dim=-1)
@@ -238,12 +241,7 @@ def ddsd_kl_verify(draft_logits, verify_logits, draft_tokens, aligned, threshold
             break
         accepted_len += 1
 
-    replacement_token = None
-    if accepted_len < len(draft_tokens):
-        replacement_probs = p_verify[accepted_len]
-        replacement_token = torch.multinomial(replacement_probs, 1).item()
-
-    return accepted_len, replacement_token, kl_scores.detach().cpu().tolist()
+    return accepted_len, kl_scores.detach().cpu().tolist()
 
 
 def theoretical_seconds(param_count, sequence_length, forward_passes, tflops):
@@ -287,12 +285,14 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
     current_draft_tokens = []
     current_verify_tokens = []
     prev_prefill_output = None
+    last_round_rejected = None
     actual_draft_time = 0.0
     actual_verify_time = 0.0
     theo_draft_time = 0.0
     theo_verify_time = 0.0
     accepted_tokens = 0
     total_drafted_tokens = 0
+    remask_retries = 0
 
     print(f"\nProblem {problem_id}")
     print(prompt)
@@ -300,29 +300,49 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
     round_id = 0
     while len(current_draft_tokens) < args.max_new_tokens:
         draft_start = time.time()
-        draft_output = get_next_tokens_dllm(
-            drafter_model,
-            helper_args,
-            orig_drafter_inputs,
-            current_draft_tokens,
-            spec_len=args.spec_len,
-            output_seqlen=3 * args.block_size,
-            small_block_size=args.small_block_size,
-            threshold=args.drafter_threshold,
-            is_drafter=True,
-            prev_prefill_output=prev_prefill_output,
-            lowconf_threshold=args.lowconf_threshold,
-            max_spec_len=args.max_spec_len,
-            incr_len=args.incr_len,
-            last_round_rejected=None,
-        )
+        if args.drafter_mode == "fixed":
+            draft_output = get_next_n_tokens_dllm(
+                drafter_model,
+                helper_args,
+                orig_drafter_inputs,
+                current_draft_tokens,
+                spec_len=args.spec_len,
+                output_seqlen=3 * args.block_size,
+                small_block_size=args.small_block_size,
+                threshold=args.drafter_threshold,
+                is_drafter=True,
+                prev_prefill_output=prev_prefill_output,
+            )
+        else:
+            draft_output = get_next_tokens_dllm(
+                drafter_model,
+                helper_args,
+                orig_drafter_inputs,
+                current_draft_tokens,
+                spec_len=args.spec_len,
+                output_seqlen=3 * args.block_size,
+                small_block_size=args.small_block_size,
+                threshold=args.drafter_threshold,
+                is_drafter=True,
+                prev_prefill_output=prev_prefill_output,
+                lowconf_threshold=args.lowconf_threshold,
+                max_spec_len=args.max_spec_len,
+                incr_len=args.incr_len,
+                last_round_rejected=last_round_rejected,
+            )
         draft_time = time.time() - draft_start
         actual_draft_time += draft_time
 
         if args.disable_reusing_drafter_kvs:
-            draft_tokens, _, num_forward_passes, _ = draft_output
+            if args.drafter_mode == "fixed":
+                draft_tokens, num_forward_passes, _ = draft_output
+            else:
+                draft_tokens, _, num_forward_passes, _ = draft_output
         else:
-            draft_tokens, _, prev_prefill_output, num_forward_passes, _ = draft_output
+            if args.drafter_mode == "fixed":
+                draft_tokens, prev_prefill_output, num_forward_passes, _ = draft_output
+            else:
+                draft_tokens, _, prev_prefill_output, num_forward_passes, _ = draft_output
 
         draft_tokens = draft_tokens[:args.max_new_tokens - len(current_draft_tokens)]
         if not draft_tokens:
@@ -357,10 +377,9 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
         draft_logits = draft_all_logits[0, draft_start_idx:draft_end_idx, :]
         verify_logits = verify_all_logits[0, verify_start_idx:verify_end_idx, :].to(draft_logits.device)
 
-        accepted_len, replacement_token, kl_scores = ddsd_kl_verify(
+        accepted_len, kl_scores = ddsd_kl_verify(
             draft_logits,
             verify_logits,
-            draft_tokens,
             aligned,
             args.kl_threshold,
             args.temperature,
@@ -369,18 +388,18 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
 
         accepted_draft = draft_tokens[:accepted_len]
         accepted_verify = verify_tokens[:accepted_len]
+        rejected_draft = draft_tokens[accepted_len:]
         tokens_to_append = list(accepted_draft)
         verify_tokens_to_append = list(accepted_verify)
-        if replacement_token is not None and len(current_draft_tokens) + len(tokens_to_append) < args.max_new_tokens:
-            replacement_text = drafter_tokenizer.decode([replacement_token], skip_special_tokens=False)
-            replacement_verify_ids = verifier_tokenizer.encode(replacement_text, add_special_tokens=False)
-            tokens_to_append.append(replacement_token)
-            verify_tokens_to_append.append(replacement_verify_ids[0] if replacement_verify_ids else verifier_tokenizer.eos_token_id)
+        last_round_rejected = rejected_draft if rejected_draft else None
+        if rejected_draft:
+            prev_prefill_output = None
 
         current_draft_tokens.extend(tokens_to_append)
         current_verify_tokens.extend(verify_tokens_to_append)
         accepted_tokens += accepted_len
         total_drafted_tokens += len(draft_tokens)
+        remask_retries = 0 if tokens_to_append else remask_retries + 1
 
         sequence_length = max(drafter_full_input.shape[1], verifier_full_input.shape[1])
         theo_draft_time += theoretical_seconds(drafter_params, sequence_length, max(num_forward_passes, 1), args.theoretical_tflops)
@@ -393,7 +412,7 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
         print(f"Round {round_id}: kl={[round(score, 4) for score in kl_scores]}")
 
         round_id += 1
-        if not tokens_to_append:
+        if not tokens_to_append and remask_retries >= args.max_remask_retries:
             break
         if drafter_tokenizer.eos_token_id in tokens_to_append:
             break
