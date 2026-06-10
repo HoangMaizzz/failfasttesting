@@ -319,17 +319,26 @@ def run_masked_drafter_cycle(args, drafter_model, drafter_prompt_ids, gen_state,
         )
         logits = forward_logits(drafter_model, input_ids)[0]
         prompt_len = drafter_prompt_ids.shape[1]
-        mask_logits = logits[prompt_len + torch.tensor(mask_positions, device=logits.device)]
-        probs = F.softmax(mask_logits.float(), dim=-1)
-        confidences = probs.max(dim=-1).values
-        selected_local_idx = torch.argmax(confidences).item()
-        selected_pos = mask_positions[selected_local_idx]
+        selected_pos = None
+        selected_score = None
+        for start in range(0, len(mask_positions), 16):
+            chunk_positions = mask_positions[start:start + 16]
+            chunk_indices = prompt_len + torch.tensor(chunk_positions, device=logits.device)
+            chunk_scores = logits[chunk_indices].amax(dim=-1)
+            chunk_best_idx = torch.argmax(chunk_scores).item()
+            chunk_best_score = chunk_scores[chunk_best_idx]
+            if selected_score is None or chunk_best_score > selected_score:
+                selected_score = chunk_best_score
+                selected_pos = chunk_positions[chunk_best_idx]
         selected_logits = logits[prompt_len + selected_pos].detach()
         token_id, _ = choose_draft_token(selected_logits, args.drafter_temperature)
         gen_state[selected_pos] = token_id
         drafted_positions.append(selected_pos)
         drafted_logits.append(selected_logits)
         total_forward_passes += 1
+        del logits
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     if drafted_logits:
         drafted_logits = torch.stack(drafted_logits, dim=0)
     else:
