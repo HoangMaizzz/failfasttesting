@@ -303,6 +303,7 @@ def choose_draft_token(logits, temperature):
 
 def run_masked_drafter_cycle(args, drafter_model, drafter_prompt_ids, gen_state, drafter_device):
     drafted_positions = []
+    drafted_logits = []
     total_forward_passes = 0
     for _ in range(args.spec_len):
         mask_positions = [idx for idx, token_id in enumerate(gen_state) if token_id == args.drafter_mask_id]
@@ -323,11 +324,17 @@ def run_masked_drafter_cycle(args, drafter_model, drafter_prompt_ids, gen_state,
         confidences = probs.max(dim=-1).values
         selected_local_idx = torch.argmax(confidences).item()
         selected_pos = mask_positions[selected_local_idx]
-        token_id, _ = choose_draft_token(logits[prompt_len + selected_pos], args.drafter_temperature)
+        selected_logits = logits[prompt_len + selected_pos].detach()
+        token_id, _ = choose_draft_token(selected_logits, args.drafter_temperature)
         gen_state[selected_pos] = token_id
         drafted_positions.append(selected_pos)
+        drafted_logits.append(selected_logits)
         total_forward_passes += 1
-    return drafted_positions, total_forward_passes
+    if drafted_logits:
+        drafted_logits = torch.stack(drafted_logits, dim=0)
+    else:
+        drafted_logits = None
+    return drafted_positions, drafted_logits, total_forward_passes
 
 
 def run_problem_masked(args, problem_id, question, drafter_model, drafter_tokenizer, verifier_model, verifier_tokenizer, projection, drafter_params, verifier_params):
@@ -358,7 +365,7 @@ def run_problem_masked(args, problem_id, question, drafter_model, drafter_tokeni
             break
 
         draft_start = time.time()
-        drafted_positions, num_forward_passes = run_masked_drafter_cycle(
+        drafted_positions, draft_logits, num_forward_passes = run_masked_drafter_cycle(
             args,
             drafter_model,
             drafter_prompt_ids,
@@ -378,13 +385,9 @@ def run_problem_masked(args, problem_id, question, drafter_model, drafter_tokeni
             drafter_tokenizer,
             verifier_tokenizer,
         )
-        drafter_full_input = torch.cat(
-            [
-                drafter_prompt_ids,
-                torch.tensor([gen_state], dtype=torch.long, device=drafter_device),
-            ],
-            dim=1,
-        )
+        for pos in drafted_positions:
+            verify_gen_state[pos] = args.verifier_mask_id
+
         verifier_full_input = torch.cat(
             [
                 verifier_prompt_ids,
@@ -394,14 +397,11 @@ def run_problem_masked(args, problem_id, question, drafter_model, drafter_tokeni
         )
 
         verify_start = time.time()
-        draft_all_logits = forward_logits(drafter_model, drafter_full_input)
         verify_all_logits = forward_logits(verifier_model, verifier_full_input)
         verify_time = time.time() - verify_start
         actual_verify_time += verify_time
 
-        draft_indices = torch.tensor([drafter_prompt_len + pos for pos in drafted_positions], device=draft_all_logits.device)
         verify_indices = torch.tensor([verifier_prompt_len + pos for pos in drafted_positions], device=verify_all_logits.device)
-        draft_logits = draft_all_logits[0, draft_indices, :]
         verify_logits = verify_all_logits[0, verify_indices, :].to(draft_logits.device)
         aligned = [state_aligned[pos] for pos in drafted_positions]
 
@@ -424,7 +424,7 @@ def run_problem_masked(args, problem_id, question, drafter_model, drafter_tokeni
         accepted_tokens += accepted_this_cycle
         total_drafted_tokens += len(drafted_positions)
 
-        sequence_length = max(drafter_full_input.shape[1], verifier_full_input.shape[1])
+        sequence_length = max(drafter_prompt_len + len(gen_state), verifier_full_input.shape[1])
         theo_draft_time += theoretical_seconds(drafter_params, sequence_length, max(num_forward_passes, 1), args.theoretical_tflops)
         theo_verify_time += theoretical_seconds(verifier_params, sequence_length, 1, args.theoretical_tflops)
 
