@@ -281,6 +281,7 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
     helper_args = SimpleNamespace(
         block_size=args.block_size,
         disable_reusing_drafter_kvs=args.disable_reusing_drafter_kvs,
+        target_tokenizer=drafter_tokenizer,
     )
 
     current_draft_tokens = []
