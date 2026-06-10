@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--small_block_size", type=int, default=8)
     parser.add_argument("--drafter_threshold", type=float, default=0.05)
+    parser.add_argument("--drafter_temperature", type=float, default=1.0)
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument("--max_spec_len", type=int, default=60)
     parser.add_argument("--incr_len", type=int, default=10)
@@ -59,7 +60,9 @@ def parse_args():
     parser.add_argument("--drafter_model_path", type=str, default="/content/failfasttesting/Fast_dLLM_v2_1_5B")
     parser.add_argument("--verifier_model_name", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--theoretical_tflops", type=float, default=150.0)
-    parser.add_argument("--max_remask_retries", type=int, default=3)
+    parser.add_argument("--max_cycles", type=int, default=512)
+    parser.add_argument("--drafter_mask_id", type=int, default=151665)
+    parser.add_argument("--verifier_mask_id", type=int, default=126336)
     parser.add_argument("--disable_reusing_drafter_kvs", action="store_true")
     parser.add_argument("--allow_remote_drafter", action="store_true")
     return parser.parse_args()
@@ -267,7 +270,213 @@ def append_csv_row(csv_path, row):
         writer.writerow(row)
 
 
+def map_generation_state_to_verifier(gen_state, drafter_mask_id, verifier_mask_id, drafter_tokenizer, verifier_tokenizer):
+    verify_tokens = []
+    aligned = []
+    for token_id in gen_state:
+        if token_id == drafter_mask_id:
+            verify_tokens.append(verifier_mask_id)
+            aligned.append(True)
+            continue
+        text = drafter_tokenizer.decode([token_id], skip_special_tokens=False)
+        ids = verifier_tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) == 1:
+            verify_tokens.append(ids[0])
+            aligned.append(True)
+        else:
+            verify_tokens.append(verifier_mask_id)
+            aligned.append(False)
+    return verify_tokens, aligned
+
+
+def choose_draft_token(logits, temperature):
+    logits = logits.float()
+    if temperature <= 0:
+        token_id = torch.argmax(logits).item()
+        probs = F.softmax(logits, dim=-1)
+        confidence = probs[token_id].item()
+        return token_id, confidence
+    probs = F.softmax(logits / temperature, dim=-1)
+    token_id = torch.multinomial(probs, 1).item()
+    return token_id, probs[token_id].item()
+
+
+def run_masked_drafter_cycle(args, drafter_model, drafter_prompt_ids, gen_state, drafter_device):
+    drafted_positions = []
+    total_forward_passes = 0
+    for _ in range(args.spec_len):
+        mask_positions = [idx for idx, token_id in enumerate(gen_state) if token_id == args.drafter_mask_id]
+        if not mask_positions:
+            break
+
+        input_ids = torch.cat(
+            [
+                drafter_prompt_ids,
+                torch.tensor([gen_state], dtype=torch.long, device=drafter_device),
+            ],
+            dim=1,
+        )
+        logits = forward_logits(drafter_model, input_ids)[0]
+        prompt_len = drafter_prompt_ids.shape[1]
+        mask_logits = logits[prompt_len + torch.tensor(mask_positions, device=logits.device)]
+        probs = F.softmax(mask_logits.float(), dim=-1)
+        confidences = probs.max(dim=-1).values
+        selected_local_idx = torch.argmax(confidences).item()
+        selected_pos = mask_positions[selected_local_idx]
+        token_id, _ = choose_draft_token(logits[prompt_len + selected_pos], args.drafter_temperature)
+        gen_state[selected_pos] = token_id
+        drafted_positions.append(selected_pos)
+        total_forward_passes += 1
+    return drafted_positions, total_forward_passes
+
+
+def run_problem_masked(args, problem_id, question, drafter_model, drafter_tokenizer, verifier_model, verifier_tokenizer, projection, drafter_params, verifier_params):
+    set_seed(args.seed)
+    prompt = format_gsm8k_prompt(question)
+    drafter_device = get_model_device(drafter_model)
+    verifier_device = get_model_device(verifier_model)
+    orig_drafter_inputs = tokenize_prompt(drafter_tokenizer, prompt, drafter_device)
+    orig_verifier_inputs = tokenize_prompt(verifier_tokenizer, prompt, verifier_device)
+    drafter_prompt_ids = orig_drafter_inputs["input_ids"]
+    verifier_prompt_ids = orig_verifier_inputs["input_ids"]
+    drafter_prompt_len = drafter_prompt_ids.shape[1]
+    verifier_prompt_len = verifier_prompt_ids.shape[1]
+
+    gen_state = [args.drafter_mask_id] * args.max_new_tokens
+    actual_draft_time = 0.0
+    actual_verify_time = 0.0
+    theo_draft_time = 0.0
+    theo_verify_time = 0.0
+    accepted_tokens = 0
+    total_drafted_tokens = 0
+
+    print(f"\nProblem {problem_id}")
+    print(prompt)
+
+    for cycle_id in range(args.max_cycles):
+        if args.drafter_mask_id not in gen_state:
+            break
+
+        draft_start = time.time()
+        drafted_positions, num_forward_passes = run_masked_drafter_cycle(
+            args,
+            drafter_model,
+            drafter_prompt_ids,
+            gen_state,
+            drafter_device,
+        )
+        draft_time = time.time() - draft_start
+        actual_draft_time += draft_time
+
+        if not drafted_positions:
+            break
+
+        verify_gen_state, state_aligned = map_generation_state_to_verifier(
+            gen_state,
+            args.drafter_mask_id,
+            args.verifier_mask_id,
+            drafter_tokenizer,
+            verifier_tokenizer,
+        )
+        drafter_full_input = torch.cat(
+            [
+                drafter_prompt_ids,
+                torch.tensor([gen_state], dtype=torch.long, device=drafter_device),
+            ],
+            dim=1,
+        )
+        verifier_full_input = torch.cat(
+            [
+                verifier_prompt_ids,
+                torch.tensor([verify_gen_state], dtype=torch.long, device=verifier_device),
+            ],
+            dim=1,
+        )
+
+        verify_start = time.time()
+        draft_all_logits = forward_logits(drafter_model, drafter_full_input)
+        verify_all_logits = forward_logits(verifier_model, verifier_full_input)
+        verify_time = time.time() - verify_start
+        actual_verify_time += verify_time
+
+        draft_indices = torch.tensor([drafter_prompt_len + pos for pos in drafted_positions], device=draft_all_logits.device)
+        verify_indices = torch.tensor([verifier_prompt_len + pos for pos in drafted_positions], device=verify_all_logits.device)
+        draft_logits = draft_all_logits[0, draft_indices, :]
+        verify_logits = verify_all_logits[0, verify_indices, :].to(draft_logits.device)
+        aligned = [state_aligned[pos] for pos in drafted_positions]
+
+        _, kl_scores = ddsd_kl_verify(
+            draft_logits,
+            verify_logits,
+            aligned,
+            args.kl_threshold,
+            args.temperature,
+            projection,
+        )
+
+        accepted_this_cycle = 0
+        for pos, is_aligned, kl_score in zip(drafted_positions, aligned, kl_scores):
+            if is_aligned and kl_score < args.kl_threshold:
+                accepted_this_cycle += 1
+            else:
+                gen_state[pos] = args.drafter_mask_id
+
+        accepted_tokens += accepted_this_cycle
+        total_drafted_tokens += len(drafted_positions)
+
+        sequence_length = max(drafter_full_input.shape[1], verifier_full_input.shape[1])
+        theo_draft_time += theoretical_seconds(drafter_params, sequence_length, max(num_forward_passes, 1), args.theoretical_tflops)
+        theo_verify_time += theoretical_seconds(verifier_params, sequence_length, 1, args.theoretical_tflops)
+
+        draft_text = drafter_tokenizer.decode(
+            [gen_state[pos] for pos in drafted_positions if gen_state[pos] != args.drafter_mask_id],
+            skip_special_tokens=True,
+        )
+        current_text = drafter_tokenizer.decode(
+            [token_id for token_id in gen_state if token_id != args.drafter_mask_id],
+            skip_special_tokens=True,
+        )
+        print(f"Round {cycle_id}: drafted_positions={drafted_positions}")
+        print(f"Round {cycle_id}: accepted={accepted_this_cycle}/{len(drafted_positions)} text={draft_text!r}")
+        print(f"Round {cycle_id}: kl={[round(score, 4) for score in kl_scores]}")
+        print(f"Round {cycle_id}: current={current_text!r}")
+
+    actual_total_time = actual_draft_time + actual_verify_time
+    draft_time_percentage = actual_draft_time / actual_total_time * 100.0 if actual_total_time else 0.0
+    acceptance_rate = accepted_tokens / total_drafted_tokens * 100.0 if total_drafted_tokens else 0.0
+    output_text = drafter_tokenizer.decode(
+        [token_id for token_id in gen_state if token_id != args.drafter_mask_id],
+        skip_special_tokens=True,
+    )
+    print(f"Output: {output_text!r}")
+
+    return {
+        "problem_id": problem_id,
+        "actual_draft_time": actual_draft_time,
+        "actual_verify_time": actual_verify_time,
+        "actual_total_time": actual_total_time,
+        "theo_draft_time": theo_draft_time,
+        "theo_verify_time": theo_verify_time,
+        "draft_time_percentage": draft_time_percentage,
+        "acceptance_rate": acceptance_rate,
+    }
+
+
 def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, verifier_model, verifier_tokenizer, projection, drafter_params, verifier_params):
+    if args.drafter_mode == "fixed":
+        return run_problem_masked(
+            args,
+            problem_id,
+            question,
+            drafter_model,
+            drafter_tokenizer,
+            verifier_model,
+            verifier_tokenizer,
+            projection,
+            drafter_params,
+            verifier_params,
+        )
+
     set_seed(args.seed)
     prompt = format_gsm8k_prompt(question)
     drafter_device = get_model_device(drafter_model)
@@ -292,13 +501,12 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
     theo_verify_time = 0.0
     accepted_tokens = 0
     total_drafted_tokens = 0
-    remask_retries = 0
 
     print(f"\nProblem {problem_id}")
     print(prompt)
 
     round_id = 0
-    while len(current_draft_tokens) < args.max_new_tokens:
+    while len(current_draft_tokens) < args.max_new_tokens and round_id < args.max_cycles:
         draft_start = time.time()
         if args.drafter_mode == "fixed":
             draft_output = get_next_n_tokens_dllm(
@@ -399,7 +607,6 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
         current_verify_tokens.extend(verify_tokens_to_append)
         accepted_tokens += accepted_len
         total_drafted_tokens += len(draft_tokens)
-        remask_retries = 0 if tokens_to_append else remask_retries + 1
 
         sequence_length = max(drafter_full_input.shape[1], verifier_full_input.shape[1])
         theo_draft_time += theoretical_seconds(drafter_params, sequence_length, max(num_forward_passes, 1), args.theoretical_tflops)
@@ -412,8 +619,6 @@ def run_problem(args, problem_id, question, drafter_model, drafter_tokenizer, ve
         print(f"Round {round_id}: kl={[round(score, 4) for score in kl_scores]}")
 
         round_id += 1
-        if not tokens_to_append and remask_retries >= args.max_remask_retries:
-            break
         if drafter_tokenizer.eos_token_id in tokens_to_append:
             break
 
