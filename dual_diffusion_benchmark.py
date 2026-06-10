@@ -58,11 +58,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
     parser.add_argument("--drafter_model_path", type=str, default="/content/failfasttesting/Fast_dLLM_v2_1_5B")
-    parser.add_argument("--verifier_model_name", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
+    parser.add_argument("--verifier_model_name", type=str, default="Efficient-Large-Model/Fast_dLLM_v2_7B")
+    parser.add_argument("--verifier_model_type", type=str, default="fastdllm", choices=["fastdllm", "llada"])
     parser.add_argument("--theoretical_tflops", type=float, default=150.0)
     parser.add_argument("--max_cycles", type=int, default=512)
     parser.add_argument("--drafter_mask_id", type=int, default=151665)
-    parser.add_argument("--verifier_mask_id", type=int, default=126336)
+    parser.add_argument("--verifier_mask_id", type=int, default=151665)
     parser.add_argument("--allow_vocab_projection", action="store_true")
     parser.add_argument("--disable_reusing_drafter_kvs", action="store_true")
     parser.add_argument("--allow_remote_drafter", action="store_true")
@@ -105,7 +106,7 @@ def tokenize_prompt(tokenizer, prompt, device):
     return tokenizer([text], return_tensors="pt").to(device)
 
 
-def load_drafter(args):
+def load_fastdllm_model(model_path, allow_remote):
     import transformers.modeling_rope_utils as rope_utils
     import transformers.modeling_utils as modeling_utils
 
@@ -126,16 +127,16 @@ def load_drafter(args):
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            args.drafter_model_path,
+            model_path,
             trust_remote_code=True,
-            local_files_only=not args.allow_remote_drafter,
+            local_files_only=not allow_remote,
         )
         model = AutoModelForCausalLM.from_pretrained(
-            args.drafter_model_path,
+            model_path,
             torch_dtype="auto",
             device_map="auto",
             trust_remote_code=True,
-            local_files_only=not args.allow_remote_drafter,
+            local_files_only=not allow_remote,
             attn_implementation="sdpa",
         )
         if hasattr(model, "lm_head") and hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
@@ -149,7 +150,14 @@ def load_drafter(args):
             modeling_utils.PreTrainedModel.get_expanded_tied_weights_keys = original_tied_weights_fn
 
 
+def load_drafter(args):
+    return load_fastdllm_model(args.drafter_model_path, args.allow_remote_drafter)
+
+
 def load_verifier(args):
+    if args.verifier_model_type == "fastdllm":
+        return load_fastdllm_model(args.verifier_model_name, True)
+
     tokenizer = AutoTokenizer.from_pretrained(args.verifier_model_name, trust_remote_code=True)
     model = AutoModel.from_pretrained(
         args.verifier_model_name,
