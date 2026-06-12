@@ -172,7 +172,7 @@ def load_verifier(args):
 def build_draft_to_verify_projection(drafter_model, drafter_tokenizer, verifier_model, verifier_tokenizer, cache_path):
     draft_vocab_size = getattr(drafter_model.config, "vocab_size", len(drafter_tokenizer))
     verify_vocab_size = getattr(verifier_model.config, "vocab_size", len(verifier_tokenizer))
-    if draft_vocab_size == verify_vocab_size and drafter_tokenizer.__class__ == verifier_tokenizer.__class__:
+    if drafter_tokenizer.__class__ == verifier_tokenizer.__class__:
         return None
     if cache_path.exists():
         return torch.load(cache_path, map_location="cpu")
@@ -194,6 +194,13 @@ def enforce_kl_vocab_compatibility(args, drafter_model, drafter_tokenizer, verif
     same_vocab_size = draft_vocab_size == verify_vocab_size
     same_tokenizer_class = drafter_tokenizer.__class__ == verifier_tokenizer.__class__
     if same_vocab_size and same_tokenizer_class:
+        return
+    if same_tokenizer_class:
+        logging.warning(
+            "Drafter/verifier use the same tokenizer with different output vocab sizes. KL will use the shared prefix vocab: drafter=%s verifier=%s.",
+            draft_vocab_size,
+            verify_vocab_size,
+        )
         return
     if args.allow_vocab_projection:
         logging.warning(
@@ -262,9 +269,15 @@ def project_verify_probs_to_draft_vocab(verify_probs, draft_vocab_size, projecti
 def ddsd_kl_verify(draft_logits, verify_logits, aligned, threshold, temperature, projection):
     draft_logits = draft_logits.float() / temperature
     verify_logits = verify_logits.float() / temperature
+    if projection is None:
+        shared_vocab_size = min(draft_logits.shape[-1], verify_logits.shape[-1])
+        draft_logits = draft_logits[..., :shared_vocab_size]
+        verify_logits = verify_logits[..., :shared_vocab_size]
+        p_verify = F.softmax(verify_logits, dim=-1)
+    else:
+        p_verify_native = F.softmax(verify_logits, dim=-1)
+        p_verify = project_verify_probs_to_draft_vocab(p_verify_native, draft_logits.shape[-1], projection)
     log_p_draft = F.log_softmax(draft_logits, dim=-1)
-    p_verify_native = F.softmax(verify_logits, dim=-1)
-    p_verify = project_verify_probs_to_draft_vocab(p_verify_native, draft_logits.shape[-1], projection)
     kl_scores = F.kl_div(log_p_draft, p_verify, reduction="none").sum(dim=-1)
 
     accepted_len = 0
