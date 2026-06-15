@@ -4,7 +4,7 @@ from transformers import AutoModelForCausalLM, AutoConfig
 print("1. Đưa Thầy 8B lên bàn mổ (Loading Teacher)...")
 # Giả sử đường dẫn tới LLaDA 8B. Sử dụng bfloat16 để tiết kiệm RAM.
 teacher_id = "GSAI-ML/LLaDA-8B-Instruct"
-teacher_model = AutoModelForCausalLM.from_pretrained(teacher_id, torch_dtype=torch.bfloat16)
+teacher_model = AutoModelForCausalLM.from_pretrained(teacher_id, torch_dtype=torch.bfloat16, trust_remote_code=True)
 
 print("2. Lên danh sách các Lớp cần giữ lại...")
 # Giữ lại 12 lớp trải đều từ 0 đến 31
@@ -17,7 +17,7 @@ student_config = AutoConfig.from_pretrained(teacher_id)
 student_config.num_hidden_layers = num_kept_layers
 
 # Khởi tạo mô hình Trò (Lúc này trọng số bên trong đang là Random/Rác)
-student_model = AutoModelForCausalLM.from_config(student_config, torch_dtype=torch.bfloat16)
+student_model = AutoModelForCausalLM.from_config(student_config, torch_dtype=torch.bfloat16, trust_remote_code=True)
 
 print("4. Bắt đầu phẫu thuật cấy ghép (Weight Transfer)...")
 state_dict_student = student_model.state_dict()
