@@ -11,7 +11,7 @@ teacher_model = AutoModelForCausalLM.from_pretrained(
 )
 
 print("2. Lên danh sách các Lớp cần giữ lại...")
-layers_to_keep = [0, 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 31]
+layers_to_keep = [0, 1, 2, 3, 10, 16, 22, 28, 29, 30, 31]
 num_kept_layers = len(layers_to_keep)
 
 print("3. Khởi tạo Thể xác 1.5B (The Clean Way)...")
