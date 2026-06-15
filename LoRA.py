@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 from torch.utils.data import DataLoader
@@ -32,11 +32,14 @@ if tokenizer.mask_token is None:
 
 mask_id = tokenizer.mask_token_id
 
-print("Đang tải Thầy 8B (4-bit)...")
-bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-teacher = AutoModelForCausalLM.from_pretrained(TEACHER_ID, quantization_config=bnb_config, trust_remote_code=True, device_map={"": 0})
-teacher.resize_token_embeddings(len(tokenizer)) # Thay đổi kích thước embedding để chứa token mới
-teacher.eval() # Thầy chỉ đứng nhìn, không học
+print("Đang tải Thầy 8B (Bản gốc siêu sắc nét bfloat16 - Tốn 15GB VRAM)...")
+teacher = AutoModelForCausalLM.from_pretrained(
+    TEACHER_ID, 
+    torch_dtype=torch.bfloat16, # Nạp nguyên bản
+    device_map="auto",          # Giao toàn quyền cho Hugging Face
+    trust_remote_code=True
+)
+teacher.eval()
 
 print("Đang tải Trò 1.5B (bf16) lên GPU...")
 student = AutoModelForCausalLM.from_pretrained(STUDENT_PATH, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True)
