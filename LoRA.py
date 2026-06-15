@@ -34,7 +34,7 @@ mask_id = tokenizer.mask_token_id
 
 print("Đang tải Thầy 8B (4-bit)...")
 bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-teacher = AutoModelForCausalLM.from_pretrained(TEACHER_ID, quantization_config=bnb_config, trust_remote_code=True)
+teacher = AutoModelForCausalLM.from_pretrained(TEACHER_ID, quantization_config=bnb_config, trust_remote_code=True, device_map="auto")
 teacher.resize_token_embeddings(len(tokenizer)) # Thay đổi kích thước embedding để chứa token mới
 teacher.eval() # Thầy chỉ đứng nhìn, không học
 
