@@ -13,8 +13,18 @@ num_kept_layers = len(layers_to_keep)
 
 print("3. Khởi tạo một Thể xác 1.5B trống rỗng (Loading empty Student)...")
 # Sao chép Config của Thầy, nhưng ép cấu hình số lớp xuống còn 12
-student_config = AutoConfig.from_pretrained(teacher_id)
-student_config.num_hidden_layers = num_kept_layers
+student_config = AutoConfig.from_pretrained(teacher_id, trust_remote_code=True)
+
+class PatchedConfig(type(student_config)):
+    pass
+
+student_config.__class__ = PatchedConfig
+PatchedConfig.num_hidden_layers = num_kept_layers
+
+if hasattr(student_config, "n_layers"):
+    student_config.n_layers = num_kept_layers
+if hasattr(student_config, "num_layers"):
+    student_config.num_layers = num_kept_layers
 
 # Khởi tạo mô hình Trò (Lúc này trọng số bên trong đang là Random/Rác)
 student_model = AutoModelForCausalLM.from_config(student_config, torch_dtype=torch.bfloat16, trust_remote_code=True)
