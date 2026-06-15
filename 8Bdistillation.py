@@ -3,7 +3,7 @@ from transformers import AutoModelForCausalLM, AutoConfig
 
 print("1. Đưa Thầy 8B lên bàn mổ (Loading Teacher)...")
 # Giả sử đường dẫn tới LLaDA 8B. Sử dụng bfloat16 để tiết kiệm RAM.
-teacher_id = "GSAI-ML/LLaDA-8B" 
+teacher_id = "GSAI-ML/LLaDA-8B-Instruct"
 teacher_model = AutoModelForCausalLM.from_pretrained(teacher_id, torch_dtype=torch.bfloat16)
 
 print("2. Lên danh sách các Lớp cần giữ lại...")
