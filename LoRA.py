@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -6,69 +5,73 @@ from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import os
+import gc
 
 # ==========================================
-# 1. CẤU HÌNH SIÊU THAM SỐ (Dành cho L4 24GB)
+# 1. CẤU HÌNH AN TOÀN CHO L4 24GB
 # ==========================================
 TEACHER_ID = "GSAI-ML/LLaDA-8B-Instruct"
 STUDENT_PATH = "./LLaDA-1.5B-Drafter-Clean"
-BATCH_SIZE = 4                  # L4 dư sức gánh Batch 4
-ACCUMULATION_STEPS = 4          # Tích lũy 4 vòng -> Effective Batch = 16
-MASKING_RATIO = 0.30            # Đục lỗ ngẫu nhiên 30% số chữ
-MAX_LENGTH = 256                # Chiều dài câu
-TEMPERATURE = 2.0               # Độ mềm của Loss
+BATCH_SIZE = 1                  # Giữ Batch 1 để tiết kiệm VRAM tuyệt đối
+ACCUMULATION_STEPS = 16         # Tích lũy 16 vòng (tương đương Batch 16)
+MASKING_RATIO = 0.30            
+MAX_LENGTH = 128                
 
 # ==========================================
-# 2. TẢI MÔ HÌNH VÀ BỘ NHỚ
+# 2. TẢI CẢ THẦY VÀ TRÒ DƯỚI DẠNG NGUYÊN BẢN (BFLOAT16)
 # ==========================================
 print("Đang tải Tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(TEACHER_ID, trust_remote_code=True)
-
-# Xử lý các token đặc biệt còn thiếu cho mô hình nền Llama
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-if tokenizer.mask_token is None:
-    tokenizer.add_special_tokens({'mask_token': '[MASK]'})
-
 mask_id = tokenizer.mask_token_id
 
-print("Đang tải Thầy 8B (Bản gốc siêu sắc nét bfloat16 - Tốn 15GB VRAM)...")
+# KHÔNG DÙNG BITSANDBYTES! Tải thẳng bf16 siêu sắc nét
+print("Đang tải Thầy 8B (~15GB VRAM)...")
 teacher = AutoModelForCausalLM.from_pretrained(
     TEACHER_ID, 
-    torch_dtype=torch.bfloat16, # Nạp nguyên bản
-    device_map="auto",          # Giao toàn quyền cho Hugging Face
+    torch_dtype=torch.bfloat16, 
+    device_map="auto", 
     trust_remote_code=True
 )
-teacher.eval()
+teacher.eval() # Khóa Thầy
 
-print("Đang tải Trò 1.5B (bf16) lên GPU...")
-student = AutoModelForCausalLM.from_pretrained(STUDENT_PATH, torch_dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True)
-student.resize_token_embeddings(len(tokenizer)) # Đồng bộ kích thước embedding cho Trò
+print("Đang tải Trò 1.5B (~3GB VRAM)...")
+student = AutoModelForCausalLM.from_pretrained(
+    STUDENT_PATH, 
+    torch_dtype=torch.bfloat16, 
+    device_map="auto", 
+    trust_remote_code=True
+)
 
-# Lắp LoRA cho Trò
+# Lắp LoRA
 lora_config = LoraConfig(
-    r=32, # Tăng rank lên 32 cho L4 học cho sâu
-    lora_alpha=64, 
+    r=32, lora_alpha=64, 
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "down_proj", "up_proj"], 
     lora_dropout=0.05
 )
 student = get_peft_model(student, lora_config)
+
+# TUYỆT ĐỐI KHÔNG GỌI student.resize_token_embeddings() Ở ĐÂY NỮA!
+
+# Bật khiên chống nổ RAM cho quá trình học
+student.config.use_cache = False
+if hasattr(student, "gradient_checkpointing_enable"):
+    student.gradient_checkpointing_enable()
+
 optimizer = torch.optim.AdamW(student.parameters(), lr=1e-4)
 
 # ==========================================
-# 3. CHUẨN BỊ DỮ LIỆU ĐA LUỒNG (DATALOADER)
+# 3. DATA LOADER ĐỤC LỖ
 # ==========================================
-print("Chuẩn bị Dữ liệu (Wikipedia)...")
+print("Chuẩn bị Dữ liệu Wikipedia...")
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-texts = [t for t in dataset['text'] if len(t.strip()) > 50][:4000] # Lấy 4000 câu
+texts = [t for t in dataset['text'] if len(t.strip()) > 50][:4000]
 
 def collate_fn(batch):
-    # Mã hóa cả cụm
     inputs = tokenizer(batch, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
     
-    # THUẬT TOÁN ĐỤC LỖ NGẪU NHIÊN (Chỉ đục những chữ có nghĩa, bỏ qua Padding)
     rand_matrix = torch.rand(input_ids.shape)
     mask_condition = (rand_matrix < MASKING_RATIO) & (attention_mask == 1)
     
@@ -83,61 +86,53 @@ def collate_fn(batch):
 dataloader = DataLoader(texts, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
 # ==========================================
-# 4. VÒNG LẶP HUẤN LUYỆN PRO
+# 4. VÒNG LẶP CHƯNG CẤT (ĐỈNH CAO)
 # ==========================================
-print(f"\nBắt đầu huấn luyện | Batch: {BATCH_SIZE} | Accumulation: {ACCUMULATION_STEPS} | Mask: 30%")
-
-# Tạo thư mục chứa các bản lưu tạm nếu chưa có
+print("\nBắt đầu Chưng cất Logits (Soft Labels) | Không nén!")
 os.makedirs("./checkpoints", exist_ok=True)
-
 student.train()
-optimizer.zero_grad()
-
-progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Đang trị liệu")
+progress_bar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Đang chưng cất")
 
 for step, batch in progress_bar:
-    # 1. Thầy tính điểm chuẩn
+    # --- PRO-TRICK: TÍNH THẦY XONG XÓA LUÔN ĐỂ CỨU RAM ---
     with torch.no_grad():
         teacher_outputs = teacher(**batch)
-        teacher_logits = teacher_outputs.logits
+        teacher_logits = teacher_outputs.logits.detach() # Tách hẳn khỏi đồ thị
+    del teacher_outputs 
+    # ----------------------------------------------------
 
-    # 2. Trò đoán thử
+    # Trò làm bài
     student_outputs = student(**batch)
     student_logits = student_outputs.logits
     
-    # 3. Tính độ lệch (Loss)
+    # Ép Trò học bảng điểm của Thầy (KL-Divergence)
+    T = 2.0
     loss = F.kl_div(
-        F.log_softmax(student_logits / TEMPERATURE, dim=-1),
-        F.softmax(teacher_logits / TEMPERATURE, dim=-1),
+        F.log_softmax(student_logits / T, dim=-1),
+        F.softmax(teacher_logits / T, dim=-1),
         reduction='batchmean'
-    ) * (TEMPERATURE ** 2)
+    ) * (T * T)
     
     loss = loss / ACCUMULATION_STEPS
     loss.backward()
-
-    # 4. Cập nhật trọng số
+    
+    # Dọn rác trung gian ngay lập tức
+    current_loss = loss.item() * ACCUMULATION_STEPS
+    del student_outputs, student_logits, teacher_logits, loss
+    
+    # Cập nhật LoRA
     if (step + 1) % ACCUMULATION_STEPS == 0:
         optimizer.step()
         optimizer.zero_grad()
         
-        real_step = (step + 1) // ACCUMULATION_STEPS
-        current_loss = loss.item() * ACCUMULATION_STEPS
-        
-        # Cập nhật hàm Loss trực tiếp lên thanh tiến trình
         progress_bar.set_postfix({"Loss": f"{current_loss:.4f}"})
+        real_step = (step + 1) // ACCUMULATION_STEPS
         
-        # ----------------------------------------------------
-        # BẢO HIỂM CHECKPOINT: Cứ 100 bước lưu lại 1 lần
-        # ----------------------------------------------------
-        if real_step > 0 and real_step % 100 == 0:
-            ckpt_path = f"./checkpoints/drafter_step_{real_step}"
-            student.save_pretrained(ckpt_path)
-            # In ra một dòng nhỏ để an tâm
-            progress_bar.write(f"Đã lưu an toàn Checkpoint tại bước {real_step}")
+        if real_step % 100 == 0:
+            student.save_pretrained(f"./checkpoints/drafter_step_{real_step}")
 
-print("\nHoàn tất khóa huấn luyện!")
-# Gộp trọng số và lưu bản Final
+print("\nChưng cất hoàn tất!")
 merged_model = student.merge_and_unload()
-merged_model.save_pretrained("./LLaDA-1.5B-Pro-Drafter")
-tokenizer.save_pretrained("./LLaDA-1.5B-Pro-Drafter")
-print("Mô hình Pro Final đã lưu tại ./LLaDA-1.5B-Pro-Drafter")
+merged_model.save_pretrained("./LLaDA-1.5B-KD-Drafter")
+tokenizer.save_pretrained("./LLaDA-1.5B-KD-Drafter")
+print("Bản sao hoàn hảo đã ra lò tại ./LLaDA-1.5B-KD-Drafter")
