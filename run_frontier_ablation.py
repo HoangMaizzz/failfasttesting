@@ -7,6 +7,7 @@ import pandas as pd
 
 
 FRONTIER_MODES = ("disabled", "mask_efficiency", "frontier", "cost_aware")
+DEFAULT_DRAFTER_THRESHOLDS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5)
 
 
 def parse_args():
@@ -22,13 +23,24 @@ def parse_args():
     parser.add_argument("--frontier_min_steps", type=int, default=2)
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
+    parser.add_argument("--drafter_thresholds", type=float, nargs="+", default=list(DEFAULT_DRAFTER_THRESHOLDS))
+    parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument("--log_level", type=str, default="INFO")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
-def run_mode(args, mode):
-    output_dir = Path(args.output_dir) / f"problem_{args.problem_id}" / mode
+def threshold_label(value):
+    return str(value).replace(".", "p")
+
+
+def run_case(args, mode, drafter_threshold):
+    output_dir = (
+        Path(args.output_dir)
+        / f"problem_{args.problem_id}"
+        / f"drafter_threshold_{threshold_label(drafter_threshold)}"
+        / mode
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "benchmark_results.csv"
     if csv_path.exists():
@@ -45,6 +57,8 @@ def run_mode(args, mode):
         "--small_block_size", str(args.small_block_size),
         "--target_model_name", args.target_model_name,
         "--dllm_dir", args.dllm_dir,
+        "--drafter_thresholds", str(drafter_threshold),
+        "--sweep_lowconf_threshold", str(args.lowconf_threshold),
         "--frontier_stop_mode", mode,
         "--frontier_min_steps", str(args.frontier_min_steps),
         "--frontier_patience", str(args.frontier_patience),
@@ -54,21 +68,29 @@ def run_mode(args, mode):
     ]
 
     print(f"\n{'=' * 90}")
-    print(f"FRONTIER MODE: {mode} | PROBLEM ID: {args.problem_id}")
+    print(f"FRONTIER MODE: {mode} | DRAFTER THRESHOLD: {drafter_threshold} | PROBLEM ID: {args.problem_id}")
     print(f"{'=' * 90}", flush=True)
     subprocess.run(cmd, check=True)
 
     df = pd.read_csv(csv_path)
     row = df[(df["problem_id"] == args.problem_id) & (df["mode"] == "dllm_ar")].iloc[-1].to_dict()
     row["frontier_stop_mode"] = mode
+    row["drafter_threshold"] = drafter_threshold
+    row["lowconf_threshold"] = args.lowconf_threshold
     return row
 
 
 def main():
     args = parse_args()
-    rows = [run_mode(args, mode) for mode in FRONTIER_MODES]
+    rows = [
+        run_case(args, mode, drafter_threshold)
+        for drafter_threshold in args.drafter_thresholds
+        for mode in FRONTIER_MODES
+    ]
     summary = pd.DataFrame(rows)
     columns = [
+        "drafter_threshold",
+        "lowconf_threshold",
         "frontier_stop_mode",
         "problem_id",
         "actual_total_time",
@@ -80,11 +102,11 @@ def main():
         "theo_total_time",
         "theo_speedup_vs_AR",
     ]
-    summary = summary[columns].sort_values("actual_total_time")
-    summary_path = Path(args.output_dir) / f"problem_{args.problem_id}" / "frontier_4mode_summary.csv"
+    summary = summary[columns].sort_values(["drafter_threshold", "actual_total_time"])
+    summary_path = Path(args.output_dir) / f"problem_{args.problem_id}" / "frontier_threshold_grid_summary.csv"
     summary.to_csv(summary_path, index=False)
 
-    print("\nFINAL FRONTIER ABLATION SUMMARY")
+    print("\nFINAL FRONTIER THRESHOLD GRID SUMMARY")
     print(summary.to_string(index=False))
     print(f"\nSaved summary: {summary_path}")
 
