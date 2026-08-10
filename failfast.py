@@ -247,6 +247,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
                         incr_len=None,
                         last_round_rejected=None,
     ):
+    ensure_frontier_runtime_state(args)
     num_tokens_in_prompt = orig_model_inputs['input_ids'].shape[1]
     new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
@@ -372,6 +373,9 @@ parser.add_argument("--frontier_min_steps", type=int, default=2)
 parser.add_argument("--frontier_patience", type=int, default=2)
 parser.add_argument("--frontier_gain_epsilon", type=float, default=0.0)
 parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
+parser.add_argument("--frontier_cost_ema_alpha", type=float, default=0.2)
+parser.add_argument("--frontier_calibration_prior", type=float, default=0.5)
+parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.0)
 parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
 parser.add_argument('--run_ar', action='store_true')
 parser.add_argument('--ar_dynamic', action='store_true')
@@ -424,6 +428,93 @@ def safe_div(numerator, denominator):
 
 def frontier_stop_enabled(args):
     return getattr(args, "frontier_stop_mode", "disabled") not in (None, "disabled", "none", "off")
+
+def ensure_frontier_runtime_state(args):
+    if not hasattr(args, "frontier_acceptance_calibration"):
+        args.frontier_acceptance_calibration = {
+            "confidence_bins": {},
+            "margin_bins": {},
+            "forced": {},
+            "prior": [0.0, 0.0],
+            "verifier_margin_sum": 0.0,
+            "verifier_margin_count": 0.0,
+        }
+    if not hasattr(args, "frontier_ema_dllm_forward_ms"):
+        args.frontier_ema_dllm_forward_ms = None
+    if not hasattr(args, "frontier_ema_target_token_ms"):
+        args.frontier_ema_target_token_ms = None
+    if not hasattr(args, "frontier_dynamic_cost_token_equiv"):
+        args.frontier_dynamic_cost_token_equiv = args.frontier_cost_token_equiv
+
+def update_ema(old_value, new_value, alpha):
+    if old_value is None:
+        return float(new_value)
+    return (1.0 - alpha) * float(old_value) + alpha * float(new_value)
+
+def calibration_bin(value):
+    return str(max(0, min(9, int(float(value) * 10.0))))
+
+def update_calibration_bucket(table, key, accepted):
+    accepted_count, total_count = table.get(key, [0.0, 0.0])
+    table[key] = [accepted_count + float(accepted), total_count + 1.0]
+
+def verifier_logit_margin(logits, draft_token_id):
+    topk = torch.topk(logits.float(), k=2)
+    best_id = topk.indices[0].item()
+    best_logit = topk.values[0].item()
+    second_logit = topk.values[1].item()
+    draft_logit = logits[draft_token_id].float().item()
+    best_other = second_logit if best_id == draft_token_id else best_logit
+    return draft_logit - best_other
+
+def update_frontier_latency_cost(args, forward_pass_latencies, verify_time, draft_len):
+    ensure_frontier_runtime_state(args)
+    alpha = args.frontier_cost_ema_alpha
+    if forward_pass_latencies:
+        avg_forward_ms = sum(forward_pass_latencies) / len(forward_pass_latencies)
+        args.frontier_ema_dllm_forward_ms = update_ema(args.frontier_ema_dllm_forward_ms, avg_forward_ms, alpha)
+    if draft_len > 0 and verify_time > 0:
+        target_token_ms = verify_time * 1000.0 / draft_len
+        args.frontier_ema_target_token_ms = update_ema(args.frontier_ema_target_token_ms, target_token_ms, alpha)
+    if args.frontier_ema_dllm_forward_ms and args.frontier_ema_target_token_ms:
+        args.frontier_dynamic_cost_token_equiv = safe_div(
+            args.frontier_ema_dllm_forward_ms,
+            args.frontier_ema_target_token_ms,
+        )
+
+def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcomes, verifier_margins):
+    if not frontier_stats or not accepted_outcomes:
+        return
+    ensure_frontier_runtime_state(args)
+    calibration = args.frontier_acceptance_calibration
+    draft_token_stats = frontier_stats.get("draft_token_stats", [])
+    verifier_token_stats = []
+    for idx, accepted in enumerate(accepted_outcomes):
+        if idx >= len(draft_token_stats):
+            break
+        token_stats = draft_token_stats[idx]
+        confidence = float(token_stats.get("confidence", 0.0))
+        margin = float(token_stats.get("margin", 0.0))
+        forced = bool(token_stats.get("forced", False))
+        update_calibration_bucket(calibration["confidence_bins"], calibration_bin(confidence), accepted)
+        update_calibration_bucket(calibration["margin_bins"], calibration_bin(margin), accepted)
+        update_calibration_bucket(calibration["forced"], "1" if forced else "0", accepted)
+        calibration["prior"][0] += float(accepted)
+        calibration["prior"][1] += 1.0
+        verifier_margin = verifier_margins[idx] if idx < len(verifier_margins) else None
+        if verifier_margin is not None:
+            calibration["verifier_margin_sum"] += float(verifier_margin)
+            calibration["verifier_margin_count"] += 1.0
+        verifier_token_stats.append({
+            "relative_pos": idx,
+            "accepted": bool(accepted),
+            "verifier_margin": verifier_margin,
+            "draft_confidence": confidence,
+            "draft_margin": margin,
+            "forced": forced,
+        })
+    frontier_stats["verifier_token_stats"] = verifier_token_stats
+    frontier_stats["dynamic_cost_token_equiv"] = getattr(args, "frontier_dynamic_cost_token_equiv", None)
 
 def build_benchmark_drafter_configs(args):
     return {
@@ -817,6 +908,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     accepted_len = 0
                     bonus_token = None
                     target_tokens = [] # Dành cho logging tương thích cũ
+                    checked_outcomes = []
+                    verifier_margins = []
                     
                     print(f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
                     for i in range(len(draft_proposal)):
@@ -867,6 +960,9 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             # === DLLM VẪN DÙNG EXACT MATCH (Do bản chất Distillation argmax) ===
                             target_pred = torch.argmax(verify_logits[i, :], dim=-1).item()
                             is_match = (draft_proposal[i] == target_pred)
+                            verifier_margin = verifier_logit_margin(verify_logits[i, :], draft_proposal[i])
+                            checked_outcomes.append(is_match)
+                            verifier_margins.append(verifier_margin)
                             
                             draft_word = target_tokenizer.decode([draft_proposal[i]])
                             target_word = target_tokenizer.decode([target_pred])
@@ -904,6 +1000,15 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     
                     accepted_tokens += accepted_len
                     rejected_tokens += len(draft_proposal) - accepted_len
+                    frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
+                    if draft_type == "dllm":
+                        update_frontier_latency_cost(args, forward_pass_latencies, verify_time, len(draft_proposal))
+                        update_frontier_acceptance_calibration(
+                            args,
+                            frontier_stats_this_round,
+                            checked_outcomes,
+                            verifier_margins,
+                        )
                     
                     info_this_round = {
                         "target_tokens": target_tokens,
@@ -917,7 +1022,9 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                         "verify_time_ms": verify_time * 1000.0,
                         "final_token": final_token,
                         "bonus_token": bonus_token,
-                        "frontier_stats": getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None,
+                        "frontier_stats": frontier_stats_this_round,
+                        "verifier_margins": verifier_margins if draft_type == "dllm" else None,
+                        "frontier_dynamic_cost_token_equiv": getattr(args, "frontier_dynamic_cost_token_equiv", None) if draft_type == "dllm" else None,
                     }
                     pickled_data["stats_each_round"].append(info_this_round)
                     

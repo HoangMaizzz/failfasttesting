@@ -1,4 +1,5 @@
 import argparse
+import shutil
 from pathlib import Path
 
 
@@ -206,6 +207,14 @@ def main():
     parser.add_argument("model_dir", nargs="?", default="/content/failfasttesting/Fast_dLLM_v2_1.5B")
     args = parser.parse_args()
     modeling_path = Path(args.model_dir) / "modeling.py"
+    bundled_modeling_path = Path(__file__).resolve().with_name("Fast_dLLM_v2_1_5B") / "modeling.py"
+    if bundled_modeling_path.exists() and bundled_modeling_path.resolve() != modeling_path.resolve():
+        backup_path = modeling_path.with_suffix(modeling_path.suffix + ".frontier.bak")
+        if modeling_path.exists() and not backup_path.exists():
+            shutil.copy2(modeling_path, backup_path)
+        shutil.copy2(bundled_modeling_path, modeling_path)
+        print(f"copied_bundled_frontier_modeling: {modeling_path}")
+        return
     changed = patch_modeling(modeling_path)
     print(f"{'patched' if changed else 'already_patched'}: {modeling_path}")
 

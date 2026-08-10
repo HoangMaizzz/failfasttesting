@@ -818,6 +818,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # Select tokens with probability greater than threshold from p_1t
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
+                        top2_probs = torch.topk(p_1t, k=2, dim=-1).values
+                        x1_margin = (top2_probs[..., 0] - top2_probs[..., 1]).float()
+                        x1_margin = torch.where(mask_idx[:, start:end], x1_margin, torch.zeros_like(x1_margin))
 
                         unmask_idx = (x1_p > threshold)
                         max_prob_idx = x1_p.argmax(dim=-1)
@@ -1090,15 +1093,60 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         frontier_stats = {
             "enabled": bool(return_frontier_stats),
             "mode": getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled",
+            "score_type": "expected_accepted_prefix",
             "steps": [],
             "stop_reason": None,
             "final_frontier_score": None,
             "actual_spec_len": None,
+            "draft_token_stats": [],
         }
         committed_confidences = {}
+        committed_margins = {}
+        committed_forced = {}
+        filled_on_stop_positions = set()
         frontier_scores = []
         frontier_recent_unmasked = []
         frontier_force_stop = False
+
+        def frontier_bin(value):
+            return str(max(0, min(9, int(float(value) * 10.0))))
+
+        def calibrated_acceptance_probability(confidence, margin, forced):
+            confidence = max(0.0, min(1.0, float(confidence)))
+            margin = max(0.0, min(1.0, float(margin)))
+            calibration = getattr(args, "frontier_acceptance_calibration", None) if args is not None else None
+            if not calibration:
+                return max(0.02, min(0.98, confidence))
+
+            prior = float(getattr(args, "frontier_calibration_prior", 0.5)) if args is not None else 0.5
+            prior_count = float(getattr(args, "frontier_calibration_prior_count", 2.0)) if args is not None else 2.0
+            estimates = [max(0.02, min(0.98, confidence))]
+            weights = [1.0]
+
+            for table_name, key in (
+                ("confidence_bins", frontier_bin(confidence)),
+                ("margin_bins", frontier_bin(margin)),
+                ("forced", "1" if forced else "0"),
+            ):
+                accepted, total = calibration.get(table_name, {}).get(key, (0.0, 0.0))
+                total = float(total)
+                if total > 0:
+                    estimate = (float(accepted) + prior * prior_count) / (total + prior_count)
+                    estimates.append(max(0.02, min(0.98, estimate)))
+                    weights.append(min(4.0, total))
+
+            return sum(value * weight for value, weight in zip(estimates, weights)) / sum(weights)
+
+        def expected_prefix_score(confidences, margins, forced_flags):
+            score = 0.0
+            survival = 1.0
+            probabilities = []
+            for confidence, margin, forced in zip(confidences, margins, forced_flags):
+                accept_prob = calibrated_acceptance_probability(confidence, margin, forced)
+                probabilities.append(accept_prob)
+                survival *= accept_prob
+                score += survival
+            return score, probabilities
         
         if input_ids.shape[1] > block_size:
             if prev_prefill_output is not None and prev_prefill_output.logits.shape[1] == (input_ids.shape[1] // block_size * block_size):
@@ -1233,6 +1281,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             draft_end_idx = draft_token_start_idx + target_len
                             block_abs_start = x_t.shape[1] - block_size
                             current_step_confidences = {}
+                            current_step_margins = {}
                             unmasked_this_step = int(unmask_idx.sum().item())
 
                             for batch_idx, local_idx in unmask_idx.nonzero(as_tuple=False).tolist():
@@ -1241,26 +1290,39 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     committed_confidences[int(absolute_pos)] = float(x1_p[batch_idx, local_idx].float().item())
+                                    committed_margins[int(absolute_pos)] = float(x1_margin[batch_idx, local_idx].float().item())
+                                    committed_forced[int(absolute_pos)] = bool(x1_p[batch_idx, local_idx].float().item() <= threshold)
 
                             for local_idx in range(x1_p.shape[1]):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     current_step_confidences[int(absolute_pos)] = float(max(x1_p[0, local_idx].float().item(), 0.0))
+                                    current_step_margins[int(absolute_pos)] = float(max(x1_margin[0, local_idx].float().item(), 0.0))
 
                             confidences = []
+                            margins = []
+                            forced_flags = []
                             recoverable = []
                             for absolute_pos in range(draft_token_start_idx, draft_end_idx):
                                 if absolute_pos in committed_confidences:
                                     confidences.append(committed_confidences[absolute_pos])
+                                    margins.append(committed_margins.get(absolute_pos, 0.0))
+                                    forced_flags.append(committed_forced.get(absolute_pos, False))
                                     recoverable.append(False)
                                 elif x_t[0, absolute_pos].item() != mask_id:
                                     confidences.append(1.0)
+                                    margins.append(1.0)
+                                    forced_flags.append(False)
                                     recoverable.append(False)
                                 elif absolute_pos in current_step_confidences:
                                     confidences.append(current_step_confidences[absolute_pos])
+                                    margins.append(current_step_margins.get(absolute_pos, 0.0))
+                                    forced_flags.append(False)
                                     recoverable.append(True)
                                 else:
                                     confidences.append(0.0)
+                                    margins.append(0.0)
+                                    forced_flags.append(False)
                                     recoverable.append(True)
 
                             frontier_k = 0
@@ -1270,14 +1332,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 else:
                                     break
 
+                            frontier_score, accept_probabilities = expected_prefix_score(confidences, margins, forced_flags)
                             if frontier_k >= target_len:
-                                frontier_score = float(target_len)
                                 frontier_confidence = None
                                 frontier_recoverable = False
                             else:
                                 frontier_confidence = confidences[frontier_k]
                                 frontier_recoverable = recoverable[frontier_k]
-                                frontier_score = float(frontier_k) + min(1.0, max(frontier_confidence, 0.0) / max(tau_f, 1e-12))
 
                             previous_score = frontier_scores[-1] if frontier_scores else None
                             frontier_gain = None if previous_score is None else frontier_score - previous_score
@@ -1295,6 +1356,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "frontier_gain": None if frontier_gain is None else float(frontier_gain),
                                 "frontier_confidence": frontier_confidence,
                                 "frontier_recoverable": bool(frontier_recoverable),
+                                "expected_accept_prob_frontier": None if frontier_k >= target_len else float(accept_probabilities[frontier_k]),
                                 "unmasked_this_step": unmasked_this_step,
                                 "masks_remaining": masks_remaining,
                             }
@@ -1305,7 +1367,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             patience = int(getattr(args, "frontier_patience", 2)) if args is not None else 2
                             gain_epsilon = float(getattr(args, "frontier_gain_epsilon", 0.0)) if args is not None else 0.0
                             max_unmask = 1
-                            cost_token_equiv = float(getattr(args, "frontier_cost_token_equiv", 0.2)) if args is not None else 0.2
+                            cost_token_equiv = float(getattr(args, "frontier_dynamic_cost_token_equiv", getattr(args, "frontier_cost_token_equiv", 0.2))) if args is not None else 0.2
                             aggressive_irrecoverable = bool(getattr(args, "frontier_aggressive_irrecoverable", False)) if args is not None else False
 
                             stop_reason = None
@@ -1345,6 +1407,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     num_forward_passes += 1
 
                                     fill_probs = torch.softmax(fill_logits, dim=-1)
+                                    fill_top2_probs = torch.topk(fill_probs, k=2, dim=-1).values
+                                    fill_margins = (fill_top2_probs[..., 0] - fill_top2_probs[..., 1]).float()
                                     draft_mask = (x_t[:, draft_token_start_idx:draft_end_idx] == mask_id)
                                     for rel_pos in draft_mask[0].nonzero(as_tuple=False).flatten().tolist():
                                         absolute_pos = draft_token_start_idx + rel_pos
@@ -1354,6 +1418,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             token_conf = torch.gather(fill_probs[:, local_pos, :], dim=-1, index=token_id.unsqueeze(-1)).squeeze(-1)
                                             x_t[:, absolute_pos] = token_id
                                             committed_confidences[int(absolute_pos)] = float(token_conf[0].float().item())
+                                            committed_margins[int(absolute_pos)] = float(fill_margins[0, local_pos].float().item())
+                                            committed_forced[int(absolute_pos)] = True
+                                            filled_on_stop_positions.add(int(absolute_pos))
 
                                 draft_tokens_unmasked = True
                                 frontier_stats["actual_spec_len"] = int(spec_len)
@@ -1421,6 +1488,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         logger.debug(f"{Colors.YELLOW}forward_pass_latencies: {[f'{latency:.2f}ms' for latency in forward_pass_latencies]}{Colors.RESET}")
         
         frontier_stats["actual_spec_len"] = int(spec_len)
+        if return_frontier_stats and is_drafter:
+            draft_token_stats = []
+            draft_end_idx = min(draft_token_start_idx + int(spec_len), input_ids.shape[1])
+            for absolute_pos in range(draft_token_start_idx, draft_end_idx):
+                draft_token_stats.append({
+                    "relative_pos": int(absolute_pos - draft_token_start_idx),
+                    "token_id": int(input_ids[0, absolute_pos].item()),
+                    "confidence": float(committed_confidences.get(absolute_pos, 0.0)),
+                    "margin": float(committed_margins.get(absolute_pos, 0.0)),
+                    "forced": bool(committed_forced.get(absolute_pos, False)),
+                    "filled_on_stop": bool(absolute_pos in filled_on_stop_positions),
+                })
+            frontier_stats["draft_token_stats"] = draft_token_stats
         if return_prefill_kvs:
             if return_frontier_stats:
                 return input_ids, spec_len, prefill_output, num_forward_passes, forward_pass_latencies, frontier_stats
