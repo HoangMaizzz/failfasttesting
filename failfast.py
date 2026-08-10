@@ -181,9 +181,11 @@ def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec
         'input_ids': torch.cat([orig_model_inputs['input_ids'], new_tokens], dim=1),
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
+    return_frontier_stats = False
+    frontier_stats = None
 
     if args.disable_reusing_drafter_kvs:
-        generated_ids, num_forward_passes, forward_pass_latencies = dllm.generate_draft_tokens(
+        draft_result = dllm.generate_draft_tokens(
             new_model_inputs["input_ids"],
             max_new_tokens=output_seqlen,
             small_block_size=small_block_size,
@@ -197,9 +199,14 @@ def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec
             spec_len=spec_len,
             return_prefill_kvs=False,
             args=args,
+            return_frontier_stats=return_frontier_stats,
         )
+        if return_frontier_stats:
+            generated_ids, num_forward_passes, forward_pass_latencies, frontier_stats = draft_result
+        else:
+            generated_ids, num_forward_passes, forward_pass_latencies = draft_result
     else:
-        generated_ids, prefill_output, num_forward_passes, forward_pass_latencies = dllm.generate_draft_tokens(
+        draft_result = dllm.generate_draft_tokens(
             new_model_inputs["input_ids"],
             max_new_tokens=output_seqlen,
             small_block_size=small_block_size,
@@ -214,7 +221,12 @@ def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec
             return_prefill_kvs=True,
             prev_prefill_output=prev_prefill_output,
             args=args,
+            return_frontier_stats=return_frontier_stats,
         )
+        if return_frontier_stats:
+            generated_ids, prefill_output, num_forward_passes, forward_pass_latencies, frontier_stats = draft_result
+        else:
+            generated_ids, prefill_output, num_forward_passes, forward_pass_latencies = draft_result
     
     full_output_seqlen = generated_ids.shape[1]
     assert full_output_seqlen > num_tokens_in_prompt + len(token_ids_so_far), f"full_output_seqlen {full_output_seqlen}, num_tokens_in_prompt {num_tokens_in_prompt}, len(token_ids_so_far) {len(token_ids_so_far)}"
@@ -243,9 +255,11 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
         'input_ids': torch.cat([orig_model_inputs['input_ids'], new_tokens], dim=1),
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
+    return_frontier_stats = frontier_stop_enabled(args)
+    frontier_stats = None
 
     if args.disable_reusing_drafter_kvs:
-        generated_ids, actual_spec_len, num_forward_passes, forward_pass_latencies = dllm.generate_draft_tokens_arbitrary_length(
+        draft_result = dllm.generate_draft_tokens_arbitrary_length(
             new_model_inputs["input_ids"],
             max_new_tokens=output_seqlen,
             small_block_size=small_block_size,
@@ -263,9 +277,14 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
             max_spec_len=max_spec_len,
             incr_len=incr_len,
             last_round_rejected=last_round_rejected,
+            return_frontier_stats=return_frontier_stats,
         )
+        if return_frontier_stats:
+            generated_ids, actual_spec_len, num_forward_passes, forward_pass_latencies, frontier_stats = draft_result
+        else:
+            generated_ids, actual_spec_len, num_forward_passes, forward_pass_latencies = draft_result
     else:
-        generated_ids, actual_spec_len, prefill_output, num_forward_passes, forward_pass_latencies = dllm.generate_draft_tokens_arbitrary_length(
+        draft_result = dllm.generate_draft_tokens_arbitrary_length(
             new_model_inputs["input_ids"],
             max_new_tokens=output_seqlen,
             small_block_size=small_block_size,
@@ -283,7 +302,12 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
             max_spec_len=max_spec_len,
             incr_len=incr_len,
             last_round_rejected=last_round_rejected,
+            return_frontier_stats=return_frontier_stats,
         )
+        if return_frontier_stats:
+            generated_ids, actual_spec_len, prefill_output, num_forward_passes, forward_pass_latencies, frontier_stats = draft_result
+        else:
+            generated_ids, actual_spec_len, prefill_output, num_forward_passes, forward_pass_latencies = draft_result
     
     full_output_seqlen = generated_ids.shape[1]
     assert full_output_seqlen > num_tokens_in_prompt + len(token_ids_so_far), f"full_output_seqlen {full_output_seqlen}, num_tokens_in_prompt {num_tokens_in_prompt}, len(token_ids_so_far) {len(token_ids_so_far)}"
@@ -294,6 +318,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
         special_token = "MASK" if 151665 in generated_ids else "STOP"
         logging.info(f"{Colors.RED}Generated ids contain {special_token} tokens! {generated_ids}{Colors.RESET}")
     
+    args.last_frontier_stats = frontier_stats
     if not args.disable_reusing_drafter_kvs:
         return generated_ids, actual_spec_len, prefill_output, num_forward_passes, forward_pass_latencies
     return generated_ids, actual_spec_len, num_forward_passes, forward_pass_latencies
@@ -342,6 +367,12 @@ parser.add_argument("--log_level", type=str, default="DEBUG", choices=["DEBUG", 
 parser.add_argument("--sweep_lowconf_threshold", type=float, nargs="+", default=[0.45])
 parser.add_argument("--sweep_max_spec_len", type=int, nargs="+", default=[60])
 parser.add_argument("--sweep_incr_len", type=int, nargs="+", default=[10])
+parser.add_argument("--frontier_stop_mode", type=str, default="disabled", choices=["disabled", "mask_efficiency", "frontier", "cost_aware"])
+parser.add_argument("--frontier_min_steps", type=int, default=2)
+parser.add_argument("--frontier_patience", type=int, default=2)
+parser.add_argument("--frontier_gain_epsilon", type=float, default=0.0)
+parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
+parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
 parser.add_argument('--run_ar', action='store_true')
 parser.add_argument('--ar_dynamic', action='store_true')
 parser.add_argument('--run_dllm_sf', action='store_true')
@@ -390,6 +421,9 @@ BENCHMARK_CSV_COLUMNS = [
 
 def safe_div(numerator, denominator):
     return numerator / denominator if denominator else 0.0
+
+def frontier_stop_enabled(args):
+    return getattr(args, "frontier_stop_mode", "disabled") not in (None, "disabled", "none", "off")
 
 def build_benchmark_drafter_configs(args):
     return {
@@ -528,7 +562,7 @@ if not args.read_pickle:
             if os.path.exists(hf_cache_dir):
                 shutil.rmtree(hf_cache_dir)
             
-            dllm_path = "/content/failfasttesting/Fast_dLLM_v2_1_5B"
+            dllm_path = args.dllm_dir or "/content/failfasttesting/Fast_dLLM_v2_1_5B"
             
             logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
@@ -883,6 +917,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                         "verify_time_ms": verify_time * 1000.0,
                         "final_token": final_token,
                         "bonus_token": bonus_token,
+                        "frontier_stats": getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None,
                     }
                     pickled_data["stats_each_round"].append(info_this_round)
                     
