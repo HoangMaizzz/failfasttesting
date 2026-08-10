@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 
-FRONTIER_MODES = ("disabled", "mask_efficiency", "frontier", "cost_aware")
+FRONTIER_MODES = ("disabled", "cost_aware")
 DEFAULT_DRAFTER_THRESHOLDS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5)
 
 
@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--frontier_min_steps", type=int, default=2)
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
+    parser.add_argument("--frontier_modes", type=str, nargs="+", choices=["disabled", "mask_efficiency", "frontier", "cost_aware"], default=list(FRONTIER_MODES))
     parser.add_argument("--drafter_thresholds", type=float, nargs="+", default=list(DEFAULT_DRAFTER_THRESHOLDS))
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument("--log_level", type=str, default="INFO")
@@ -52,6 +53,7 @@ def run_case(args, mode, drafter_threshold):
         "failfast.py",
         "--dataset_name", "gsm8k",
         "--num_questions", str(args.num_questions),
+        "--benchmark_modes", "dllm_ar",
         "--max_new_tokens", str(args.max_new_tokens),
         "--spec_len", str(args.spec_len),
         "--block_size", str(args.block_size),
@@ -101,7 +103,7 @@ def main():
     rows = [
         run_case(args, mode, drafter_threshold)
         for drafter_threshold in args.drafter_thresholds
-        for mode in FRONTIER_MODES
+        for mode in args.frontier_modes
     ]
     summary = pd.DataFrame(rows)
     columns = [

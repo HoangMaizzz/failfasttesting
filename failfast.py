@@ -354,6 +354,7 @@ parser = argparse.ArgumentParser(description="Profiles the acceptance rate of sp
 parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gsm8k", "gpqa", "humaneval", "mt_bench"], default="math")
 parser.add_argument("--output_dir", type=str, default="/data2/USERNAME/failfast")
 parser.add_argument("--mode", type=str, choices=["verifier_ar", "ar_ar", "dllm_ar"], default="dllm_ar")
+parser.add_argument("--benchmark_modes", type=str, nargs="+", choices=["verifier_ar", "ar_ar", "dllm_ar"], default=["verifier_ar", "ar_ar", "dllm_ar"])
 parser.add_argument("--target_model_name", type=str, default=None)
 parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
@@ -712,7 +713,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
 
     problem_benchmark_rows = []
     ar_drafter_speedup = {k: None for k in args.latency.keys()}
-    for benchmark_mode in BENCHMARK_MODES:
+    for benchmark_mode in args.benchmark_modes:
         args.mode = benchmark_mode
         apply_mode_settings(args)
         transformers.set_seed(42)
@@ -1110,12 +1111,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             drafted_tokens,
         ))
 
-    baseline_row = next(row for row in problem_benchmark_rows if row["mode"] == "verifier_ar")
+    baseline_row = next((row for row in problem_benchmark_rows if row["mode"] == "verifier_ar"), None)
     for row in problem_benchmark_rows:
         if row["mode"] == "verifier_ar":
             row["actual_speedup_vs_AR"] = 1.0
             row["theo_speedup_vs_AR"] = 1.0
-        else:
+        elif baseline_row is not None:
             row["actual_speedup_vs_AR"] = safe_div(baseline_row["actual_total_time"], row["actual_total_time"])
             row["theo_speedup_vs_AR"] = safe_div(baseline_row["theo_total_time"], row["theo_total_time"])
     append_benchmark_rows(args, problem_benchmark_rows)
