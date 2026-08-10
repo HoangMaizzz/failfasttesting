@@ -1264,6 +1264,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # Select tokens with probability greater than threshold from p_1t
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
+                        top2_probs = torch.topk(p_1t, k=2, dim=-1).values
+                        x1_margin = (top2_probs[..., 0] - top2_probs[..., 1]).float()
+                        x1_margin = torch.where(mask_idx[:, start:end], x1_margin, torch.zeros_like(x1_margin))
                         
                         # record the confidence of already-unmasked tokens
                         conf_of_unmasked_tokens.extend(x1_p[x1_p != -torch.inf].float().cpu().numpy().tolist())  # FIXME TODO(ruipan): n=5, small blk size 8 -- might include non-drafted tokens?!
