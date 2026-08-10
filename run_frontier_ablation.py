@@ -13,6 +13,7 @@ DEFAULT_DRAFTER_THRESHOLDS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5)
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--problem_id", type=int, default=0)
+    parser.add_argument("--num_questions", type=int, default=30)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--spec_len", type=int, default=10)
     parser.add_argument("--block_size", type=int, default=32)
@@ -37,7 +38,7 @@ def threshold_label(value):
 def run_case(args, mode, drafter_threshold):
     output_dir = (
         Path(args.output_dir)
-        / f"problem_{args.problem_id}"
+        / f"num_questions_{args.num_questions}"
         / f"drafter_threshold_{threshold_label(drafter_threshold)}"
         / mode
     )
@@ -50,7 +51,7 @@ def run_case(args, mode, drafter_threshold):
         sys.executable,
         "failfast.py",
         "--dataset_name", "gsm8k",
-        "--num_questions", str(args.problem_id + 1),
+        "--num_questions", str(args.num_questions),
         "--max_new_tokens", str(args.max_new_tokens),
         "--spec_len", str(args.spec_len),
         "--block_size", str(args.block_size),
@@ -68,12 +69,27 @@ def run_case(args, mode, drafter_threshold):
     ]
 
     print(f"\n{'=' * 90}")
-    print(f"FRONTIER MODE: {mode} | DRAFTER THRESHOLD: {drafter_threshold} | PROBLEM ID: {args.problem_id}")
+    print(f"FRONTIER MODE: {mode} | DRAFTER THRESHOLD: {drafter_threshold} | NUM QUESTIONS: {args.num_questions}")
     print(f"{'=' * 90}", flush=True)
     subprocess.run(cmd, check=True)
 
     df = pd.read_csv(csv_path)
-    row = df[(df["problem_id"] == args.problem_id) & (df["mode"] == "dllm_ar")].iloc[-1].to_dict()
+    dllm_rows = df[df["mode"] == "dllm_ar"].copy()
+    numeric_columns = [
+        "actual_total_time",
+        "theo_total_time",
+        "actual_draft_time",
+        "theo_draft_time",
+        "actual_verify_time",
+        "theo_verify_time",
+        "actual_draft_verify_ratio",
+        "theo_draft_verify_ratio",
+        "acceptance_rate_percent",
+        "actual_speedup_vs_AR",
+        "theo_speedup_vs_AR",
+    ]
+    row = dllm_rows[numeric_columns].mean(numeric_only=True).to_dict()
+    row["num_samples"] = len(dllm_rows)
     row["frontier_stop_mode"] = mode
     row["drafter_threshold"] = drafter_threshold
     row["lowconf_threshold"] = args.lowconf_threshold
@@ -92,7 +108,7 @@ def main():
         "drafter_threshold",
         "lowconf_threshold",
         "frontier_stop_mode",
-        "problem_id",
+        "num_samples",
         "actual_total_time",
         "actual_draft_time",
         "actual_verify_time",
@@ -103,7 +119,7 @@ def main():
         "theo_speedup_vs_AR",
     ]
     summary = summary[columns].sort_values(["drafter_threshold", "actual_total_time"])
-    summary_path = Path(args.output_dir) / f"problem_{args.problem_id}" / "frontier_threshold_grid_summary.csv"
+    summary_path = Path(args.output_dir) / f"num_questions_{args.num_questions}" / "frontier_threshold_grid_mean_summary.csv"
     summary.to_csv(summary_path, index=False)
 
     print("\nFINAL FRONTIER THRESHOLD GRID SUMMARY")
