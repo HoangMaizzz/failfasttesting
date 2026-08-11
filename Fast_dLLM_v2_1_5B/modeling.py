@@ -1100,6 +1100,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "actual_spec_len": None,
             "draft_token_stats": [],
             "refinement_actions": [],
+            "forward_pass_breakdown": {
+                "prefill": 0,
+                "cache_update": 0,
+                "denoising": 0,
+                "fill": 0,
+                "total": 0,
+            },
         }
         committed_confidences = {}
         committed_margins = {}
@@ -1167,6 +1174,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 # logger.debug(f"{Colors.CYAN}Initial fwd pass to populate KV cache because input seqlen {input_ids.shape[1]} > block_size {block_size}{Colors.RESET}")
                 # logger.debug(f"{Colors.CYAN}The prefill pass operated on tokens up until index {input_ids.shape[1] // block_size * block_size}{Colors.RESET}")
                 num_forward_passes += 1
+                frontier_stats["forward_pass_breakdown"]["prefill"] += 1
                 logits, past_key_values = output.logits, output.past_key_values
                 if input_ids.shape[1] % block_size == 0:
                     next_token = logits[:, -1:, :].argmax(dim=-1)
@@ -1208,6 +1216,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     forward_pass_latencies.append(start_time.elapsed_time(end_time))
                     ##################End of timer##################
                     num_forward_passes += 1
+                    frontier_stats["forward_pass_breakdown"]["cache_update"] += 1
                     logger.debug(f"{Colors.CYAN}Doing 1 more fwd pass because mask_idx.sum() == 0{Colors.RESET}")
                     
                     logits, past_key_values = output.logits, output.past_key_values
@@ -1259,6 +1268,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         forward_pass_latencies.append(start_time.elapsed_time(end_time))
                         ##################End of timer##################
                         num_forward_passes += 1
+                        frontier_stats["forward_pass_breakdown"]["denoising"] += 1
                         logger.debug(f"{Colors.CYAN}block {block_idx}, small_block_idx {small_block_idx}, fwd pass. start {start}, end {end}.{Colors.RESET}")
                         
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
@@ -1278,7 +1288,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         unmask_idx = unmask_idx & mask_idx[:, start:end]  # only allowed to update MASK tokens
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
-                        if is_drafter and return_frontier_stats and lowconf_threshold is not None and draft_token_end_idx <= x_t.shape[1]:
+                        if is_drafter and return_frontier_stats and frontier_stats["mode"] not in ("disabled", "none", "off") and lowconf_threshold is not None and draft_token_end_idx <= x_t.shape[1]:
                             frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
                             tau_f = float(lowconf_threshold)
                             target_len = int(spec_len)
@@ -1415,6 +1425,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     torch.cuda.synchronize()
                                     forward_pass_latencies.append(fill_start_time.elapsed_time(fill_end_time))
                                     num_forward_passes += 1
+                                    frontier_stats["forward_pass_breakdown"]["fill"] += 1
 
                                     fill_probs = torch.softmax(fill_logits, dim=-1)
                                     fill_top2_probs = torch.topk(fill_probs, k=2, dim=-1).values
@@ -1499,7 +1510,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         logger.debug(f"{Colors.YELLOW}forward_pass_latencies: {[f'{latency:.2f}ms' for latency in forward_pass_latencies]}{Colors.RESET}")
         
         frontier_stats["actual_spec_len"] = int(spec_len)
-        if return_frontier_stats and is_drafter:
+        frontier_stats["forward_pass_breakdown"]["total"] = int(num_forward_passes)
+        if return_frontier_stats and is_drafter and frontier_stats["mode"] not in ("disabled", "none", "off"):
             draft_token_stats = []
             draft_end_idx = min(draft_token_start_idx + int(spec_len), input_ids.shape[1])
             for absolute_pos in range(draft_token_start_idx, draft_end_idx):

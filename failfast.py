@@ -256,7 +256,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
         'input_ids': torch.cat([orig_model_inputs['input_ids'], new_tokens], dim=1),
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
-    return_frontier_stats = frontier_stop_enabled(args)
+    return_frontier_stats = frontier_stop_enabled(args) or getattr(args, "collect_draft_diagnostics", False)
     frontier_stats = None
 
     if args.disable_reusing_drafter_kvs:
@@ -378,6 +378,7 @@ parser.add_argument("--frontier_cost_ema_alpha", type=float, default=0.2)
 parser.add_argument("--frontier_calibration_prior", type=float, default=0.5)
 parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.0)
 parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
+parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument('--run_ar', action='store_true')
 parser.add_argument('--ar_dynamic', action='store_true')
 parser.add_argument('--run_dllm_sf', action='store_true')
