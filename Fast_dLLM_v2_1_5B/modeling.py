@@ -1090,9 +1090,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         draft_tokens_unmasked = False
         prefill_output = None
         conf_of_unmasked_tokens = []
+        frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
         frontier_stats = {
             "enabled": bool(return_frontier_stats),
-            "mode": getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled",
+            "mode": frontier_mode,
             "score_type": "expected_accepted_prefix",
             "steps": [],
             "stop_reason": None,

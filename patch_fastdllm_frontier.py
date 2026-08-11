@@ -3,9 +3,10 @@ import shutil
 from pathlib import Path
 
 
-FRONTIER_INIT = '''        frontier_stats = {
+FRONTIER_INIT = '''        frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
+        frontier_stats = {
             "enabled": bool(return_frontier_stats),
-            "mode": getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled",
+            "mode": frontier_mode,
             "steps": [],
             "stop_reason": None,
             "final_frontier_score": None,
