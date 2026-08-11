@@ -1482,14 +1482,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             logger.info(f"{Colors.YELLOW}Reusing: {len(curr_proposal)}->{spec_len}. Current num_forward_passes {num_forward_passes}{Colors.RESET}")
                                     ###end of logic of reusing rejected drafts from the last round###
                                 
-                            elif len(conf_of_unmasked_tokens) >= max_spec_len:
+                            elif (
+                                frontier_mode in ("disabled", "none", "off")
+                                and len(conf_of_unmasked_tokens) >= max_spec_len
+                            ) or (
+                                frontier_mode not in ("disabled", "none", "off")
+                                and spec_len >= max_spec_len
+                            ):
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_max_spec_len"
                                 logger.debug(f"{Colors.GREEN}Already drafted {len(conf_of_unmasked_tokens)}>{max_spec_len} high-confidence tokens, stopping just in case.{Colors.RESET}")
                                 draft_tokens_unmasked = True
                             else:
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. All are high-confidence, continue speculating.{Colors.RESET}")
-                                draft_token_end_idx += incr_len
-                                spec_len += incr_len
+                                extension = incr_len if frontier_mode in ("disabled", "none", "off") else min(incr_len, max_spec_len - spec_len)
+                                draft_token_end_idx += extension
+                                spec_len += extension
                                 draft_tokens_unmasked = False
 
                     if is_drafter and draft_tokens_unmasked:

@@ -2,6 +2,8 @@ import os
 import sys
 import copy
 import csv
+import hashlib
+import re
 import time
 import torch
 import pickle
@@ -379,6 +381,9 @@ parser.add_argument("--frontier_calibration_prior", type=float, default=0.5)
 parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.0)
 parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
+parser.add_argument("--quiet_generation", action="store_true")
+parser.add_argument("--skip_plots", action="store_true")
+parser.add_argument("--seed", type=int, default=42)
 parser.add_argument('--run_ar', action='store_true')
 parser.add_argument('--ar_dynamic', action='store_true')
 parser.add_argument('--run_dllm_sf', action='store_true')
@@ -423,10 +428,45 @@ BENCHMARK_CSV_COLUMNS = [
     "acceptance_rate_percent",
     "actual_speedup_vs_AR",
     "theo_speedup_vs_AR",
+    "actual_e2e_time",
+    "output_tokens",
+    "accepted_tokens",
+    "drafted_tokens",
+    "num_speculation_rounds",
+    "total_num_forward_passes",
+    "modeled_ms_per_output_token",
+    "modeled_speedup",
+    "output_token_hash",
+    "predicted_answer",
+    "reference_answer",
+    "is_correct",
 ]
 
 def safe_div(numerator, denominator):
     return numerator / denominator if denominator else 0.0
+
+def generation_print(args, *values, **kwargs):
+    if not args.quiet_generation:
+        print(*values, **kwargs)
+
+def token_sequence_hash(token_ids):
+    payload = ",".join(str(int(token_id)) for token_id in token_ids).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+def normalize_math_answer(value):
+    if value is None:
+        return None
+    return value.strip().replace(",", "").replace("$", "").replace(" ", "")
+
+def extract_predicted_answer(text):
+    matches = re.findall(r"\\boxed\{([^{}]+)\}", text)
+    return normalize_math_answer(matches[-1]) if matches else None
+
+def extract_reference_answer(raw_data):
+    answer = raw_data.get("answer")
+    if not answer:
+        return None
+    return normalize_math_answer(answer.rsplit("####", 1)[-1])
 
 def frontier_stop_enabled(args):
     return getattr(args, "frontier_stop_mode", "disabled") not in (None, "disabled", "none", "off")
@@ -542,6 +582,10 @@ def build_benchmark_row(
     num_speculation_rounds,
     accepted_tokens,
     drafted_tokens,
+    actual_e2e_time,
+    output_token_ids,
+    predicted_answer,
+    reference_answer,
 ):
     latency = args.latency["vLLM_A6000"]
     actual_draft_time = draft_time_total
@@ -550,6 +594,8 @@ def build_benchmark_row(
     theo_draft_time = total_num_forward_passes * latency["draft_fwd_pass"]
     theo_verify_time = num_speculation_rounds * latency["target_tpt"][args.target_model_name_clean]
     theo_total_time = theo_draft_time + theo_verify_time
+    output_tokens = len(output_token_ids)
+    modeled_ms_per_output_token = safe_div(theo_total_time, output_tokens)
     return {
         "problem_id": problem_id,
         "mode": mode,
@@ -564,6 +610,18 @@ def build_benchmark_row(
         "acceptance_rate_percent": safe_div(accepted_tokens, drafted_tokens) * 100.0,
         "actual_speedup_vs_AR": None,
         "theo_speedup_vs_AR": None,
+        "actual_e2e_time": actual_e2e_time,
+        "output_tokens": output_tokens,
+        "accepted_tokens": accepted_tokens,
+        "drafted_tokens": drafted_tokens,
+        "num_speculation_rounds": num_speculation_rounds,
+        "total_num_forward_passes": total_num_forward_passes,
+        "modeled_ms_per_output_token": modeled_ms_per_output_token,
+        "modeled_speedup": safe_div(latency["target_tpt"][args.target_model_name_clean], modeled_ms_per_output_token),
+        "output_token_hash": token_sequence_hash(output_token_ids),
+        "predicted_answer": predicted_answer,
+        "reference_answer": reference_answer,
+        "is_correct": predicted_answer is not None and predicted_answer == reference_answer,
     }
 
 def append_benchmark_rows(args, rows):
@@ -698,7 +756,7 @@ if not args.read_pickle:
         draft_tokenizer = target_tokenizer
 
 for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
-    transformers.set_seed(42)
+    transformers.set_seed(args.seed)
     raw_data = format_problem_and_options(args, problem_id)
     messages = [
         {"role": "user", "content": get_first_user_msg(args, raw_data)},
@@ -717,7 +775,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
     for benchmark_mode in args.benchmark_modes:
         args.mode = benchmark_mode
         apply_mode_settings(args)
-        transformers.set_seed(42)
+        transformers.set_seed(args.seed)
         drafter_config = args.benchmark_drafter_configs[benchmark_mode]
         draft_type, drafter_threshold, freq_scheme, lowconf_threshold, max_spec_len, incr_len = drafter_config
         drafter_name = format_drafter_name(args, drafter_config)
@@ -736,11 +794,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             rejected_tokens = pickled_data["rejected_tokens"]
             num_speculation_rounds = pickled_data["num_speculation_rounds"]
             total_num_forward_passes = pickled_data["total_num_forward_passes"]
-            current_token_ids = get_output_tokens(pickled_data["stats_each_round"])
+            current_token_ids = pickled_data.get("output_token_ids") or get_output_tokens(pickled_data["stats_each_round"])
             if draft_type == "verifier_ar" and not current_token_ids and pickled_data["stats_each_round"]:
                 current_token_ids = pickled_data["stats_each_round"][0].get("target_tokens", [])
             draft_time_total = sum(x.get("draft_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
             verify_time_total = sum(x.get("verify_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
+            actual_e2e_time = pickled_data.get("actual_e2e_time", draft_time_total + verify_time_total)
         else:
             orig_model_inputs = {key: value.clone() for key, value in base_orig_model_inputs.items()}
             logging.info(f"{Colors.BOLD}=== [Problem {problem_id}] Running drafter: {drafter_name} ==={Colors.RESET}")
@@ -759,6 +818,10 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 "stats_each_round": [],
             }
 
+            if orig_model_inputs["input_ids"].is_cuda:
+                torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+            generation_start = time.perf_counter()
+
             if is_interactive():
                 inner_bar = tqdm(total=num_target_tokens, miniters=1, desc=f"Verification (Problem {problem_id})",
                                 position=1, leave=True, dynamic_ncols=False, file=sys.stdout)
@@ -767,10 +830,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 logging.info(f"{Colors.BOLD}=== [Problem {problem_id}] Running verifier-only AR generation ({args.target_model_name}) ==={Colors.RESET}")
                 
                 from transformers import TextStreamer
-                streamer = TextStreamer(target_tokenizer, skip_prompt=True, skip_special_tokens=True)
+                streamer = None if args.quiet_generation else TextStreamer(target_tokenizer, skip_prompt=True, skip_special_tokens=True)
                 
-                print(f"\n⏳ BẮT ĐẦU AR-ONLY GENERATION (Live Stream):", flush=True)
+                generation_print(args, f"\n⏳ BẮT ĐẦU AR-ONLY GENERATION (Live Stream):", flush=True)
 
+                if orig_model_inputs["input_ids"].is_cuda:
+                    torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
                 verify_start = time.perf_counter()
                 generated_ids = target_model.generate(
                     **orig_model_inputs,
@@ -783,6 +848,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     eos_token_id=target_model.config.eos_token_id,
                     streamer=streamer
                 )
+                if orig_model_inputs["input_ids"].is_cuda:
+                    torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
                 verify_time_total = time.perf_counter() - verify_start
                 current_token_ids = generated_ids[0][orig_model_inputs['input_ids'].shape[1]:].tolist()
                 accepted_tokens = len(current_token_ids)
@@ -807,6 +874,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 while len(current_token_ids) < num_target_tokens:
                     logging.debug(f"--- [{drafter_name}_{freq_scheme}] Speculation round {num_speculation_rounds} ---")
 
+                    if orig_model_inputs["input_ids"].is_cuda:
+                        torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
                     draft_start = time.perf_counter()
                     if draft_type == "ar":
                         if freq_scheme == "sf":
@@ -825,8 +894,9 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             )
                             spec_len = len(draft_proposal)
                         
-                        draft_text = target_tokenizer.decode(draft_proposal, skip_special_tokens=True)
-                        print(f"\n[VÒNG {num_speculation_rounds}] 🤖 DRAFTER NHÁP: {draft_text!r}", flush=True)
+                        if not args.quiet_generation:
+                            draft_text = target_tokenizer.decode(draft_proposal, skip_special_tokens=True)
+                            generation_print(args, f"\n[VÒNG {num_speculation_rounds}] 🤖 DRAFTER NHÁP: {draft_text!r}", flush=True)
                         num_forward_passes = spec_len
                         
                     elif draft_type == "dllm":
@@ -875,9 +945,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             spec_len = actual_spec_len
                             
                     if draft_type == "dllm":
-                        draft_text = target_tokenizer.decode(draft_proposal, skip_special_tokens=True)
-                        print(f"\n[VÒNG {num_speculation_rounds}] ⚡ DLLM NHÁP: {draft_text!r}", flush=True)
-                        
+                        if not args.quiet_generation:
+                            draft_text = target_tokenizer.decode(draft_proposal, skip_special_tokens=True)
+                            generation_print(args, f"\n[VÒNG {num_speculation_rounds}] ⚡ DLLM NHÁP: {draft_text!r}", flush=True)
+
+                    if orig_model_inputs["input_ids"].is_cuda:
+                        torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
                     draft_time = time.perf_counter() - draft_start
                     draft_time_total += draft_time
                     total_num_forward_passes += num_forward_passes
@@ -917,7 +990,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     checked_outcomes = []
                     verifier_margins = []
                     
-                    print(f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
+                    generation_print(args, f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
                     for i in range(len(draft_proposal)):
                         if draft_type == "ar":
                             # === TOÁN HỌC RESIDUAL SAMPLING CHO AR-AR ===
@@ -940,9 +1013,10 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             r = torch.rand(1).item()
                             is_match = (r < acceptance_prob)
                             
-                            draft_word = target_tokenizer.decode([draft_token_id])
-                            status = f"✅ NHẬN (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)" if is_match else f"❌ GẠCH BỎ (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)"
-                            print(f"   Vị trí {i}: Drafter đoán [{draft_word!r}] -> {status}", flush=True)
+                            if not args.quiet_generation:
+                                draft_word = target_tokenizer.decode([draft_token_id])
+                                status = f"✅ NHẬN (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)" if is_match else f"❌ GẠCH BỎ (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)"
+                                generation_print(args, f"   Vị trí {i}: Drafter đoán [{draft_word!r}] -> {status}", flush=True)
                             
                             target_tokens.append(draft_token_id if is_match else torch.argmax(p_target).item())
 
@@ -958,22 +1032,25 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 else:
                                     final_token = torch.argmax(p_target).item()
                                     
-                                target_word = target_tokenizer.decode([final_token])
-                                print(f"   👉 Dừng duyệt! Dùng Residual Sampling bốc được chữ thay thế: [{target_word!r}]", flush=True)
+                                if not args.quiet_generation:
+                                    target_word = target_tokenizer.decode([final_token])
+                                    generation_print(args, f"   👉 Dừng duyệt! Dùng Residual Sampling bốc được chữ thay thế: [{target_word!r}]", flush=True)
                                 break
                                 
                         else:
                             # === DLLM VẪN DÙNG EXACT MATCH (Do bản chất Distillation argmax) ===
                             target_pred = torch.argmax(verify_logits[i, :], dim=-1).item()
                             is_match = (draft_proposal[i] == target_pred)
-                            verifier_margin = verifier_logit_margin(verify_logits[i, :], draft_proposal[i])
-                            checked_outcomes.append(is_match)
-                            verifier_margins.append(verifier_margin)
-                            
-                            draft_word = target_tokenizer.decode([draft_proposal[i]])
-                            target_word = target_tokenizer.decode([target_pred])
-                            status = "✅ NHẬN" if is_match else "❌ GẠCH BỎ"
-                            print(f"   Vị trí {i}: Đoán [{draft_word!r}] | Sửa thành [{target_word!r}] -> {status}", flush=True)
+                            if frontier_stop_enabled(args):
+                                verifier_margin = verifier_logit_margin(verify_logits[i, :], draft_proposal[i])
+                                checked_outcomes.append(is_match)
+                                verifier_margins.append(verifier_margin)
+
+                            if not args.quiet_generation:
+                                draft_word = target_tokenizer.decode([draft_proposal[i]])
+                                target_word = target_tokenizer.decode([target_pred])
+                                status = "✅ NHẬN" if is_match else "❌ GẠCH BỎ"
+                                generation_print(args, f"   Vị trí {i}: Đoán [{draft_word!r}] | Sửa thành [{target_word!r}] -> {status}", flush=True)
                             
                             target_tokens.append(target_pred)
 
@@ -981,7 +1058,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 accepted_len += 1
                             else:
                                 final_token = target_pred
-                                print(f"   👉 Dừng duyệt tại đây! Chốt sửa lỗi thành: [{target_word!r}]", flush=True)
+                                if not args.quiet_generation:
+                                    generation_print(args, f"   👉 Dừng duyệt tại đây! Chốt sửa lỗi thành: [{target_word!r}]", flush=True)
                                 break
                     else:
                         # NẾU TOÀN BỘ NHÁP ĐƯỢC CHẤP NHẬN -> TẶNG KÈM 1 CHỮ BONUS
@@ -993,21 +1071,30 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             final_token = torch.argmax(final_token_logits, dim=-1).item()
                             
                         bonus_token = final_token
-                        bonus_word = target_tokenizer.decode([final_token])
-                        print(f"   👉 Trúng phóc 100%! Verifier tặng kèm 1 token bonus: [{bonus_word!r}]", flush=True)
+                        if not args.quiet_generation:
+                            bonus_word = target_tokenizer.decode([final_token])
+                            generation_print(args, f"   👉 Trúng phóc 100%! Verifier tặng kèm 1 token bonus: [{bonus_word!r}]", flush=True)
                     
-                    print(f"🎯 TỔNG KẾT VÒNG {num_speculation_rounds}: Chấp nhận {accepted_len}/{len(draft_proposal)} token.\n" + "-"*50, flush=True)
+                    generation_print(args, f"🎯 TỔNG KẾT VÒNG {num_speculation_rounds}: Chấp nhận {accepted_len}/{len(draft_proposal)} token.\n" + "-"*50, flush=True)
                     # ---------------------------------------------------------
                 
-                    proposal_str = get_proposal_str(args, spec_len, accepted_len, draft_proposal, final_token)
+                    if not args.quiet_generation:
+                        get_proposal_str(args, spec_len, accepted_len, draft_proposal, final_token)
                     
                     tokens_to_append = draft_proposal[:accepted_len] + [final_token]
+                    if target_tokenizer.eos_token_id in tokens_to_append:
+                        eos_index = tokens_to_append.index(target_tokenizer.eos_token_id)
+                        tokens_to_append = tokens_to_append[:eos_index + 1]
+                    remaining_tokens = num_target_tokens - len(current_token_ids)
+                    tokens_to_append = tokens_to_append[:remaining_tokens]
                     current_token_ids.extend(tokens_to_append)
                     
                     accepted_tokens += accepted_len
                     rejected_tokens += len(draft_proposal) - accepted_len
                     frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
-                    if draft_type == "dllm":
+                    if draft_type == "dllm" and (
+                        frontier_stop_enabled(args) or args.collect_draft_diagnostics
+                    ):
                         update_frontier_latency_cost(args, forward_pass_latencies, verify_time, len(draft_proposal))
                         update_frontier_acceptance_calibration(
                             args,
@@ -1028,6 +1115,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                         "verify_time_ms": verify_time * 1000.0,
                         "final_token": final_token,
                         "bonus_token": bonus_token,
+                        "emitted_tokens": tokens_to_append,
                         "frontier_stats": frontier_stats_this_round,
                         "verifier_margins": verifier_margins if draft_type == "dllm" else None,
                         "frontier_dynamic_cost_token_equiv": getattr(args, "frontier_dynamic_cost_token_equiv", None) if draft_type == "dllm" else None,
@@ -1041,6 +1129,10 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
 
                     if target_tokenizer.eos_token_id in tokens_to_append:
                         break
+
+            if orig_model_inputs["input_ids"].is_cuda:
+                torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+            actual_e2e_time = time.perf_counter() - generation_start
 
             if is_interactive():
                 inner_bar.close()
@@ -1079,12 +1171,18 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] [{hardware}] Win over AR drafter: {safe_div(speedup, ar_drafter_speedup[hardware]):.3f}x.{Colors.RESET}")
 
         stats_each_round = pickled_data["stats_each_round"]
-        if args.overwrite:
-            visualize_acc_rate_over_time(stats_each_round, spec_len=args.spec_len, acceptance_rate=acceptance_rate, output_dir=output_dir_figures, filename=f"{drafter_name}")
-        else:
-            visualize_acc_rate_over_time(stats_each_round, spec_len=args.spec_len, acceptance_rate=acceptance_rate, output_dir=None, filename=None)
-        
-        print_sd_trajectory(pickled_data, target_tokenizer)
+        if not args.skip_plots:
+            if args.overwrite:
+                visualize_acc_rate_over_time(stats_each_round, spec_len=args.spec_len, acceptance_rate=acceptance_rate, output_dir=output_dir_figures, filename=f"{drafter_name}")
+            else:
+                visualize_acc_rate_over_time(stats_each_round, spec_len=args.spec_len, acceptance_rate=acceptance_rate, output_dir=None, filename=None)
+
+        if not args.quiet_generation:
+            print_sd_trajectory(pickled_data, target_tokenizer)
+
+        generated_text = target_tokenizer.decode(current_token_ids, skip_special_tokens=True)
+        predicted_answer = extract_predicted_answer(generated_text)
+        reference_answer = extract_reference_answer(raw_data)
         
         pickled_data["num_speculation_rounds"] = num_speculation_rounds
         pickled_data["total_num_forward_passes"] = total_num_forward_passes
@@ -1093,6 +1191,12 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
         pickled_data["rejected_tokens"] = rejected_tokens
         pickled_data["acceptance_rate"] = acceptance_rate
         pickled_data["total_output_tokens"] = total_output_tokens
+        pickled_data["output_token_ids"] = current_token_ids
+        pickled_data["actual_e2e_time"] = actual_e2e_time
+        pickled_data["generated_text"] = generated_text
+        pickled_data["predicted_answer"] = predicted_answer
+        pickled_data["reference_answer"] = reference_answer
+        pickled_data["is_correct"] = predicted_answer is not None and predicted_answer == reference_answer
         
         if (args.overwrite and not args.read_pickle) or (not os.path.exists(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"))):
             with open(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"), "wb") as f:
@@ -1114,6 +1218,10 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             num_speculation_rounds,
             accepted_tokens,
             drafted_tokens,
+            actual_e2e_time,
+            current_token_ids,
+            predicted_answer,
+            reference_answer,
         ))
 
     baseline_row = next((row for row in problem_benchmark_rows if row["mode"] == "verifier_ar"), None)

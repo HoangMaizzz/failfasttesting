@@ -191,7 +191,10 @@ def format_problem_and_options(args, problem_id):
             "category": data["category"],
         }
     elif args.dataset_name == "gsm8k":
-        return {"problem": args.dataset["question"][problem_id]}
+        return {
+            "problem": args.dataset["question"][problem_id],
+            "answer": args.dataset["answer"][problem_id],
+        }
     elif args.dataset_name == "humaneval":
         data = args.dataset[problem_id]
         return {"problem": data["prompt"]}
@@ -302,6 +305,11 @@ def join_outputs(output, output_to_append):
 def get_output_tokens(stats_each_round):
     output_token_ids = []
     for round_id in range(len(stats_each_round)):
+        emitted_tokens = stats_each_round[round_id].get("emitted_tokens")
+        if emitted_tokens is not None:
+            output_token_ids.extend(emitted_tokens)
+            continue
+
         # 1. Lấy bản nháp (nếu có)
         draft_proposal = stats_each_round[round_id].get("~draft_proposal", [])
         accepted_len = stats_each_round[round_id].get("accepted_len", len(draft_proposal))
@@ -310,10 +318,6 @@ def get_output_tokens(stats_each_round):
             output_token_ids.extend(draft_proposal[:accepted_len])
 
         # 2. Lấy bonus token (nếu có)
-        bonus_token = stats_each_round[round_id].get("bonus_token")
-        if bonus_token is not None:
-            output_token_ids.append(bonus_token)
-
         # 3. Lấy final token (nếu có)
         final_token = stats_each_round[round_id].get("final_token")
         if final_token is not None:
