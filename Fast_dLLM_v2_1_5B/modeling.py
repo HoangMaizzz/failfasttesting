@@ -1099,6 +1099,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "final_frontier_score": None,
             "actual_spec_len": None,
             "draft_token_stats": [],
+            "refinement_actions": [],
         }
         committed_confidences = {}
         committed_margins = {}
@@ -1372,9 +1373,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             max_unmask = 1
                             cost_token_equiv = float(getattr(args, "frontier_dynamic_cost_token_equiv", getattr(args, "frontier_cost_token_equiv", 0.2))) if args is not None else 0.2
                             aggressive_irrecoverable = bool(getattr(args, "frontier_aggressive_irrecoverable", False)) if args is not None else False
+                            force_stop_modes = ("mask_efficiency", "frontier", "cost_aware_no_extend")
 
                             stop_reason = None
-                            if frontier_k >= target_len:
+                            if frontier_k >= target_len and frontier_mode in force_stop_modes:
                                 stop_reason = "frontier_all_pass"
                             elif aggressive_irrecoverable and frontier_k < target_len and not frontier_recoverable and frontier_confidence is not None and frontier_confidence < tau_f:
                                 stop_reason = "frontier_irrecoverable_low_conf"
@@ -1384,7 +1386,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             elif len(frontier_scores) >= min_steps and frontier_mode == "frontier":
                                 if frontier_gain is not None and frontier_gain <= gain_epsilon and unmasked_this_step <= max_unmask:
                                     stop_reason = "frontier_stall"
-                            elif len(frontier_scores) >= min_steps and frontier_mode == "cost_aware":
+                            elif len(frontier_scores) >= min_steps and frontier_mode in ("cost_aware", "cost_aware_no_extend"):
                                 if frontier_gain is not None:
                                     if len(frontier_scores) >= 3:
                                         prev_gain = frontier_scores[-2] - frontier_scores[-3]
@@ -1396,8 +1398,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         stop_reason = "cost_aware_low_expected_gain"
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
-                                frontier_stats["stop_reason"] = stop_reason
-                                frontier_force_stop = True
+                                frontier_force_stop = frontier_mode in force_stop_modes
+                                frontier_stats["refinement_actions"].append({
+                                    "step": len(frontier_scores),
+                                    "action": stop_reason,
+                                    "target_len": target_len,
+                                    "masks_remaining": masks_remaining,
+                                })
                                 if masks_remaining > 0:
                                     fill_start_time = torch.cuda.Event(enable_timing=True)
                                     fill_start_time.record()
@@ -1424,9 +1431,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             committed_margins[int(absolute_pos)] = float(fill_margins[0, local_pos].float().item())
                                             committed_forced[int(absolute_pos)] = True
                                             filled_on_stop_positions.add(int(absolute_pos))
-
-                                draft_tokens_unmasked = True
-                                frontier_stats["actual_spec_len"] = int(spec_len)
+                                            conf_of_unmasked_tokens.append(float(token_conf[0].float().item()))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")
@@ -1437,9 +1442,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             and x_t[:, draft_token_start_idx:draft_token_end_idx].ne(mask_id).all():
                             
                             if frontier_force_stop:
+                                frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or frontier_stats["refinement_actions"][-1]["action"]
                                 logger.debug(f"{Colors.GREEN}Frontier controller stopped refinement. reason={frontier_stats.get('stop_reason')} spec_len={spec_len}{Colors.RESET}")
                                 draft_tokens_unmasked = True
                             elif any([x < lowconf_threshold for x in conf_of_unmasked_tokens]):
+                                frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_low_confidence"
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. Some are low-confidence, stop speculating. spec_len is {spec_len}{Colors.RESET}")
                                 # none of the first n tokens after the original input tokens are mask tokens
                                 draft_tokens_unmasked = True
@@ -1465,6 +1472,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ###end of logic of reusing rejected drafts from the last round###
                                 
                             elif len(conf_of_unmasked_tokens) >= max_spec_len:
+                                frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_max_spec_len"
                                 logger.debug(f"{Colors.GREEN}Already drafted {len(conf_of_unmasked_tokens)}>{max_spec_len} high-confidence tokens, stopping just in case.{Colors.RESET}")
                                 draft_tokens_unmasked = True
                             else:

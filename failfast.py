@@ -369,7 +369,7 @@ parser.add_argument("--log_level", type=str, default="DEBUG", choices=["DEBUG", 
 parser.add_argument("--sweep_lowconf_threshold", type=float, nargs="+", default=[0.45])
 parser.add_argument("--sweep_max_spec_len", type=int, nargs="+", default=[60])
 parser.add_argument("--sweep_incr_len", type=int, nargs="+", default=[10])
-parser.add_argument("--frontier_stop_mode", type=str, default="disabled", choices=["disabled", "mask_efficiency", "frontier", "cost_aware"])
+parser.add_argument("--frontier_stop_mode", type=str, default="disabled", choices=["disabled", "mask_efficiency", "frontier", "cost_aware", "cost_aware_no_extend"])
 parser.add_argument("--frontier_min_steps", type=int, default=2)
 parser.add_argument("--frontier_patience", type=int, default=2)
 parser.add_argument("--frontier_gain_epsilon", type=float, default=0.0)
