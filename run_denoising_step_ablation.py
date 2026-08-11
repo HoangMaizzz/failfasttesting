@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import math
+import os
 import pickle
 import subprocess
 import sys
@@ -109,6 +110,24 @@ def token_sequence_hash(token_ids):
     return hashlib.sha256(payload).hexdigest()
 
 
+def run_streaming(cmd):
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    for line in process.stdout:
+        print(line, end="", flush=True)
+    return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, cmd)
+
+
 def run_case(args, case):
     output_dir = Path(args.output_dir) / case["case"]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,7 +168,7 @@ def run_case(args, case):
         f"max_spec_len={case['max_spec_len']}"
     )
     print("=" * 100, flush=True)
-    subprocess.run(cmd, check=True)
+    run_streaming(cmd)
     return output_dir
 
 
