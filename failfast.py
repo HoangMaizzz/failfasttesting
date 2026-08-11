@@ -894,9 +894,13 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     verify_mask_tensor = torch.ones_like(verify_input_tensor)
                     full_attention_mask = torch.cat([orig_model_inputs['attention_mask'], verify_mask_tensor], dim=1)
 
+                    if verify_input_tensor.is_cuda:
+                        torch.cuda.synchronize(verify_input_tensor.device)
                     verify_start = time.perf_counter()
                     with torch.no_grad():
                         outputs = target_model(input_ids=full_input_ids, attention_mask=full_attention_mask)
+                    if verify_input_tensor.is_cuda:
+                        torch.cuda.synchronize(verify_input_tensor.device)
                     verify_time = time.perf_counter() - verify_start
                     verify_time_total += verify_time
                     

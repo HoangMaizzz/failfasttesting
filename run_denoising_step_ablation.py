@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import math
 import pickle
 import subprocess
 import sys
@@ -9,22 +11,62 @@ import pandas as pd
 
 CASES = (
     {
-        "case": "disabled_spec10_lowconf0p45",
+        "case": "paper_failfast_dynamic_spec10_tau0p50",
         "mode": "disabled",
         "spec_len": 10,
-        "lowconf_threshold": 0.45,
+        "lowconf_threshold": 0.50,
+        "max_spec_len": 60,
     },
     {
-        "case": "cost_aware_no_extend_spec5_lowconf0p45",
+        "case": "disabled_fixed_spec5_tau0p50",
+        "mode": "disabled",
+        "spec_len": 5,
+        "lowconf_threshold": 0.50,
+        "max_spec_len": 5,
+    },
+    {
+        "case": "cost_aware_fixed_spec5_tau0p50",
         "mode": "cost_aware_no_extend",
         "spec_len": 5,
-        "lowconf_threshold": 0.45,
+        "lowconf_threshold": 0.50,
+        "max_spec_len": 5,
     },
     {
-        "case": "cost_aware_extend_spec5_lowconf0p60",
+        "case": "disabled_dynamic_spec5_tau0p50",
+        "mode": "disabled",
+        "spec_len": 5,
+        "lowconf_threshold": 0.50,
+        "max_spec_len": 60,
+    },
+    {
+        "case": "cost_aware_dynamic_spec5_tau0p50",
         "mode": "cost_aware",
         "spec_len": 5,
-        "lowconf_threshold": 0.60,
+        "lowconf_threshold": 0.50,
+        "max_spec_len": 60,
+    },
+)
+
+COMPARISONS = (
+    {
+        "comparison": "fixed5_controller_effect",
+        "baseline": "disabled_fixed_spec5_tau0p50",
+        "candidate": "cost_aware_fixed_spec5_tau0p50",
+    },
+    {
+        "comparison": "dynamic5_controller_effect",
+        "baseline": "disabled_dynamic_spec5_tau0p50",
+        "candidate": "cost_aware_dynamic_spec5_tau0p50",
+    },
+    {
+        "comparison": "initial_length_effect_without_controller",
+        "baseline": "paper_failfast_dynamic_spec10_tau0p50",
+        "candidate": "disabled_dynamic_spec5_tau0p50",
+    },
+    {
+        "comparison": "full_method_vs_paper_failfast",
+        "baseline": "paper_failfast_dynamic_spec10_tau0p50",
+        "candidate": "cost_aware_dynamic_spec5_tau0p50",
     },
 )
 
@@ -41,13 +83,30 @@ def parse_args():
     parser.add_argument("--frontier_min_steps", type=int, default=2)
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
-    parser.add_argument("--output_dir", default="/content/failfasttesting/outputs_denoising_step_ablation")
+    parser.add_argument("--output_dir", default="/content/failfasttesting/outputs_controlled_denoising_ablation")
     parser.add_argument("--log_level", default="INFO")
     return parser.parse_args()
 
 
 def safe_div(numerator, denominator):
     return numerator / denominator if denominator else 0.0
+
+
+def get_output_tokens(rounds):
+    output_tokens = []
+    for round_data in rounds:
+        draft = round_data.get("~draft_proposal", [])
+        accepted_len = int(round_data.get("accepted_len", 0))
+        output_tokens.extend(draft[:accepted_len])
+        final_token = round_data.get("final_token")
+        if final_token is not None:
+            output_tokens.append(int(final_token))
+    return output_tokens
+
+
+def token_sequence_hash(token_ids):
+    payload = ",".join(str(token_id) for token_id in token_ids).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def run_case(args, case):
@@ -71,6 +130,8 @@ def run_case(args, case):
         "--dllm_dir", args.dllm_dir,
         "--drafter_thresholds", str(args.drafter_threshold),
         "--sweep_lowconf_threshold", str(case["lowconf_threshold"]),
+        "--sweep_max_spec_len", str(case["max_spec_len"]),
+        "--sweep_incr_len", "10",
         "--frontier_stop_mode", case["mode"],
         "--frontier_min_steps", str(args.frontier_min_steps),
         "--frontier_patience", str(args.frontier_patience),
@@ -84,7 +145,8 @@ def run_case(args, case):
     print("\n" + "=" * 100)
     print(
         f"RUNNING {case['case']} | mode={case['mode']} | "
-        f"spec_len={case['spec_len']} | lowconf={case['lowconf_threshold']}"
+        f"spec_len={case['spec_len']} | lowconf={case['lowconf_threshold']} | "
+        f"max_spec_len={case['max_spec_len']}"
     )
     print("=" * 100, flush=True)
     subprocess.run(cmd, check=True)
@@ -138,19 +200,25 @@ def load_case_rows(case, output_dir):
 
         drafted_tokens = sum(len(round_data.get("~draft_proposal", [])) for round_data in rounds)
         accepted_tokens = sum(int(round_data.get("accepted_len", 0)) for round_data in rounds)
-        output_tokens = int(data.get("total_output_tokens", accepted_tokens + len(rounds)))
+        output_token_ids = get_output_tokens(rounds)
+        output_tokens = len(output_token_ids)
         benchmark_row = benchmark.loc[problem_id]
         sample_rows.append({
             "case": case["case"],
             "mode": case["mode"],
             "spec_len": case["spec_len"],
             "lowconf_threshold": case["lowconf_threshold"],
+            "max_spec_len": case["max_spec_len"],
             "problem_id": problem_id,
             "num_rounds": len(rounds),
             "drafted_tokens": drafted_tokens,
             "accepted_tokens": accepted_tokens,
             "output_tokens": output_tokens,
+            "output_token_hash": token_sequence_hash(output_token_ids),
             "acceptance_rate_percent": 100.0 * safe_div(accepted_tokens, drafted_tokens),
+            "drafted_tokens_per_round": safe_div(drafted_tokens, len(rounds)),
+            "accepted_tokens_per_round": safe_div(accepted_tokens, len(rounds)),
+            "output_tokens_per_round": safe_div(output_tokens, len(rounds)),
             "total_forward_passes": totals["total"],
             "denoising_forward_passes": totals["denoising"],
             "fill_forward_passes": totals["fill"],
@@ -159,6 +227,8 @@ def load_case_rows(case, output_dir):
             "denoising_steps_per_10_drafted_tokens": 10.0 * safe_div(totals["denoising"], drafted_tokens),
             "total_passes_per_10_drafted_tokens": 10.0 * safe_div(totals["total"], drafted_tokens),
             "denoising_steps_per_10_output_tokens": 10.0 * safe_div(totals["denoising"], output_tokens),
+            "total_passes_per_10_output_tokens": 10.0 * safe_div(totals["total"], output_tokens),
+            "fill_passes_per_100_output_tokens": 100.0 * safe_div(totals["fill"], output_tokens),
             "rounds_per_100_output_tokens": 100.0 * safe_div(len(rounds), output_tokens),
             "actual_total_time": float(benchmark_row["actual_total_time"]),
             "actual_draft_time": float(benchmark_row["actual_draft_time"]),
@@ -183,6 +253,7 @@ def aggregate_samples(samples):
             "mode": first["mode"],
             "spec_len": int(first["spec_len"]),
             "lowconf_threshold": first["lowconf_threshold"],
+            "max_spec_len": int(first["max_spec_len"]),
             "num_samples": len(group),
             "actual_total_time_mean": group["actual_total_time"].mean(),
             "actual_draft_time_mean": group["actual_draft_time"].mean(),
@@ -195,6 +266,8 @@ def aggregate_samples(samples):
             "denoising_steps_per_10_drafted_tokens": 10.0 * safe_div(denoising, drafted),
             "total_passes_per_10_drafted_tokens": 10.0 * safe_div(total_passes, drafted),
             "denoising_steps_per_10_output_tokens": 10.0 * safe_div(denoising, output),
+            "total_passes_per_10_output_tokens": 10.0 * safe_div(total_passes, output),
+            "fill_passes_per_100_output_tokens": 100.0 * safe_div(group["fill_forward_passes"].sum(), output),
             "rounds_per_100_output_tokens": 100.0 * safe_div(rounds, output),
             "fill_passes_total": group["fill_forward_passes"].sum(),
             "prefill_passes_total": group["prefill_forward_passes"].sum(),
@@ -206,13 +279,10 @@ def aggregate_samples(samples):
 
 
 def build_paired_comparison(samples):
-    baseline_name = "disabled_spec10_lowconf0p45"
-    baseline = samples[samples["case"] == baseline_name].set_index("problem_id")
     rows = []
-    for case_name in samples["case"].unique():
-        if case_name == baseline_name:
-            continue
-        candidate = samples[samples["case"] == case_name].set_index("problem_id")
+    for comparison in COMPARISONS:
+        baseline = samples[samples["case"] == comparison["baseline"]].set_index("problem_id")
+        candidate = samples[samples["case"] == comparison["candidate"]].set_index("problem_id")
         for problem_id in baseline.index.intersection(candidate.index):
             base = baseline.loc[problem_id]
             current = candidate.loc[problem_id]
@@ -220,23 +290,78 @@ def build_paired_comparison(samples):
             current_steps = current["denoising_steps_per_10_drafted_tokens"]
             rows.append({
                 "problem_id": problem_id,
-                "case": case_name,
-                "actual_speedup_vs_disabled": safe_div(base["actual_total_time"], current["actual_total_time"]),
+                "comparison": comparison["comparison"],
+                "baseline": comparison["baseline"],
+                "candidate": comparison["candidate"],
+                "actual_speedup_vs_baseline": safe_div(base["actual_total_time"], current["actual_total_time"]),
                 "actual_total_time_delta": current["actual_total_time"] - base["actual_total_time"],
                 "actual_draft_time_delta": current["actual_draft_time"] - base["actual_draft_time"],
                 "actual_verify_time_delta": current["actual_verify_time"] - base["actual_verify_time"],
                 "acceptance_rate_delta_percent": current["acceptance_rate_percent"] - base["acceptance_rate_percent"],
                 "denoising_steps_per_10_drafted_tokens_delta": current_steps - base_steps,
                 "denoising_step_reduction_percent": 100.0 * safe_div(base_steps - current_steps, base_steps),
+                "total_pass_reduction_per_10_drafted_tokens_percent": 100.0 * safe_div(
+                    base["total_passes_per_10_drafted_tokens"]
+                    - current["total_passes_per_10_drafted_tokens"],
+                    base["total_passes_per_10_drafted_tokens"],
+                ),
                 "denoising_steps_per_10_output_tokens_delta": (
                     current["denoising_steps_per_10_output_tokens"]
                     - base["denoising_steps_per_10_output_tokens"]
                 ),
+                "total_passes_per_10_output_tokens_delta": (
+                    current["total_passes_per_10_output_tokens"]
+                    - base["total_passes_per_10_output_tokens"]
+                ),
+                "accepted_tokens_per_round_delta": (
+                    current["accepted_tokens_per_round"] - base["accepted_tokens_per_round"]
+                ),
+                "output_matches_baseline": current["output_token_hash"] == base["output_token_hash"],
+                "output_length_delta": current["output_tokens"] - base["output_tokens"],
                 "rounds_per_100_output_tokens_delta": (
                     current["rounds_per_100_output_tokens"]
                     - base["rounds_per_100_output_tokens"]
                 ),
             })
+    return pd.DataFrame(rows)
+
+
+def aggregate_paired_comparisons(paired):
+    rows = []
+    numeric_columns = [
+        "actual_speedup_vs_baseline",
+        "actual_total_time_delta",
+        "actual_draft_time_delta",
+        "actual_verify_time_delta",
+        "acceptance_rate_delta_percent",
+        "denoising_step_reduction_percent",
+        "total_pass_reduction_per_10_drafted_tokens_percent",
+        "denoising_steps_per_10_output_tokens_delta",
+        "total_passes_per_10_output_tokens_delta",
+        "accepted_tokens_per_round_delta",
+        "output_length_delta",
+        "rounds_per_100_output_tokens_delta",
+    ]
+    for comparison_name, group in paired.groupby("comparison", sort=False):
+        first = group.iloc[0]
+        row = {
+            "comparison": comparison_name,
+            "baseline": first["baseline"],
+            "candidate": first["candidate"],
+            "num_samples": len(group),
+            "candidate_win_rate_percent": 100.0 * (group["actual_total_time_delta"] < 0).mean(),
+            "output_match_rate_percent": 100.0 * group["output_matches_baseline"].mean(),
+        }
+        for column in numeric_columns:
+            mean = group[column].mean()
+            std = group[column].std(ddof=1)
+            ci95_half_width = 1.96 * std / math.sqrt(len(group)) if len(group) > 1 else float("nan")
+            row[f"{column}_mean"] = mean
+            row[f"{column}_median"] = group[column].median()
+            row[f"{column}_std"] = std
+            row[f"{column}_ci95_low"] = mean - ci95_half_width
+            row[f"{column}_ci95_high"] = mean + ci95_half_width
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -255,10 +380,12 @@ def main():
     rounds = pd.DataFrame(all_rounds)
     summary = aggregate_samples(samples)
     paired = build_paired_comparison(samples)
+    paired_summary = aggregate_paired_comparisons(paired)
     samples.to_csv(output_root / "denoising_per_sample.csv", index=False)
     rounds.to_csv(output_root / "denoising_per_round.csv", index=False)
     summary.to_csv(output_root / "denoising_summary.csv", index=False)
-    paired.to_csv(output_root / "paired_vs_disabled.csv", index=False)
+    paired.to_csv(output_root / "paired_controlled_comparisons.csv", index=False)
+    paired_summary.to_csv(output_root / "paired_controlled_summary.csv", index=False)
 
     columns = [
         "case",
@@ -274,22 +401,38 @@ def main():
         "denoising_steps_per_10_drafted_tokens",
         "total_passes_per_10_drafted_tokens",
         "denoising_steps_per_10_output_tokens",
+        "total_passes_per_10_output_tokens",
+        "fill_passes_per_100_output_tokens",
         "rounds_per_100_output_tokens",
     ]
     print("\nDENOISING STEP ABLATION SUMMARY")
     print(summary[columns].to_string(index=False))
-    paired_columns = [
-        "actual_speedup_vs_disabled",
-        "actual_total_time_delta",
-        "actual_draft_time_delta",
-        "actual_verify_time_delta",
-        "acceptance_rate_delta_percent",
-        "denoising_step_reduction_percent",
-        "denoising_steps_per_10_output_tokens_delta",
-        "rounds_per_100_output_tokens_delta",
+    paired_metric_columns = [
+        "actual_speedup_vs_baseline_mean",
+        "actual_speedup_vs_baseline_ci95_low",
+        "actual_speedup_vs_baseline_ci95_high",
+        "actual_total_time_delta_mean",
+        "actual_total_time_delta_ci95_low",
+        "actual_total_time_delta_ci95_high",
+        "actual_draft_time_delta_mean",
+        "actual_verify_time_delta_mean",
+        "acceptance_rate_delta_percent_mean",
+        "denoising_step_reduction_percent_mean",
+        "total_pass_reduction_per_10_drafted_tokens_percent_mean",
+        "denoising_steps_per_10_output_tokens_delta_mean",
+        "total_passes_per_10_output_tokens_delta_mean",
+        "accepted_tokens_per_round_delta_mean",
+        "rounds_per_100_output_tokens_delta_mean",
     ]
-    print("\nPAIRED MEAN VS DISABLED")
-    print(paired.groupby("case")[paired_columns].mean().to_string())
+    paired_mean_columns = [
+        "comparison",
+        "num_samples",
+        "candidate_win_rate_percent",
+        "output_match_rate_percent",
+        *paired_metric_columns,
+    ]
+    print("\nCONTROLLED PAIRED COMPARISONS")
+    print(paired_summary[paired_mean_columns].to_string(index=False))
     print(f"\nSaved: {output_root / 'denoising_summary.csv'}")
 
 
