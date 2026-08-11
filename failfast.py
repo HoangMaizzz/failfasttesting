@@ -429,6 +429,9 @@ BENCHMARK_CSV_COLUMNS = [
     "actual_speedup_vs_AR",
     "theo_speedup_vs_AR",
     "actual_e2e_time",
+    "actual_post_verify_time",
+    "actual_algorithm_time",
+    "actual_algorithm_ms_per_output_token",
     "output_tokens",
     "accepted_tokens",
     "drafted_tokens",
@@ -583,6 +586,7 @@ def build_benchmark_row(
     accepted_tokens,
     drafted_tokens,
     actual_e2e_time,
+    post_verify_time_total,
     output_token_ids,
     predicted_answer,
     reference_answer,
@@ -591,6 +595,7 @@ def build_benchmark_row(
     actual_draft_time = draft_time_total
     actual_verify_time = verify_time_total
     actual_total_time = actual_draft_time + actual_verify_time
+    actual_algorithm_time = actual_total_time + post_verify_time_total
     theo_draft_time = total_num_forward_passes * latency["draft_fwd_pass"]
     theo_verify_time = num_speculation_rounds * latency["target_tpt"][args.target_model_name_clean]
     theo_total_time = theo_draft_time + theo_verify_time
@@ -611,6 +616,9 @@ def build_benchmark_row(
         "actual_speedup_vs_AR": None,
         "theo_speedup_vs_AR": None,
         "actual_e2e_time": actual_e2e_time,
+        "actual_post_verify_time": post_verify_time_total,
+        "actual_algorithm_time": actual_algorithm_time,
+        "actual_algorithm_ms_per_output_token": safe_div(actual_algorithm_time * 1000.0, output_tokens),
         "output_tokens": output_tokens,
         "accepted_tokens": accepted_tokens,
         "drafted_tokens": drafted_tokens,
@@ -799,6 +807,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 current_token_ids = pickled_data["stats_each_round"][0].get("target_tokens", [])
             draft_time_total = sum(x.get("draft_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
             verify_time_total = sum(x.get("verify_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
+            post_verify_time_total = sum(x.get("post_verify_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
             actual_e2e_time = pickled_data.get("actual_e2e_time", draft_time_total + verify_time_total)
         else:
             orig_model_inputs = {key: value.clone() for key, value in base_orig_model_inputs.items()}
@@ -811,6 +820,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             prev_prefill_output = None
             draft_time_total = 0.0
             verify_time_total = 0.0
+            post_verify_time_total = 0.0
             pickled_data = {
                 "orig_model_inputs": orig_model_inputs["input_ids"][0].tolist(),
                 "raw_data": raw_data,
@@ -840,10 +850,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 generated_ids = target_model.generate(
                     **orig_model_inputs,
                     max_new_tokens=num_target_tokens,
-                    do_sample=True, # 🚀 Bật Sampling
-                    temperature=TEMPERATURE,
-                    top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
-                    top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
+                    do_sample=False,
                     pad_token_id=target_model.config.eos_token_id,
                     eos_token_id=target_model.config.eos_token_id,
                     streamer=streamer
@@ -980,6 +987,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     start_index = orig_model_inputs['input_ids'].shape[1] + prefix_len - 1
                     end_index = start_index + len(draft_proposal)
                     verify_logits = outputs.logits[0, start_index:end_index]
+                    post_verify_start = time.perf_counter()
                     
                     # ---------------------------------------------------------
                     # 🚀 BƯỚC C. ACCEPT/REJECT (CÓ TÍCH HỢP RESIDUAL SAMPLING)
@@ -1018,7 +1026,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 status = f"✅ NHẬN (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)" if is_match else f"❌ GẠCH BỎ (Tỉ lệ duyệt: {acceptance_prob*100:.1f}%)"
                                 generation_print(args, f"   Vị trí {i}: Drafter đoán [{draft_word!r}] -> {status}", flush=True)
                             
-                            target_tokens.append(draft_token_id if is_match else torch.argmax(p_target).item())
+                            if not args.quiet_generation:
+                                target_tokens.append(draft_token_id if is_match else torch.argmax(p_target).item())
 
                             if is_match:
                                 accepted_len += 1
@@ -1052,7 +1061,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 status = "✅ NHẬN" if is_match else "❌ GẠCH BỎ"
                                 generation_print(args, f"   Vị trí {i}: Đoán [{draft_word!r}] | Sửa thành [{target_word!r}] -> {status}", flush=True)
                             
-                            target_tokens.append(target_pred)
+                            if not args.quiet_generation:
+                                target_tokens.append(target_pred)
 
                             if is_match:
                                 accepted_len += 1
@@ -1102,6 +1112,11 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                             checked_outcomes,
                             verifier_margins,
                         )
+
+                    if verify_input_tensor.is_cuda:
+                        torch.cuda.synchronize(verify_input_tensor.device)
+                    post_verify_time = time.perf_counter() - post_verify_start
+                    post_verify_time_total += post_verify_time
                     
                     info_this_round = {
                         "target_tokens": target_tokens,
@@ -1113,6 +1128,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                         "num_forward_passes": num_forward_passes,
                         "draft_time_ms": draft_time * 1000.0,
                         "verify_time_ms": verify_time * 1000.0,
+                        "post_verify_time_ms": post_verify_time * 1000.0,
                         "final_token": final_token,
                         "bonus_token": bonus_token,
                         "emitted_tokens": tokens_to_append,
@@ -1193,6 +1209,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
         pickled_data["total_output_tokens"] = total_output_tokens
         pickled_data["output_token_ids"] = current_token_ids
         pickled_data["actual_e2e_time"] = actual_e2e_time
+        pickled_data["actual_post_verify_time"] = post_verify_time_total
+        pickled_data["actual_algorithm_time"] = draft_time_total + verify_time_total + post_verify_time_total
         pickled_data["generated_text"] = generated_text
         pickled_data["predicted_answer"] = predicted_answer
         pickled_data["reference_answer"] = reference_answer
@@ -1219,6 +1237,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             accepted_tokens,
             drafted_tokens,
             actual_e2e_time,
+            post_verify_time_total,
             current_token_ids,
             predicted_answer,
             reference_answer,
@@ -1230,6 +1249,6 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
             row["actual_speedup_vs_AR"] = 1.0
             row["theo_speedup_vs_AR"] = 1.0
         elif baseline_row is not None:
-            row["actual_speedup_vs_AR"] = safe_div(baseline_row["actual_total_time"], row["actual_total_time"])
+            row["actual_speedup_vs_AR"] = safe_div(baseline_row["actual_algorithm_time"], row["actual_algorithm_time"])
             row["theo_speedup_vs_AR"] = safe_div(baseline_row["theo_total_time"], row["theo_total_time"])
     append_benchmark_rows(args, problem_benchmark_rows)

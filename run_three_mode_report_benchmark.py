@@ -25,6 +25,9 @@ REQUIRED_BENCHMARK_COLUMNS = {
     "actual_draft_time",
     "actual_verify_time",
     "actual_e2e_time",
+    "actual_post_verify_time",
+    "actual_algorithm_time",
+    "actual_algorithm_ms_per_output_token",
     "output_tokens",
     "accepted_tokens",
     "drafted_tokens",
@@ -231,6 +234,7 @@ def aggregate_group(group, args):
     passes = group["total_num_forward_passes"].sum()
     modeled_total_ms = passes * args.draft_fwd_pass_ms + rounds * args.target_tpt_ms
     actual_e2e_total_ms = 1000.0 * group["actual_e2e_time"].sum()
+    actual_algorithm_total_ms = 1000.0 * group["actual_algorithm_time"].sum()
     modeled_ms_per_output_token = modeled_total_ms / output_tokens
     return {
         "num_observations": len(group),
@@ -241,9 +245,12 @@ def aggregate_group(group, args):
         "modeled_speedup_vs_verifier_ar": args.target_tpt_ms / modeled_ms_per_output_token,
         "actual_e2e_time_mean_s": group["actual_e2e_time"].mean(),
         "actual_e2e_ms_per_output_token": actual_e2e_total_ms / output_tokens,
+        "actual_algorithm_time_mean_s": group["actual_algorithm_time"].mean(),
+        "actual_algorithm_ms_per_output_token": actual_algorithm_total_ms / output_tokens,
         "actual_compute_time_mean_s": group["actual_total_time"].mean(),
         "actual_draft_time_mean_s": group["actual_draft_time"].mean(),
         "actual_verify_time_mean_s": group["actual_verify_time"].mean(),
+        "actual_post_verify_time_mean_s": group["actual_post_verify_time"].mean(),
         "acceptance_rate_percent": 100.0 * accepted_tokens / drafted_tokens,
         "drafted_tokens_per_round": drafted_tokens / rounds,
         "accepted_tokens_per_round": accepted_tokens / rounds,
@@ -260,7 +267,7 @@ def aggregate_cases(raw_rows, args):
         row = {"case": case_name}
         row.update(aggregate_group(group, args))
         rows.append(row)
-    return pd.DataFrame(rows).sort_values("modeled_ms_per_output_token")
+    return pd.DataFrame(rows).sort_values("actual_algorithm_ms_per_output_token")
 
 
 def aggregate_repetitions(raw_rows, args):
@@ -289,8 +296,8 @@ def build_paired_rows(raw_rows, args):
                 current["total_num_forward_passes"] * args.draft_fwd_pass_ms
                 + current["num_speculation_rounds"] * args.target_tpt_ms
             ) / current["output_tokens"]
-            base_actual_tpt = 1000.0 * base["actual_e2e_time"] / base["output_tokens"]
-            current_actual_tpt = 1000.0 * current["actual_e2e_time"] / current["output_tokens"]
+            base_actual_tpt = 1000.0 * base["actual_algorithm_time"] / base["output_tokens"]
+            current_actual_tpt = 1000.0 * current["actual_algorithm_time"] / current["output_tokens"]
             rows.append({
                 "comparison": comparison["comparison"],
                 "baseline": comparison["baseline"],
@@ -299,8 +306,8 @@ def build_paired_rows(raw_rows, args):
                 "measured_problem_id": index[1],
                 "modeled_speedup_candidate_vs_baseline": base_modeled_tpt / current_modeled_tpt,
                 "modeled_ms_per_output_token_delta": current_modeled_tpt - base_modeled_tpt,
-                "actual_e2e_speedup_candidate_vs_baseline": base_actual_tpt / current_actual_tpt,
-                "actual_e2e_ms_per_output_token_delta": current_actual_tpt - base_actual_tpt,
+                "actual_algorithm_speedup_candidate_vs_baseline": base_actual_tpt / current_actual_tpt,
+                "actual_algorithm_ms_per_output_token_delta": current_actual_tpt - base_actual_tpt,
                 "acceptance_rate_delta_percent": current["acceptance_rate_percent"] - base["acceptance_rate_percent"],
                 "verifier_round_delta": current["num_speculation_rounds"] - base["num_speculation_rounds"],
                 "draft_forward_pass_delta": current["total_num_forward_passes"] - base["total_num_forward_passes"],
@@ -315,8 +322,8 @@ def summarize_paired(paired):
     metric_columns = [
         "modeled_speedup_candidate_vs_baseline",
         "modeled_ms_per_output_token_delta",
-        "actual_e2e_speedup_candidate_vs_baseline",
-        "actual_e2e_ms_per_output_token_delta",
+        "actual_algorithm_speedup_candidate_vs_baseline",
+        "actual_algorithm_ms_per_output_token_delta",
         "acceptance_rate_delta_percent",
         "verifier_round_delta",
         "draft_forward_pass_delta",
@@ -334,7 +341,7 @@ def summarize_paired(paired):
             "num_questions": len(by_problem),
             "num_observations": len(observations),
             "candidate_modeled_win_rate_percent": 100.0 * (by_problem["modeled_ms_per_output_token_delta"] < 0).mean(),
-            "candidate_actual_win_rate_percent": 100.0 * (by_problem["actual_e2e_ms_per_output_token_delta"] < 0).mean(),
+            "candidate_actual_win_rate_percent": 100.0 * (by_problem["actual_algorithm_ms_per_output_token_delta"] < 0).mean(),
             "output_match_rate_percent": 100.0 * observations["output_matches_baseline"].mean(),
         }
         for column in metric_columns:
@@ -366,15 +373,17 @@ def write_manifest(args, output_dir):
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "arguments": vars(args),
         "cases": CASES,
-        "primary_metric": "modeled_ms_per_output_token",
-        "primary_metric_formula": (
+        "primary_metric": "actual_algorithm_ms_per_output_token",
+        "primary_metric_scope": "drafting including stop/extend controller, verifier forward, and required post-verification acceptance/controller update; excludes model loading, prompt tokenization, output decoding, reporting, plotting, and file output",
+        "modeled_metric_formula": (
             f"(draft_forward_passes * {args.draft_fwd_pass_ms} + "
             f"verifier_rounds * {args.target_tpt_ms}) / output_tokens"
         ),
-        "secondary_metric": "synchronized_actual_e2e_ms_per_output_token",
+        "secondary_metrics": ["modeled_ms_per_output_token", "synchronized_actual_e2e_ms_per_output_token"],
         "timing_scope": "prompt/model inputs prepared; synchronized immediately before generation and after final token; excludes model loading, prompt tokenization, output decoding, plotting, file output, and console generation output",
         "case_order_policy": "cyclic rotation across repetitions",
-        "sampling_temperature": 0.6,
+        "target_decoding": "greedy_argmax",
+        "dllm_drafter_decoding": "greedy_temperature_0",
     }
     with (output_dir / "report_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -411,8 +420,10 @@ def main():
         "num_unique_questions",
         "modeled_ms_per_output_token",
         "modeled_speedup_vs_verifier_ar",
+        "actual_algorithm_ms_per_output_token",
+        "actual_algorithm_time_mean_s",
+        "actual_post_verify_time_mean_s",
         "actual_e2e_ms_per_output_token",
-        "actual_e2e_time_mean_s",
         "acceptance_rate_percent",
         "accepted_tokens_per_round",
         "output_tokens_per_round",
@@ -429,12 +440,12 @@ def main():
         "modeled_speedup_candidate_vs_baseline_mean",
         "modeled_speedup_candidate_vs_baseline_ci95_low",
         "modeled_speedup_candidate_vs_baseline_ci95_high",
-        "actual_e2e_speedup_candidate_vs_baseline_mean",
-        "actual_e2e_speedup_candidate_vs_baseline_ci95_low",
-        "actual_e2e_speedup_candidate_vs_baseline_ci95_high",
+        "actual_algorithm_speedup_candidate_vs_baseline_mean",
+        "actual_algorithm_speedup_candidate_vs_baseline_ci95_low",
+        "actual_algorithm_speedup_candidate_vs_baseline_ci95_high",
     ]
-    print("\nREPORT AGGREGATE (PRIMARY SORT: FAILFAST A6000 MODELED LATENCY)")
-    print(aggregate[display_columns].to_string(index=False))
+    print("\nREPORT AGGREGATE (PRIMARY SORT: MEASURED ALGORITHM LATENCY)")
+    print(aggregate.sort_values("actual_algorithm_ms_per_output_token")[display_columns].to_string(index=False))
     print("\nPAIRED REPORT")
     print(paired_summary[paired_columns].to_string(index=False))
     print(f"\nSaved report: {output_dir}")
