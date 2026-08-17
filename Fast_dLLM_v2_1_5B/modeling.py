@@ -1116,6 +1116,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         frontier_scores = []
         frontier_recent_unmasked = []
         frontier_force_stop = False
+        frontier_force_extend = False
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
@@ -1156,6 +1157,28 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 survival *= accept_prob
                 score += survival
             return score, probabilities
+
+        def calibration_prior_probability():
+            calibration = getattr(args, "frontier_acceptance_calibration", None) if args is not None else None
+            prior = float(getattr(args, "frontier_calibration_prior", 0.5)) if args is not None else 0.5
+            prior_count = float(getattr(args, "frontier_calibration_prior_count", 2.0)) if args is not None else 2.0
+            if not calibration:
+                return prior
+            accepted, total = calibration.get("prior", (0.0, 0.0))
+            return max(0.02, min(0.98, (float(accepted) + prior * prior_count) / (float(total) + prior_count)))
+
+        def v2_latency_estimates():
+            recent_forward_ms = forward_pass_latencies[-1] if forward_pass_latencies else 6.1
+            draft_forward_ms = float(getattr(args, "frontier_ema_dllm_forward_ms", None) or recent_forward_ms)
+            verify_round_ms = getattr(args, "frontier_ema_target_round_ms", None)
+            if verify_round_ms is None and args is not None:
+                latency = getattr(args, "latency", {}).get("vLLM_A6000", {})
+                target_tpt = latency.get("target_tpt", {})
+                verify_round_ms = target_tpt.get(getattr(args, "target_model_name_clean", ""))
+            if verify_round_ms is None:
+                verify_round_ms = max(draft_forward_ms, 13.5)
+            controller_ms = float(getattr(args, "frontier_ema_controller_ms", None) or 0.0)
+            return max(draft_forward_ms, 1e-6), max(float(verify_round_ms), 1e-6), max(controller_ms, 0.0)
         
         if input_ids.shape[1] > block_size:
             if prev_prefill_output is not None and prev_prefill_output.logits.shape[1] == (input_ids.shape[1] // block_size * block_size):
@@ -1387,6 +1410,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             force_stop_modes = ("mask_efficiency", "frontier", "cost_aware_no_extend")
 
                             stop_reason = None
+                            frontier_force_extend = False
+                            predicted_gain = None
+                            if frontier_gain is not None:
+                                if len(frontier_scores) >= 3:
+                                    prev_gain = frontier_scores[-2] - frontier_scores[-3]
+                                    ratio = max(0.0, min(1.0, frontier_gain / max(prev_gain, 1e-12)))
+                                    predicted_gain = max(0.0, frontier_gain * ratio)
+                                else:
+                                    predicted_gain = max(0.0, frontier_gain)
                             if frontier_k >= target_len and frontier_mode in force_stop_modes:
                                 stop_reason = "frontier_all_pass"
                             elif aggressive_irrecoverable and frontier_k < target_len and not frontier_recoverable and frontier_confidence is not None and frontier_confidence < tau_f:
@@ -1398,18 +1430,88 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 if frontier_gain is not None and frontier_gain <= gain_epsilon and unmasked_this_step <= max_unmask:
                                     stop_reason = "frontier_stall"
                             elif len(frontier_scores) >= min_steps and frontier_mode in ("cost_aware", "cost_aware_no_extend"):
-                                if frontier_gain is not None:
-                                    if len(frontier_scores) >= 3:
-                                        prev_gain = frontier_scores[-2] - frontier_scores[-3]
-                                        ratio = max(0.0, min(1.0, frontier_gain / max(prev_gain, 1e-12)))
-                                        predicted_gain = frontier_gain * ratio
-                                    else:
-                                        predicted_gain = frontier_gain
+                                if predicted_gain is not None:
                                     if predicted_gain <= cost_token_equiv:
                                         stop_reason = "cost_aware_low_expected_gain"
+                            elif len(frontier_scores) >= min_steps and frontier_mode == "cost_aware_v2":
+                                draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates()
+                                elapsed_draft_ms = float(sum(forward_pass_latencies))
+                                expected_output = 1.0 + float(frontier_score)
+                                hysteresis = float(getattr(args, "frontier_v2_hysteresis", 0.03))
+                                min_expected_output = float(getattr(args, "frontier_v2_min_expected_output", 7.0))
+                                stop_fill_ms = draft_forward_ms if masks_remaining > 0 else 0.0
+                                stop_ms_per_output = (
+                                    elapsed_draft_ms + stop_fill_ms + verify_round_ms + controller_ms
+                                ) / max(expected_output, 1e-6)
+                                step_record.update({
+                                    "v2_expected_output": expected_output,
+                                    "v2_draft_forward_ms": draft_forward_ms,
+                                    "v2_verify_round_ms": verify_round_ms,
+                                    "v2_controller_ms": controller_ms,
+                                    "v2_stop_ms_per_output": stop_ms_per_output,
+                                })
+
+                                if masks_remaining > 0:
+                                    expected_unmask = max(
+                                        1.0,
+                                        sum(frontier_recent_unmasked[-patience:]) / max(1, len(frontier_recent_unmasked[-patience:])),
+                                    )
+                                    next_fill_ms = draft_forward_ms if masks_remaining > expected_unmask else 0.0
+                                    next_expected_output = expected_output + float(predicted_gain or 0.0)
+                                    continue_ms_per_output = (
+                                        elapsed_draft_ms
+                                        + draft_forward_ms
+                                        + next_fill_ms
+                                        + verify_round_ms
+                                        + controller_ms
+                                    ) / max(next_expected_output, 1e-6)
+                                    step_record["v2_continue_ms_per_output"] = continue_ms_per_output
+                                    must_refine = expected_output < min_expected_output and frontier_recoverable
+                                    if not must_refine and continue_ms_per_output >= stop_ms_per_output * (1.0 - hysteresis):
+                                        stop_reason = "cost_aware_v2_verify_lower_cost"
+                                else:
+                                    extension = min(incr_len, max_spec_len - spec_len)
+                                    survival = 1.0
+                                    for accept_probability in accept_probabilities:
+                                        survival *= accept_probability
+                                    extension_probability = calibration_prior_probability()
+                                    extension_gain = 0.0
+                                    for offset in range(1, extension + 1):
+                                        extension_gain += survival * (extension_probability ** offset)
+                                    denoising_passes = frontier_stats["forward_pass_breakdown"]["denoising"]
+                                    estimated_extension_passes = max(
+                                        1.0,
+                                        extension * denoising_passes / max(target_len, 1),
+                                    ) if extension > 0 else 0.0
+                                    extend_ms_per_output = (
+                                        elapsed_draft_ms
+                                        + estimated_extension_passes * draft_forward_ms
+                                        + verify_round_ms
+                                        + controller_ms
+                                    ) / max(expected_output + extension_gain, 1e-6) if extension > 0 else float("inf")
+                                    step_record.update({
+                                        "v2_extension_size": int(extension),
+                                        "v2_extension_gain": float(extension_gain),
+                                        "v2_extend_ms_per_output": float(extend_ms_per_output),
+                                    })
+                                    must_extend = expected_output < min_expected_output and extension_gain >= 0.25
+                                    if extension > 0 and (
+                                        must_extend
+                                        or extend_ms_per_output < stop_ms_per_output * (1.0 - hysteresis)
+                                    ):
+                                        frontier_force_extend = True
+                                        frontier_stats["refinement_actions"].append({
+                                            "step": len(frontier_scores),
+                                            "action": "cost_aware_v2_extend",
+                                            "target_len": target_len,
+                                            "masks_remaining": masks_remaining,
+                                            "extension": int(extension),
+                                        })
+                                    else:
+                                        stop_reason = "cost_aware_v2_verify_lower_cost"
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
-                                frontier_force_stop = frontier_mode in force_stop_modes
+                                frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode == "cost_aware_v2"
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),
                                     "action": stop_reason,
@@ -1457,6 +1559,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or frontier_stats["refinement_actions"][-1]["action"]
                                 logger.debug(f"{Colors.GREEN}Frontier controller stopped refinement. reason={frontier_stats.get('stop_reason')} spec_len={spec_len}{Colors.RESET}")
                                 draft_tokens_unmasked = True
+                            elif frontier_force_extend:
+                                extension = min(incr_len, max_spec_len - spec_len)
+                                if extension > 0:
+                                    draft_token_end_idx += extension
+                                    spec_len += extension
+                                    draft_tokens_unmasked = False
+                                    frontier_force_extend = False
+                                    logger.debug(f"{Colors.GREEN}Cost-aware v2 extended proposal by {extension} tokens. spec_len={spec_len}{Colors.RESET}")
+                                else:
+                                    frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "cost_aware_v2_max_spec_len"
+                                    draft_tokens_unmasked = True
                             elif any([x < lowconf_threshold for x in conf_of_unmasked_tokens]):
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_low_confidence"
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. Some are low-confidence, stop speculating. spec_len is {spec_len}{Colors.RESET}")
