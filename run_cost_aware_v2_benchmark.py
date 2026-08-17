@@ -12,7 +12,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
-BENCHMARK_VERSION = "cost_aware_v2_paired_v1"
+BENCHMARK_VERSION = "paired_frontier_candidate_v2"
 METHODS = {
     "failfast": {
         "frontier_mode": "disabled",
@@ -26,12 +26,19 @@ METHODS = {
         "lowconf_threshold": 0.60,
         "incr_len": 4,
     },
+    "cost_aware_v1_spec8": {
+        "frontier_mode": "cost_aware",
+        "spec_len": 8,
+        "lowconf_threshold": 0.60,
+        "incr_len": 10,
+    },
 }
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=["math", "aime", "gsm8k", "humaneval"])
+    parser.add_argument("--candidate", choices=("cost_aware_v2", "cost_aware_v1_spec8"), default="cost_aware_v2")
     parser.add_argument("--num_questions", type=int, default=10)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
@@ -47,10 +54,13 @@ def parse_args():
     parser.add_argument("--frontier_v2_min_expected_output", type=float, default=7.0)
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output_dir", default="/content/failfasttesting/outputs_cost_aware_v2_test10")
+    parser.add_argument("--output_dir")
     parser.add_argument("--log_level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     parser.add_argument("--resume", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = f"/content/failfasttesting/outputs_{args.candidate}_test{args.num_questions}"
+    return args
 
 
 def validate_args(args):
@@ -262,7 +272,7 @@ def build_dataset_summary(rows):
     return pd.DataFrame(records).sort_values(["dataset", "method"])
 
 
-def build_paired_observations(rows):
+def build_paired_observations(rows, candidate_method):
     columns = [
         "dataset",
         "problem_id",
@@ -285,54 +295,56 @@ def build_paired_observations(rows):
         "is_correct",
     ]
     baseline = rows[rows["method"] == "failfast"][columns].copy()
-    candidate = rows[rows["method"] == "cost_aware_v2"][columns].copy()
+    candidate = rows[rows["method"] == candidate_method][columns].copy()
     baseline = baseline.rename(columns={column: f"failfast_{column}" for column in columns if column not in ("dataset", "problem_id")})
-    candidate = candidate.rename(columns={column: f"v2_{column}" for column in columns if column not in ("dataset", "problem_id")})
+    candidate = candidate.rename(columns={column: f"candidate_{column}" for column in columns if column not in ("dataset", "problem_id")})
     paired = baseline.merge(candidate, on=["dataset", "problem_id"], how="inner", validate="one_to_one")
-    paired["v2_speedup_vs_failfast"] = (
+    paired["candidate_speedup_vs_failfast"] = (
         paired["failfast_actual_measured_ms_per_output_token"]
-        / paired["v2_actual_measured_ms_per_output_token"]
+        / paired["candidate_actual_measured_ms_per_output_token"]
     )
-    paired["v2_ms_per_output_token_delta"] = (
-        paired["v2_actual_measured_ms_per_output_token"]
+    paired["candidate_ms_per_output_token_delta"] = (
+        paired["candidate_actual_measured_ms_per_output_token"]
         - paired["failfast_actual_measured_ms_per_output_token"]
     )
-    paired["verifier_round_delta"] = paired["v2_num_speculation_rounds"] - paired["failfast_num_speculation_rounds"]
-    paired["draft_forward_pass_delta"] = paired["v2_total_num_forward_passes"] - paired["failfast_total_num_forward_passes"]
-    paired["fill_forward_pass_delta"] = paired["v2_frontier_fill_forward_passes"] - paired["failfast_frontier_fill_forward_passes"]
-    paired["denoising_forward_pass_delta"] = paired["v2_frontier_denoising_forward_passes"] - paired["failfast_frontier_denoising_forward_passes"]
-    paired["output_length_delta"] = paired["v2_output_tokens"] - paired["failfast_output_tokens"]
-    paired["output_matches_failfast"] = paired["v2_output_token_hash"] == paired["failfast_output_token_hash"]
+    paired["verifier_round_delta"] = paired["candidate_num_speculation_rounds"] - paired["failfast_num_speculation_rounds"]
+    paired["draft_forward_pass_delta"] = paired["candidate_total_num_forward_passes"] - paired["failfast_total_num_forward_passes"]
+    paired["fill_forward_pass_delta"] = paired["candidate_frontier_fill_forward_passes"] - paired["failfast_frontier_fill_forward_passes"]
+    paired["denoising_forward_pass_delta"] = paired["candidate_frontier_denoising_forward_passes"] - paired["failfast_frontier_denoising_forward_passes"]
+    paired["output_length_delta"] = paired["candidate_output_tokens"] - paired["failfast_output_tokens"]
+    paired["output_matches_failfast"] = paired["candidate_output_token_hash"] == paired["failfast_output_token_hash"]
+    paired["candidate_method"] = candidate_method
     return paired
 
 
-def build_comparison_summary(dataset_summary, paired):
+def build_comparison_summary(dataset_summary, paired, candidate_method):
     records = []
     for dataset in dataset_summary["dataset"].unique():
         baseline = dataset_summary[(dataset_summary["dataset"] == dataset) & (dataset_summary["method"] == "failfast")].iloc[0]
-        candidate = dataset_summary[(dataset_summary["dataset"] == dataset) & (dataset_summary["method"] == "cost_aware_v2")].iloc[0]
+        candidate = dataset_summary[(dataset_summary["dataset"] == dataset) & (dataset_summary["method"] == candidate_method)].iloc[0]
         observations = paired[paired["dataset"] == dataset]
         records.append({
             "dataset": dataset,
+            "candidate_method": candidate_method,
             "num_samples": len(observations),
-            "v2_speedup_vs_failfast": safe_ratio(
+            "candidate_speedup_vs_failfast": safe_ratio(
                 baseline["actual_measured_ms_per_output_token"],
                 candidate["actual_measured_ms_per_output_token"],
             ),
-            "v2_win_rate_percent": 100.0 * (observations["v2_ms_per_output_token_delta"] < 0).mean(),
+            "candidate_win_rate_percent": 100.0 * (observations["candidate_ms_per_output_token_delta"] < 0).mean(),
             "output_match_rate_percent": 100.0 * observations["output_matches_failfast"].mean(),
             "failfast_ms_per_output_token": baseline["actual_measured_ms_per_output_token"],
-            "v2_ms_per_output_token": candidate["actual_measured_ms_per_output_token"],
+            "candidate_ms_per_output_token": candidate["actual_measured_ms_per_output_token"],
             "failfast_verifier_rounds_per_100_tokens": baseline["verifier_rounds_per_100_output_tokens"],
-            "v2_verifier_rounds_per_100_tokens": candidate["verifier_rounds_per_100_output_tokens"],
+            "candidate_verifier_rounds_per_100_tokens": candidate["verifier_rounds_per_100_output_tokens"],
             "failfast_output_tokens_per_round": baseline["output_tokens_per_round"],
-            "v2_output_tokens_per_round": candidate["output_tokens_per_round"],
+            "candidate_output_tokens_per_round": candidate["output_tokens_per_round"],
             "failfast_acceptance_rate_percent": baseline["acceptance_rate_percent"],
-            "v2_acceptance_rate_percent": candidate["acceptance_rate_percent"],
+            "candidate_acceptance_rate_percent": candidate["acceptance_rate_percent"],
         })
     summary = pd.DataFrame(records)
     failfast = dataset_summary[dataset_summary["method"] == "failfast"]
-    candidate = dataset_summary[dataset_summary["method"] == "cost_aware_v2"]
+    candidate = dataset_summary[dataset_summary["method"] == candidate_method]
     failfast_pooled_ms = safe_ratio(
         1000.0 * failfast["actual_measured_time_s"].sum(),
         failfast["output_tokens"].sum(),
@@ -342,14 +354,15 @@ def build_comparison_summary(dataset_summary, paired):
         candidate["output_tokens"].sum(),
     )
     overall = pd.DataFrame([{
+        "candidate_method": candidate_method,
         "datasets_completed": summary["dataset"].nunique(),
         "num_samples": len(paired),
-        "macro_speedup_v2_vs_failfast": summary["v2_speedup_vs_failfast"].mean(),
-        "pooled_speedup_v2_vs_failfast": safe_ratio(failfast_pooled_ms, candidate_pooled_ms),
-        "paired_v2_win_rate_percent": 100.0 * (paired["v2_ms_per_output_token_delta"] < 0).mean(),
+        "macro_speedup_candidate_vs_failfast": summary["candidate_speedup_vs_failfast"].mean(),
+        "pooled_speedup_candidate_vs_failfast": safe_ratio(failfast_pooled_ms, candidate_pooled_ms),
+        "paired_candidate_win_rate_percent": 100.0 * (paired["candidate_ms_per_output_token_delta"] < 0).mean(),
         "output_match_rate_percent": 100.0 * paired["output_matches_failfast"].mean(),
         "failfast_pooled_ms_per_output_token": failfast_pooled_ms,
-        "v2_pooled_ms_per_output_token": candidate_pooled_ms,
+        "candidate_pooled_ms_per_output_token": candidate_pooled_ms,
     }])
     return summary, overall
 
@@ -369,13 +382,16 @@ def write_manifest(args, output_dir):
         "python": sys.version,
         "platform": platform.platform(),
         "arguments": vars(args),
-        "methods": METHODS,
+        "methods": {
+            "failfast": METHODS["failfast"],
+            args.candidate: METHODS[args.candidate],
+        },
         "primary_metric": "measured milliseconds per output token",
         "time_formula": "actual_draft_time + actual_verify_time + actual_post_verify_time",
-        "comparison": "cost_aware_v2 versus FailFast",
+        "comparison": f"{args.candidate} versus FailFast",
         "target_decoding": "greedy",
-        "macro_speedup": "arithmetic mean of per-dataset v2 speedups versus FailFast",
-        "pooled_speedup": "ratio of total FailFast milliseconds/output-token to total v2 milliseconds/output-token",
+        "macro_speedup": "arithmetic mean of per-dataset candidate speedups versus FailFast",
+        "pooled_speedup": "ratio of total FailFast milliseconds/output-token to total candidate milliseconds/output-token",
         "dataset_order_policy": "method order alternates by dataset",
     }
     with (output_dir / "benchmark_manifest.json").open("w", encoding="utf-8") as handle:
@@ -389,13 +405,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     frames = []
     for dataset_index, dataset in enumerate(args.datasets):
-        method_order = ("failfast", "cost_aware_v2") if dataset_index % 2 == 0 else ("cost_aware_v2", "failfast")
+        method_order = ("failfast", args.candidate) if dataset_index % 2 == 0 else (args.candidate, "failfast")
         for method in method_order:
             frames.append(run_method(args, dataset, method))
     rows = pd.concat(frames, ignore_index=True, sort=False)
     dataset_summary = build_dataset_summary(rows)
-    paired = build_paired_observations(rows)
-    comparison, overall = build_comparison_summary(dataset_summary, paired)
+    paired = build_paired_observations(rows, args.candidate)
+    comparison, overall = build_comparison_summary(dataset_summary, paired, args.candidate)
     rows.to_csv(output_dir / "per_observation.csv", index=False)
     dataset_summary.to_csv(output_dir / "dataset_method_summary.csv", index=False)
     paired.to_csv(output_dir / "paired_observations.csv", index=False)
