@@ -12,7 +12,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
-BENCHMARK_VERSION = "paired_frontier_candidate_v2"
+BENCHMARK_VERSION = "paired_frontier_candidate_v3"
 METHODS = {
     "failfast": {
         "frontier_mode": "disabled",
@@ -26,6 +26,18 @@ METHODS = {
         "lowconf_threshold": 0.60,
         "incr_len": 4,
     },
+    "cost_aware_v1_spec8_incr8": {
+        "frontier_mode": "cost_aware",
+        "spec_len": 8,
+        "lowconf_threshold": 0.60,
+        "incr_len": 8,
+    },
+    "cost_aware_v1_spec8_incr10": {
+        "frontier_mode": "cost_aware",
+        "spec_len": 8,
+        "lowconf_threshold": 0.60,
+        "incr_len": 10,
+    },
     "cost_aware_v1_spec8": {
         "frontier_mode": "cost_aware",
         "spec_len": 8,
@@ -37,8 +49,10 @@ METHODS = {
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    candidate_choices = tuple(method for method in METHODS if method != "failfast")
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=["math", "aime", "gsm8k", "humaneval"])
-    parser.add_argument("--candidate", choices=("cost_aware_v2", "cost_aware_v1_spec8"), default="cost_aware_v2")
+    parser.add_argument("--candidate", choices=candidate_choices)
+    parser.add_argument("--candidates", nargs="+", choices=candidate_choices)
     parser.add_argument("--num_questions", type=int, default=10)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
@@ -58,8 +72,13 @@ def parse_args():
     parser.add_argument("--log_level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
+    if args.candidate and args.candidates:
+        parser.error("use either --candidate or --candidates, not both")
+    args.candidates = args.candidates or ([args.candidate] if args.candidate else ["cost_aware_v2"])
+    args.candidate = None
     if args.output_dir is None:
-        args.output_dir = f"/content/failfasttesting/outputs_{args.candidate}_test{args.num_questions}"
+        candidate_label = "_vs_".join(args.candidates)
+        args.output_dir = f"/content/failfasttesting/outputs_{candidate_label}_test{args.num_questions}"
     return args
 
 
@@ -74,6 +93,8 @@ def validate_args(args):
         raise ValueError("--frontier_v2_min_expected_output must be greater than 1")
     if not 0 <= args.frontier_v2_hysteresis < 1:
         raise ValueError("--frontier_v2_hysteresis must be in [0, 1)")
+    if len(args.candidates) != len(set(args.candidates)):
+        raise ValueError("--candidates must not contain duplicates")
 
 
 def measured_questions(args, dataset):
@@ -382,17 +403,14 @@ def write_manifest(args, output_dir):
         "python": sys.version,
         "platform": platform.platform(),
         "arguments": vars(args),
-        "methods": {
-            "failfast": METHODS["failfast"],
-            args.candidate: METHODS[args.candidate],
-        },
+        "methods": {method: METHODS[method] for method in ("failfast", *args.candidates)},
         "primary_metric": "measured milliseconds per output token",
         "time_formula": "actual_draft_time + actual_verify_time + actual_post_verify_time",
-        "comparison": f"{args.candidate} versus FailFast",
+        "comparison": f"{', '.join(args.candidates)} versus FailFast",
         "target_decoding": "greedy",
         "macro_speedup": "arithmetic mean of per-dataset candidate speedups versus FailFast",
         "pooled_speedup": "ratio of total FailFast milliseconds/output-token to total candidate milliseconds/output-token",
-        "dataset_order_policy": "method order alternates by dataset",
+        "dataset_order_policy": "method order rotates by dataset",
     }
     with (output_dir / "benchmark_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -404,14 +422,30 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     frames = []
+    methods = ("failfast", *args.candidates)
     for dataset_index, dataset in enumerate(args.datasets):
-        method_order = ("failfast", args.candidate) if dataset_index % 2 == 0 else (args.candidate, "failfast")
+        rotation = dataset_index % len(methods)
+        method_order = methods[rotation:] + methods[:rotation]
         for method in method_order:
             frames.append(run_method(args, dataset, method))
     rows = pd.concat(frames, ignore_index=True, sort=False)
     dataset_summary = build_dataset_summary(rows)
-    paired = build_paired_observations(rows, args.candidate)
-    comparison, overall = build_comparison_summary(dataset_summary, paired, args.candidate)
+    paired_frames = []
+    comparison_frames = []
+    overall_frames = []
+    for candidate in args.candidates:
+        candidate_paired = build_paired_observations(rows, candidate)
+        candidate_comparison, candidate_overall = build_comparison_summary(
+            dataset_summary,
+            candidate_paired,
+            candidate,
+        )
+        paired_frames.append(candidate_paired)
+        comparison_frames.append(candidate_comparison)
+        overall_frames.append(candidate_overall)
+    paired = pd.concat(paired_frames, ignore_index=True, sort=False)
+    comparison = pd.concat(comparison_frames, ignore_index=True, sort=False)
+    overall = pd.concat(overall_frames, ignore_index=True, sort=False)
     rows.to_csv(output_dir / "per_observation.csv", index=False)
     dataset_summary.to_csv(output_dir / "dataset_method_summary.csv", index=False)
     paired.to_csv(output_dir / "paired_observations.csv", index=False)
