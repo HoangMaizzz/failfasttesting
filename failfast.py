@@ -24,8 +24,7 @@ os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 transformers.logging.set_verbosity_error()
 
-# 🚀 BẬT SAMPLING VÀ RESIDUAL SAMPLING CHO AR-AR
-TEMPERATURE = 0.6 
+TEMPERATURE = 0.6
 
 sys.path.insert(1, os.path.dirname(os.getcwd()))
 from plotting import (
@@ -64,7 +63,7 @@ def get_target_token_ids(model, tokenizer, messages, max_new_tokens):
     
     return generated_ids[0].tolist(), model_inputs
 
-def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n, temperature=TEMPERATURE):
+def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n, temperature=TEMPERATURE, do_sample=False):
     new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
 
@@ -73,18 +72,17 @@ def get_next_n_tokens_ar(model, orig_model_inputs, token_ids_so_far, n, temperat
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
 
-    generate_output = model.generate(
-        **new_model_inputs,
-        max_new_tokens=n,
-        do_sample=True, # 🚀 Đã đổi sang Sampling
-        temperature=temperature,
-        top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
-        top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
-        output_scores=True,
-        return_dict_in_generate=True,
-        pad_token_id=model.config.eos_token_id,
-        eos_token_id=model.config.eos_token_id,
-    )
+    generation_kwargs = {
+        "max_new_tokens": n,
+        "do_sample": do_sample,
+        "output_scores": True,
+        "return_dict_in_generate": True,
+        "pad_token_id": model.config.eos_token_id,
+        "eos_token_id": model.config.eos_token_id,
+    }
+    if do_sample:
+        generation_kwargs.update(temperature=temperature, top_k=0, top_p=1.0)
+    generate_output = model.generate(**new_model_inputs, **generation_kwargs)
     generated_ids = generate_output.sequences[0][len(new_model_inputs["input_ids"][0]):].tolist()
     
     # 🚀 LẤY BẢNG XÁC SUẤT CỦA AR DRAFTER ĐỂ LÀM RESIDUAL SAMPLING
@@ -104,7 +102,8 @@ def get_next_tokens_ar(
     lowconf_threshold,
     max_spec_len,
     incr_len,
-    temperature=TEMPERATURE
+    temperature=TEMPERATURE,
+    do_sample=False,
 ):
     if incr_len is None or incr_len <= 0:
         raise ValueError(f"incr_len must be a positive int, got {incr_len}")
@@ -133,18 +132,17 @@ def get_next_tokens_ar(
         while len(drafted) < cap:
             chunk_size = min(incr_len, cap - len(drafted))
             
-            generate_output = model.generate(
-                **current_inputs,
-                max_new_tokens=chunk_size,
-                do_sample=True, # 🚀 Đã đổi sang Sampling
-                temperature=temperature,
-                top_k=0,        # 🚀 Tắt ép top_k mặc định của HF
-                top_p=1.0,      # 🚀 Tắt ép top_p mặc định của HF
-                output_scores=True,
-                return_dict_in_generate=True,
-                pad_token_id=model.config.eos_token_id,
-                eos_token_id=model.config.eos_token_id,
-            )
+            generation_kwargs = {
+                "max_new_tokens": chunk_size,
+                "do_sample": do_sample,
+                "output_scores": True,
+                "return_dict_in_generate": True,
+                "pad_token_id": model.config.eos_token_id,
+                "eos_token_id": model.config.eos_token_id,
+            }
+            if do_sample:
+                generation_kwargs.update(temperature=temperature, top_k=0, top_p=1.0)
+            generate_output = model.generate(**current_inputs, **generation_kwargs)
             
             generated_ids = generate_output.sequences[0][len(current_inputs["input_ids"][0]):].tolist()
             scores = generate_output.scores
@@ -357,11 +355,14 @@ parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gsm8k"
 parser.add_argument("--output_dir", type=str, default="/data2/USERNAME/failfast")
 parser.add_argument("--mode", type=str, choices=["verifier_ar", "ar_ar", "dllm_ar"], default="dllm_ar")
 parser.add_argument("--benchmark_modes", type=str, nargs="+", choices=["verifier_ar", "ar_ar", "dllm_ar"], default=["verifier_ar", "ar_ar", "dllm_ar"])
+parser.add_argument("--dllm_variant", type=str, choices=["failfast", "fixed"], default="failfast")
+parser.add_argument("--decoding_strategy", type=str, choices=["greedy", "sampling"], default="greedy")
 parser.add_argument("--target_model_name", type=str, default=None)
 parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--num_questions", type=int, default=1)
+parser.add_argument("--warmup_questions", type=int, default=0)
 parser.add_argument("--max_new_tokens", type=int, default=1024)
 parser.add_argument("--block_size", type=int, default=32)
 parser.add_argument("--small_block_size", type=int, default=8)
@@ -382,6 +383,8 @@ parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.
 parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--quiet_generation", action="store_true")
+parser.add_argument("--disable_progress", action="store_true")
+parser.add_argument("--skip_artifacts", action="store_true")
 parser.add_argument("--skip_plots", action="store_true")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument('--run_ar', action='store_true')
@@ -427,11 +430,15 @@ BENCHMARK_CSV_COLUMNS = [
     "theo_draft_verify_ratio",
     "acceptance_rate_percent",
     "actual_speedup_vs_AR",
+    "actual_e2e_speedup_vs_AR",
     "theo_speedup_vs_AR",
     "actual_e2e_time",
+    "actual_e2e_ms_per_output_token",
+    "output_tokens_per_ms",
     "actual_post_verify_time",
     "actual_algorithm_time",
     "actual_algorithm_ms_per_output_token",
+    "actual_unattributed_core_time",
     "output_tokens",
     "accepted_tokens",
     "drafted_tokens",
@@ -490,6 +497,17 @@ def ensure_frontier_runtime_state(args):
         args.frontier_ema_target_token_ms = None
     if not hasattr(args, "frontier_dynamic_cost_token_equiv"):
         args.frontier_dynamic_cost_token_equiv = args.frontier_cost_token_equiv
+
+def reset_frontier_runtime_state(args):
+    for name in (
+        "frontier_acceptance_calibration",
+        "frontier_ema_dllm_forward_ms",
+        "frontier_ema_target_token_ms",
+        "frontier_dynamic_cost_token_equiv",
+        "last_frontier_stats",
+    ):
+        if hasattr(args, name):
+            delattr(args, name)
 
 def update_ema(old_value, new_value, alpha):
     if old_value is None:
@@ -562,17 +580,22 @@ def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcom
     frontier_stats["dynamic_cost_token_equiv"] = getattr(args, "frontier_dynamic_cost_token_equiv", None)
 
 def build_benchmark_drafter_configs(args):
-    return {
-        "verifier_ar": ("verifier_ar", None, "none", None, None, None),
-        "ar_ar": ("ar", None, "sf", None, None, None),
-        "dllm_ar": (
+    dllm_config = (
+        ("dllm", args.drafter_thresholds[0], "sf", None, None, None)
+        if args.dllm_variant == "fixed"
+        else (
             "dllm",
             args.drafter_thresholds[0],
             "df",
             args.sweep_lowconf_threshold[0],
             args.sweep_max_spec_len[0],
             args.sweep_incr_len[0],
-        ),
+        )
+    )
+    return {
+        "verifier_ar": ("verifier_ar", None, "none", None, None, None),
+        "ar_ar": ("ar", None, "sf", None, None, None),
+        "dllm_ar": dllm_config,
     }
 
 def build_benchmark_row(
@@ -601,6 +624,8 @@ def build_benchmark_row(
     theo_total_time = theo_draft_time + theo_verify_time
     output_tokens = len(output_token_ids)
     modeled_ms_per_output_token = safe_div(theo_total_time, output_tokens)
+    actual_e2e_ms_per_output_token = safe_div(actual_e2e_time * 1000.0, output_tokens)
+    actual_unattributed_core_time = max(0.0, actual_e2e_time - actual_algorithm_time)
     return {
         "problem_id": problem_id,
         "mode": mode,
@@ -614,11 +639,15 @@ def build_benchmark_row(
         "theo_draft_verify_ratio": safe_div(theo_draft_time, theo_verify_time),
         "acceptance_rate_percent": safe_div(accepted_tokens, drafted_tokens) * 100.0,
         "actual_speedup_vs_AR": None,
+        "actual_e2e_speedup_vs_AR": None,
         "theo_speedup_vs_AR": None,
         "actual_e2e_time": actual_e2e_time,
+        "actual_e2e_ms_per_output_token": actual_e2e_ms_per_output_token,
+        "output_tokens_per_ms": safe_div(output_tokens, actual_e2e_time * 1000.0),
         "actual_post_verify_time": post_verify_time_total,
         "actual_algorithm_time": actual_algorithm_time,
         "actual_algorithm_ms_per_output_token": safe_div(actual_algorithm_time * 1000.0, output_tokens),
+        "actual_unattributed_core_time": actual_unattributed_core_time,
         "output_tokens": output_tokens,
         "accepted_tokens": accepted_tokens,
         "drafted_tokens": drafted_tokens,
@@ -763,7 +792,18 @@ if not args.read_pickle:
             raise
         draft_tokenizer = target_tokenizer
 
-for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
+benchmark_runs = (
+    [(problem_id, True) for problem_id in range(args.warmup_questions)]
+    + [(problem_id, False) for problem_id in range(args.num_questions)]
+)
+for problem_id, is_warmup in tqdm(
+    benchmark_runs,
+    desc="Problems",
+    position=0,
+    disable=args.disable_progress,
+):
+    if not is_warmup and problem_id == 0:
+        reset_frontier_runtime_state(args)
     transformers.set_seed(args.seed)
     raw_data = format_problem_and_options(args, problem_id)
     messages = [
@@ -832,7 +872,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
             generation_start = time.perf_counter()
 
-            if is_interactive():
+            inner_bar = None
+            if is_interactive() and not args.disable_progress:
                 inner_bar = tqdm(total=num_target_tokens, miniters=1, desc=f"Verification (Problem {problem_id})",
                                 position=1, leave=True, dynamic_ncols=False, file=sys.stdout)
 
@@ -874,7 +915,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     "verify_time_ms": verify_time_total * 1000.0,
                 })
             else:
-                if is_interactive():
+                if is_interactive() and not args.disable_progress:
                     inner_bar = tqdm(total=num_target_tokens, miniters=1, desc=f"Verification (Problem {problem_id})",
                                     position=1, leave=True, dynamic_ncols=False, file=sys.stdout)
 
@@ -886,7 +927,14 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     draft_start = time.perf_counter()
                     if draft_type == "ar":
                         if freq_scheme == "sf":
-                            draft_proposal, drafter_probs = get_next_n_tokens_ar(draft_model, orig_model_inputs, current_token_ids, n=args.spec_len, temperature=TEMPERATURE)
+                            draft_proposal, drafter_probs = get_next_n_tokens_ar(
+                                draft_model,
+                                orig_model_inputs,
+                                current_token_ids,
+                                n=args.spec_len,
+                                temperature=TEMPERATURE,
+                                do_sample=args.decoding_strategy == "sampling",
+                            )
                             spec_len = args.spec_len
                         else:
                             draft_proposal, confidences, drafter_probs = get_next_tokens_ar(
@@ -897,7 +945,8 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                                 lowconf_threshold=lowconf_threshold,
                                 max_spec_len=max_spec_len,
                                 incr_len=incr_len,
-                                temperature=TEMPERATURE
+                                temperature=TEMPERATURE,
+                                do_sample=args.decoding_strategy == "sampling",
                             )
                             spec_len = len(draft_proposal)
                         
@@ -1000,7 +1049,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     
                     generation_print(args, f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
                     for i in range(len(draft_proposal)):
-                        if draft_type == "ar":
+                        if draft_type == "ar" and args.decoding_strategy == "sampling":
                             # === TOÁN HỌC RESIDUAL SAMPLING CHO AR-AR ===
                             p_drafter = drafter_probs[i]
                             # verify_logits là raw logit, cần chia cho TEMPERATURE
@@ -1074,7 +1123,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     else:
                         # NẾU TOÀN BỘ NHÁP ĐƯỢC CHẤP NHẬN -> TẶNG KÈM 1 CHỮ BONUS
                         final_token_logits = outputs.logits[0, -1, :]
-                        if draft_type == "ar":
+                        if draft_type == "ar" and args.decoding_strategy == "sampling":
                             final_probs = torch.softmax(final_token_logits / TEMPERATURE, dim=-1)
                             final_token = torch.multinomial(final_probs, 1).item()
                         else:
@@ -1140,7 +1189,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                     
                     num_speculation_rounds += 1
                     
-                    if is_interactive():
+                    if inner_bar is not None:
                         inner_bar.update(len(tokens_to_append))
 
                     if target_tokenizer.eos_token_id in tokens_to_append:
@@ -1150,7 +1199,7 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
                 torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
             actual_e2e_time = time.perf_counter() - generation_start
 
-            if is_interactive():
+            if inner_bar is not None:
                 inner_bar.close()
 
         stats_each_round = pickled_data["stats_each_round"]
@@ -1216,14 +1265,18 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
         pickled_data["reference_answer"] = reference_answer
         pickled_data["is_correct"] = predicted_answer is not None and predicted_answer == reference_answer
         
-        if (args.overwrite and not args.read_pickle) or (not os.path.exists(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"))):
+        should_write_artifacts = not args.skip_artifacts and (
+            (args.overwrite and not args.read_pickle)
+            or not os.path.exists(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"))
+        )
+        if should_write_artifacts:
             with open(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.pickle"), "wb") as f:
                 pickle.dump(pickled_data, f)
                 logging.info(f"Saved pickled data to {os.path.join(output_dir_pickles, f'{args.max_new_tokens}.pickle')}")
             with open(os.path.join(output_dir_pickles, f"{args.max_new_tokens}.txt"), "w") as f:
                 pp = pprint.PrettyPrinter(width=1000, stream=f)
                 pp.pprint(pickled_data)
-        else:
+        elif not args.skip_artifacts:
             logging.info(f"Skipping save for pickled data to {os.path.join(output_dir_pickles, f'{args.max_new_tokens}.pickle')}")
 
         problem_benchmark_rows.append(build_benchmark_row(
@@ -1247,8 +1300,13 @@ for problem_id in tqdm(range(args.num_questions), desc="Problems", position=0):
     for row in problem_benchmark_rows:
         if row["mode"] == "verifier_ar":
             row["actual_speedup_vs_AR"] = 1.0
+            row["actual_e2e_speedup_vs_AR"] = 1.0
             row["theo_speedup_vs_AR"] = 1.0
         elif baseline_row is not None:
             row["actual_speedup_vs_AR"] = safe_div(baseline_row["actual_algorithm_time"], row["actual_algorithm_time"])
+            baseline_e2e_tpt = safe_div(baseline_row["actual_e2e_time"], baseline_row["output_tokens"])
+            row_e2e_tpt = safe_div(row["actual_e2e_time"], row["output_tokens"])
+            row["actual_e2e_speedup_vs_AR"] = safe_div(baseline_e2e_tpt, row_e2e_tpt)
             row["theo_speedup_vs_AR"] = safe_div(baseline_row["theo_total_time"], row["theo_total_time"])
-    append_benchmark_rows(args, problem_benchmark_rows)
+    if not is_warmup:
+        append_benchmark_rows(args, problem_benchmark_rows)
