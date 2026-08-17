@@ -30,7 +30,7 @@ METHODS = {
         "frontier_mode": "cost_aware",
         "spec_len": 8,
         "lowconf_threshold": 0.60,
-        "incr_len": 10,
+        "incr_len": 8,
     },
 }
 
