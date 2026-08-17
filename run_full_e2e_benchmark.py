@@ -12,6 +12,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
+BENCHMARK_VERSION = "actual_latency_v2_sdpa_subset_logits"
 METHOD_ORDER = (
     "ar_only",
     "ar_draft",
@@ -126,11 +127,45 @@ def measured_questions(args, dataset):
     return min(args.num_questions, DATASET_LIMITS.get(dataset, args.num_questions))
 
 
-def local_results_complete(path, expected_rows):
-    if not path.exists():
+def run_metadata(args, dataset, method):
+    config = LOCAL_METHODS[method]
+    return {
+        "benchmark_version": BENCHMARK_VERSION,
+        "dataset": dataset,
+        "method": method,
+        "num_questions": measured_questions(args, dataset),
+        "warmup_questions": args.warmup_questions,
+        "max_new_tokens": args.max_new_tokens,
+        "target_model_name": args.target_model_name,
+        "drafter_model_name": args.drafter_model_name,
+        "dllm_dir": args.dllm_dir,
+        "block_size": args.block_size,
+        "small_block_size": args.small_block_size,
+        "drafter_threshold": args.drafter_threshold,
+        "max_spec_len": args.max_spec_len,
+        "incr_len": args.incr_len,
+        "frontier_min_steps": args.frontier_min_steps,
+        "frontier_patience": args.frontier_patience,
+        "frontier_cost_token_equiv": args.frontier_cost_token_equiv,
+        "seed": args.seed,
+        "method_config": config,
+    }
+
+
+def local_results_complete(path, expected_rows, metadata_path, expected_metadata):
+    if not path.exists() or not metadata_path.exists():
         return False
-    rows = pd.read_csv(path)
-    return len(rows) == expected_rows and rows["problem_id"].nunique() == expected_rows
+    try:
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            stored_metadata = json.load(handle)
+        rows = pd.read_csv(path)
+    except (OSError, ValueError, KeyError, pd.errors.ParserError):
+        return False
+    return (
+        stored_metadata == expected_metadata
+        and len(rows) == expected_rows
+        and rows["problem_id"].nunique() == expected_rows
+    )
 
 
 def run_local_method(args, dataset, method):
@@ -138,8 +173,15 @@ def run_local_method(args, dataset, method):
     output_dir = local_output_dir(args, dataset, method)
     output_dir.mkdir(parents=True, exist_ok=True)
     benchmark_path = output_dir / "benchmark_results.csv"
+    metadata_path = output_dir / "run_metadata.json"
     expected_rows = measured_questions(args, dataset)
-    if args.resume and local_results_complete(benchmark_path, expected_rows):
+    expected_metadata = run_metadata(args, dataset, method)
+    if args.resume and local_results_complete(
+        benchmark_path,
+        expected_rows,
+        metadata_path,
+        expected_metadata,
+    ):
         print(f"RESUME {dataset} | {method}", flush=True)
     else:
         if benchmark_path.exists():
@@ -182,6 +224,8 @@ def run_local_method(args, dataset, method):
         print(f"RUN {dataset} | {method} | measured={expected_rows} | max_tokens={args.max_new_tokens}", flush=True)
         print("=" * 100, flush=True)
         run_streaming(command, Path(__file__).resolve().parent)
+        with metadata_path.open("w", encoding="utf-8") as handle:
+            json.dump(expected_metadata, handle, indent=2)
     rows = pd.read_csv(benchmark_path)
     if len(rows) != expected_rows:
         raise RuntimeError(f"Expected {expected_rows} rows in {benchmark_path}, found {len(rows)}")
@@ -202,8 +246,17 @@ def read_existing_rows(args):
     frames = []
     for dataset in args.datasets:
         for method in args.methods:
-            path = local_output_dir(args, dataset, method) / "benchmark_results.csv"
-            if not path.exists():
+            output_dir = local_output_dir(args, dataset, method)
+            path = output_dir / "benchmark_results.csv"
+            metadata_path = output_dir / "run_metadata.json"
+            expected_rows = measured_questions(args, dataset)
+            expected_metadata = run_metadata(args, dataset, method)
+            if not local_results_complete(
+                path,
+                expected_rows,
+                metadata_path,
+                expected_metadata,
+            ):
                 continue
             rows = pd.read_csv(path)
             rows["source_problem_id"] = rows["problem_id"]
@@ -346,6 +399,7 @@ def write_manifest(args, output_dir):
     except subprocess.SubprocessError:
         commit = None
     manifest = {
+        "benchmark_version": BENCHMARK_VERSION,
         "git_commit": commit,
         "python": sys.version,
         "platform": platform.platform(),
@@ -363,6 +417,9 @@ def write_manifest(args, output_dir):
         "decoding": "greedy",
         "warmup_policy": "warmup samples excluded; adaptive controller state reset immediately before the first measured sample",
         "hardware_latency_constants_used": False,
+        "target_attention_implementation": "sdpa",
+        "verification_logits_scope": "draft tokens plus one bonus position",
+        "verification_kv_cache_enabled": False,
         "eagle3_included": False,
     }
     with (output_dir / "benchmark_manifest.json").open("w", encoding="utf-8") as handle:

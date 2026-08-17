@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import sys
 import copy
 import csv
@@ -19,8 +21,6 @@ logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
-
-os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 transformers.logging.set_verbosity_error()
 
@@ -713,7 +713,7 @@ if not args.read_pickle:
             args.target_model_name,
             torch_dtype="auto",
             device_map={"": 0},
-            attn_implementation="eager"
+            attn_implementation="sdpa"
         )
     except Exception as e:
         msg = str(e).lower()
@@ -1026,16 +1026,19 @@ for problem_id, is_warmup in tqdm(
                     if verify_input_tensor.is_cuda:
                         torch.cuda.synchronize(verify_input_tensor.device)
                     verify_start = time.perf_counter()
-                    with torch.no_grad():
-                        outputs = target_model(input_ids=full_input_ids, attention_mask=full_attention_mask)
+                    with torch.inference_mode():
+                        outputs = target_model(
+                            input_ids=full_input_ids,
+                            attention_mask=full_attention_mask,
+                            use_cache=False,
+                            logits_to_keep=len(draft_proposal) + 1,
+                        )
                     if verify_input_tensor.is_cuda:
                         torch.cuda.synchronize(verify_input_tensor.device)
                     verify_time = time.perf_counter() - verify_start
                     verify_time_total += verify_time
                     
-                    start_index = orig_model_inputs['input_ids'].shape[1] + prefix_len - 1
-                    end_index = start_index + len(draft_proposal)
-                    verify_logits = outputs.logits[0, start_index:end_index]
+                    verify_logits = outputs.logits[0, :len(draft_proposal)]
                     post_verify_start = time.perf_counter()
                     
                     # ---------------------------------------------------------
