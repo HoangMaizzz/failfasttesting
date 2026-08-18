@@ -380,13 +380,15 @@ def summarize_extension_gain(extensions):
 def summarize_next_step_gain(gains):
     if gains.empty:
         return pd.DataFrame()
-    valid = gains[pd.to_numeric(gains["same_target_len"], errors="coerce") == 1].copy()
     records = []
-    for (dataset, method), group in valid.groupby(["dataset", "method"], sort=False):
+    for (dataset, method), group in gains.groupby(["dataset", "method"], sort=False):
         record = {
             "dataset": dataset,
             "method": method,
             "lowconf_threshold": METHODS[method],
+            "same_target_len_rate_percent": 100.0 * pd.to_numeric(
+                group["same_target_len"], errors="coerce"
+            ).mean(),
         }
         record.update(prediction_metrics(
             group,
@@ -552,9 +554,7 @@ def main():
         [-math.inf, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, math.inf],
     )
     next_step_gain_calibration = build_calibration_table(
-        gains[pd.to_numeric(gains["same_target_len"], errors="coerce") == 1]
-        if not gains.empty
-        else gains,
+        gains,
         "predicted_next_gain",
         "actual_next_gain",
         [-math.inf, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, math.inf],

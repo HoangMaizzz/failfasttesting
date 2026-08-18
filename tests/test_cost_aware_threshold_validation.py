@@ -6,6 +6,7 @@ import pandas as pd
 from run_cost_aware_threshold_validation import (
     build_calibration_table,
     prediction_metrics,
+    summarize_next_step_gain,
     summarize_rounds,
 )
 
@@ -55,6 +56,20 @@ class CostAwareThresholdValidationTests(unittest.TestCase):
         )
 
         self.assertTrue(result.empty)
+
+    def test_next_step_gain_supports_only_extension_transitions(self):
+        frame = pd.DataFrame({
+            "dataset": ["gsm8k", "gsm8k"],
+            "method": ["cost_aware_lowconf_0p45"] * 2,
+            "same_target_len": [0, 0],
+            "predicted_next_gain": [0.2, 0.4],
+            "actual_next_gain": [0.1, 0.5],
+        })
+
+        summary = summarize_next_step_gain(frame).iloc[0]
+
+        self.assertEqual(summary["num_observations"], 2)
+        self.assertEqual(summary["same_target_len_rate_percent"], 0.0)
 
 
 if __name__ == "__main__":
