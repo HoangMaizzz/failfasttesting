@@ -382,6 +382,8 @@ parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
 parser.add_argument("--frontier_cost_ema_alpha", type=float, default=0.2)
 parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
 parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=-0.03)
+parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
+parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
 parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
 parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
 parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -460,6 +462,8 @@ BENCHMARK_CSV_COLUMNS = [
     "frontier_v2_hazard_ready_steps",
     "frontier_v2_extension_history_ready_steps",
     "frontier_v2_predicted_extension_gain_mean",
+    "frontier_v2_raw_extension_gain_mean",
+    "frontier_v2_extension_gain_correction_mean",
     "frontier_fill_forward_passes",
     "frontier_denoising_forward_passes",
     "frontier_expected_output_mean",
@@ -498,6 +502,8 @@ FRONTIER_ROUND_DIAGNOSTIC_COLUMNS = [
     "v2_hazard_ready_steps",
     "v2_extension_history_ready_steps",
     "v2_predicted_extension_gain_mean",
+    "v2_raw_extension_gain_mean",
+    "v2_extension_gain_correction_mean",
 ]
 
 FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
@@ -517,6 +523,10 @@ FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
     "prefix_survival_without_forced_bucket",
     "extension_prior_probability",
     "predicted_extension_gain",
+    "raw_predicted_extension_gain",
+    "extension_gain_correction",
+    "gain_calibration_source",
+    "gain_calibration_count",
     "predicted_extension_gain_raw_confidence",
     "predicted_extension_gain_without_confidence_bucket",
     "predicted_extension_gain_without_margin_bucket",
@@ -580,6 +590,8 @@ def summarize_frontier_diagnostics(stats_each_round):
     hazard_ready_steps = 0
     extension_history_ready_steps = 0
     predicted_extension_gains = []
+    raw_extension_gains = []
+    extension_gain_corrections = []
     for round_stats in stats_each_round:
         frontier_stats = round_stats.get("frontier_stats") or {}
         breakdown = frontier_stats.get("forward_pass_breakdown") or {}
@@ -607,6 +619,16 @@ def summarize_frontier_diagnostics(stats_each_round):
                 for step in v2_steps
                 if step.get("v2_extension_gain") is not None
             )
+            raw_extension_gains.extend(
+                float(step["v2_raw_extension_gain"])
+                for step in v2_steps
+                if step.get("v2_raw_extension_gain") is not None
+            )
+            extension_gain_corrections.extend(
+                float(step["v2_extension_gain_correction"])
+                for step in v2_steps
+                if step.get("v2_extension_gain_correction") is not None
+            )
             final_step = v2_steps[-1]
             expected_outputs.append(float(final_step["v2_expected_output"]))
             if final_step.get("v2_stop_ms_per_output") is not None:
@@ -621,6 +643,12 @@ def summarize_frontier_diagnostics(stats_each_round):
         "frontier_v2_extension_history_ready_steps": extension_history_ready_steps,
         "frontier_v2_predicted_extension_gain_mean": safe_div(
             sum(predicted_extension_gains), len(predicted_extension_gains)
+        ),
+        "frontier_v2_raw_extension_gain_mean": safe_div(
+            sum(raw_extension_gains), len(raw_extension_gains)
+        ),
+        "frontier_v2_extension_gain_correction_mean": safe_div(
+            sum(extension_gain_corrections), len(extension_gain_corrections)
         ),
         "frontier_fill_forward_passes": fill_passes,
         "frontier_denoising_forward_passes": denoising_passes,
@@ -659,6 +687,8 @@ def ensure_frontier_runtime_state(args):
             "token_confidence": {},
             "extension_block_offset": {},
             "extension_offset": {},
+            "extension_gain_by_block": {},
+            "extension_gain_global": [0.0, 0.0, 0],
             "total_checked_tokens": 0,
             "total_extension_tokens": 0,
         }
@@ -709,6 +739,15 @@ def calibration_bin(value):
 def update_calibration_bucket(table, key, accepted):
     accepted_count, total_count = table.get(key, [0.0, 0.0])
     table[key] = [accepted_count + float(accepted), total_count + 1.0]
+
+
+def update_gain_calibration(table, key, predicted_gain, actual_gain):
+    predicted_sum, actual_sum, count = table.get(key, [0.0, 0.0, 0])
+    table[key] = [
+        predicted_sum + float(predicted_gain),
+        actual_sum + float(actual_gain),
+        int(count) + 1,
+    ]
 
 
 def frontier_v2_position_bin(position):
@@ -875,6 +914,22 @@ def update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcome
             continue
         from_len = int(event.get("from_len", 0))
         extension_size = int(event.get("extension_size", 0))
+        raw_predicted_gain = event.get("raw_predicted_extension_gain")
+        if raw_predicted_gain is not None:
+            actual_gain = max(0, min(extension_size, accepted_len - from_len))
+            block_key = frontier_v2_length_bin(from_len)
+            update_gain_calibration(
+                calibration["extension_gain_by_block"],
+                block_key,
+                raw_predicted_gain,
+                actual_gain,
+            )
+            global_predicted, global_actual, global_count = calibration["extension_gain_global"]
+            calibration["extension_gain_global"] = [
+                global_predicted + float(raw_predicted_gain),
+                global_actual + float(actual_gain),
+                int(global_count) + 1,
+            ]
         if accepted_len < from_len:
             continue
         block_bin = frontier_v2_length_bin(from_len)
@@ -1029,6 +1084,16 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
             for step in steps
             if step.get("v2_extension_gain") is not None
         ]
+        v2_raw_extension_gains = [
+            float(step["v2_raw_extension_gain"])
+            for step in steps
+            if step.get("v2_raw_extension_gain") is not None
+        ]
+        v2_extension_gain_corrections = [
+            float(step["v2_extension_gain_correction"])
+            for step in steps
+            if step.get("v2_extension_gain_correction") is not None
+        ]
         prediction_error = (
             float(predicted_accepted) - accepted_len
             if predicted_accepted is not None
@@ -1074,6 +1139,12 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
             "v2_predicted_extension_gain_mean": safe_div(
                 sum(v2_extension_gains), len(v2_extension_gains)
             ),
+            "v2_raw_extension_gain_mean": safe_div(
+                sum(v2_raw_extension_gains), len(v2_raw_extension_gains)
+            ),
+            "v2_extension_gain_correction_mean": safe_div(
+                sum(v2_extension_gain_corrections), len(v2_extension_gain_corrections)
+            ),
         })
 
         for event_id, event in enumerate(extension_events):
@@ -1111,6 +1182,10 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "prefix_survival_without_forced_bucket": survival_variants.get("without_forced_bucket"),
                 "extension_prior_probability": extension_probability,
                 "predicted_extension_gain": predicted_gain,
+                "raw_predicted_extension_gain": event.get("raw_predicted_extension_gain"),
+                "extension_gain_correction": event.get("extension_gain_correction"),
+                "gain_calibration_source": event.get("gain_calibration_source"),
+                "gain_calibration_count": event.get("gain_calibration_count"),
                 "predicted_extension_gain_raw_confidence": gain_variants.get("raw_confidence"),
                 "predicted_extension_gain_without_confidence_bucket": gain_variants.get("without_confidence_bucket"),
                 "predicted_extension_gain_without_margin_bucket": gain_variants.get("without_margin_bucket"),

@@ -1217,6 +1217,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             extension,
             accept_probabilities=None,
             probability_variants=None,
+            extension_details=None,
         ):
             extension = int(extension)
             if extension <= 0:
@@ -1234,6 +1235,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 "prefix_survival_by_variant": None,
                 "predicted_extension_gain_by_variant": None,
             }
+            if extension_details:
+                event.update(extension_details)
             if accept_probabilities is not None:
                 extension_probability = calibration_prior_probability()
                 event.update({
@@ -1353,6 +1356,33 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     return None
                 hazards.append(probability)
             return hazards
+
+        def v2_extension_gain_correction(from_len):
+            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
+            min_observations = int(
+                getattr(args, "frontier_v2_min_gain_calibration_observations", 8)
+            )
+            prior_strength = float(
+                getattr(args, "frontier_v2_gain_calibration_prior_strength", 8.0)
+            )
+            candidates = (
+                (
+                    "block",
+                    calibration.get("extension_gain_by_block", {}).get(v2_length_bin(from_len)),
+                ),
+                ("global", calibration.get("extension_gain_global")),
+            )
+            for source, stats in candidates:
+                if not stats:
+                    continue
+                predicted_sum, actual_sum, count = map(float, stats)
+                if count < min_observations or predicted_sum <= 0.0:
+                    continue
+                observed_ratio = actual_sum / predicted_sum
+                weight = count / (count + prior_strength)
+                correction = 1.0 + weight * (observed_ratio - 1.0)
+                return max(0.5, min(2.0, correction)), source, int(count)
+            return 1.0, "uncalibrated", 0
 
         def v2_nearest_latency(table, context_len, proposal_len=None):
             if not table:
@@ -1723,6 +1753,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         for probability in extension_hazards:
                                             extension_survival *= probability
                                             extension_gain += prefix_survival * extension_survival
+                                        raw_extension_gain = float(extension_gain)
+                                        extension_gain_correction, gain_calibration_source, gain_calibration_count = (
+                                            v2_extension_gain_correction(target_len)
+                                        )
+                                        extension_gain = min(
+                                            prefix_survival * extension,
+                                            raw_extension_gain * extension_gain_correction,
+                                        )
                                         blocks_generated = max(
                                             1,
                                             (target_len + small_block_size - 1) // small_block_size,
@@ -1747,7 +1785,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             "v2_extension_size": int(extension),
                                             "v2_extension_hazards": list(extension_hazards),
                                             "v2_prefix_survival": float(prefix_survival),
+                                            "v2_raw_extension_gain": raw_extension_gain,
                                             "v2_extension_gain": float(extension_gain),
+                                            "v2_extension_gain_correction": extension_gain_correction,
+                                            "v2_gain_calibration_source": gain_calibration_source,
+                                            "v2_gain_calibration_count": gain_calibration_count,
                                             "v2_extend_ms_per_output": float(extend_ms_per_output),
                                             "v2_extended_verify_round_ms": float(extended_verify_ms),
                                             "v2_extension_cost_margin": float(extension_cost_margin),
@@ -1761,7 +1803,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 "target_len": target_len,
                                                 "masks_remaining": masks_remaining,
                                                 "extension": int(extension),
+                                                "raw_predicted_extension_gain": raw_extension_gain,
                                                 "predicted_extension_gain": float(extension_gain),
+                                                "extension_gain_correction": extension_gain_correction,
+                                                "gain_calibration_source": gain_calibration_source,
+                                                "gain_calibration_count": gain_calibration_count,
                                                 "stop_ms_per_output": float(stop_ms_per_output),
                                                 "extend_ms_per_output": float(extend_ms_per_output),
                                                 "extension_cost_margin": float(extension_cost_margin),
@@ -1827,6 +1873,26 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         extension,
                                         accept_probabilities,
                                         probability_variants,
+                                        {
+                                            "raw_predicted_extension_gain": frontier_stats["steps"][-1].get(
+                                                "v2_raw_extension_gain"
+                                            ),
+                                            "predicted_extension_gain": frontier_stats["steps"][-1].get(
+                                                "v2_extension_gain"
+                                            ),
+                                            "extension_gain_correction": frontier_stats["steps"][-1].get(
+                                                "v2_extension_gain_correction"
+                                            ),
+                                            "gain_calibration_source": frontier_stats["steps"][-1].get(
+                                                "v2_gain_calibration_source"
+                                            ),
+                                            "gain_calibration_count": frontier_stats["steps"][-1].get(
+                                                "v2_gain_calibration_count"
+                                            ),
+                                            "prefix_survival_probability": frontier_stats["steps"][-1].get(
+                                                "v2_prefix_survival"
+                                            ),
+                                        },
                                     )
                                     draft_token_end_idx += extension
                                     spec_len += extension

@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument("--frontier_min_steps", type=int, default=2)
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
+    parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
+    parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
     parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
     parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -73,6 +75,10 @@ def validate_args(args):
         raise ValueError("--extension_cost_margins must not contain duplicates")
     if any(not -0.99 < margin <= 1.0 for margin in args.extension_cost_margins):
         raise ValueError("extension cost margins must be in (-0.99, 1.0]")
+    if args.frontier_v2_gain_calibration_prior_strength <= 0:
+        raise ValueError("--frontier_v2_gain_calibration_prior_strength must be positive")
+    if args.frontier_v2_min_gain_calibration_observations <= 0:
+        raise ValueError("--frontier_v2_min_gain_calibration_observations must be positive")
     matching_reference = next(
         (
             margin
@@ -125,6 +131,8 @@ def expected_metadata(args, dataset, margin):
         "frontier_patience": args.frontier_patience,
         "frontier_v2_hysteresis": args.frontier_v2_hysteresis,
         "frontier_v2_extension_cost_margin": margin,
+        "frontier_v2_gain_calibration_prior_strength": args.frontier_v2_gain_calibration_prior_strength,
+        "frontier_v2_min_gain_calibration_observations": args.frontier_v2_min_gain_calibration_observations,
         "frontier_v2_hazard_prior_strength": args.frontier_v2_hazard_prior_strength,
         "frontier_v2_extension_prior_strength": args.frontier_v2_extension_prior_strength,
         "frontier_v2_min_hazard_observations": args.frontier_v2_min_hazard_observations,
@@ -191,6 +199,8 @@ def run_case(args, dataset, margin):
             "--frontier_patience", str(args.frontier_patience),
             "--frontier_v2_hysteresis", str(args.frontier_v2_hysteresis),
             "--frontier_v2_extension_cost_margin", str(margin),
+            "--frontier_v2_gain_calibration_prior_strength", str(args.frontier_v2_gain_calibration_prior_strength),
+            "--frontier_v2_min_gain_calibration_observations", str(args.frontier_v2_min_gain_calibration_observations),
             "--frontier_v2_hazard_prior_strength", str(args.frontier_v2_hazard_prior_strength),
             "--frontier_v2_extension_prior_strength", str(args.frontier_v2_extension_prior_strength),
             "--frontier_v2_min_hazard_observations", str(args.frontier_v2_min_hazard_observations),

@@ -23,6 +23,8 @@ class V2ExtensionMarginSweepTests(unittest.TestCase):
             max_new_tokens=1024,
             extension_cost_margins=[-0.05, -0.0300000000001, 0.0],
             reference_margin=-0.03,
+            frontier_v2_gain_calibration_prior_strength=8.0,
+            frontier_v2_min_gain_calibration_observations=8,
         )
 
         validate_args(args)
