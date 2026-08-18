@@ -12,7 +12,7 @@ import pandas as pd
 
 
 DATASETS = ("math", "aime", "gsm8k", "humaneval")
-BENCHMARK_VERSION = "cost_aware_v2_gain_calibration_validation_v1"
+BENCHMARK_VERSION = "cost_aware_v2_gain_calibration_validation_v2"
 
 
 def parse_args():
@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--frontier_v2_min_calibration_tokens", type=int, default=64)
     parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
+    parser.add_argument("--frontier_v2_prefix_calibration_prior_strength", type=float, default=8.0)
+    parser.add_argument("--frontier_v2_min_prefix_calibration_observations", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output_dir",
@@ -63,6 +65,10 @@ def validate_args(args):
         raise ValueError("--frontier_v2_gain_calibration_prior_strength must be positive")
     if args.frontier_v2_min_gain_calibration_observations <= 0:
         raise ValueError("--frontier_v2_min_gain_calibration_observations must be positive")
+    if args.frontier_v2_prefix_calibration_prior_strength <= 0:
+        raise ValueError("--frontier_v2_prefix_calibration_prior_strength must be positive")
+    if args.frontier_v2_min_prefix_calibration_observations <= 0:
+        raise ValueError("--frontier_v2_min_prefix_calibration_observations must be positive")
 
 
 def run_streaming(command, cwd):
@@ -110,6 +116,8 @@ def run_metadata(args, dataset):
         "frontier_v2_min_calibration_tokens": args.frontier_v2_min_calibration_tokens,
         "frontier_v2_gain_calibration_prior_strength": args.frontier_v2_gain_calibration_prior_strength,
         "frontier_v2_min_gain_calibration_observations": args.frontier_v2_min_gain_calibration_observations,
+        "frontier_v2_prefix_calibration_prior_strength": args.frontier_v2_prefix_calibration_prior_strength,
+        "frontier_v2_min_prefix_calibration_observations": args.frontier_v2_min_prefix_calibration_observations,
         "seed": args.seed,
     }
 
@@ -181,6 +189,8 @@ def run_dataset(args, dataset):
             "--frontier_v2_min_calibration_tokens", str(args.frontier_v2_min_calibration_tokens),
             "--frontier_v2_gain_calibration_prior_strength", str(args.frontier_v2_gain_calibration_prior_strength),
             "--frontier_v2_min_gain_calibration_observations", str(args.frontier_v2_min_gain_calibration_observations),
+            "--frontier_v2_prefix_calibration_prior_strength", str(args.frontier_v2_prefix_calibration_prior_strength),
+            "--frontier_v2_min_prefix_calibration_observations", str(args.frontier_v2_min_prefix_calibration_observations),
             "--seed", str(args.seed),
             "--quiet_generation",
             "--skip_artifacts",
@@ -224,9 +234,30 @@ def summarize_events(group):
     calibrated_error = calibrated - actual
     raw_mae = raw_error.abs().mean()
     calibrated_mae = calibrated_error.abs().mean()
+    raw_prefix = pd.to_numeric(
+        group["raw_prefix_survival_probability"], errors="coerce"
+    )
+    calibrated_prefix = pd.to_numeric(
+        group["calibrated_prefix_survival_probability"], errors="coerce"
+    )
+    actual_prefix = pd.to_numeric(
+        group["original_prefix_fully_accepted"], errors="coerce"
+    )
+    prefix_full = actual_prefix == 1
+    raw_conditional = pd.to_numeric(
+        group["raw_conditional_extension_gain"], errors="coerce"
+    )[prefix_full]
+    calibrated_conditional = pd.to_numeric(
+        group["calibrated_conditional_extension_gain"], errors="coerce"
+    )[prefix_full]
+    actual_conditional = actual[prefix_full]
+    if "dataset" in group:
+        num_problems = group[["dataset", "problem_id"]].drop_duplicates().shape[0]
+    else:
+        num_problems = group["problem_id"].nunique()
     return {
         "num_events": len(group),
-        "num_problems": group["problem_id"].nunique(),
+        "num_problems": num_problems,
         "mean_actual_gain": actual.mean(),
         "mean_raw_expected_gain": raw.mean(),
         "mean_calibrated_expected_gain": calibrated.mean(),
@@ -246,9 +277,26 @@ def summarize_events(group):
         "mean_gain_correction": pd.to_numeric(
             group["extension_gain_correction"], errors="coerce"
         ).mean(),
-        "prefix_fully_accepted_rate_percent": 100.0 * pd.to_numeric(
-            group["original_prefix_fully_accepted"], errors="coerce"
+        "prefix_fully_accepted_rate_percent": 100.0 * actual_prefix.mean(),
+        "mean_raw_prefix_survival": raw_prefix.mean(),
+        "mean_calibrated_prefix_survival": calibrated_prefix.mean(),
+        "raw_prefix_bias": (raw_prefix - actual_prefix).mean(),
+        "calibrated_prefix_bias": (calibrated_prefix - actual_prefix).mean(),
+        "raw_prefix_brier_score": ((raw_prefix - actual_prefix) ** 2).mean(),
+        "calibrated_prefix_brier_score": (
+            (calibrated_prefix - actual_prefix) ** 2
         ).mean(),
+        "mean_actual_gain_given_prefix_full": actual_conditional.mean(),
+        "mean_raw_conditional_gain": raw_conditional.mean(),
+        "mean_calibrated_conditional_gain": calibrated_conditional.mean(),
+        "raw_conditional_bias": (raw_conditional - actual_conditional).mean(),
+        "calibrated_conditional_bias": (
+            calibrated_conditional - actual_conditional
+        ).mean(),
+        "raw_conditional_mae": (raw_conditional - actual_conditional).abs().mean(),
+        "calibrated_conditional_mae": (
+            calibrated_conditional - actual_conditional
+        ).abs().mean(),
     }
 
 
@@ -282,6 +330,15 @@ def add_analysis_columns(events):
         bins=[-1, 0, 31, float("inf")],
         labels=["0", "1-31", "32+"],
     ).astype(str)
+    prefix_count = pd.to_numeric(
+        events["prefix_calibration_count"], errors="coerce"
+    ).fillna(0)
+    prefix_source = events["prefix_calibration_source"].fillna("uncalibrated")
+    events["prefix_calibration_stage"] = prefix_source + ":" + pd.cut(
+        prefix_count,
+        bins=[-1, 0, 31, float("inf")],
+        labels=["0", "1-31", "32+"],
+    ).astype(str)
     return events
 
 
@@ -301,8 +358,8 @@ def write_manifest(args, output_dir):
         "platform": platform.platform(),
         "arguments": vars(args),
         "evaluation_unit": "executed cost_aware_v2 extension event",
-        "raw_prediction": "conditional hazard extension gain before residual correction",
-        "calibrated_prediction": "raw gain multiplied by online block/global residual correction",
+        "raw_prediction": "raw prefix survival multiplied by raw conditional extension gain",
+        "calibrated_prediction": "calibrated prefix survival multiplied by calibrated conditional extension gain",
         "actual_gain": "draft extension tokens accepted by greedy verifier",
         "leakage_policy": "each event prediction uses only outcomes from earlier verifier rounds",
         "limitation": "on-policy evaluation does not observe rejected extension counterfactuals",
@@ -327,11 +384,17 @@ def main():
     overall_summary = pd.DataFrame([summarize_events(events)])
     length_summary = grouped_summary(events, ["dataset", "proposal_length_bucket"])
     calibration_stage_summary = grouped_summary(events, ["dataset", "calibration_stage"])
+    prefix_calibration_stage_summary = grouped_summary(
+        events, ["dataset", "prefix_calibration_stage"]
+    )
     events.to_csv(output_dir / "per_extension_event.csv", index=False)
     dataset_summary.to_csv(output_dir / "dataset_gain_calibration_summary.csv", index=False)
     overall_summary.to_csv(output_dir / "overall_gain_calibration_summary.csv", index=False)
     length_summary.to_csv(output_dir / "proposal_length_gain_summary.csv", index=False)
     calibration_stage_summary.to_csv(output_dir / "calibration_stage_summary.csv", index=False)
+    prefix_calibration_stage_summary.to_csv(
+        output_dir / "prefix_calibration_stage_summary.csv", index=False
+    )
     write_manifest(args, output_dir)
     archive_path = shutil.make_archive(
         str(output_dir),

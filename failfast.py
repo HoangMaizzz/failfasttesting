@@ -384,6 +384,8 @@ parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
 parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=-0.03)
 parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
 parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
+parser.add_argument("--frontier_v2_prefix_calibration_prior_strength", type=float, default=8.0)
+parser.add_argument("--frontier_v2_min_prefix_calibration_observations", type=int, default=8)
 parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
 parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
 parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -517,6 +519,12 @@ FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
     "to_len",
     "extension_size",
     "prefix_survival_probability",
+    "raw_prefix_survival_probability",
+    "calibrated_prefix_survival_probability",
+    "prefix_calibration_source",
+    "prefix_calibration_count",
+    "raw_conditional_extension_gain",
+    "calibrated_conditional_extension_gain",
     "prefix_survival_raw_confidence",
     "prefix_survival_without_confidence_bucket",
     "prefix_survival_without_margin_bucket",
@@ -687,8 +695,10 @@ def ensure_frontier_runtime_state(args):
             "token_confidence": {},
             "extension_block_offset": {},
             "extension_offset": {},
-            "extension_gain_by_block": {},
-            "extension_gain_global": [0.0, 0.0, 0],
+            "extension_prefix_block_probability": {},
+            "extension_prefix_probability": {},
+            "extension_conditional_gain_by_block": {},
+            "extension_conditional_gain_global": [0.0, 0.0, 0],
             "total_checked_tokens": 0,
             "total_extension_tokens": 0,
         }
@@ -914,23 +924,39 @@ def update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcome
             continue
         from_len = int(event.get("from_len", 0))
         extension_size = int(event.get("extension_size", 0))
-        raw_predicted_gain = event.get("raw_predicted_extension_gain")
-        if raw_predicted_gain is not None:
+        raw_prefix_survival = event.get("raw_prefix_survival_probability")
+        raw_conditional_gain = event.get("raw_conditional_extension_gain")
+        prefix_fully_accepted = accepted_len >= from_len
+        block_key = frontier_v2_length_bin(from_len)
+        if raw_prefix_survival is not None:
+            prefix_probability_key = calibration_bin(raw_prefix_survival)
+            update_calibration_bucket(
+                calibration["extension_prefix_block_probability"],
+                f"{block_key}:{prefix_probability_key}",
+                prefix_fully_accepted,
+            )
+            update_calibration_bucket(
+                calibration["extension_prefix_probability"],
+                prefix_probability_key,
+                prefix_fully_accepted,
+            )
+        if prefix_fully_accepted and raw_conditional_gain is not None:
             actual_gain = max(0, min(extension_size, accepted_len - from_len))
-            block_key = frontier_v2_length_bin(from_len)
             update_gain_calibration(
-                calibration["extension_gain_by_block"],
+                calibration["extension_conditional_gain_by_block"],
                 block_key,
-                raw_predicted_gain,
+                raw_conditional_gain,
                 actual_gain,
             )
-            global_predicted, global_actual, global_count = calibration["extension_gain_global"]
-            calibration["extension_gain_global"] = [
-                global_predicted + float(raw_predicted_gain),
+            global_predicted, global_actual, global_count = calibration[
+                "extension_conditional_gain_global"
+            ]
+            calibration["extension_conditional_gain_global"] = [
+                global_predicted + float(raw_conditional_gain),
                 global_actual + float(actual_gain),
                 int(global_count) + 1,
             ]
-        if accepted_len < from_len:
+        if not prefix_fully_accepted:
             continue
         block_bin = frontier_v2_length_bin(from_len)
         for offset in range(1, extension_size + 1):
@@ -1176,6 +1202,20 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "to_len": event.get("to_len"),
                 "extension_size": extension_size,
                 "prefix_survival_probability": survival,
+                "raw_prefix_survival_probability": event.get(
+                    "raw_prefix_survival_probability"
+                ),
+                "calibrated_prefix_survival_probability": event.get(
+                    "calibrated_prefix_survival_probability"
+                ),
+                "prefix_calibration_source": event.get("prefix_calibration_source"),
+                "prefix_calibration_count": event.get("prefix_calibration_count"),
+                "raw_conditional_extension_gain": event.get(
+                    "raw_conditional_extension_gain"
+                ),
+                "calibrated_conditional_extension_gain": event.get(
+                    "calibrated_conditional_extension_gain"
+                ),
                 "prefix_survival_raw_confidence": survival_variants.get("raw_confidence"),
                 "prefix_survival_without_confidence_bucket": survival_variants.get("without_confidence_bucket"),
                 "prefix_survival_without_margin_bucket": survival_variants.get("without_margin_bucket"),

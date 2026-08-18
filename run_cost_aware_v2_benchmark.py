@@ -13,7 +13,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
-BENCHMARK_VERSION = "conditional_hazard_cost_aware_v2_v1"
+BENCHMARK_VERSION = "two_stage_gain_calibrated_cost_aware_v2_v2"
 METHODS = {
     "failfast": {
         "frontier_mode": "disabled",
@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=-0.03)
     parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
+    parser.add_argument("--frontier_v2_prefix_calibration_prior_strength", type=float, default=8.0)
+    parser.add_argument("--frontier_v2_min_prefix_calibration_observations", type=int, default=8)
     parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
     parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -96,6 +98,10 @@ def validate_args(args):
         raise ValueError("--frontier_v2_gain_calibration_prior_strength must be positive")
     if args.frontier_v2_min_gain_calibration_observations <= 0:
         raise ValueError("--frontier_v2_min_gain_calibration_observations must be positive")
+    if args.frontier_v2_prefix_calibration_prior_strength <= 0:
+        raise ValueError("--frontier_v2_prefix_calibration_prior_strength must be positive")
+    if args.frontier_v2_min_prefix_calibration_observations <= 0:
+        raise ValueError("--frontier_v2_min_prefix_calibration_observations must be positive")
     if args.frontier_v2_hazard_prior_strength <= 0:
         raise ValueError("--frontier_v2_hazard_prior_strength must be positive")
     if args.frontier_v2_extension_prior_strength <= 0:
@@ -133,6 +139,8 @@ def run_metadata(args, dataset, method):
         "frontier_v2_extension_cost_margin": args.frontier_v2_extension_cost_margin,
         "frontier_v2_gain_calibration_prior_strength": args.frontier_v2_gain_calibration_prior_strength,
         "frontier_v2_min_gain_calibration_observations": args.frontier_v2_min_gain_calibration_observations,
+        "frontier_v2_prefix_calibration_prior_strength": args.frontier_v2_prefix_calibration_prior_strength,
+        "frontier_v2_min_prefix_calibration_observations": args.frontier_v2_min_prefix_calibration_observations,
         "frontier_v2_hazard_prior_strength": args.frontier_v2_hazard_prior_strength,
         "frontier_v2_extension_prior_strength": args.frontier_v2_extension_prior_strength,
         "frontier_v2_min_hazard_observations": args.frontier_v2_min_hazard_observations,
@@ -233,6 +241,8 @@ def run_method(args, dataset, method):
             "--frontier_v2_extension_cost_margin", str(args.frontier_v2_extension_cost_margin),
             "--frontier_v2_gain_calibration_prior_strength", str(args.frontier_v2_gain_calibration_prior_strength),
             "--frontier_v2_min_gain_calibration_observations", str(args.frontier_v2_min_gain_calibration_observations),
+            "--frontier_v2_prefix_calibration_prior_strength", str(args.frontier_v2_prefix_calibration_prior_strength),
+            "--frontier_v2_min_prefix_calibration_observations", str(args.frontier_v2_min_prefix_calibration_observations),
             "--frontier_v2_hazard_prior_strength", str(args.frontier_v2_hazard_prior_strength),
             "--frontier_v2_extension_prior_strength", str(args.frontier_v2_extension_prior_strength),
             "--frontier_v2_min_hazard_observations", str(args.frontier_v2_min_hazard_observations),

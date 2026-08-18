@@ -14,7 +14,7 @@ from run_cost_aware_v2_benchmark import aggregate_method, safe_ratio
 
 
 DATASETS = ("math", "aime", "gsm8k", "humaneval")
-BENCHMARK_VERSION = "cost_aware_v2_extension_margin_sweep_v1"
+BENCHMARK_VERSION = "cost_aware_v2_extension_margin_sweep_v2"
 DEFAULT_MARGINS = (-0.05, -0.03, 0.0, 0.03, 0.05, 0.10)
 
 
@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
     parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
+    parser.add_argument("--frontier_v2_prefix_calibration_prior_strength", type=float, default=8.0)
+    parser.add_argument("--frontier_v2_min_prefix_calibration_observations", type=int, default=8)
     parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
     parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -79,6 +81,10 @@ def validate_args(args):
         raise ValueError("--frontier_v2_gain_calibration_prior_strength must be positive")
     if args.frontier_v2_min_gain_calibration_observations <= 0:
         raise ValueError("--frontier_v2_min_gain_calibration_observations must be positive")
+    if args.frontier_v2_prefix_calibration_prior_strength <= 0:
+        raise ValueError("--frontier_v2_prefix_calibration_prior_strength must be positive")
+    if args.frontier_v2_min_prefix_calibration_observations <= 0:
+        raise ValueError("--frontier_v2_min_prefix_calibration_observations must be positive")
     matching_reference = next(
         (
             margin
@@ -133,6 +139,8 @@ def expected_metadata(args, dataset, margin):
         "frontier_v2_extension_cost_margin": margin,
         "frontier_v2_gain_calibration_prior_strength": args.frontier_v2_gain_calibration_prior_strength,
         "frontier_v2_min_gain_calibration_observations": args.frontier_v2_min_gain_calibration_observations,
+        "frontier_v2_prefix_calibration_prior_strength": args.frontier_v2_prefix_calibration_prior_strength,
+        "frontier_v2_min_prefix_calibration_observations": args.frontier_v2_min_prefix_calibration_observations,
         "frontier_v2_hazard_prior_strength": args.frontier_v2_hazard_prior_strength,
         "frontier_v2_extension_prior_strength": args.frontier_v2_extension_prior_strength,
         "frontier_v2_min_hazard_observations": args.frontier_v2_min_hazard_observations,
@@ -201,6 +209,8 @@ def run_case(args, dataset, margin):
             "--frontier_v2_extension_cost_margin", str(margin),
             "--frontier_v2_gain_calibration_prior_strength", str(args.frontier_v2_gain_calibration_prior_strength),
             "--frontier_v2_min_gain_calibration_observations", str(args.frontier_v2_min_gain_calibration_observations),
+            "--frontier_v2_prefix_calibration_prior_strength", str(args.frontier_v2_prefix_calibration_prior_strength),
+            "--frontier_v2_min_prefix_calibration_observations", str(args.frontier_v2_min_prefix_calibration_observations),
             "--frontier_v2_hazard_prior_strength", str(args.frontier_v2_hazard_prior_strength),
             "--frontier_v2_extension_prior_strength", str(args.frontier_v2_extension_prior_strength),
             "--frontier_v2_min_hazard_observations", str(args.frontier_v2_min_hazard_observations),

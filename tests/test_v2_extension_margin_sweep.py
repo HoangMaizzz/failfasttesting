@@ -25,6 +25,8 @@ class V2ExtensionMarginSweepTests(unittest.TestCase):
             reference_margin=-0.03,
             frontier_v2_gain_calibration_prior_strength=8.0,
             frontier_v2_min_gain_calibration_observations=8,
+            frontier_v2_prefix_calibration_prior_strength=8.0,
+            frontier_v2_min_prefix_calibration_observations=8,
         )
 
         validate_args(args)
