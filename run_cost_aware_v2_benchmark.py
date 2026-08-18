@@ -13,7 +13,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
-BENCHMARK_VERSION = "two_stage_gain_calibrated_cost_aware_v2_v2"
+BENCHMARK_VERSION = "bayesian_ucb_one_stage_cost_aware_v2_v3"
 METHODS = {
     "failfast": {
         "frontier_mode": "disabled",
@@ -55,11 +55,11 @@ def parse_args():
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
-    parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=-0.03)
+    parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=0.05)
     parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
-    parser.add_argument("--frontier_v2_prefix_calibration_prior_strength", type=float, default=8.0)
-    parser.add_argument("--frontier_v2_min_prefix_calibration_observations", type=int, default=8)
+    parser.add_argument("--frontier_v2_gain_ucb_beta", type=float, default=1.0)
+    parser.add_argument("--frontier_v2_gain_prior_std", type=float, default=2.0)
     parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
     parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -98,10 +98,10 @@ def validate_args(args):
         raise ValueError("--frontier_v2_gain_calibration_prior_strength must be positive")
     if args.frontier_v2_min_gain_calibration_observations <= 0:
         raise ValueError("--frontier_v2_min_gain_calibration_observations must be positive")
-    if args.frontier_v2_prefix_calibration_prior_strength <= 0:
-        raise ValueError("--frontier_v2_prefix_calibration_prior_strength must be positive")
-    if args.frontier_v2_min_prefix_calibration_observations <= 0:
-        raise ValueError("--frontier_v2_min_prefix_calibration_observations must be positive")
+    if args.frontier_v2_gain_ucb_beta < 0:
+        raise ValueError("--frontier_v2_gain_ucb_beta must be non-negative")
+    if args.frontier_v2_gain_prior_std <= 0:
+        raise ValueError("--frontier_v2_gain_prior_std must be positive")
     if args.frontier_v2_hazard_prior_strength <= 0:
         raise ValueError("--frontier_v2_hazard_prior_strength must be positive")
     if args.frontier_v2_extension_prior_strength <= 0:
@@ -139,8 +139,8 @@ def run_metadata(args, dataset, method):
         "frontier_v2_extension_cost_margin": args.frontier_v2_extension_cost_margin,
         "frontier_v2_gain_calibration_prior_strength": args.frontier_v2_gain_calibration_prior_strength,
         "frontier_v2_min_gain_calibration_observations": args.frontier_v2_min_gain_calibration_observations,
-        "frontier_v2_prefix_calibration_prior_strength": args.frontier_v2_prefix_calibration_prior_strength,
-        "frontier_v2_min_prefix_calibration_observations": args.frontier_v2_min_prefix_calibration_observations,
+        "frontier_v2_gain_ucb_beta": args.frontier_v2_gain_ucb_beta,
+        "frontier_v2_gain_prior_std": args.frontier_v2_gain_prior_std,
         "frontier_v2_hazard_prior_strength": args.frontier_v2_hazard_prior_strength,
         "frontier_v2_extension_prior_strength": args.frontier_v2_extension_prior_strength,
         "frontier_v2_min_hazard_observations": args.frontier_v2_min_hazard_observations,
@@ -241,8 +241,8 @@ def run_method(args, dataset, method):
             "--frontier_v2_extension_cost_margin", str(args.frontier_v2_extension_cost_margin),
             "--frontier_v2_gain_calibration_prior_strength", str(args.frontier_v2_gain_calibration_prior_strength),
             "--frontier_v2_min_gain_calibration_observations", str(args.frontier_v2_min_gain_calibration_observations),
-            "--frontier_v2_prefix_calibration_prior_strength", str(args.frontier_v2_prefix_calibration_prior_strength),
-            "--frontier_v2_min_prefix_calibration_observations", str(args.frontier_v2_min_prefix_calibration_observations),
+            "--frontier_v2_gain_ucb_beta", str(args.frontier_v2_gain_ucb_beta),
+            "--frontier_v2_gain_prior_std", str(args.frontier_v2_gain_prior_std),
             "--frontier_v2_hazard_prior_strength", str(args.frontier_v2_hazard_prior_strength),
             "--frontier_v2_extension_prior_strength", str(args.frontier_v2_extension_prior_strength),
             "--frontier_v2_min_hazard_observations", str(args.frontier_v2_min_hazard_observations),
@@ -311,6 +311,7 @@ def aggregate_method(group):
     rounds = pd.to_numeric(group["num_speculation_rounds"], errors="coerce").sum()
     passes = pd.to_numeric(group["total_num_forward_passes"], errors="coerce").sum()
     extend_actions = pd.to_numeric(group["frontier_v2_extend_actions"], errors="coerce").sum()
+    counterfactual_actions = numeric_sum("frontier_v2_counterfactual_actions")
     verify_actions = pd.to_numeric(group["frontier_v2_verify_actions"], errors="coerce").sum()
     refinement_stops = numeric_sum("frontier_v2_refinement_stop_actions")
     extension_stops = numeric_sum("frontier_v2_extension_stop_actions")
@@ -340,6 +341,9 @@ def aggregate_method(group):
         "draft_forward_passes_per_100_output_tokens": safe_ratio(100.0 * passes, output_tokens),
         "verifier_rounds_per_100_output_tokens": safe_ratio(100.0 * rounds, output_tokens),
         "frontier_v2_extend_actions_per_100_rounds": safe_ratio(100.0 * extend_actions, rounds),
+        "frontier_v2_counterfactual_actions_per_100_rounds": safe_ratio(
+            100.0 * counterfactual_actions, rounds
+        ),
         "frontier_v2_verify_actions_per_100_rounds": safe_ratio(100.0 * verify_actions, rounds),
         "frontier_v2_refinement_stops_per_100_rounds": safe_ratio(100.0 * refinement_stops, rounds),
         "frontier_v2_extension_stops_per_100_rounds": safe_ratio(100.0 * extension_stops, rounds),
@@ -386,6 +390,7 @@ def build_paired_observations(rows, candidate_method):
         "num_speculation_rounds",
         "total_num_forward_passes",
         "frontier_v2_extend_actions",
+        "frontier_v2_counterfactual_actions",
         "frontier_v2_verify_actions",
         "frontier_v2_refinement_stop_actions",
         "frontier_v2_extension_stop_actions",
@@ -461,6 +466,9 @@ def build_comparison_summary(dataset_summary, paired, candidate_method):
             "failfast_draft_passes_per_100_tokens": baseline["draft_forward_passes_per_100_output_tokens"],
             "candidate_draft_passes_per_100_tokens": candidate["draft_forward_passes_per_100_output_tokens"],
             "candidate_v2_extend_actions_per_100_rounds": candidate["frontier_v2_extend_actions_per_100_rounds"],
+            "candidate_v2_counterfactual_actions_per_100_rounds": candidate[
+                "frontier_v2_counterfactual_actions_per_100_rounds"
+            ],
             "candidate_v2_refinement_stops_per_100_rounds": candidate["frontier_v2_refinement_stops_per_100_rounds"],
             "candidate_v2_extension_stops_per_100_rounds": candidate["frontier_v2_extension_stops_per_100_rounds"],
             "failfast_accuracy_percent": baseline["parsed_accuracy_percent"],
@@ -586,9 +594,9 @@ def write_manifest(args, output_dir):
         "primary_metric": "measured milliseconds per output token",
         "time_formula": "actual_draft_time + actual_verify_time + actual_post_verify_time",
         "comparison": f"{', '.join(args.candidates)} versus FailFast",
-        "v2_controller": "conditional token hazards plus extension-offset hazards",
+        "v2_controller": "one-stage expected extension gain with Bayesian backoff and UCB optimism",
         "v2_latency_model": "measured EMA lookup by context-length and proposal-length bins",
-        "v2_fallback": "FailFast until online hazard history is sufficient",
+        "v2_fallback": "none; raw hazards and Bayesian priors are available from cold start",
         "target_decoding": "greedy",
         "macro_speedup": "arithmetic mean of per-dataset candidate speedups versus FailFast",
         "pooled_speedup": "ratio of total FailFast milliseconds/output-token to total candidate milliseconds/output-token",

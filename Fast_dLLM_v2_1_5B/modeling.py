@@ -1276,10 +1276,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             return str(max(0, int(context_len) // 256))
 
         def v2_posterior(table, key, prior, prior_strength, min_observations):
-            accepted, total = table.get(key, (0.0, 0.0))
-            total = float(total)
-            if total < min_observations:
+            stats = table.get(key)
+            if not stats:
                 return None
+            accepted, total = stats
+            total = float(total)
             probability = (float(accepted) + prior_strength * prior) / (total + prior_strength)
             return max(0.02, min(0.98, probability))
 
@@ -1300,17 +1301,24 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 ("token_position_confidence", f"{position_key}:{confidence_key}"),
                 ("token_confidence", confidence_key),
             )
+            fallback = None
             for table_name, key in candidates:
+                table = calibration.get(table_name, {})
                 probability = v2_posterior(
-                    calibration.get(table_name, {}),
+                    table,
                     key,
                     raw_probability,
                     prior_strength,
                     min_observations,
                 )
                 if probability is not None:
-                    return probability
-            return raw_probability
+                    total = float(table[key][1])
+                    if total >= min_observations:
+                        return probability
+                    candidate = (total, probability)
+                    if fallback is None or candidate[0] > fallback[0]:
+                        fallback = candidate
+            return raw_probability if fallback is None else fallback[1]
 
         def v2_expected_prefix_score(confidences, margins):
             probabilities = [
@@ -1327,70 +1335,54 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         def v2_calibration_ready():
             calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
             total = int(calibration.get("total_checked_tokens", 0))
-            required = int(getattr(args, "frontier_v2_min_calibration_tokens", 64))
-            return total >= required, total
+            return True, total
 
         def v2_extension_hazards(from_len, extension):
             calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
             min_observations = int(getattr(args, "frontier_v2_min_hazard_observations", 8))
             prior_strength = float(getattr(args, "frontier_v2_extension_prior_strength", 2.0))
             block_key = v2_length_bin(from_len)
+            prior = calibration_prior_probability()
             hazards = []
             for offset in range(1, extension + 1):
+                block_table = calibration.get("extension_block_offset", {})
+                global_table = calibration.get("extension_offset", {})
+                block_key_offset = f"{block_key}:{offset}"
                 probability = v2_posterior(
-                    calibration.get("extension_block_offset", {}),
-                    f"{block_key}:{offset}",
-                    0.5,
+                    block_table,
+                    block_key_offset,
+                    prior,
                     prior_strength,
                     min_observations,
                 )
+                block_total = float(block_table.get(block_key_offset, (0.0, 0.0))[1])
+                if probability is None or block_total < min_observations:
+                    global_probability = v2_posterior(
+                        global_table,
+                        str(offset),
+                        prior,
+                        prior_strength,
+                        min_observations,
+                    )
+                    global_total = float(global_table.get(str(offset), (0.0, 0.0))[1])
+                    if global_probability is not None and (
+                        probability is None or global_total >= block_total
+                    ):
+                        probability = global_probability
                 if probability is None:
                     probability = v2_posterior(
-                        calibration.get("extension_offset", {}),
+                        global_table,
                         str(offset),
-                        0.5,
+                        prior,
                         prior_strength,
                         min_observations,
                     )
                 if probability is None:
-                    return None
+                    probability = prior
                 hazards.append(probability)
             return hazards
 
-        def v2_calibrated_prefix_survival(raw_probability, from_len):
-            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
-            min_observations = int(
-                getattr(args, "frontier_v2_min_prefix_calibration_observations", 8)
-            )
-            prior_strength = float(
-                getattr(args, "frontier_v2_prefix_calibration_prior_strength", 8.0)
-            )
-            probability_key = frontier_bin(raw_probability)
-            candidates = (
-                (
-                    "block",
-                    calibration.get("extension_prefix_block_probability", {}).get(
-                        f"{v2_length_bin(from_len)}:{probability_key}"
-                    ),
-                ),
-                (
-                    "global",
-                    calibration.get("extension_prefix_probability", {}).get(probability_key),
-                ),
-            )
-            for source, stats in candidates:
-                if not stats:
-                    continue
-                accepted, total = map(float, stats)
-                if total < min_observations:
-                    continue
-                probability = (accepted + prior_strength * raw_probability) / (
-                    total + prior_strength
-                )
-                return max(0.02, min(0.98, probability)), source, int(total)
-            return raw_probability, "uncalibrated", 0
-
-        def v2_conditional_gain_correction(from_len):
+        def v2_extension_gain_adjustment(from_len):
             calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
             min_observations = int(
                 getattr(args, "frontier_v2_min_gain_calibration_observations", 8)
@@ -1398,26 +1390,62 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             prior_strength = float(
                 getattr(args, "frontier_v2_gain_calibration_prior_strength", 8.0)
             )
+            prior_std = float(getattr(args, "frontier_v2_gain_prior_std", 2.0))
+            ucb_beta = float(getattr(args, "frontier_v2_gain_ucb_beta", 1.0))
             candidates = (
                 (
                     "block",
-                    calibration.get("extension_conditional_gain_by_block", {}).get(
+                    calibration.get("extension_gain_by_block", {}).get(
                         v2_length_bin(from_len)
                     ),
                 ),
-                ("global", calibration.get("extension_conditional_gain_global")),
+                ("global", calibration.get("extension_gain_global")),
             )
+            fallback = None
             for source, stats in candidates:
                 if not stats:
                     continue
-                predicted_sum, actual_sum, count = map(float, stats)
-                if count < min_observations or predicted_sum <= 0.0:
+                if len(stats) == 3:
+                    predicted_sum, actual_sum, count = map(float, stats)
+                    squared_error_sum = 0.0
+                else:
+                    predicted_sum, actual_sum, squared_error_sum, count = map(float, stats)
+                if count <= 0.0 or predicted_sum <= 0.0:
                     continue
                 observed_ratio = actual_sum / predicted_sum
                 weight = count / (count + prior_strength)
                 correction = 1.0 + weight * (observed_ratio - 1.0)
-                return max(0.5, min(2.0, correction)), source, int(count)
-            return 1.0, "uncalibrated", 0
+                uncertainty = (
+                    (squared_error_sum + prior_strength * prior_std * prior_std) ** 0.5
+                    / (count + prior_strength)
+                )
+                result = (
+                    max(0.5, min(2.0, correction)),
+                    max(0.0, uncertainty),
+                    max(0.0, ucb_beta * uncertainty),
+                    source,
+                    int(count),
+                )
+                if count >= min_observations:
+                    return result
+                if fallback is None or count > fallback[0]:
+                    fallback = (count, result)
+            if fallback is not None:
+                return fallback[1]
+            uncertainty = prior_std / max(prior_strength ** 0.5, 1e-6)
+            return 1.0, uncertainty, max(0.0, ucb_beta * uncertainty), "prior", 0
+
+        def v2_counterfactual_draw():
+            rate = float(getattr(args, "frontier_v2_counterfactual_rate", 0.0))
+            if rate <= 0.0:
+                return False, None
+            counter = int(getattr(args, "frontier_v2_counterfactual_counter", 0))
+            setattr(args, "frontier_v2_counterfactual_counter", counter + 1)
+            seed = getattr(args, "frontier_v2_counterfactual_seed", None)
+            if seed is None:
+                seed = int(getattr(args, "seed", 42))
+            value = ((int(seed) ^ ((counter + 1) * 2654435761)) & 0xFFFFFFFF) / 4294967296.0
+            return value < rate, value
 
         def v2_nearest_latency(table, context_len, proposal_len=None):
             if not table:
@@ -1740,7 +1768,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 expected_output = 1.0 + float(frontier_score)
                                 hysteresis = float(getattr(args, "frontier_v2_hysteresis", 0.03))
                                 extension_cost_margin = float(
-                                    getattr(args, "frontier_v2_extension_cost_margin", -0.03)
+                                    getattr(args, "frontier_v2_extension_cost_margin", 0.05)
                                 )
                                 stop_fill_ms = draft_forward_ms if masks_remaining > 0 else 0.0
                                 stop_ms_per_output = (
@@ -1776,34 +1804,29 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 elif v2_ready and masks_remaining == 0 and frontier_k >= target_len:
                                     extension = min(incr_len, max_spec_len - spec_len)
                                     extension_hazards = v2_extension_hazards(target_len, extension)
-                                    step_record["v2_extension_history_ready"] = extension_hazards is not None
+                                    calibration = getattr(args, "frontier_v2_hazard_calibration", {})
+                                    step_record["v2_extension_history_ready"] = bool(
+                                        calibration.get("total_extension_tokens", 0)
+                                    )
                                     if extension <= 0:
                                         stop_reason = "cost_aware_v2_max_spec_len"
-                                    elif extension_hazards is not None:
+                                    else:
                                         raw_prefix_survival = 1.0
                                         for probability in accept_probabilities:
                                             raw_prefix_survival *= probability
-                                        calibrated_prefix_survival, prefix_calibration_source, prefix_calibration_count = (
-                                            v2_calibrated_prefix_survival(
-                                                raw_prefix_survival,
-                                                target_len,
-                                            )
-                                        )
-                                        raw_conditional_gain = 0.0
+                                        raw_extension_gain = 0.0
                                         extension_survival = 1.0
                                         for probability in extension_hazards:
                                             extension_survival *= probability
-                                            raw_conditional_gain += extension_survival
-                                        conditional_gain_correction, conditional_gain_source, conditional_gain_count = (
-                                            v2_conditional_gain_correction(target_len)
+                                            raw_extension_gain += (
+                                                raw_prefix_survival * extension_survival
+                                            )
+                                        gain_correction, gain_uncertainty, gain_ucb_bonus, gain_source, gain_count = (
+                                            v2_extension_gain_adjustment(target_len)
                                         )
-                                        calibrated_conditional_gain = min(
-                                            float(extension),
-                                            raw_conditional_gain * conditional_gain_correction,
-                                        )
-                                        raw_extension_gain = raw_prefix_survival * raw_conditional_gain
-                                        extension_gain = (
-                                            calibrated_prefix_survival * calibrated_conditional_gain
+                                        extension_gain = min(
+                                            raw_prefix_survival * float(extension),
+                                            raw_extension_gain * gain_correction + gain_ucb_bonus,
                                         )
                                         blocks_generated = max(
                                             1,
@@ -1819,45 +1842,72 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             denoising_passes * extension_blocks / blocks_generated,
                                         )
                                         _, extended_verify_ms, _ = v2_latency_estimates(target_len + extension)
-                                        extend_ms_per_output = (
+                                        estimated_extension_total_ms = (
                                             elapsed_draft_ms
                                             + estimated_extension_passes * draft_forward_ms
                                             + extended_verify_ms
                                             + controller_ms
-                                        ) / max(expected_output + extension_gain, 1e-6)
+                                        )
+                                        extend_ms_per_output = estimated_extension_total_ms / max(
+                                            expected_output + extension_gain, 1e-6
+                                        )
                                         step_record.update({
                                             "v2_extension_size": int(extension),
                                             "v2_extension_hazards": list(extension_hazards),
-                                            "v2_prefix_survival": float(calibrated_prefix_survival),
-                                            "v2_raw_prefix_survival": float(raw_prefix_survival),
-                                            "v2_calibrated_prefix_survival": float(calibrated_prefix_survival),
-                                            "v2_prefix_calibration_source": prefix_calibration_source,
-                                            "v2_prefix_calibration_count": prefix_calibration_count,
-                                            "v2_raw_conditional_gain": float(raw_conditional_gain),
-                                            "v2_calibrated_conditional_gain": float(calibrated_conditional_gain),
+                                            "v2_prefix_survival": float(raw_prefix_survival),
                                             "v2_raw_extension_gain": raw_extension_gain,
                                             "v2_extension_gain": float(extension_gain),
-                                            "v2_extension_gain_correction": conditional_gain_correction,
-                                            "v2_gain_calibration_source": conditional_gain_source,
-                                            "v2_gain_calibration_count": conditional_gain_count,
+                                            "v2_extension_gain_correction": gain_correction,
+                                            "v2_extension_gain_uncertainty": gain_uncertainty,
+                                            "v2_extension_gain_ucb_bonus": gain_ucb_bonus,
+                                            "v2_gain_calibration_source": gain_source,
+                                            "v2_gain_calibration_count": gain_count,
                                             "v2_extend_ms_per_output": float(extend_ms_per_output),
                                             "v2_extended_verify_round_ms": float(extended_verify_ms),
                                             "v2_extension_cost_margin": float(extension_cost_margin),
                                         })
-                                        if extend_ms_per_output <= stop_ms_per_output * (1.0 + extension_cost_margin):
+                                        should_extend = (
+                                            extend_ms_per_output
+                                            <= stop_ms_per_output * (1.0 + extension_cost_margin)
+                                        )
+                                        counterfactual_selected = False
+                                        counterfactual_draw = None
+                                        if not should_extend:
+                                            counterfactual_selected, counterfactual_draw = (
+                                                v2_counterfactual_draw()
+                                            )
+                                        if should_extend or counterfactual_selected:
                                             frontier_force_extend = True
+                                            action = (
+                                                "cost_aware_v2_counterfactual_extend"
+                                                if counterfactual_selected
+                                                else "cost_aware_v2_extend"
+                                            )
                                             frontier_stats["refinement_actions"].append({
                                                 "step": len(frontier_scores),
-                                                "action": "cost_aware_v2_extend",
+                                                "action": action,
                                                 "phase": "extension",
                                                 "target_len": target_len,
                                                 "masks_remaining": masks_remaining,
                                                 "extension": int(extension),
                                                 "raw_predicted_extension_gain": raw_extension_gain,
                                                 "predicted_extension_gain": float(extension_gain),
-                                                "extension_gain_correction": conditional_gain_correction,
-                                                "gain_calibration_source": conditional_gain_source,
-                                                "gain_calibration_count": conditional_gain_count,
+                                                "extension_gain_correction": gain_correction,
+                                                "extension_gain_uncertainty": gain_uncertainty,
+                                                "extension_gain_ucb_bonus": gain_ucb_bonus,
+                                                "gain_calibration_source": gain_source,
+                                                "gain_calibration_count": gain_count,
+                                                "counterfactual_selected": counterfactual_selected,
+                                                "counterfactual_original_action": (
+                                                    "cost_aware_v2_verify_lower_cost"
+                                                    if counterfactual_selected
+                                                    else None
+                                                ),
+                                                "counterfactual_draw": counterfactual_draw,
+                                                "decision_expected_output": float(expected_output),
+                                                "estimated_extension_total_ms": float(
+                                                    estimated_extension_total_ms
+                                                ),
                                                 "stop_ms_per_output": float(stop_ms_per_output),
                                                 "extend_ms_per_output": float(extend_ms_per_output),
                                                 "extension_cost_margin": float(extension_cost_margin),
@@ -1918,8 +1968,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             elif frontier_force_extend:
                                 extension = min(incr_len, max_spec_len - spec_len)
                                 if extension > 0:
+                                    extension_action = frontier_stats["refinement_actions"][-1]
+                                    extension_trigger = extension_action.get(
+                                        "action", "cost_aware_v2_extend"
+                                    )
                                     record_extension_event(
-                                        "cost_aware_v2_extend",
+                                        extension_trigger,
                                         extension,
                                         accept_probabilities,
                                         probability_variants,
@@ -1933,6 +1987,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             "extension_gain_correction": frontier_stats["steps"][-1].get(
                                                 "v2_extension_gain_correction"
                                             ),
+                                            "extension_gain_uncertainty": frontier_stats["steps"][-1].get(
+                                                "v2_extension_gain_uncertainty"
+                                            ),
+                                            "extension_gain_ucb_bonus": frontier_stats["steps"][-1].get(
+                                                "v2_extension_gain_ucb_bonus"
+                                            ),
                                             "gain_calibration_source": frontier_stats["steps"][-1].get(
                                                 "v2_gain_calibration_source"
                                             ),
@@ -1942,23 +2002,26 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             "prefix_survival_probability": frontier_stats["steps"][-1].get(
                                                 "v2_prefix_survival"
                                             ),
-                                            "raw_prefix_survival_probability": frontier_stats["steps"][-1].get(
-                                                "v2_raw_prefix_survival"
+                                            "counterfactual_selected": extension_action.get(
+                                                "counterfactual_selected", False
                                             ),
-                                            "calibrated_prefix_survival_probability": frontier_stats["steps"][-1].get(
-                                                "v2_calibrated_prefix_survival"
+                                            "counterfactual_original_action": extension_action.get(
+                                                "counterfactual_original_action"
                                             ),
-                                            "prefix_calibration_source": frontier_stats["steps"][-1].get(
-                                                "v2_prefix_calibration_source"
+                                            "counterfactual_draw": extension_action.get(
+                                                "counterfactual_draw"
                                             ),
-                                            "prefix_calibration_count": frontier_stats["steps"][-1].get(
-                                                "v2_prefix_calibration_count"
+                                            "decision_expected_output": extension_action.get(
+                                                "decision_expected_output"
                                             ),
-                                            "raw_conditional_extension_gain": frontier_stats["steps"][-1].get(
-                                                "v2_raw_conditional_gain"
+                                            "stop_ms_per_output": extension_action.get(
+                                                "stop_ms_per_output"
                                             ),
-                                            "calibrated_conditional_extension_gain": frontier_stats["steps"][-1].get(
-                                                "v2_calibrated_conditional_gain"
+                                            "predicted_extend_ms_per_output": extension_action.get(
+                                                "extend_ms_per_output"
+                                            ),
+                                            "estimated_extension_total_ms": extension_action.get(
+                                                "estimated_extension_total_ms"
                                             ),
                                         },
                                     )

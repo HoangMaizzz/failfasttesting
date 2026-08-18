@@ -16,11 +16,9 @@ class V2GainCalibrationValidationTests(unittest.TestCase):
             "predicted_extension_gain": [3.8, 4.0, 4.2],
             "actual_extension_accepted_tokens": [4.0, 4.0, 4.0],
             "extension_gain_correction": [1.9, 2.0, 2.0],
+            "extension_gain_uncertainty": [0.5, 0.4, 0.3],
+            "extension_gain_ucb_bonus": [0.5, 0.4, 0.3],
             "original_prefix_fully_accepted": [1, 1, 1],
-            "raw_prefix_survival_probability": [0.5, 0.5, 0.5],
-            "calibrated_prefix_survival_probability": [0.8, 0.8, 0.8],
-            "raw_conditional_extension_gain": [4.0, 4.0, 4.0],
-            "calibrated_conditional_extension_gain": [5.0, 5.0, 5.0],
         })
 
         summary = summarize_events(events)
@@ -37,8 +35,6 @@ class V2GainCalibrationValidationTests(unittest.TestCase):
             "from_len": [16],
             "gain_calibration_count": [12],
             "gain_calibration_source": ["block"],
-            "prefix_calibration_count": [12],
-            "prefix_calibration_source": ["block"],
         })
 
         result = add_analysis_columns(events).iloc[0]
@@ -47,7 +43,6 @@ class V2GainCalibrationValidationTests(unittest.TestCase):
         self.assertEqual(result["calibrated_error"], -1.0)
         self.assertEqual(result["proposal_length_bucket"], "9-16")
         self.assertEqual(result["calibration_stage"], "block:1-31")
-        self.assertEqual(result["prefix_calibration_stage"], "block:1-31")
 
 
 if __name__ == "__main__":

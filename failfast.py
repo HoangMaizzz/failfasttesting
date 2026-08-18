@@ -364,6 +364,7 @@ parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--num_questions", type=int, default=1)
+parser.add_argument("--problem_ids", type=int, nargs="+")
 parser.add_argument("--warmup_questions", type=int, default=0)
 parser.add_argument("--max_new_tokens", type=int, default=1024)
 parser.add_argument("--block_size", type=int, default=32)
@@ -381,11 +382,13 @@ parser.add_argument("--frontier_gain_epsilon", type=float, default=0.0)
 parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
 parser.add_argument("--frontier_cost_ema_alpha", type=float, default=0.2)
 parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
-parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=-0.03)
+parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=0.05)
 parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
 parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
-parser.add_argument("--frontier_v2_prefix_calibration_prior_strength", type=float, default=8.0)
-parser.add_argument("--frontier_v2_min_prefix_calibration_observations", type=int, default=8)
+parser.add_argument("--frontier_v2_gain_ucb_beta", type=float, default=1.0)
+parser.add_argument("--frontier_v2_gain_prior_std", type=float, default=2.0)
+parser.add_argument("--frontier_v2_counterfactual_rate", type=float, default=0.0)
+parser.add_argument("--frontier_v2_counterfactual_seed", type=int)
 parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
 parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
 parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -457,6 +460,7 @@ BENCHMARK_CSV_COLUMNS = [
     "num_speculation_rounds",
     "total_num_forward_passes",
     "frontier_v2_extend_actions",
+    "frontier_v2_counterfactual_actions",
     "frontier_v2_verify_actions",
     "frontier_v2_refinement_stop_actions",
     "frontier_v2_extension_stop_actions",
@@ -519,12 +523,6 @@ FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
     "to_len",
     "extension_size",
     "prefix_survival_probability",
-    "raw_prefix_survival_probability",
-    "calibrated_prefix_survival_probability",
-    "prefix_calibration_source",
-    "prefix_calibration_count",
-    "raw_conditional_extension_gain",
-    "calibrated_conditional_extension_gain",
     "prefix_survival_raw_confidence",
     "prefix_survival_without_confidence_bucket",
     "prefix_survival_without_margin_bucket",
@@ -533,8 +531,17 @@ FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
     "predicted_extension_gain",
     "raw_predicted_extension_gain",
     "extension_gain_correction",
+    "extension_gain_uncertainty",
+    "extension_gain_ucb_bonus",
     "gain_calibration_source",
     "gain_calibration_count",
+    "counterfactual_selected",
+    "counterfactual_original_action",
+    "counterfactual_draw",
+    "decision_expected_output",
+    "stop_ms_per_output",
+    "predicted_extend_ms_per_output",
+    "estimated_extension_total_ms",
     "predicted_extension_gain_raw_confidence",
     "predicted_extension_gain_without_confidence_bucket",
     "predicted_extension_gain_without_margin_bucket",
@@ -587,6 +594,7 @@ def extract_reference_answer(raw_data):
 
 def summarize_frontier_diagnostics(stats_each_round):
     extend_actions = 0
+    counterfactual_actions = 0
     verify_actions = 0
     fill_passes = 0
     denoising_passes = 0
@@ -608,6 +616,9 @@ def summarize_frontier_diagnostics(stats_each_round):
         for action in frontier_stats.get("refinement_actions", []):
             action_name = action.get("action")
             extend_actions += int(action_name == "cost_aware_v2_extend")
+            counterfactual_actions += int(
+                action_name == "cost_aware_v2_counterfactual_extend"
+            )
             verify_actions += int(action_name == "cost_aware_v2_verify_lower_cost")
             if action_name == "cost_aware_v2_verify_lower_cost":
                 refinement_stop_actions += int(action.get("phase") == "refinement")
@@ -643,6 +654,7 @@ def summarize_frontier_diagnostics(stats_each_round):
                 stop_costs.append(float(final_step["v2_stop_ms_per_output"]))
     return {
         "frontier_v2_extend_actions": extend_actions,
+        "frontier_v2_counterfactual_actions": counterfactual_actions,
         "frontier_v2_verify_actions": verify_actions,
         "frontier_v2_refinement_stop_actions": refinement_stop_actions,
         "frontier_v2_extension_stop_actions": extension_stop_actions,
@@ -695,10 +707,8 @@ def ensure_frontier_runtime_state(args):
             "token_confidence": {},
             "extension_block_offset": {},
             "extension_offset": {},
-            "extension_prefix_block_probability": {},
-            "extension_prefix_probability": {},
-            "extension_conditional_gain_by_block": {},
-            "extension_conditional_gain_global": [0.0, 0.0, 0],
+            "extension_gain_by_block": {},
+            "extension_gain_global": [0.0, 0.0, 0.0, 0],
             "total_checked_tokens": 0,
             "total_extension_tokens": 0,
         }
@@ -706,6 +716,8 @@ def ensure_frontier_runtime_state(args):
         args.frontier_v2_verify_latency_bins = {}
     if not hasattr(args, "frontier_v2_draft_latency_bins"):
         args.frontier_v2_draft_latency_bins = {}
+    if not hasattr(args, "frontier_v2_counterfactual_counter"):
+        args.frontier_v2_counterfactual_counter = 0
 
 def reset_frontier_runtime_state(args, preserve_hardware_latency=False):
     preserved = {}
@@ -732,6 +744,7 @@ def reset_frontier_runtime_state(args, preserve_hardware_latency=False):
         "frontier_v2_verify_latency_bins",
         "frontier_v2_draft_latency_bins",
         "last_frontier_stats",
+        "frontier_v2_counterfactual_counter",
     ):
         if hasattr(args, name):
             delattr(args, name)
@@ -752,10 +765,17 @@ def update_calibration_bucket(table, key, accepted):
 
 
 def update_gain_calibration(table, key, predicted_gain, actual_gain):
-    predicted_sum, actual_sum, count = table.get(key, [0.0, 0.0, 0])
+    stats = table.get(key, [0.0, 0.0, 0.0, 0])
+    if len(stats) == 3:
+        predicted_sum, actual_sum, count = stats
+        squared_error_sum = 0.0
+    else:
+        predicted_sum, actual_sum, squared_error_sum, count = stats
+    error = float(actual_gain) - float(predicted_gain)
     table[key] = [
         predicted_sum + float(predicted_gain),
         actual_sum + float(actual_gain),
+        squared_error_sum + error * error,
         int(count) + 1,
     ]
 
@@ -920,43 +940,38 @@ def update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcome
             break
         accepted_len += 1
     for event in frontier_stats.get("extension_events", []):
-        if event.get("trigger") not in ("high_confidence_extend", "cost_aware_v2_extend"):
+        if event.get("trigger") not in (
+            "high_confidence_extend",
+            "cost_aware_v2_extend",
+            "cost_aware_v2_counterfactual_extend",
+        ):
             continue
         from_len = int(event.get("from_len", 0))
         extension_size = int(event.get("extension_size", 0))
-        raw_prefix_survival = event.get("raw_prefix_survival_probability")
-        raw_conditional_gain = event.get("raw_conditional_extension_gain")
-        prefix_fully_accepted = accepted_len >= from_len
-        block_key = frontier_v2_length_bin(from_len)
-        if raw_prefix_survival is not None:
-            prefix_probability_key = calibration_bin(raw_prefix_survival)
-            update_calibration_bucket(
-                calibration["extension_prefix_block_probability"],
-                f"{block_key}:{prefix_probability_key}",
-                prefix_fully_accepted,
-            )
-            update_calibration_bucket(
-                calibration["extension_prefix_probability"],
-                prefix_probability_key,
-                prefix_fully_accepted,
-            )
-        if prefix_fully_accepted and raw_conditional_gain is not None:
+        raw_predicted_gain = event.get("raw_predicted_extension_gain")
+        if raw_predicted_gain is not None:
             actual_gain = max(0, min(extension_size, accepted_len - from_len))
+            block_key = frontier_v2_length_bin(from_len)
             update_gain_calibration(
-                calibration["extension_conditional_gain_by_block"],
+                calibration["extension_gain_by_block"],
                 block_key,
-                raw_conditional_gain,
+                raw_predicted_gain,
                 actual_gain,
             )
-            global_predicted, global_actual, global_count = calibration[
-                "extension_conditional_gain_global"
-            ]
-            calibration["extension_conditional_gain_global"] = [
-                global_predicted + float(raw_conditional_gain),
+            global_stats = calibration["extension_gain_global"]
+            if len(global_stats) == 3:
+                global_predicted, global_actual, global_count = global_stats
+                global_squared_error = 0.0
+            else:
+                global_predicted, global_actual, global_squared_error, global_count = global_stats
+            error = float(actual_gain) - float(raw_predicted_gain)
+            calibration["extension_gain_global"] = [
+                global_predicted + float(raw_predicted_gain),
                 global_actual + float(actual_gain),
+                global_squared_error + error * error,
                 int(global_count) + 1,
             ]
-        if not prefix_fully_accepted:
+        if accepted_len < from_len:
             continue
         block_bin = frontier_v2_length_bin(from_len)
         for offset in range(1, extension_size + 1):
@@ -1202,20 +1217,6 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "to_len": event.get("to_len"),
                 "extension_size": extension_size,
                 "prefix_survival_probability": survival,
-                "raw_prefix_survival_probability": event.get(
-                    "raw_prefix_survival_probability"
-                ),
-                "calibrated_prefix_survival_probability": event.get(
-                    "calibrated_prefix_survival_probability"
-                ),
-                "prefix_calibration_source": event.get("prefix_calibration_source"),
-                "prefix_calibration_count": event.get("prefix_calibration_count"),
-                "raw_conditional_extension_gain": event.get(
-                    "raw_conditional_extension_gain"
-                ),
-                "calibrated_conditional_extension_gain": event.get(
-                    "calibrated_conditional_extension_gain"
-                ),
                 "prefix_survival_raw_confidence": survival_variants.get("raw_confidence"),
                 "prefix_survival_without_confidence_bucket": survival_variants.get("without_confidence_bucket"),
                 "prefix_survival_without_margin_bucket": survival_variants.get("without_margin_bucket"),
@@ -1224,8 +1225,21 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "predicted_extension_gain": predicted_gain,
                 "raw_predicted_extension_gain": event.get("raw_predicted_extension_gain"),
                 "extension_gain_correction": event.get("extension_gain_correction"),
+                "extension_gain_uncertainty": event.get("extension_gain_uncertainty"),
+                "extension_gain_ucb_bonus": event.get("extension_gain_ucb_bonus"),
                 "gain_calibration_source": event.get("gain_calibration_source"),
                 "gain_calibration_count": event.get("gain_calibration_count"),
+                "counterfactual_selected": int(bool(event.get("counterfactual_selected"))),
+                "counterfactual_original_action": event.get("counterfactual_original_action"),
+                "counterfactual_draw": event.get("counterfactual_draw"),
+                "decision_expected_output": event.get("decision_expected_output"),
+                "stop_ms_per_output": event.get("stop_ms_per_output"),
+                "predicted_extend_ms_per_output": event.get(
+                    "predicted_extend_ms_per_output"
+                ),
+                "estimated_extension_total_ms": event.get(
+                    "estimated_extension_total_ms"
+                ),
                 "predicted_extension_gain_raw_confidence": gain_variants.get("raw_confidence"),
                 "predicted_extension_gain_without_confidence_bucket": gain_variants.get("without_confidence_bucket"),
                 "predicted_extension_gain_without_margin_bucket": gain_variants.get("without_margin_bucket"),
@@ -1398,21 +1412,35 @@ if not args.read_pickle:
             raise
         draft_tokenizer = target_tokenizer
 
+measured_problem_ids = args.problem_ids or list(range(args.num_questions))
+if len(measured_problem_ids) != args.num_questions:
+    raise ValueError("--problem_ids must contain exactly --num_questions values")
+if len(set(measured_problem_ids)) != len(measured_problem_ids):
+    raise ValueError("--problem_ids must not contain duplicates")
+if any(problem_id < 0 or problem_id >= len(args.dataset) for problem_id in measured_problem_ids):
+    raise ValueError("--problem_ids contains an index outside the selected dataset")
+warmup_problem_ids = [
+    problem_id
+    for problem_id in range(len(args.dataset))
+    if problem_id not in set(measured_problem_ids)
+][:args.warmup_questions]
 benchmark_runs = (
-    [(problem_id, True) for problem_id in range(args.warmup_questions)]
-    + [(problem_id, False) for problem_id in range(args.num_questions)]
+    [(problem_id, True) for problem_id in warmup_problem_ids]
+    + [(problem_id, False) for problem_id in measured_problem_ids]
 )
+measured_run_started = False
 for problem_id, is_warmup in tqdm(
     benchmark_runs,
     desc="Problems",
     position=0,
     disable=args.disable_progress,
 ):
-    if not is_warmup and problem_id == 0:
+    if not is_warmup and not measured_run_started:
         reset_frontier_runtime_state(
             args,
             preserve_hardware_latency=args.frontier_stop_mode == "cost_aware_v2",
         )
+        measured_run_started = True
     transformers.set_seed(args.seed)
     raw_data = format_problem_and_options(args, problem_id)
     messages = [
