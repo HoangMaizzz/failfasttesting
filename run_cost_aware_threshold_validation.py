@@ -3,6 +3,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,7 +16,29 @@ METHODS = {
     "cost_aware_lowconf_0p45": 0.45,
     "cost_aware_lowconf_0p60": 0.60,
 }
-BENCHMARK_VERSION = "cost_aware_v1_threshold_validation_v1"
+BENCHMARK_VERSION = "cost_aware_v1_bucket_ablation_v2"
+BUCKET_GAIN_VARIANTS = {
+    "full_calibration": (
+        "predicted_extension_gain",
+        "prefix_survival_probability",
+    ),
+    "raw_confidence": (
+        "predicted_extension_gain_raw_confidence",
+        "prefix_survival_raw_confidence",
+    ),
+    "without_confidence_bucket": (
+        "predicted_extension_gain_without_confidence_bucket",
+        "prefix_survival_without_confidence_bucket",
+    ),
+    "without_margin_bucket": (
+        "predicted_extension_gain_without_margin_bucket",
+        "prefix_survival_without_margin_bucket",
+    ),
+    "without_forced_bucket": (
+        "predicted_extension_gain_without_forced_bucket",
+        "prefix_survival_without_forced_bucket",
+    ),
+}
 
 
 def parse_args():
@@ -377,6 +400,121 @@ def summarize_extension_gain(extensions):
     return pd.DataFrame(records).sort_values(["dataset", "lowconf_threshold"])
 
 
+def summarize_bucket_gain_ablation(extensions):
+    if extensions.empty:
+        return pd.DataFrame()
+    valid = extensions[extensions["trigger"].eq("high_confidence_extend")].copy()
+    required = {
+        "predicted_extension_gain",
+        "actual_extension_accepted_tokens",
+        "original_prefix_fully_accepted",
+        "extension_prior_probability",
+        "extension_size",
+    }
+    if valid.empty or not required.issubset(valid.columns):
+        return pd.DataFrame()
+
+    valid["global_q_conditional_gain"] = [
+        sum(float(q) ** offset for offset in range(1, int(extension_size) + 1))
+        for q, extension_size in zip(
+            valid["extension_prior_probability"],
+            valid["extension_size"],
+        )
+    ]
+    valid["oracle_prefix_global_q_gain"] = (
+        pd.to_numeric(valid["original_prefix_fully_accepted"], errors="coerce")
+        * valid["global_q_conditional_gain"]
+    )
+
+    records = []
+    for (dataset, method), group in valid.groupby(["dataset", "method"], sort=False):
+        full_mean = pd.to_numeric(
+            group["predicted_extension_gain"], errors="coerce"
+        ).mean()
+        actual_prefix_rate = pd.to_numeric(
+            group["original_prefix_fully_accepted"], errors="coerce"
+        ).mean()
+        for variant, (gain_column, survival_column) in BUCKET_GAIN_VARIANTS.items():
+            if gain_column not in group or survival_column not in group:
+                continue
+            record = {
+                "dataset": dataset,
+                "method": method,
+                "lowconf_threshold": METHODS[method],
+                "variant": variant,
+                "predicted_prefix_survival_mean": pd.to_numeric(
+                    group[survival_column], errors="coerce"
+                ).mean(),
+                "actual_prefix_full_accept_rate": actual_prefix_rate,
+            }
+            record.update(prediction_metrics(
+                group,
+                gain_column,
+                "actual_extension_accepted_tokens",
+            ))
+            record["predicted_gain_change_vs_full"] = record["predicted_mean"] - full_mean
+            records.append(record)
+
+        oracle_record = {
+            "dataset": dataset,
+            "method": method,
+            "lowconf_threshold": METHODS[method],
+            "variant": "oracle_prefix_global_q",
+            "predicted_prefix_survival_mean": actual_prefix_rate,
+            "actual_prefix_full_accept_rate": actual_prefix_rate,
+        }
+        oracle_record.update(prediction_metrics(
+            group,
+            "oracle_prefix_global_q_gain",
+            "actual_extension_accepted_tokens",
+        ))
+        oracle_record["predicted_gain_change_vs_full"] = (
+            oracle_record["predicted_mean"] - full_mean
+        )
+        records.append(oracle_record)
+
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records).sort_values(
+        ["dataset", "lowconf_threshold", "variant"]
+    )
+
+
+def summarize_gain_gap_decomposition(bucket_ablation):
+    if bucket_ablation.empty:
+        return pd.DataFrame()
+    records = []
+    for (dataset, method), group in bucket_ablation.groupby(
+        ["dataset", "method"], sort=False
+    ):
+        indexed = group.set_index("variant")
+        if not {"full_calibration", "oracle_prefix_global_q"}.issubset(indexed.index):
+            continue
+        full = indexed.loc["full_calibration"]
+        oracle = indexed.loc["oracle_prefix_global_q"]
+        actual = float(full["actual_mean"])
+        current = float(full["predicted_mean"])
+        oracle_prefix = float(oracle["predicted_mean"])
+        total_gap = actual - current
+        prefix_gap = oracle_prefix - current
+        global_q_gap = actual - oracle_prefix
+        records.append({
+            "dataset": dataset,
+            "method": method,
+            "lowconf_threshold": float(full["lowconf_threshold"]),
+            "num_extension_events": int(full["num_observations"]),
+            "current_predicted_gain": current,
+            "oracle_prefix_same_q_gain": oracle_prefix,
+            "actual_extension_gain": actual,
+            "total_underprediction": total_gap,
+            "prefix_product_gap": prefix_gap,
+            "global_q_gap": global_q_gap,
+            "prefix_product_gap_percent": safe_ratio(100.0 * prefix_gap, total_gap),
+            "global_q_gap_percent": safe_ratio(100.0 * global_q_gap, total_gap),
+        })
+    return pd.DataFrame(records).sort_values(["dataset", "lowconf_threshold"])
+
+
 def summarize_next_step_gain(gains):
     if gains.empty:
         return pd.DataFrame()
@@ -536,6 +674,14 @@ def main():
     overall_extension_gain = summarize_extension_gain(
         extensions.assign(dataset="ALL") if not extensions.empty else extensions
     )
+    bucket_gain_ablation = summarize_bucket_gain_ablation(extensions)
+    overall_bucket_gain_ablation = summarize_bucket_gain_ablation(
+        extensions.assign(dataset="ALL") if not extensions.empty else extensions
+    )
+    gain_gap_decomposition = summarize_gain_gap_decomposition(bucket_gain_ablation)
+    overall_gain_gap_decomposition = summarize_gain_gap_decomposition(
+        overall_bucket_gain_ablation
+    )
     overall_next_step_gain = summarize_next_step_gain(
         gains.assign(dataset="ALL") if not gains.empty else gains
     )
@@ -590,6 +736,14 @@ def main():
     overall_expected_prefix.to_csv(output_dir / "overall_expected_prefix_validation_summary.csv", index=False)
     extension_gain.to_csv(output_dir / "extension_gain_validation_summary.csv", index=False)
     overall_extension_gain.to_csv(output_dir / "overall_extension_gain_validation_summary.csv", index=False)
+    bucket_gain_ablation.to_csv(output_dir / "bucket_gain_ablation_summary.csv", index=False)
+    overall_bucket_gain_ablation.to_csv(
+        output_dir / "overall_bucket_gain_ablation_summary.csv", index=False
+    )
+    gain_gap_decomposition.to_csv(output_dir / "gain_gap_decomposition_summary.csv", index=False)
+    overall_gain_gap_decomposition.to_csv(
+        output_dir / "overall_gain_gap_decomposition_summary.csv", index=False
+    )
     next_step_gain.to_csv(output_dir / "next_step_gain_validation_summary.csv", index=False)
     overall_next_step_gain.to_csv(output_dir / "overall_next_step_gain_validation_summary.csv", index=False)
     prefix_calibration.to_csv(output_dir / "expected_prefix_calibration.csv", index=False)
@@ -598,6 +752,12 @@ def main():
     paired.to_csv(output_dir / "paired_threshold_comparison.csv", index=False)
     overall_comparison.to_csv(output_dir / "overall_threshold_comparison.csv", index=False)
     write_manifest(args, output_dir)
+    archive_path = shutil.make_archive(
+        str(output_dir),
+        "zip",
+        root_dir=output_dir.parent,
+        base_dir=output_dir.name,
+    )
 
     print("\nTIMING SUMMARY")
     print(timing.to_string(index=False))
@@ -609,9 +769,22 @@ def main():
     print(expected_prefix.to_string(index=False))
     print("\nEXTENSION GAIN VALIDATION")
     print(extension_gain.to_string(index=False) if not extension_gain.empty else "No extension events")
+    print("\nBUCKET GAIN ABLATION")
+    print(
+        overall_bucket_gain_ablation.to_string(index=False)
+        if not overall_bucket_gain_ablation.empty
+        else "No bucket diagnostics"
+    )
+    print("\nGAIN GAP DECOMPOSITION")
+    print(
+        overall_gain_gap_decomposition.to_string(index=False)
+        if not overall_gain_gap_decomposition.empty
+        else "No gain decomposition"
+    )
     print("\nNEXT DENOISING STEP GAIN VALIDATION")
     print(next_step_gain.to_string(index=False) if not next_step_gain.empty else "No comparable step transitions")
     print(f"\nSaved report: {output_dir}")
+    print(f"Saved archive: {archive_path}")
 
 
 if __name__ == "__main__":

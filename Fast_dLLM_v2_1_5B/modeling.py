@@ -1122,21 +1122,29 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         frontier_recent_unmasked = []
         frontier_force_stop = False
         frontier_force_extend = False
+        accept_probabilities = None
+        probability_variants = None
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
 
-        def calibrated_acceptance_probability(confidence, margin, forced):
+        def acceptance_probability_variants(confidence, margin, forced):
             confidence = max(0.0, min(1.0, float(confidence)))
             margin = max(0.0, min(1.0, float(margin)))
             calibration = getattr(args, "frontier_acceptance_calibration", None) if args is not None else None
+            raw_confidence = max(0.02, min(0.98, confidence))
             if not calibration:
-                return max(0.02, min(0.98, confidence))
+                return {
+                    "full_calibration": raw_confidence,
+                    "raw_confidence": raw_confidence,
+                    "without_confidence_bucket": raw_confidence,
+                    "without_margin_bucket": raw_confidence,
+                    "without_forced_bucket": raw_confidence,
+                }
 
             prior = float(getattr(args, "frontier_calibration_prior", 0.5)) if args is not None else 0.5
             prior_count = float(getattr(args, "frontier_calibration_prior_count", 2.0)) if args is not None else 2.0
-            estimates = [max(0.02, min(0.98, confidence))]
-            weights = [1.0]
+            bucket_values = []
 
             for table_name, key in (
                 ("confidence_bins", frontier_bin(confidence)),
@@ -1147,21 +1155,53 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 total = float(total)
                 if total > 0:
                     estimate = (float(accepted) + prior * prior_count) / (total + prior_count)
-                    estimates.append(max(0.02, min(0.98, estimate)))
-                    weights.append(min(4.0, total))
+                    bucket_values.append((
+                        table_name,
+                        max(0.02, min(0.98, estimate)),
+                        min(4.0, total),
+                    ))
 
-            return sum(value * weight for value, weight in zip(estimates, weights)) / sum(weights)
+            def weighted_probability(excluded_bucket=None):
+                weighted_sum = raw_confidence
+                total_weight = 1.0
+                for table_name, estimate, weight in bucket_values:
+                    if table_name == excluded_bucket:
+                        continue
+                    weighted_sum += estimate * weight
+                    total_weight += weight
+                return weighted_sum / total_weight
+
+            return {
+                "full_calibration": weighted_probability(),
+                "raw_confidence": raw_confidence,
+                "without_confidence_bucket": weighted_probability("confidence_bins"),
+                "without_margin_bucket": weighted_probability("margin_bins"),
+                "without_forced_bucket": weighted_probability("forced"),
+            }
+
+        def calibrated_acceptance_probability(confidence, margin, forced):
+            return acceptance_probability_variants(confidence, margin, forced)["full_calibration"]
 
         def expected_prefix_score(confidences, margins, forced_flags):
             score = 0.0
             survival = 1.0
             probabilities = []
+            probabilities_by_variant = {
+                "full_calibration": [],
+                "raw_confidence": [],
+                "without_confidence_bucket": [],
+                "without_margin_bucket": [],
+                "without_forced_bucket": [],
+            }
             for confidence, margin, forced in zip(confidences, margins, forced_flags):
-                accept_prob = calibrated_acceptance_probability(confidence, margin, forced)
+                variants = acceptance_probability_variants(confidence, margin, forced)
+                accept_prob = variants["full_calibration"]
                 probabilities.append(accept_prob)
+                for name, probability in variants.items():
+                    probabilities_by_variant[name].append(probability)
                 survival *= accept_prob
                 score += survival
-            return score, probabilities
+            return score, probabilities, probabilities_by_variant
 
         def calibration_prior_probability():
             calibration = getattr(args, "frontier_acceptance_calibration", None) if args is not None else None
@@ -1172,7 +1212,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             accepted, total = calibration.get("prior", (0.0, 0.0))
             return max(0.02, min(0.98, (float(accepted) + prior * prior_count) / (float(total) + prior_count)))
 
-        def record_extension_event(trigger, extension, accept_probabilities=None):
+        def record_extension_event(
+            trigger,
+            extension,
+            accept_probabilities=None,
+            probability_variants=None,
+        ):
             extension = int(extension)
             if extension <= 0:
                 return
@@ -1186,6 +1231,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 "prefix_survival_probability": None,
                 "extension_prior_probability": None,
                 "accept_probabilities": None,
+                "prefix_survival_by_variant": None,
+                "predicted_extension_gain_by_variant": None,
             }
             if accept_probabilities is not None:
                 extension_probability = calibration_prior_probability()
@@ -1193,6 +1240,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     "extension_prior_probability": float(extension_probability),
                     "accept_probabilities": list(accept_probabilities),
                 })
+                if probability_variants is not None:
+                    prefix_survival_by_variant = {}
+                    predicted_gain_by_variant = {}
+                    extension_multiplier = sum(
+                        extension_probability ** offset
+                        for offset in range(1, extension + 1)
+                    )
+                    for name, probabilities in probability_variants.items():
+                        survival = 1.0
+                        for probability in probabilities:
+                            survival *= probability
+                        prefix_survival_by_variant[name] = float(survival)
+                        predicted_gain_by_variant[name] = float(survival * extension_multiplier)
+                    event["prefix_survival_by_variant"] = prefix_survival_by_variant
+                    event["predicted_extension_gain_by_variant"] = predicted_gain_by_variant
             frontier_stats["extension_events"].append(event)
 
         def v2_latency_estimates():
@@ -1398,7 +1460,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 else:
                                     break
 
-                            frontier_score, accept_probabilities = expected_prefix_score(confidences, margins, forced_flags)
+                            frontier_score, accept_probabilities, probability_variants = expected_prefix_score(
+                                confidences,
+                                margins,
+                                forced_flags,
+                            )
                             if frontier_k >= target_len:
                                 frontier_confidence = None
                                 frontier_recoverable = False
@@ -1597,6 +1663,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "cost_aware_v2_extend",
                                         extension,
                                         accept_probabilities,
+                                        probability_variants,
                                     )
                                     draft_token_end_idx += extension
                                     spec_len += extension
@@ -1653,6 +1720,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "high_confidence_extend",
                                     extension,
                                     accept_probabilities,
+                                    probability_variants,
                                 )
                                 draft_token_end_idx += extension
                                 spec_len += extension

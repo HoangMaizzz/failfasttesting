@@ -6,6 +6,8 @@ import pandas as pd
 from run_cost_aware_threshold_validation import (
     build_calibration_table,
     prediction_metrics,
+    summarize_bucket_gain_ablation,
+    summarize_gain_gap_decomposition,
     summarize_next_step_gain,
     summarize_rounds,
 )
@@ -70,6 +72,41 @@ class CostAwareThresholdValidationTests(unittest.TestCase):
 
         self.assertEqual(summary["num_observations"], 2)
         self.assertEqual(summary["same_target_len_rate_percent"], 0.0)
+
+    def test_bucket_ablation_separates_prefix_and_global_prior_error(self):
+        frame = pd.DataFrame({
+            "dataset": ["gsm8k", "gsm8k"],
+            "method": ["cost_aware_lowconf_0p45"] * 2,
+            "trigger": ["high_confidence_extend"] * 2,
+            "extension_size": [2, 2],
+            "extension_prior_probability": [0.5, 0.5],
+            "original_prefix_fully_accepted": [1, 0],
+            "actual_extension_accepted_tokens": [2, 0],
+            "prefix_survival_probability": [0.25, 0.25],
+            "prefix_survival_raw_confidence": [0.5, 0.5],
+            "prefix_survival_without_confidence_bucket": [0.3, 0.3],
+            "prefix_survival_without_margin_bucket": [0.4, 0.4],
+            "prefix_survival_without_forced_bucket": [0.2, 0.2],
+            "predicted_extension_gain": [0.1875, 0.1875],
+            "predicted_extension_gain_raw_confidence": [0.375, 0.375],
+            "predicted_extension_gain_without_confidence_bucket": [0.225, 0.225],
+            "predicted_extension_gain_without_margin_bucket": [0.3, 0.3],
+            "predicted_extension_gain_without_forced_bucket": [0.15, 0.15],
+        })
+
+        ablation = summarize_bucket_gain_ablation(frame)
+        full = ablation[ablation["variant"] == "full_calibration"].iloc[0]
+        no_margin = ablation[ablation["variant"] == "without_margin_bucket"].iloc[0]
+        oracle = ablation[ablation["variant"] == "oracle_prefix_global_q"].iloc[0]
+
+        self.assertAlmostEqual(full["predicted_mean"], 0.1875)
+        self.assertAlmostEqual(no_margin["predicted_gain_change_vs_full"], 0.1125)
+        self.assertAlmostEqual(oracle["predicted_mean"], 0.375)
+
+        decomposition = summarize_gain_gap_decomposition(ablation).iloc[0]
+        self.assertAlmostEqual(decomposition["actual_extension_gain"], 1.0)
+        self.assertAlmostEqual(decomposition["prefix_product_gap"], 0.1875)
+        self.assertAlmostEqual(decomposition["global_q_gap"], 0.625)
 
 
 if __name__ == "__main__":

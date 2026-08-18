@@ -492,8 +492,16 @@ FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
     "to_len",
     "extension_size",
     "prefix_survival_probability",
+    "prefix_survival_raw_confidence",
+    "prefix_survival_without_confidence_bucket",
+    "prefix_survival_without_margin_bucket",
+    "prefix_survival_without_forced_bucket",
     "extension_prior_probability",
     "predicted_extension_gain",
+    "predicted_extension_gain_raw_confidence",
+    "predicted_extension_gain_without_confidence_bucket",
+    "predicted_extension_gain_without_margin_bucket",
+    "predicted_extension_gain_without_forced_bucket",
     "actual_extension_accepted_tokens",
     "extension_gain_error",
     "original_prefix_fully_accepted",
@@ -864,6 +872,8 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
         for event_id, event in enumerate(extension_events):
             predicted_gain = event.get("predicted_extension_gain")
             survival = event.get("prefix_survival_probability")
+            survival_variants = event.get("prefix_survival_by_variant") or {}
+            gain_variants = event.get("predicted_extension_gain_by_variant") or {}
             extension_probability = event.get("extension_prior_probability")
             from_len = int(event.get("from_len", 0))
             extension_size = int(event.get("extension_size", 0))
@@ -888,8 +898,16 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "to_len": event.get("to_len"),
                 "extension_size": extension_size,
                 "prefix_survival_probability": survival,
+                "prefix_survival_raw_confidence": survival_variants.get("raw_confidence"),
+                "prefix_survival_without_confidence_bucket": survival_variants.get("without_confidence_bucket"),
+                "prefix_survival_without_margin_bucket": survival_variants.get("without_margin_bucket"),
+                "prefix_survival_without_forced_bucket": survival_variants.get("without_forced_bucket"),
                 "extension_prior_probability": extension_probability,
                 "predicted_extension_gain": predicted_gain,
+                "predicted_extension_gain_raw_confidence": gain_variants.get("raw_confidence"),
+                "predicted_extension_gain_without_confidence_bucket": gain_variants.get("without_confidence_bucket"),
+                "predicted_extension_gain_without_margin_bucket": gain_variants.get("without_margin_bucket"),
+                "predicted_extension_gain_without_forced_bucket": gain_variants.get("without_forced_bucket"),
                 "actual_extension_accepted_tokens": actual_gain,
                 "extension_gain_error": (
                     float(predicted_gain) - actual_gain
