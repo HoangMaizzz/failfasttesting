@@ -12,7 +12,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
-BENCHMARK_VERSION = "paired_frontier_candidate_v3"
+BENCHMARK_VERSION = "paired_frontier_candidate_v4"
 METHODS = {
     "failfast": {
         "frontier_mode": "disabled",
@@ -44,6 +44,12 @@ METHODS = {
         "lowconf_threshold": 0.60,
         "incr_len": 8,
     },
+    "cost_aware_v1_round_spec8_incr8": {
+        "frontier_mode": "cost_aware_round",
+        "spec_len": 8,
+        "lowconf_threshold": 0.60,
+        "incr_len": 8,
+    },
 }
 
 
@@ -67,6 +73,9 @@ def parse_args():
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
     parser.add_argument("--frontier_v2_min_expected_output", type=float, default=7.0)
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
+    parser.add_argument("--frontier_round_hysteresis", type=float, default=0.03)
+    parser.add_argument("--frontier_latency_context_bucket_size", type=int, default=256)
+    parser.add_argument("--frontier_latency_proposal_bucket_size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir")
     parser.add_argument("--log_level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
@@ -93,6 +102,12 @@ def validate_args(args):
         raise ValueError("--frontier_v2_min_expected_output must be greater than 1")
     if not 0 <= args.frontier_v2_hysteresis < 1:
         raise ValueError("--frontier_v2_hysteresis must be in [0, 1)")
+    if not 0 <= args.frontier_round_hysteresis < 1:
+        raise ValueError("--frontier_round_hysteresis must be in [0, 1)")
+    if args.frontier_latency_context_bucket_size <= 0:
+        raise ValueError("--frontier_latency_context_bucket_size must be positive")
+    if args.frontier_latency_proposal_bucket_size <= 0:
+        raise ValueError("--frontier_latency_proposal_bucket_size must be positive")
     if len(args.candidates) != len(set(args.candidates)):
         raise ValueError("--candidates must not contain duplicates")
 
@@ -120,6 +135,9 @@ def run_metadata(args, dataset, method):
         "frontier_cost_token_equiv": args.frontier_cost_token_equiv,
         "frontier_v2_min_expected_output": args.frontier_v2_min_expected_output,
         "frontier_v2_hysteresis": args.frontier_v2_hysteresis,
+        "frontier_round_hysteresis": args.frontier_round_hysteresis,
+        "frontier_latency_context_bucket_size": args.frontier_latency_context_bucket_size,
+        "frontier_latency_proposal_bucket_size": args.frontier_latency_proposal_bucket_size,
         "seed": args.seed,
         "method_config": METHODS[method],
     }
@@ -205,6 +223,9 @@ def run_method(args, dataset, method):
             "--frontier_cost_token_equiv", str(args.frontier_cost_token_equiv),
             "--frontier_v2_min_expected_output", str(args.frontier_v2_min_expected_output),
             "--frontier_v2_hysteresis", str(args.frontier_v2_hysteresis),
+            "--frontier_round_hysteresis", str(args.frontier_round_hysteresis),
+            "--frontier_latency_context_bucket_size", str(args.frontier_latency_context_bucket_size),
+            "--frontier_latency_proposal_bucket_size", str(args.frontier_latency_proposal_bucket_size),
             "--seed", str(args.seed),
             "--quiet_generation",
             "--disable_progress",
@@ -259,6 +280,10 @@ def aggregate_method(group):
     passes = pd.to_numeric(group["total_num_forward_passes"], errors="coerce").sum()
     extend_actions = pd.to_numeric(group["frontier_v2_extend_actions"], errors="coerce").sum()
     verify_actions = pd.to_numeric(group["frontier_v2_verify_actions"], errors="coerce").sum()
+    round_extend_actions = pd.to_numeric(group["frontier_round_extend_actions"], errors="coerce").sum()
+    round_verify_actions = pd.to_numeric(group["frontier_round_verify_actions"], errors="coerce").sum()
+    round_profiled_steps = pd.to_numeric(group["frontier_round_profiled_steps"], errors="coerce").sum()
+    round_fallback_steps = pd.to_numeric(group["frontier_round_fallback_steps"], errors="coerce").sum()
     fill_passes = pd.to_numeric(group["frontier_fill_forward_passes"], errors="coerce").sum()
     denoising_passes = pd.to_numeric(group["frontier_denoising_forward_passes"], errors="coerce").sum()
     return {
@@ -277,6 +302,13 @@ def aggregate_method(group):
         "verifier_rounds_per_100_output_tokens": safe_ratio(100.0 * rounds, output_tokens),
         "frontier_v2_extend_actions_per_100_rounds": safe_ratio(100.0 * extend_actions, rounds),
         "frontier_v2_verify_actions_per_100_rounds": safe_ratio(100.0 * verify_actions, rounds),
+        "frontier_round_extend_actions_per_100_rounds": safe_ratio(100.0 * round_extend_actions, rounds),
+        "frontier_round_verify_actions_per_100_rounds": safe_ratio(100.0 * round_verify_actions, rounds),
+        "frontier_round_verify_latency_ms_mean": pd.to_numeric(group["frontier_round_verify_latency_ms_mean"], errors="coerce").mean(),
+        "frontier_round_stop_ms_per_output_mean": pd.to_numeric(group["frontier_round_stop_ms_per_output_mean"], errors="coerce").mean(),
+        "frontier_round_latency_samples_mean": pd.to_numeric(group["frontier_round_latency_samples_mean"], errors="coerce").mean(),
+        "frontier_round_profiled_steps": round_profiled_steps,
+        "frontier_round_fallback_steps": round_fallback_steps,
         "frontier_fill_passes_per_100_output_tokens": safe_ratio(100.0 * fill_passes, output_tokens),
         "frontier_denoising_passes_per_100_output_tokens": safe_ratio(100.0 * denoising_passes, output_tokens),
         "frontier_expected_output_mean": pd.to_numeric(group["frontier_expected_output_mean"], errors="coerce").mean(),
@@ -312,6 +344,13 @@ def build_paired_observations(rows, candidate_method):
         "frontier_fill_forward_passes",
         "frontier_denoising_forward_passes",
         "frontier_expected_output_mean",
+        "frontier_round_extend_actions",
+        "frontier_round_verify_actions",
+        "frontier_round_verify_latency_ms_mean",
+        "frontier_round_stop_ms_per_output_mean",
+        "frontier_round_latency_samples_mean",
+        "frontier_round_profiled_steps",
+        "frontier_round_fallback_steps",
         "output_token_hash",
         "is_correct",
     ]
