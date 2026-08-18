@@ -55,6 +55,7 @@ def parse_args():
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
+    parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=-0.03)
     parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
     parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
     parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
@@ -87,6 +88,8 @@ def validate_args(args):
         raise ValueError("--max_new_tokens must be positive")
     if not 0 <= args.frontier_v2_hysteresis < 1:
         raise ValueError("--frontier_v2_hysteresis must be in [0, 1)")
+    if not -0.99 < args.frontier_v2_extension_cost_margin <= 1.0:
+        raise ValueError("--frontier_v2_extension_cost_margin must be in (-0.99, 1.0]")
     if args.frontier_v2_hazard_prior_strength <= 0:
         raise ValueError("--frontier_v2_hazard_prior_strength must be positive")
     if args.frontier_v2_extension_prior_strength <= 0:
@@ -121,6 +124,7 @@ def run_metadata(args, dataset, method):
         "frontier_patience": args.frontier_patience,
         "frontier_cost_token_equiv": args.frontier_cost_token_equiv,
         "frontier_v2_hysteresis": args.frontier_v2_hysteresis,
+        "frontier_v2_extension_cost_margin": args.frontier_v2_extension_cost_margin,
         "frontier_v2_hazard_prior_strength": args.frontier_v2_hazard_prior_strength,
         "frontier_v2_extension_prior_strength": args.frontier_v2_extension_prior_strength,
         "frontier_v2_min_hazard_observations": args.frontier_v2_min_hazard_observations,
@@ -218,6 +222,7 @@ def run_method(args, dataset, method):
             "--frontier_patience", str(args.frontier_patience),
             "--frontier_cost_token_equiv", str(args.frontier_cost_token_equiv),
             "--frontier_v2_hysteresis", str(args.frontier_v2_hysteresis),
+            "--frontier_v2_extension_cost_margin", str(args.frontier_v2_extension_cost_margin),
             "--frontier_v2_hazard_prior_strength", str(args.frontier_v2_hazard_prior_strength),
             "--frontier_v2_extension_prior_strength", str(args.frontier_v2_extension_prior_strength),
             "--frontier_v2_min_hazard_observations", str(args.frontier_v2_min_hazard_observations),

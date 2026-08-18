@@ -1674,6 +1674,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
                                 expected_output = 1.0 + float(frontier_score)
                                 hysteresis = float(getattr(args, "frontier_v2_hysteresis", 0.03))
+                                extension_cost_margin = float(
+                                    getattr(args, "frontier_v2_extension_cost_margin", -0.03)
+                                )
                                 stop_fill_ms = draft_forward_ms if masks_remaining > 0 else 0.0
                                 stop_ms_per_output = (
                                     elapsed_draft_ms + stop_fill_ms + verify_round_ms + controller_ms
@@ -1747,8 +1750,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             "v2_extension_gain": float(extension_gain),
                                             "v2_extend_ms_per_output": float(extend_ms_per_output),
                                             "v2_extended_verify_round_ms": float(extended_verify_ms),
+                                            "v2_extension_cost_margin": float(extension_cost_margin),
                                         })
-                                        if extend_ms_per_output < stop_ms_per_output * (1.0 - hysteresis):
+                                        if extend_ms_per_output <= stop_ms_per_output * (1.0 + extension_cost_margin):
                                             frontier_force_extend = True
                                             frontier_stats["refinement_actions"].append({
                                                 "step": len(frontier_scores),
@@ -1760,6 +1764,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 "predicted_extension_gain": float(extension_gain),
                                                 "stop_ms_per_output": float(stop_ms_per_output),
                                                 "extend_ms_per_output": float(extend_ms_per_output),
+                                                "extension_cost_margin": float(extension_cost_margin),
                                             })
                                         else:
                                             stop_reason = "cost_aware_v2_verify_lower_cost"
