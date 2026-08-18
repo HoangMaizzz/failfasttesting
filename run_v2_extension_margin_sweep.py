@@ -73,8 +73,17 @@ def validate_args(args):
         raise ValueError("--extension_cost_margins must not contain duplicates")
     if any(not -0.99 < margin <= 1.0 for margin in args.extension_cost_margins):
         raise ValueError("extension cost margins must be in (-0.99, 1.0]")
-    if args.reference_margin not in args.extension_cost_margins:
+    matching_reference = next(
+        (
+            margin
+            for margin in args.extension_cost_margins
+            if math.isclose(margin, args.reference_margin, rel_tol=0.0, abs_tol=1e-9)
+        ),
+        None,
+    )
+    if matching_reference is None:
         raise ValueError("--reference_margin must be included in --extension_cost_margins")
+    args.reference_margin = matching_reference
 
 
 def run_streaming(command, cwd):
@@ -247,7 +256,12 @@ def build_reference_comparison(rows, reference_margin):
         "frontier_v2_extension_stop_actions",
         "output_token_hash",
     ]
-    reference = rows[rows["extension_cost_margin"] == reference_margin][
+    reference_mask = rows["extension_cost_margin"].map(
+        lambda margin: math.isclose(
+            float(margin), float(reference_margin), rel_tol=0.0, abs_tol=1e-9
+        )
+    )
+    reference = rows[reference_mask][
         ["dataset", "problem_id", *metrics]
     ].copy()
     reference = reference.rename(columns={metric: f"reference_{metric}" for metric in metrics})

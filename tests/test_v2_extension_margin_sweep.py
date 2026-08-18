@@ -1,10 +1,12 @@
 import unittest
+from types import SimpleNamespace
 
 import pandas as pd
 
 from run_v2_extension_margin_sweep import (
     build_reference_comparison,
     margin_label,
+    validate_args,
 )
 
 
@@ -13,6 +15,19 @@ class V2ExtensionMarginSweepTests(unittest.TestCase):
         self.assertEqual(margin_label(-0.05), "require_gain_5pct")
         self.assertEqual(margin_label(0.0), "break_even")
         self.assertEqual(margin_label(0.10), "allow_loss_10pct")
+
+    def test_reference_margin_uses_tolerant_float_matching(self):
+        args = SimpleNamespace(
+            num_questions=20,
+            warmup_questions=1,
+            max_new_tokens=1024,
+            extension_cost_margins=[-0.05, -0.0300000000001, 0.0],
+            reference_margin=-0.03,
+        )
+
+        validate_args(args)
+
+        self.assertEqual(args.reference_margin, -0.0300000000001)
 
     def test_reference_comparison_is_paired_by_problem(self):
         common = {
