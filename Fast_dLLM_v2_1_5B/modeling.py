@@ -24,8 +24,6 @@ from .configuration import Fast_dLLM_QwenConfig
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from einops import rearrange, repeat
 
-from frontier_latency import estimate_verify_latency_ms
-
 logging.set_verbosity_error()
 # logging.set_verbosity_warning()
 # logging.set_verbosity_debug()
@@ -1097,12 +1095,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "enabled": bool(return_frontier_stats),
             "mode": frontier_mode,
             "score_type": "expected_accepted_prefix",
+            "initial_spec_len": int(spec_len),
+            "max_spec_len": int(max_spec_len),
+            "incr_len": int(incr_len),
+            "lowconf_threshold": None if lowconf_threshold is None else float(lowconf_threshold),
             "steps": [],
             "stop_reason": None,
             "final_frontier_score": None,
             "actual_spec_len": None,
             "draft_token_stats": [],
             "refinement_actions": [],
+            "extension_events": [],
             "forward_pass_breakdown": {
                 "prefill": 0,
                 "cache_update": 0,
@@ -1169,6 +1172,29 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             accepted, total = calibration.get("prior", (0.0, 0.0))
             return max(0.02, min(0.98, (float(accepted) + prior * prior_count) / (float(total) + prior_count)))
 
+        def record_extension_event(trigger, extension, accept_probabilities=None):
+            extension = int(extension)
+            if extension <= 0:
+                return
+            from_len = int(spec_len)
+            event = {
+                "trigger": trigger,
+                "from_len": from_len,
+                "to_len": from_len + extension,
+                "extension_size": extension,
+                "predicted_extension_gain": None,
+                "prefix_survival_probability": None,
+                "extension_prior_probability": None,
+                "accept_probabilities": None,
+            }
+            if accept_probabilities is not None:
+                extension_probability = calibration_prior_probability()
+                event.update({
+                    "extension_prior_probability": float(extension_probability),
+                    "accept_probabilities": list(accept_probabilities),
+                })
+            frontier_stats["extension_events"].append(event)
+
         def v2_latency_estimates():
             recent_forward_ms = forward_pass_latencies[-1] if forward_pass_latencies else 6.1
             draft_forward_ms = float(getattr(args, "frontier_ema_dllm_forward_ms", None) or recent_forward_ms)
@@ -1181,25 +1207,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 verify_round_ms = max(draft_forward_ms, 13.5)
             controller_ms = float(getattr(args, "frontier_ema_controller_ms", None) or 0.0)
             return max(draft_forward_ms, 1e-6), max(float(verify_round_ms), 1e-6), max(controller_ms, 0.0)
-
-        def round_latency_estimates(proposal_len):
-            recent_forward_ms = forward_pass_latencies[-1] if forward_pass_latencies else 6.1
-            draft_forward_ms = float(getattr(args, "frontier_ema_dllm_forward_ms", None) or recent_forward_ms)
-            fallback_verify_ms = getattr(args, "frontier_ema_target_round_ms", None)
-            if fallback_verify_ms is None and args is not None:
-                latency = getattr(args, "latency", {}).get("vLLM_A6000", {})
-                target_tpt = latency.get("target_tpt", {})
-                fallback_verify_ms = target_tpt.get(getattr(args, "target_model_name_clean", ""))
-            if fallback_verify_ms is None:
-                fallback_verify_ms = max(draft_forward_ms, 13.5)
-            estimate = estimate_verify_latency_ms(
-                getattr(args, "frontier_verify_latency_model", None),
-                getattr(args, "frontier_current_context_len", original_input_length),
-                proposal_len,
-                fallback_verify_ms,
-            )
-            controller_ms = float(getattr(args, "frontier_ema_controller_ms", None) or 0.0)
-            return max(draft_forward_ms, 1e-6), estimate, max(controller_ms, 0.0)
         
         if input_ids.shape[1] > block_size:
             if prev_prefill_output is not None and prev_prefill_output.logits.shape[1] == (input_ids.shape[1] // block_size * block_size):
@@ -1440,6 +1447,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     predicted_gain = max(0.0, frontier_gain * ratio)
                                 else:
                                     predicted_gain = max(0.0, frontier_gain)
+                            step_record["predicted_next_gain"] = (
+                                None if predicted_gain is None else float(predicted_gain)
+                            )
                             if frontier_k >= target_len and frontier_mode in force_stop_modes:
                                 stop_reason = "frontier_all_pass"
                             elif aggressive_irrecoverable and frontier_k < target_len and not frontier_recoverable and frontier_confidence is not None and frontier_confidence < tau_f:
@@ -1454,88 +1464,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 if predicted_gain is not None:
                                     if predicted_gain <= cost_token_equiv:
                                         stop_reason = "cost_aware_low_expected_gain"
-                            elif len(frontier_scores) >= min_steps and frontier_mode == "cost_aware_round":
-                                draft_forward_ms, verify_estimate, controller_ms = round_latency_estimates(target_len)
-                                verify_round_ms = float(verify_estimate["latency_ms"])
-                                elapsed_draft_ms = float(sum(forward_pass_latencies))
-                                expected_output = 1.0 + float(frontier_score)
-                                hysteresis = float(getattr(args, "frontier_round_hysteresis", 0.03))
-                                stop_fill_ms = draft_forward_ms if masks_remaining > 0 else 0.0
-                                stop_ms_per_output = (
-                                    elapsed_draft_ms + stop_fill_ms + verify_round_ms + controller_ms
-                                ) / max(expected_output, 1e-6)
-                                step_record.update({
-                                    "round_expected_output": expected_output,
-                                    "round_draft_forward_ms": draft_forward_ms,
-                                    "round_verify_latency_ms": verify_round_ms,
-                                    "round_verify_latency_source": verify_estimate["source"],
-                                    "round_latency_samples": int(verify_estimate["samples"]),
-                                    "round_controller_ms": controller_ms,
-                                    "round_stop_ms_per_output": stop_ms_per_output,
-                                })
-
-                                if masks_remaining > 0:
-                                    expected_unmask = max(
-                                        1.0,
-                                        sum(frontier_recent_unmasked[-patience:]) / max(1, len(frontier_recent_unmasked[-patience:])),
-                                    )
-                                    next_fill_ms = draft_forward_ms if masks_remaining > expected_unmask else 0.0
-                                    next_expected_output = expected_output + float(predicted_gain or 0.0)
-                                    continue_ms_per_output = (
-                                        elapsed_draft_ms
-                                        + draft_forward_ms
-                                        + next_fill_ms
-                                        + verify_round_ms
-                                        + controller_ms
-                                    ) / max(next_expected_output, 1e-6)
-                                    step_record["round_continue_ms_per_output"] = continue_ms_per_output
-                                    if continue_ms_per_output >= stop_ms_per_output * (1.0 - hysteresis):
-                                        stop_reason = "cost_aware_round_verify_lower_cost"
-                                else:
-                                    extension = min(incr_len, max_spec_len - spec_len)
-                                    survival = 1.0
-                                    for accept_probability in accept_probabilities:
-                                        survival *= accept_probability
-                                    extension_probability = calibration_prior_probability()
-                                    extension_gain = 0.0
-                                    for offset in range(1, extension + 1):
-                                        extension_gain += survival * (extension_probability ** offset)
-                                    next_verify_estimate = round_latency_estimates(target_len + extension)[1]
-                                    extended_verify_ms = max(
-                                        verify_round_ms,
-                                        float(next_verify_estimate["latency_ms"]),
-                                    )
-                                    denoising_passes = frontier_stats["forward_pass_breakdown"]["denoising"]
-                                    estimated_extension_passes = max(
-                                        1.0,
-                                        extension * denoising_passes / max(target_len, 1),
-                                    ) if extension > 0 else 0.0
-                                    extend_ms_per_output = (
-                                        elapsed_draft_ms
-                                        + estimated_extension_passes * draft_forward_ms
-                                        + extended_verify_ms
-                                        + controller_ms
-                                    ) / max(expected_output + extension_gain, 1e-6) if extension > 0 else float("inf")
-                                    step_record.update({
-                                        "round_extension_size": int(extension),
-                                        "round_extension_gain": float(extension_gain),
-                                        "round_extended_verify_latency_ms": float(extended_verify_ms),
-                                        "round_extended_verify_latency_source": next_verify_estimate["source"],
-                                        "round_extend_ms_per_output": float(extend_ms_per_output),
-                                    })
-                                    if extension > 0 and extend_ms_per_output < stop_ms_per_output * (1.0 - hysteresis):
-                                        frontier_force_extend = True
-                                        frontier_stats["refinement_actions"].append({
-                                            "step": len(frontier_scores),
-                                            "action": "cost_aware_round_extend",
-                                            "target_len": target_len,
-                                            "masks_remaining": masks_remaining,
-                                            "extension": int(extension),
-                                            "stop_ms_per_output": float(stop_ms_per_output),
-                                            "extend_ms_per_output": float(extend_ms_per_output),
-                                        })
-                                    else:
-                                        stop_reason = "cost_aware_round_verify_lower_cost"
                             elif len(frontier_scores) >= min_steps and frontier_mode == "cost_aware_v2":
                                 draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates()
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
@@ -1614,7 +1542,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         stop_reason = "cost_aware_v2_verify_lower_cost"
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
-                                frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode in ("cost_aware_v2", "cost_aware_round")
+                                frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode == "cost_aware_v2"
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),
                                     "action": stop_reason,
@@ -1665,13 +1593,18 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             elif frontier_force_extend:
                                 extension = min(incr_len, max_spec_len - spec_len)
                                 if extension > 0:
+                                    record_extension_event(
+                                        "cost_aware_v2_extend",
+                                        extension,
+                                        accept_probabilities,
+                                    )
                                     draft_token_end_idx += extension
                                     spec_len += extension
                                     draft_tokens_unmasked = False
                                     frontier_force_extend = False
-                                    logger.debug(f"{Colors.GREEN}{frontier_mode} extended proposal by {extension} tokens. spec_len={spec_len}{Colors.RESET}")
+                                    logger.debug(f"{Colors.GREEN}Cost-aware v2 extended proposal by {extension} tokens. spec_len={spec_len}{Colors.RESET}")
                                 else:
-                                    frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or f"{frontier_mode}_max_spec_len"
+                                    frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "cost_aware_v2_max_spec_len"
                                     draft_tokens_unmasked = True
                             elif any([x < lowconf_threshold for x in conf_of_unmasked_tokens]):
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_low_confidence"
@@ -1690,6 +1623,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         veri_len = start_index_proposal + num_salvagable_tokens
                                         
                                         if veri_len > spec_len:
+                                            record_extension_event(
+                                                "rejected_overlap_reuse",
+                                                veri_len - spec_len,
+                                            )
                                             spec_len = veri_len
                                             draft_token_end_idx = draft_token_start_idx + spec_len
                                             draft_proposal = curr_proposal[:start_index_proposal] + last_round_rejected[start_index_rejected:]
@@ -1712,6 +1649,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             else:
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. All are high-confidence, continue speculating.{Colors.RESET}")
                                 extension = incr_len if frontier_mode in ("disabled", "none", "off") else min(incr_len, max_spec_len - spec_len)
+                                record_extension_event(
+                                    "high_confidence_extend",
+                                    extension,
+                                    accept_probabilities,
+                                )
                                 draft_token_end_idx += extension
                                 spec_len += extension
                                 draft_tokens_unmasked = False
