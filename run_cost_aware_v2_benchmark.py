@@ -3,6 +3,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pandas as pd
 
 DATASETS = ("math", "aime", "gsm8k", "gpqa", "humaneval")
 DATASET_LIMITS = {"aime": 30}
-BENCHMARK_VERSION = "paired_frontier_candidate_v3"
+BENCHMARK_VERSION = "conditional_hazard_cost_aware_v2_v1"
 METHODS = {
     "failfast": {
         "frontier_mode": "disabled",
@@ -20,26 +21,14 @@ METHODS = {
         "lowconf_threshold": 0.45,
         "incr_len": 10,
     },
-    "cost_aware_v2": {
+    "cost_aware_v2_lowconf_0p45": {
         "frontier_mode": "cost_aware_v2",
-        "spec_len": 10,
-        "lowconf_threshold": 0.60,
-        "incr_len": 4,
-    },
-    "cost_aware_v1_spec8_incr8": {
-        "frontier_mode": "cost_aware",
         "spec_len": 8,
-        "lowconf_threshold": 0.60,
+        "lowconf_threshold": 0.45,
         "incr_len": 8,
     },
-    "cost_aware_v1_spec8_incr10": {
-        "frontier_mode": "cost_aware",
-        "spec_len": 8,
-        "lowconf_threshold": 0.60,
-        "incr_len": 10,
-    },
-    "cost_aware_v1_spec8": {
-        "frontier_mode": "cost_aware",
+    "cost_aware_v2_lowconf_0p60": {
+        "frontier_mode": "cost_aware_v2",
         "spec_len": 8,
         "lowconf_threshold": 0.60,
         "incr_len": 8,
@@ -65,8 +54,11 @@ def parse_args():
     parser.add_argument("--frontier_min_steps", type=int, default=2)
     parser.add_argument("--frontier_patience", type=int, default=2)
     parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
-    parser.add_argument("--frontier_v2_min_expected_output", type=float, default=7.0)
     parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
+    parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
+    parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
+    parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
+    parser.add_argument("--frontier_v2_min_calibration_tokens", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir")
     parser.add_argument("--log_level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
@@ -74,7 +66,11 @@ def parse_args():
     args = parser.parse_args()
     if args.candidate and args.candidates:
         parser.error("use either --candidate or --candidates, not both")
-    args.candidates = args.candidates or ([args.candidate] if args.candidate else ["cost_aware_v2"])
+    args.candidates = args.candidates or (
+        [args.candidate]
+        if args.candidate
+        else ["cost_aware_v2_lowconf_0p45", "cost_aware_v2_lowconf_0p60"]
+    )
     args.candidate = None
     if args.output_dir is None:
         candidate_label = "_vs_".join(args.candidates)
@@ -89,10 +85,16 @@ def validate_args(args):
         raise ValueError("--warmup_questions must be at least 1 for latency calibration")
     if args.max_new_tokens <= 0:
         raise ValueError("--max_new_tokens must be positive")
-    if args.frontier_v2_min_expected_output <= 1:
-        raise ValueError("--frontier_v2_min_expected_output must be greater than 1")
     if not 0 <= args.frontier_v2_hysteresis < 1:
         raise ValueError("--frontier_v2_hysteresis must be in [0, 1)")
+    if args.frontier_v2_hazard_prior_strength <= 0:
+        raise ValueError("--frontier_v2_hazard_prior_strength must be positive")
+    if args.frontier_v2_extension_prior_strength <= 0:
+        raise ValueError("--frontier_v2_extension_prior_strength must be positive")
+    if args.frontier_v2_min_hazard_observations <= 0:
+        raise ValueError("--frontier_v2_min_hazard_observations must be positive")
+    if args.frontier_v2_min_calibration_tokens <= 0:
+        raise ValueError("--frontier_v2_min_calibration_tokens must be positive")
     if len(args.candidates) != len(set(args.candidates)):
         raise ValueError("--candidates must not contain duplicates")
 
@@ -118,8 +120,11 @@ def run_metadata(args, dataset, method):
         "frontier_min_steps": args.frontier_min_steps,
         "frontier_patience": args.frontier_patience,
         "frontier_cost_token_equiv": args.frontier_cost_token_equiv,
-        "frontier_v2_min_expected_output": args.frontier_v2_min_expected_output,
         "frontier_v2_hysteresis": args.frontier_v2_hysteresis,
+        "frontier_v2_hazard_prior_strength": args.frontier_v2_hazard_prior_strength,
+        "frontier_v2_extension_prior_strength": args.frontier_v2_extension_prior_strength,
+        "frontier_v2_min_hazard_observations": args.frontier_v2_min_hazard_observations,
+        "frontier_v2_min_calibration_tokens": args.frontier_v2_min_calibration_tokens,
         "seed": args.seed,
         "method_config": METHODS[method],
     }
@@ -177,8 +182,17 @@ def run_method(args, dataset, method):
     ):
         print(f"RESUME {dataset} | {method}", flush=True)
     else:
-        if result_path.exists():
-            result_path.unlink()
+        for filename in (
+            "benchmark_results.csv",
+            "frontier_round_diagnostics.csv",
+            "frontier_extension_diagnostics.csv",
+            "frontier_gain_diagnostics.csv",
+            "frontier_v2_runtime_state.json",
+            "run_metadata.json",
+        ):
+            path = output_dir / filename
+            if path.exists():
+                path.unlink()
         command = [
             sys.executable,
             "-u",
@@ -203,8 +217,11 @@ def run_method(args, dataset, method):
             "--frontier_min_steps", str(args.frontier_min_steps),
             "--frontier_patience", str(args.frontier_patience),
             "--frontier_cost_token_equiv", str(args.frontier_cost_token_equiv),
-            "--frontier_v2_min_expected_output", str(args.frontier_v2_min_expected_output),
             "--frontier_v2_hysteresis", str(args.frontier_v2_hysteresis),
+            "--frontier_v2_hazard_prior_strength", str(args.frontier_v2_hazard_prior_strength),
+            "--frontier_v2_extension_prior_strength", str(args.frontier_v2_extension_prior_strength),
+            "--frontier_v2_min_hazard_observations", str(args.frontier_v2_min_hazard_observations),
+            "--frontier_v2_min_calibration_tokens", str(args.frontier_v2_min_calibration_tokens),
             "--seed", str(args.seed),
             "--quiet_generation",
             "--disable_progress",
@@ -248,27 +265,44 @@ def safe_ratio(numerator, denominator):
 
 
 def aggregate_method(group):
+    def numeric_sum(column):
+        if column not in group:
+            return 0.0
+        return pd.to_numeric(group[column], errors="coerce").sum()
+
     output_tokens = pd.to_numeric(group["output_tokens"], errors="coerce").sum()
-    draft_time = pd.to_numeric(group["actual_draft_time"], errors="coerce").sum()
-    verify_time = pd.to_numeric(group["actual_verify_time"], errors="coerce").sum()
-    controller_time = pd.to_numeric(group["actual_post_verify_time"], errors="coerce").sum()
+    draft_time = numeric_sum("actual_draft_time")
+    verify_time = numeric_sum("actual_verify_time")
+    controller_time = numeric_sum("actual_post_verify_time")
     total_time = draft_time + verify_time + controller_time
+    theoretical_time = numeric_sum("theo_total_time")
     drafted_tokens = pd.to_numeric(group["drafted_tokens"], errors="coerce").sum()
     accepted_tokens = pd.to_numeric(group["accepted_tokens"], errors="coerce").sum()
     rounds = pd.to_numeric(group["num_speculation_rounds"], errors="coerce").sum()
     passes = pd.to_numeric(group["total_num_forward_passes"], errors="coerce").sum()
     extend_actions = pd.to_numeric(group["frontier_v2_extend_actions"], errors="coerce").sum()
     verify_actions = pd.to_numeric(group["frontier_v2_verify_actions"], errors="coerce").sum()
+    refinement_stops = numeric_sum("frontier_v2_refinement_stop_actions")
+    extension_stops = numeric_sum("frontier_v2_extension_stop_actions")
+    fallback_steps = numeric_sum("frontier_v2_fallback_steps")
+    hazard_ready_steps = numeric_sum("frontier_v2_hazard_ready_steps")
+    extension_ready_steps = numeric_sum("frontier_v2_extension_history_ready_steps")
     fill_passes = pd.to_numeric(group["frontier_fill_forward_passes"], errors="coerce").sum()
     denoising_passes = pd.to_numeric(group["frontier_denoising_forward_passes"], errors="coerce").sum()
     return {
         "num_samples": len(group),
         "output_tokens": output_tokens,
         "actual_measured_time_s": total_time,
+        "actual_draft_time_s": draft_time,
+        "actual_verify_time_s": verify_time,
+        "actual_controller_time_s": controller_time,
         "actual_measured_ms_per_output_token": safe_ratio(1000.0 * total_time, output_tokens),
+        "output_tokens_per_second": safe_ratio(output_tokens, total_time),
         "actual_draft_ms_per_output_token": safe_ratio(1000.0 * draft_time, output_tokens),
         "actual_verify_ms_per_output_token": safe_ratio(1000.0 * verify_time, output_tokens),
         "actual_controller_ms_per_output_token": safe_ratio(1000.0 * controller_time, output_tokens),
+        "theoretical_time_ms": theoretical_time,
+        "theoretical_ms_per_output_token": safe_ratio(theoretical_time, output_tokens),
         "acceptance_rate_percent": safe_ratio(100.0 * accepted_tokens, drafted_tokens),
         "drafted_tokens_per_round": safe_ratio(drafted_tokens, rounds),
         "accepted_tokens_per_round": safe_ratio(accepted_tokens, rounds),
@@ -277,6 +311,14 @@ def aggregate_method(group):
         "verifier_rounds_per_100_output_tokens": safe_ratio(100.0 * rounds, output_tokens),
         "frontier_v2_extend_actions_per_100_rounds": safe_ratio(100.0 * extend_actions, rounds),
         "frontier_v2_verify_actions_per_100_rounds": safe_ratio(100.0 * verify_actions, rounds),
+        "frontier_v2_refinement_stops_per_100_rounds": safe_ratio(100.0 * refinement_stops, rounds),
+        "frontier_v2_extension_stops_per_100_rounds": safe_ratio(100.0 * extension_stops, rounds),
+        "frontier_v2_fallback_steps": fallback_steps,
+        "frontier_v2_hazard_ready_steps": hazard_ready_steps,
+        "frontier_v2_extension_history_ready_steps": extension_ready_steps,
+        "frontier_v2_predicted_extension_gain_mean": pd.to_numeric(
+            group.get("frontier_v2_predicted_extension_gain_mean"), errors="coerce"
+        ).replace(0.0, math.nan).mean(),
         "frontier_fill_passes_per_100_output_tokens": safe_ratio(100.0 * fill_passes, output_tokens),
         "frontier_denoising_passes_per_100_output_tokens": safe_ratio(100.0 * denoising_passes, output_tokens),
         "frontier_expected_output_mean": pd.to_numeric(group["frontier_expected_output_mean"], errors="coerce").mean(),
@@ -309,6 +351,12 @@ def build_paired_observations(rows, candidate_method):
         "total_num_forward_passes",
         "frontier_v2_extend_actions",
         "frontier_v2_verify_actions",
+        "frontier_v2_refinement_stop_actions",
+        "frontier_v2_extension_stop_actions",
+        "frontier_v2_fallback_steps",
+        "frontier_v2_hazard_ready_steps",
+        "frontier_v2_extension_history_ready_steps",
+        "frontier_v2_predicted_extension_gain_mean",
         "frontier_fill_forward_passes",
         "frontier_denoising_forward_passes",
         "frontier_expected_output_mean",
@@ -352,16 +400,35 @@ def build_comparison_summary(dataset_summary, paired, candidate_method):
                 baseline["actual_measured_ms_per_output_token"],
                 candidate["actual_measured_ms_per_output_token"],
             ),
+            "candidate_theoretical_speedup_vs_failfast": safe_ratio(
+                baseline["theoretical_ms_per_output_token"],
+                candidate["theoretical_ms_per_output_token"],
+            ),
             "candidate_win_rate_percent": 100.0 * (observations["candidate_ms_per_output_token_delta"] < 0).mean(),
             "output_match_rate_percent": 100.0 * observations["output_matches_failfast"].mean(),
             "failfast_ms_per_output_token": baseline["actual_measured_ms_per_output_token"],
             "candidate_ms_per_output_token": candidate["actual_measured_ms_per_output_token"],
+            "failfast_output_tokens_per_second": baseline["output_tokens_per_second"],
+            "candidate_output_tokens_per_second": candidate["output_tokens_per_second"],
+            "failfast_draft_ms_per_output_token": baseline["actual_draft_ms_per_output_token"],
+            "candidate_draft_ms_per_output_token": candidate["actual_draft_ms_per_output_token"],
+            "failfast_verify_ms_per_output_token": baseline["actual_verify_ms_per_output_token"],
+            "candidate_verify_ms_per_output_token": candidate["actual_verify_ms_per_output_token"],
+            "failfast_controller_ms_per_output_token": baseline["actual_controller_ms_per_output_token"],
+            "candidate_controller_ms_per_output_token": candidate["actual_controller_ms_per_output_token"],
             "failfast_verifier_rounds_per_100_tokens": baseline["verifier_rounds_per_100_output_tokens"],
             "candidate_verifier_rounds_per_100_tokens": candidate["verifier_rounds_per_100_output_tokens"],
             "failfast_output_tokens_per_round": baseline["output_tokens_per_round"],
             "candidate_output_tokens_per_round": candidate["output_tokens_per_round"],
             "failfast_acceptance_rate_percent": baseline["acceptance_rate_percent"],
             "candidate_acceptance_rate_percent": candidate["acceptance_rate_percent"],
+            "failfast_draft_passes_per_100_tokens": baseline["draft_forward_passes_per_100_output_tokens"],
+            "candidate_draft_passes_per_100_tokens": candidate["draft_forward_passes_per_100_output_tokens"],
+            "candidate_v2_extend_actions_per_100_rounds": candidate["frontier_v2_extend_actions_per_100_rounds"],
+            "candidate_v2_refinement_stops_per_100_rounds": candidate["frontier_v2_refinement_stops_per_100_rounds"],
+            "candidate_v2_extension_stops_per_100_rounds": candidate["frontier_v2_extension_stops_per_100_rounds"],
+            "failfast_accuracy_percent": baseline["parsed_accuracy_percent"],
+            "candidate_accuracy_percent": candidate["parsed_accuracy_percent"],
         })
     summary = pd.DataFrame(records)
     failfast = dataset_summary[dataset_summary["method"] == "failfast"]
@@ -388,6 +455,82 @@ def build_comparison_summary(dataset_summary, paired, candidate_method):
     return summary, overall
 
 
+def build_threshold_comparison(rows):
+    low = rows[rows["method"] == "cost_aware_v2_lowconf_0p45"].copy()
+    high = rows[rows["method"] == "cost_aware_v2_lowconf_0p60"].copy()
+    columns = [
+        "dataset",
+        "problem_id",
+        "actual_measured_time",
+        "actual_measured_ms_per_output_token",
+        "actual_draft_time",
+        "actual_verify_time",
+        "actual_post_verify_time",
+        "output_tokens",
+        "num_speculation_rounds",
+        "total_num_forward_passes",
+        "accepted_tokens",
+        "drafted_tokens",
+        "output_token_hash",
+    ]
+    low = low[columns].rename(columns={
+        column: f"lowconf_0p45_{column}"
+        for column in columns
+        if column not in ("dataset", "problem_id")
+    })
+    high = high[columns].rename(columns={
+        column: f"lowconf_0p60_{column}"
+        for column in columns
+        if column not in ("dataset", "problem_id")
+    })
+    paired = low.merge(high, on=["dataset", "problem_id"], validate="one_to_one")
+    paired["speedup_0p60_vs_0p45"] = (
+        paired["lowconf_0p45_actual_measured_ms_per_output_token"]
+        / paired["lowconf_0p60_actual_measured_ms_per_output_token"]
+    )
+    paired["lowconf_0p60_faster"] = (
+        paired["lowconf_0p60_actual_measured_ms_per_output_token"]
+        < paired["lowconf_0p45_actual_measured_ms_per_output_token"]
+    )
+    paired["output_matches"] = (
+        paired["lowconf_0p45_output_token_hash"]
+        == paired["lowconf_0p60_output_token_hash"]
+    )
+    records = []
+    for dataset, group in paired.groupby("dataset", sort=False):
+        low_time = pd.to_numeric(group["lowconf_0p45_actual_measured_time"], errors="coerce").sum()
+        high_time = pd.to_numeric(group["lowconf_0p60_actual_measured_time"], errors="coerce").sum()
+        low_tokens = pd.to_numeric(group["lowconf_0p45_output_tokens"], errors="coerce").sum()
+        high_tokens = pd.to_numeric(group["lowconf_0p60_output_tokens"], errors="coerce").sum()
+        records.append({
+            "dataset": dataset,
+            "num_samples": len(group),
+            "pooled_speedup_0p60_vs_0p45": safe_ratio(
+                safe_ratio(1000.0 * low_time, low_tokens),
+                safe_ratio(1000.0 * high_time, high_tokens),
+            ),
+            "paired_0p60_win_rate_percent": 100.0 * group["lowconf_0p60_faster"].mean(),
+            "output_match_rate_percent": 100.0 * group["output_matches"].mean(),
+        })
+    return paired, pd.DataFrame(records)
+
+
+def collect_frontier_diagnostics(output_dir, datasets, methods, filename):
+    frames = []
+    for dataset in datasets:
+        for method in methods:
+            path = output_dir / "raw" / dataset / method / filename
+            if not path.exists():
+                continue
+            frame = pd.read_csv(path)
+            if frame.empty:
+                continue
+            frame["dataset"] = dataset
+            frame["method"] = method
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+
 def write_manifest(args, output_dir):
     try:
         commit = subprocess.check_output(
@@ -407,6 +550,9 @@ def write_manifest(args, output_dir):
         "primary_metric": "measured milliseconds per output token",
         "time_formula": "actual_draft_time + actual_verify_time + actual_post_verify_time",
         "comparison": f"{', '.join(args.candidates)} versus FailFast",
+        "v2_controller": "conditional token hazards plus extension-offset hazards",
+        "v2_latency_model": "measured EMA lookup by context-length and proposal-length bins",
+        "v2_fallback": "FailFast until online hazard history is sufficient",
         "target_decoding": "greedy",
         "macro_speedup": "arithmetic mean of per-dataset candidate speedups versus FailFast",
         "pooled_speedup": "ratio of total FailFast milliseconds/output-token to total candidate milliseconds/output-token",
@@ -446,17 +592,50 @@ def main():
     paired = pd.concat(paired_frames, ignore_index=True, sort=False)
     comparison = pd.concat(comparison_frames, ignore_index=True, sort=False)
     overall = pd.concat(overall_frames, ignore_index=True, sort=False)
+    threshold_paired, threshold_summary = build_threshold_comparison(rows)
+    round_diagnostics = collect_frontier_diagnostics(
+        output_dir,
+        args.datasets,
+        args.candidates,
+        "frontier_round_diagnostics.csv",
+    )
+    extension_diagnostics = collect_frontier_diagnostics(
+        output_dir,
+        args.datasets,
+        args.candidates,
+        "frontier_extension_diagnostics.csv",
+    )
+    gain_diagnostics = collect_frontier_diagnostics(
+        output_dir,
+        args.datasets,
+        args.candidates,
+        "frontier_gain_diagnostics.csv",
+    )
     rows.to_csv(output_dir / "per_observation.csv", index=False)
     dataset_summary.to_csv(output_dir / "dataset_method_summary.csv", index=False)
     paired.to_csv(output_dir / "paired_observations.csv", index=False)
     comparison.to_csv(output_dir / "dataset_comparison.csv", index=False)
     overall.to_csv(output_dir / "overall_comparison.csv", index=False)
+    threshold_paired.to_csv(output_dir / "paired_v2_threshold_observations.csv", index=False)
+    threshold_summary.to_csv(output_dir / "v2_threshold_comparison.csv", index=False)
+    round_diagnostics.to_csv(output_dir / "all_frontier_round_diagnostics.csv", index=False)
+    extension_diagnostics.to_csv(output_dir / "all_frontier_extension_diagnostics.csv", index=False)
+    gain_diagnostics.to_csv(output_dir / "all_frontier_gain_diagnostics.csv", index=False)
     write_manifest(args, output_dir)
+    archive_path = shutil.make_archive(
+        str(output_dir),
+        "zip",
+        root_dir=output_dir.parent,
+        base_dir=output_dir.name,
+    )
     print("\nDATASET COMPARISON")
     print(comparison.to_string(index=False))
     print("\nOVERALL COMPARISON")
     print(overall.to_string(index=False))
+    print("\nV2 THRESHOLD COMPARISON")
+    print(threshold_summary.to_string(index=False))
     print(f"\nSaved report: {output_dir}")
+    print(f"Saved archive: {archive_path}")
 
 
 if __name__ == "__main__":

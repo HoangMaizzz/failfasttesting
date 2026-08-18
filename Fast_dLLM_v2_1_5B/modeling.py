@@ -1257,18 +1257,149 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     event["predicted_extension_gain_by_variant"] = predicted_gain_by_variant
             frontier_stats["extension_events"].append(event)
 
-        def v2_latency_estimates():
+        def v2_position_bin(position):
+            if position < 2:
+                return "0-1"
+            if position < 4:
+                return "2-3"
+            if position < 8:
+                return "4-7"
+            return "8+"
+
+        def v2_length_bin(length):
+            return str(max(1, (int(length) + 7) // 8))
+
+        def v2_context_bin(context_len):
+            return str(max(0, int(context_len) // 256))
+
+        def v2_posterior(table, key, prior, prior_strength, min_observations):
+            accepted, total = table.get(key, (0.0, 0.0))
+            total = float(total)
+            if total < min_observations:
+                return None
+            probability = (float(accepted) + prior_strength * prior) / (total + prior_strength)
+            return max(0.02, min(0.98, probability))
+
+        def v2_token_hazard(confidence, margin, position):
+            raw_probability = max(0.02, min(0.98, float(confidence)))
+            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
+            min_observations = int(getattr(args, "frontier_v2_min_hazard_observations", 8))
+            prior_strength = float(getattr(args, "frontier_v2_hazard_prior_strength", 8.0))
+            confidence_key = frontier_bin(confidence)
+            margin_key = frontier_bin(margin)
+            position_key = v2_position_bin(position)
+            candidates = (
+                (
+                    "token_position_confidence_margin",
+                    f"{position_key}:{confidence_key}:{margin_key}",
+                ),
+                ("token_confidence_margin", f"{confidence_key}:{margin_key}"),
+                ("token_position_confidence", f"{position_key}:{confidence_key}"),
+                ("token_confidence", confidence_key),
+            )
+            for table_name, key in candidates:
+                probability = v2_posterior(
+                    calibration.get(table_name, {}),
+                    key,
+                    raw_probability,
+                    prior_strength,
+                    min_observations,
+                )
+                if probability is not None:
+                    return probability
+            return raw_probability
+
+        def v2_expected_prefix_score(confidences, margins):
+            probabilities = [
+                v2_token_hazard(confidence, margin, position)
+                for position, (confidence, margin) in enumerate(zip(confidences, margins))
+            ]
+            score = 0.0
+            survival = 1.0
+            for probability in probabilities:
+                survival *= probability
+                score += survival
+            return score, probabilities
+
+        def v2_calibration_ready():
+            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
+            total = int(calibration.get("total_checked_tokens", 0))
+            required = int(getattr(args, "frontier_v2_min_calibration_tokens", 64))
+            return total >= required, total
+
+        def v2_extension_hazards(from_len, extension):
+            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
+            min_observations = int(getattr(args, "frontier_v2_min_hazard_observations", 8))
+            prior_strength = float(getattr(args, "frontier_v2_extension_prior_strength", 2.0))
+            block_key = v2_length_bin(from_len)
+            hazards = []
+            for offset in range(1, extension + 1):
+                probability = v2_posterior(
+                    calibration.get("extension_block_offset", {}),
+                    f"{block_key}:{offset}",
+                    0.5,
+                    prior_strength,
+                    min_observations,
+                )
+                if probability is None:
+                    probability = v2_posterior(
+                        calibration.get("extension_offset", {}),
+                        str(offset),
+                        0.5,
+                        prior_strength,
+                        min_observations,
+                    )
+                if probability is None:
+                    return None
+                hazards.append(probability)
+            return hazards
+
+        def v2_nearest_latency(table, context_len, proposal_len=None):
+            if not table:
+                return None
+            context_index = int(v2_context_bin(context_len))
+            proposal_index = int(v2_length_bin(proposal_len)) if proposal_len is not None else None
+            best = None
+            for key, value in table.items():
+                parts = str(key).split(":")
+                key_context = int(parts[0])
+                key_proposal = int(parts[1]) if len(parts) > 1 else None
+                distance = abs(key_context - context_index) * 4
+                if proposal_index is not None and key_proposal is not None:
+                    distance += abs(key_proposal - proposal_index)
+                latency = float(value[0])
+                count = int(value[1])
+                candidate = (distance, -count, latency)
+                if best is None or candidate < best:
+                    best = candidate
+            return None if best is None else best[2]
+
+        def v2_latency_estimates(proposal_len):
             recent_forward_ms = forward_pass_latencies[-1] if forward_pass_latencies else 6.1
-            draft_forward_ms = float(getattr(args, "frontier_ema_dllm_forward_ms", None) or recent_forward_ms)
-            verify_round_ms = getattr(args, "frontier_ema_target_round_ms", None)
-            if verify_round_ms is None and args is not None:
-                latency = getattr(args, "latency", {}).get("vLLM_A6000", {})
-                target_tpt = latency.get("target_tpt", {})
-                verify_round_ms = target_tpt.get(getattr(args, "target_model_name_clean", ""))
+            context_len = int(getattr(args, "frontier_current_context_len", input_ids.shape[1]))
+            draft_forward_ms = v2_nearest_latency(
+                getattr(args, "frontier_v2_draft_latency_bins", {}),
+                context_len,
+            )
+            if draft_forward_ms is None:
+                draft_forward_ms = float(
+                    getattr(args, "frontier_ema_dllm_forward_ms", None) or recent_forward_ms
+                )
+            verify_round_ms = v2_nearest_latency(
+                getattr(args, "frontier_v2_verify_latency_bins", {}),
+                context_len,
+                proposal_len,
+            )
+            if verify_round_ms is None:
+                verify_round_ms = getattr(args, "frontier_ema_target_round_ms", None)
             if verify_round_ms is None:
                 verify_round_ms = max(draft_forward_ms, 13.5)
             controller_ms = float(getattr(args, "frontier_ema_controller_ms", None) or 0.0)
-            return max(draft_forward_ms, 1e-6), max(float(verify_round_ms), 1e-6), max(controller_ms, 0.0)
+            return (
+                max(float(draft_forward_ms), 1e-6),
+                max(float(verify_round_ms), 1e-6),
+                max(controller_ms, 0.0),
+            )
         
         if input_ids.shape[1] > block_size:
             if prev_prefill_output is not None and prev_prefill_output.logits.shape[1] == (input_ids.shape[1] // block_size * block_size):
@@ -1465,6 +1596,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 margins,
                                 forced_flags,
                             )
+                            v2_ready, v2_calibration_tokens = v2_calibration_ready()
+                            if frontier_mode == "cost_aware_v2":
+                                frontier_score, accept_probabilities = v2_expected_prefix_score(
+                                    confidences,
+                                    margins,
+                                )
                             if frontier_k >= target_len:
                                 frontier_confidence = None
                                 frontier_recoverable = False
@@ -1491,6 +1628,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "expected_accept_prob_frontier": None if frontier_k >= target_len else float(accept_probabilities[frontier_k]),
                                 "unmasked_this_step": unmasked_this_step,
                                 "masks_remaining": masks_remaining,
+                                "v2_hazard_ready": bool(v2_ready),
+                                "v2_calibration_tokens": int(v2_calibration_tokens),
                             }
                             frontier_stats["steps"].append(step_record)
                             frontier_stats["final_frontier_score"] = float(frontier_score)
@@ -1531,11 +1670,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     if predicted_gain <= cost_token_equiv:
                                         stop_reason = "cost_aware_low_expected_gain"
                             elif len(frontier_scores) >= min_steps and frontier_mode == "cost_aware_v2":
-                                draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates()
+                                draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
                                 expected_output = 1.0 + float(frontier_score)
                                 hysteresis = float(getattr(args, "frontier_v2_hysteresis", 0.03))
-                                min_expected_output = float(getattr(args, "frontier_v2_min_expected_output", 7.0))
                                 stop_fill_ms = draft_forward_ms if masks_remaining > 0 else 0.0
                                 stop_ms_per_output = (
                                     elapsed_draft_ms + stop_fill_ms + verify_round_ms + controller_ms
@@ -1546,15 +1684,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "v2_verify_round_ms": verify_round_ms,
                                     "v2_controller_ms": controller_ms,
                                     "v2_stop_ms_per_output": stop_ms_per_output,
+                                    "v2_fallback": not v2_ready,
                                 })
 
-                                if masks_remaining > 0:
+                                if v2_ready and masks_remaining > 0 and predicted_gain is not None:
                                     expected_unmask = max(
                                         1.0,
-                                        sum(frontier_recent_unmasked[-patience:]) / max(1, len(frontier_recent_unmasked[-patience:])),
+                                        sum(frontier_recent_unmasked[-patience:])
+                                        / max(1, len(frontier_recent_unmasked[-patience:])),
                                     )
                                     next_fill_ms = draft_forward_ms if masks_remaining > expected_unmask else 0.0
-                                    next_expected_output = expected_output + float(predicted_gain or 0.0)
+                                    next_expected_output = expected_output + float(predicted_gain)
                                     continue_ms_per_output = (
                                         elapsed_draft_ms
                                         + draft_forward_ms
@@ -1563,55 +1703,73 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         + controller_ms
                                     ) / max(next_expected_output, 1e-6)
                                     step_record["v2_continue_ms_per_output"] = continue_ms_per_output
-                                    must_refine = expected_output < min_expected_output and frontier_recoverable
-                                    if not must_refine and continue_ms_per_output >= stop_ms_per_output * (1.0 - hysteresis):
+                                    if continue_ms_per_output >= stop_ms_per_output * (1.0 - hysteresis):
                                         stop_reason = "cost_aware_v2_verify_lower_cost"
-                                else:
+                                elif v2_ready and masks_remaining == 0 and frontier_k >= target_len:
                                     extension = min(incr_len, max_spec_len - spec_len)
-                                    survival = 1.0
-                                    for accept_probability in accept_probabilities:
-                                        survival *= accept_probability
-                                    extension_probability = calibration_prior_probability()
-                                    extension_gain = 0.0
-                                    for offset in range(1, extension + 1):
-                                        extension_gain += survival * (extension_probability ** offset)
-                                    denoising_passes = frontier_stats["forward_pass_breakdown"]["denoising"]
-                                    estimated_extension_passes = max(
-                                        1.0,
-                                        extension * denoising_passes / max(target_len, 1),
-                                    ) if extension > 0 else 0.0
-                                    extend_ms_per_output = (
-                                        elapsed_draft_ms
-                                        + estimated_extension_passes * draft_forward_ms
-                                        + verify_round_ms
-                                        + controller_ms
-                                    ) / max(expected_output + extension_gain, 1e-6) if extension > 0 else float("inf")
-                                    step_record.update({
-                                        "v2_extension_size": int(extension),
-                                        "v2_extension_gain": float(extension_gain),
-                                        "v2_extend_ms_per_output": float(extend_ms_per_output),
-                                    })
-                                    must_extend = expected_output < min_expected_output and extension_gain >= 0.25
-                                    if extension > 0 and (
-                                        must_extend
-                                        or extend_ms_per_output < stop_ms_per_output * (1.0 - hysteresis)
-                                    ):
-                                        frontier_force_extend = True
-                                        frontier_stats["refinement_actions"].append({
-                                            "step": len(frontier_scores),
-                                            "action": "cost_aware_v2_extend",
-                                            "target_len": target_len,
-                                            "masks_remaining": masks_remaining,
-                                            "extension": int(extension),
+                                    extension_hazards = v2_extension_hazards(target_len, extension)
+                                    step_record["v2_extension_history_ready"] = extension_hazards is not None
+                                    if extension <= 0:
+                                        stop_reason = "cost_aware_v2_max_spec_len"
+                                    elif extension_hazards is not None:
+                                        prefix_survival = 1.0
+                                        for probability in accept_probabilities:
+                                            prefix_survival *= probability
+                                        extension_gain = 0.0
+                                        extension_survival = 1.0
+                                        for probability in extension_hazards:
+                                            extension_survival *= probability
+                                            extension_gain += prefix_survival * extension_survival
+                                        blocks_generated = max(
+                                            1,
+                                            (target_len + small_block_size - 1) // small_block_size,
+                                        )
+                                        extension_blocks = max(
+                                            1,
+                                            (extension + small_block_size - 1) // small_block_size,
+                                        )
+                                        denoising_passes = frontier_stats["forward_pass_breakdown"]["denoising"]
+                                        estimated_extension_passes = max(
+                                            1.0,
+                                            denoising_passes * extension_blocks / blocks_generated,
+                                        )
+                                        _, extended_verify_ms, _ = v2_latency_estimates(target_len + extension)
+                                        extend_ms_per_output = (
+                                            elapsed_draft_ms
+                                            + estimated_extension_passes * draft_forward_ms
+                                            + extended_verify_ms
+                                            + controller_ms
+                                        ) / max(expected_output + extension_gain, 1e-6)
+                                        step_record.update({
+                                            "v2_extension_size": int(extension),
+                                            "v2_extension_hazards": list(extension_hazards),
+                                            "v2_prefix_survival": float(prefix_survival),
+                                            "v2_extension_gain": float(extension_gain),
+                                            "v2_extend_ms_per_output": float(extend_ms_per_output),
+                                            "v2_extended_verify_round_ms": float(extended_verify_ms),
                                         })
-                                    else:
-                                        stop_reason = "cost_aware_v2_verify_lower_cost"
+                                        if extend_ms_per_output < stop_ms_per_output * (1.0 - hysteresis):
+                                            frontier_force_extend = True
+                                            frontier_stats["refinement_actions"].append({
+                                                "step": len(frontier_scores),
+                                                "action": "cost_aware_v2_extend",
+                                                "phase": "extension",
+                                                "target_len": target_len,
+                                                "masks_remaining": masks_remaining,
+                                                "extension": int(extension),
+                                                "predicted_extension_gain": float(extension_gain),
+                                                "stop_ms_per_output": float(stop_ms_per_output),
+                                                "extend_ms_per_output": float(extend_ms_per_output),
+                                            })
+                                        else:
+                                            stop_reason = "cost_aware_v2_verify_lower_cost"
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
                                 frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode == "cost_aware_v2"
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),
                                     "action": stop_reason,
+                                    "phase": "extension" if masks_remaining == 0 else "refinement",
                                     "target_len": target_len,
                                     "masks_remaining": masks_remaining,
                                 })
