@@ -1620,7 +1620,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # record the confidence of already-unmasked tokens
                         conf_of_unmasked_tokens.extend(x1_p[x1_p != -torch.inf].float().cpu().numpy().tolist())  # FIXME TODO(ruipan): n=5, small blk size 8 -- might include non-drafted tokens?!
 
-                        unmask_idx = (x1_p > threshold)
+                        threshold_free_refinement = (
+                            is_drafter
+                            and frontier_mode == "cost_aware_v2_refinement_no_threshold"
+                        )
+                        if threshold_free_refinement:
+                            unmask_idx = torch.zeros_like(x1_p, dtype=torch.bool)
+                        else:
+                            unmask_idx = (x1_p > threshold)
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
                         unmask_idx = unmask_idx & mask_idx[:, start:end]  # only allowed to update MASK tokens
@@ -1643,7 +1650,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     committed_confidences[int(absolute_pos)] = float(x1_p[batch_idx, local_idx].float().item())
                                     committed_margins[int(absolute_pos)] = float(x1_margin[batch_idx, local_idx].float().item())
-                                    committed_forced[int(absolute_pos)] = bool(x1_p[batch_idx, local_idx].float().item() <= threshold)
+                                    committed_forced[int(absolute_pos)] = bool(
+                                        threshold_free_refinement
+                                        or x1_p[batch_idx, local_idx].float().item() <= threshold
+                                    )
 
                             for local_idx in range(x1_p.shape[1]):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
@@ -1690,7 +1700,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 forced_flags,
                             )
                             v2_ready, v2_calibration_tokens = v2_calibration_ready()
-                            if frontier_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only"):
+                            if frontier_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only", "cost_aware_v2_refinement_no_threshold"):
                                 frontier_score, accept_probabilities = v2_expected_prefix_score(
                                     confidences,
                                     margins,
@@ -1765,6 +1775,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             elif len(frontier_scores) >= min_steps and frontier_mode in (
                                 "cost_aware_v2",
                                 "cost_aware_v2_refinement_only",
+                                "cost_aware_v2_refinement_no_threshold",
                             ):
                                 draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
@@ -1927,6 +1938,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode in (
                                     "cost_aware_v2",
                                     "cost_aware_v2_refinement_only",
+                                    "cost_aware_v2_refinement_no_threshold",
                                 )
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),

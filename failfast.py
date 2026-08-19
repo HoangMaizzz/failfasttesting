@@ -375,7 +375,7 @@ parser.add_argument("--log_level", type=str, default="DEBUG", choices=["DEBUG", 
 parser.add_argument("--sweep_lowconf_threshold", type=float, nargs="+", default=[0.45])
 parser.add_argument("--sweep_max_spec_len", type=int, nargs="+", default=[60])
 parser.add_argument("--sweep_incr_len", type=int, nargs="+", default=[10])
-parser.add_argument("--frontier_stop_mode", type=str, default="disabled", choices=["disabled", "mask_efficiency", "frontier", "cost_aware", "cost_aware_no_extend", "cost_aware_v2", "cost_aware_v2_refinement_only"])
+parser.add_argument("--frontier_stop_mode", type=str, default="disabled", choices=["disabled", "mask_efficiency", "frontier", "cost_aware", "cost_aware_no_extend", "cost_aware_v2", "cost_aware_v2_refinement_only", "cost_aware_v2_refinement_no_threshold"])
 parser.add_argument("--frontier_min_steps", type=int, default=2)
 parser.add_argument("--frontier_patience", type=int, default=2)
 parser.add_argument("--frontier_gain_epsilon", type=float, default=0.0)
@@ -1441,6 +1441,7 @@ for problem_id, is_warmup in tqdm(
             preserve_hardware_latency=args.frontier_stop_mode in (
                 "cost_aware_v2",
                 "cost_aware_v2_refinement_only",
+                "cost_aware_v2_refinement_no_threshold",
             ),
         )
         measured_run_started = True
@@ -1971,7 +1972,7 @@ for problem_id, is_warmup in tqdm(
     if not is_warmup:
         append_benchmark_rows(args, problem_benchmark_rows)
 
-if args.frontier_stop_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only"):
+if args.frontier_stop_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only", "cost_aware_v2_refinement_no_threshold"):
     ensure_frontier_runtime_state(args)
     runtime_report = {
         "hazard_calibration": args.frontier_v2_hazard_calibration,
