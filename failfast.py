@@ -258,7 +258,11 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
     args.frontier_current_context_len = int(new_model_inputs['input_ids'].shape[1])
-    return_frontier_stats = frontier_stop_enabled(args) or getattr(args, "collect_draft_diagnostics", False)
+    return_frontier_stats = (
+        frontier_stop_enabled(args)
+        or getattr(args, "collect_draft_diagnostics", False)
+        or getattr(args, "collect_oracle_refinement", False)
+    )
     frontier_stats = None
 
     if args.disable_reusing_drafter_kvs:
@@ -397,6 +401,7 @@ parser.add_argument("--frontier_calibration_prior", type=float, default=0.5)
 parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.0)
 parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
+parser.add_argument("--collect_oracle_refinement", action="store_true")
 parser.add_argument("--quiet_generation", action="store_true")
 parser.add_argument("--disable_progress", action="store_true")
 parser.add_argument("--skip_artifacts", action="store_true")
@@ -564,6 +569,27 @@ FRONTIER_GAIN_DIAGNOSTIC_COLUMNS = [
     "predicted_next_gain",
     "actual_next_gain",
     "prediction_error",
+]
+
+FRONTIER_ORACLE_REFINEMENT_COLUMNS = [
+    "problem_id",
+    "mode",
+    "round_id",
+    "step",
+    "target_len",
+    "draft_passes_elapsed",
+    "draft_latency_elapsed_ms",
+    "masks_remaining",
+    "committed_tokens",
+    "filled_tokens",
+    "accepted_len_if_stop",
+    "emitted_len_if_stop",
+    "delta_accepted_len",
+    "delta_emitted_len",
+    "accepted_gain_per_draft_pass",
+    "emitted_gain_per_draft_pass",
+    "is_oracle_best_accept",
+    "is_oracle_best_emitted_per_ms",
 ]
 
 def safe_div(numerator, denominator):
@@ -1291,6 +1317,112 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
         gain_rows,
     )
 
+def compute_greedy_acceptance_for_proposal(
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    draft_proposal,
+):
+    combined_ids = current_token_ids + draft_proposal
+    verify_input_tensor = torch.tensor(
+        [combined_ids],
+        device=target_model.device,
+        dtype=torch.long,
+    )
+    full_input_ids = torch.cat([orig_model_inputs["input_ids"], verify_input_tensor], dim=1)
+    verify_mask_tensor = torch.ones_like(verify_input_tensor)
+    full_attention_mask = torch.cat([orig_model_inputs["attention_mask"], verify_mask_tensor], dim=1)
+    with torch.inference_mode():
+        outputs = target_model(
+            input_ids=full_input_ids,
+            attention_mask=full_attention_mask,
+            use_cache=False,
+            logits_to_keep=len(draft_proposal) + 1,
+        )
+    verify_logits = outputs.logits[0, :len(draft_proposal)]
+    accepted_len = 0
+    for index, draft_token_id in enumerate(draft_proposal):
+        target_pred = torch.argmax(verify_logits[index, :], dim=-1).item()
+        if draft_token_id != target_pred:
+            return accepted_len, accepted_len + 1
+        accepted_len += 1
+    return accepted_len, accepted_len + 1
+
+def append_oracle_refinement_rows(
+    args,
+    problem_id,
+    mode,
+    round_id,
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    frontier_stats,
+):
+    if not args.collect_oracle_refinement:
+        return
+    snapshots = (frontier_stats or {}).get("oracle_refinement_snapshots") or []
+    if not snapshots:
+        return
+
+    rows = []
+    previous_accepted = 0
+    previous_emitted = 0
+    accepted_values = []
+    emitted_efficiencies = []
+    for snapshot in snapshots:
+        draft_proposal = [int(token_id) for token_id in snapshot["draft_proposal"]]
+        accepted_len, emitted_len = compute_greedy_acceptance_for_proposal(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            draft_proposal,
+        )
+        delta_accepted = accepted_len - previous_accepted
+        delta_emitted = emitted_len - previous_emitted
+        draft_latency_elapsed_ms = float(snapshot.get("draft_latency_elapsed_ms") or 0.0)
+        rows.append({
+            "problem_id": problem_id,
+            "mode": mode,
+            "round_id": round_id,
+            "step": snapshot.get("step"),
+            "target_len": snapshot.get("target_len"),
+            "draft_passes_elapsed": snapshot.get("draft_passes_elapsed"),
+            "draft_latency_elapsed_ms": draft_latency_elapsed_ms,
+            "masks_remaining": snapshot.get("masks_remaining"),
+            "committed_tokens": snapshot.get("committed_tokens"),
+            "filled_tokens": snapshot.get("filled_tokens"),
+            "accepted_len_if_stop": accepted_len,
+            "emitted_len_if_stop": emitted_len,
+            "delta_accepted_len": delta_accepted,
+            "delta_emitted_len": delta_emitted,
+            "accepted_gain_per_draft_pass": safe_div(
+                delta_accepted,
+                1,
+            ),
+            "emitted_gain_per_draft_pass": safe_div(
+                delta_emitted,
+                1,
+            ),
+            "is_oracle_best_accept": 0,
+            "is_oracle_best_emitted_per_ms": 0,
+        })
+        accepted_values.append(accepted_len)
+        emitted_efficiencies.append(safe_div(emitted_len, draft_latency_elapsed_ms))
+        previous_accepted = accepted_len
+        previous_emitted = emitted_len
+
+    if rows:
+        best_accept = max(accepted_values)
+        best_efficiency = max(emitted_efficiencies)
+        for row, efficiency in zip(rows, emitted_efficiencies):
+            row["is_oracle_best_accept"] = int(row["accepted_len_if_stop"] == best_accept)
+            row["is_oracle_best_emitted_per_ms"] = int(efficiency == best_efficiency)
+    append_csv_rows(
+        os.path.join(args.output_dir, "frontier_oracle_refinement_diagnostics.csv"),
+        FRONTIER_ORACLE_REFINEMENT_COLUMNS,
+        rows,
+    )
+
 apply_mode_settings(args)
 args.target_model_name_clean = args.target_model_name.split("/", 1)[1]
 logging.basicConfig(
@@ -1790,11 +1922,22 @@ for problem_id, is_warmup in tqdm(
                         tokens_to_append = tokens_to_append[:eos_index + 1]
                     remaining_tokens = num_target_tokens - len(current_token_ids)
                     tokens_to_append = tokens_to_append[:remaining_tokens]
+                    frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
+                    if draft_type == "dllm" and args.collect_oracle_refinement:
+                        append_oracle_refinement_rows(
+                            args,
+                            problem_id,
+                            benchmark_mode,
+                            num_speculation_rounds,
+                            target_model,
+                            orig_model_inputs,
+                            current_token_ids,
+                            frontier_stats_this_round,
+                        )
                     current_token_ids.extend(tokens_to_append)
                     
                     accepted_tokens += accepted_len
                     rejected_tokens += len(draft_proposal) - accepted_len
-                    frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
                     if draft_type == "dllm" and (
                         frontier_stop_enabled(args) or args.collect_draft_diagnostics
                     ):
@@ -1931,7 +2074,11 @@ for problem_id, is_warmup in tqdm(
         elif not args.skip_artifacts:
             logging.info(f"Skipping save for pickled data to {os.path.join(output_dir_pickles, f'{args.max_new_tokens}.pickle')}")
 
-        if not is_warmup and draft_type == "dllm" and frontier_stop_enabled(args):
+        if not is_warmup and draft_type == "dllm" and (
+            frontier_stop_enabled(args)
+            or args.collect_draft_diagnostics
+            or args.collect_oracle_refinement
+        ):
             append_frontier_diagnostic_rows(
                 args,
                 problem_id,

@@ -1106,6 +1106,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "draft_token_stats": [],
             "refinement_actions": [],
             "extension_events": [],
+            "oracle_refinement_snapshots": [],
             "forward_pass_breakdown": {
                 "prefill": 0,
                 "cache_update": 0,
@@ -1633,7 +1634,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         unmask_idx = unmask_idx & mask_idx[:, start:end]  # only allowed to update MASK tokens
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
-                        if is_drafter and return_frontier_stats and frontier_stats["mode"] not in ("disabled", "none", "off") and lowconf_threshold is not None and draft_token_end_idx <= x_t.shape[1]:
+                        if (
+                            is_drafter
+                            and return_frontier_stats
+                            and (
+                                frontier_stats["mode"] not in ("disabled", "none", "off")
+                                or bool(getattr(args, "collect_oracle_refinement", False))
+                            )
+                            and lowconf_threshold is not None
+                            and draft_token_end_idx <= x_t.shape[1]
+                        ):
                             frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
                             tau_f = float(lowconf_threshold)
                             target_len = int(spec_len)
@@ -1736,6 +1746,44 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             }
                             frontier_stats["steps"].append(step_record)
                             frontier_stats["final_frontier_score"] = float(frontier_score)
+                            if bool(getattr(args, "collect_oracle_refinement", False)):
+                                oracle_x = x_t.clone()
+                                oracle_mask = (
+                                    oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
+                                )
+                                if oracle_mask.any():
+                                    with torch.inference_mode():
+                                        oracle_logits = self.forward(
+                                            input_ids=oracle_x[:, -block_size:],
+                                            use_cache=True,
+                                            past_key_values=past_key_values,
+                                            update_past_key_values=False,
+                                        ).logits
+                                    oracle_logits = torch.cat(
+                                        [oracle_logits[:, :1, :], oracle_logits[:, :-1, :]],
+                                        dim=1,
+                                    )
+                                    for rel_pos in oracle_mask[0].nonzero(as_tuple=False).flatten().tolist():
+                                        absolute_pos = draft_token_start_idx + rel_pos
+                                        local_pos = absolute_pos - block_abs_start
+                                        if 0 <= local_pos < oracle_logits.shape[1]:
+                                            oracle_x[:, absolute_pos] = oracle_logits[:, local_pos, :].argmax(dim=-1)
+                                if not (
+                                    oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
+                                ).any():
+                                    frontier_stats["oracle_refinement_snapshots"].append({
+                                        "step": len(frontier_scores),
+                                        "target_len": int(target_len),
+                                        "draft_passes_elapsed": int(num_forward_passes),
+                                        "draft_latency_elapsed_ms": float(sum(forward_pass_latencies)),
+                                        "masks_remaining": int(masks_remaining),
+                                        "committed_tokens": int(target_len - masks_remaining),
+                                        "filled_tokens": int(masks_remaining),
+                                        "draft_proposal": oracle_x[
+                                            0,
+                                            draft_token_start_idx:draft_end_idx,
+                                        ].tolist(),
+                                    })
 
                             min_steps = int(getattr(args, "frontier_min_steps", 2)) if args is not None else 2
                             patience = int(getattr(args, "frontier_patience", 2)) if args is not None else 2
