@@ -1796,16 +1796,31 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             stop_reason = None
                             frontier_force_extend = False
                             predicted_gain = None
+                            predicted_gain_source = None
                             if frontier_gain is not None:
                                 if len(frontier_scores) >= 3:
                                     prev_gain = frontier_scores[-2] - frontier_scores[-3]
                                     ratio = max(0.0, min(1.0, frontier_gain / max(prev_gain, 1e-12)))
                                     predicted_gain = max(0.0, frontier_gain * ratio)
+                                    predicted_gain_source = "decayed_frontier_gain"
                                 else:
                                     predicted_gain = max(0.0, frontier_gain)
+                                    predicted_gain_source = "frontier_gain"
+                            elif (
+                                min_steps <= 1
+                                and len(frontier_scores) == 1
+                                and frontier_mode in (
+                                    "cost_aware_v2",
+                                    "cost_aware_v2_refinement_only",
+                                    "cost_aware_v2_refinement_no_threshold",
+                                )
+                            ):
+                                predicted_gain = max(0.0, frontier_score)
+                                predicted_gain_source = "first_step_frontier_score"
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )
+                            step_record["predicted_next_gain_source"] = predicted_gain_source
                             if frontier_k >= target_len and frontier_mode in force_stop_modes:
                                 stop_reason = "frontier_all_pass"
                             elif aggressive_irrecoverable and frontier_k < target_len and not frontier_recoverable and frontier_confidence is not None and frontier_confidence < tau_f:

@@ -1,0 +1,37 @@
+import sys
+
+import run_adaptive_unmask_only_benchmark as benchmark
+
+
+DEFAULT_OUTPUT_DIR = "/content/failfasttesting/outputs_adaptive_unmask_min1_test15"
+OLD_OUTPUT_DIR = "/content/failfasttesting/outputs_adaptive_unmask_only_test15"
+
+
+benchmark.BENCHMARK_VERSION = "adaptive_unmask_only_min1_v1"
+benchmark.METHOD = {
+    "name": "adaptive_unmask_only_min1",
+    "frontier_mode": "cost_aware_v2_refinement_only",
+    "spec_len": 8,
+    "incr_len": 8,
+    "lowconf_threshold": 0.45,
+}
+
+
+_parse_args = benchmark.parse_args
+
+
+def parse_args():
+    explicit_min_steps = "--frontier_min_steps" in sys.argv
+    args = _parse_args()
+    if args.output_dir == OLD_OUTPUT_DIR:
+        args.output_dir = DEFAULT_OUTPUT_DIR
+    if not explicit_min_steps:
+        args.frontier_min_steps = 1
+    return args
+
+
+benchmark.parse_args = parse_args
+
+
+if __name__ == "__main__":
+    benchmark.main()
