@@ -19,6 +19,7 @@ class AdaptiveUnmaskMin1BenchmarkTests(unittest.TestCase):
 
         self.assertEqual(args.frontier_min_steps, 1)
         self.assertEqual(args.output_dir, benchmark.DEFAULT_OUTPUT_DIR)
+        self.assertEqual(args.frontier_v2_first_step_prior_shrink, 0.2)
 
     def test_explicit_min_steps_is_preserved(self):
         with patch.object(

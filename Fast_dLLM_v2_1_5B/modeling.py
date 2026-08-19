@@ -1340,7 +1340,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         def first_step_marginal_gain(accept_probabilities, masks_remaining, unmasked_this_step):
             if masks_remaining <= 0:
                 return 0.0
-            prior = calibration_prior_probability()
+            shrink = float(getattr(args, "frontier_v2_first_step_prior_shrink", 0.2)) if args is not None else 0.2
+            shrink = max(0.0, min(1.0, shrink))
+            prior = max(0.02, min(0.98, calibration_prior_probability() * shrink))
             expected_new_tokens = max(1, int(unmasked_this_step))
             replacement_budget = min(int(masks_remaining), expected_new_tokens)
             replaced = 0
@@ -1872,9 +1874,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 extension_cost_margin = float(
                                     getattr(args, "frontier_v2_extension_cost_margin", 0.05)
                                 )
-                                stop_fill_ms = draft_forward_ms if masks_remaining > 0 else 0.0
                                 stop_ms_per_output = (
-                                    elapsed_draft_ms + stop_fill_ms + verify_round_ms + controller_ms
+                                    elapsed_draft_ms + verify_round_ms + controller_ms
                                 ) / max(expected_output, 1e-6)
                                 step_record.update({
                                     "v2_expected_output": expected_output,
