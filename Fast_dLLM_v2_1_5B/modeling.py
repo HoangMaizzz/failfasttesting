@@ -1690,7 +1690,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 forced_flags,
                             )
                             v2_ready, v2_calibration_tokens = v2_calibration_ready()
-                            if frontier_mode == "cost_aware_v2":
+                            if frontier_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only"):
                                 frontier_score, accept_probabilities = v2_expected_prefix_score(
                                     confidences,
                                     margins,
@@ -1762,7 +1762,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 if predicted_gain is not None:
                                     if predicted_gain <= cost_token_equiv:
                                         stop_reason = "cost_aware_low_expected_gain"
-                            elif len(frontier_scores) >= min_steps and frontier_mode == "cost_aware_v2":
+                            elif len(frontier_scores) >= min_steps and frontier_mode in (
+                                "cost_aware_v2",
+                                "cost_aware_v2_refinement_only",
+                            ):
                                 draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
                                 expected_output = 1.0 + float(frontier_score)
@@ -1801,7 +1804,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     step_record["v2_continue_ms_per_output"] = continue_ms_per_output
                                     if continue_ms_per_output >= stop_ms_per_output * (1.0 - hysteresis):
                                         stop_reason = "cost_aware_v2_verify_lower_cost"
-                                elif v2_ready and masks_remaining == 0 and frontier_k >= target_len:
+                                elif (
+                                    frontier_mode == "cost_aware_v2"
+                                    and v2_ready
+                                    and masks_remaining == 0
+                                    and frontier_k >= target_len
+                                ):
                                     extension = min(incr_len, max_spec_len - spec_len)
                                     extension_hazards = v2_extension_hazards(target_len, extension)
                                     calibration = getattr(args, "frontier_v2_hazard_calibration", {})
@@ -1916,7 +1924,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             stop_reason = "cost_aware_v2_verify_lower_cost"
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
-                                frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode == "cost_aware_v2"
+                                frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode in (
+                                    "cost_aware_v2",
+                                    "cost_aware_v2_refinement_only",
+                                )
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),
                                     "action": stop_reason,
