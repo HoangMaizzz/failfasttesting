@@ -1337,9 +1337,40 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 score += survival
             return score
 
-        def first_step_marginal_gain(accept_probabilities, masks_remaining, unmasked_this_step):
+        def refinement_gain_key(from_step, masks_remaining, frontier_k, frontier_score):
+            masks_bin = str(min(8, max(0, int(masks_remaining))))
+            frontier_bin = str(min(8, max(0, int(frontier_k))))
+            score_bin = str(min(8, max(0, int(float(frontier_score)))))
+            return f"{int(from_step)}:{masks_bin}:{frontier_bin}:{score_bin}"
+
+        def refinement_gain_estimate(from_step, masks_remaining, frontier_k, frontier_score):
+            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
+            min_observations = int(getattr(args, "frontier_v2_min_refinement_gain_observations", 4)) if args is not None else 4
+            table = calibration.get("refinement_step_gain", {})
+            key = refinement_gain_key(from_step, masks_remaining, frontier_k, frontier_score)
+            stats = table.get(key)
+            if stats:
+                gain_sum, count = float(stats[0]), int(stats[1])
+                if count >= min_observations:
+                    return max(0.0, gain_sum / max(1, count)), "bucket_refinement_gain"
+            global_stats = calibration.get("refinement_step_gain_global", {}).get(str(int(from_step)))
+            if global_stats:
+                gain_sum, count = float(global_stats[0]), int(global_stats[1])
+                if count > 0:
+                    return max(0.0, gain_sum / max(1, count)), "global_refinement_gain"
+            return None, None
+
+        def first_step_marginal_gain(accept_probabilities, masks_remaining, unmasked_this_step, frontier_k, frontier_score):
             if masks_remaining <= 0:
-                return 0.0
+                return 0.0, "no_masks_remaining"
+            empirical_gain, empirical_source = refinement_gain_estimate(
+                1,
+                masks_remaining,
+                frontier_k,
+                frontier_score,
+            )
+            if empirical_gain is not None:
+                return empirical_gain, empirical_source
             shrink = float(getattr(args, "frontier_v2_first_step_prior_shrink", 1.0)) if args is not None else 1.0
             floor = float(getattr(args, "frontier_v2_first_step_prior_floor", 0.6)) if args is not None else 0.6
             shrink = max(0.0, min(1.0, shrink))
@@ -1357,7 +1388,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 else:
                     next_probabilities.append(probability)
             next_score = expected_prefix_score_from_probabilities(next_probabilities)
-            return max(0.0, next_score - expected_prefix_score_from_probabilities(accept_probabilities))
+            return max(0.0, next_score - expected_prefix_score_from_probabilities(accept_probabilities)), "simulated_prior_gain"
 
         def v2_calibration_ready():
             calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
@@ -1841,12 +1872,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "cost_aware_v2_refinement_no_threshold",
                                 )
                             ):
-                                predicted_gain = first_step_marginal_gain(
+                                predicted_gain, predicted_gain_source = first_step_marginal_gain(
                                     accept_probabilities,
                                     masks_remaining,
                                     unmasked_this_step,
+                                    frontier_k,
+                                    frontier_score,
                                 )
-                                predicted_gain_source = "first_step_marginal_gain"
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )

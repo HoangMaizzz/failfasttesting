@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--frontier_v2_min_calibration_tokens", type=int, default=64)
     parser.add_argument("--frontier_v2_first_step_prior_shrink", type=float, default=1.0)
     parser.add_argument("--frontier_v2_first_step_prior_floor", type=float, default=0.6)
+    parser.add_argument("--frontier_v2_min_refinement_gain_observations", type=int, default=4)
     parser.add_argument("--sample_seed", type=int, default=2026)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -115,6 +116,7 @@ def run_metadata(args, dataset, problem_ids):
         "frontier_v2_min_calibration_tokens": args.frontier_v2_min_calibration_tokens,
         "frontier_v2_first_step_prior_shrink": args.frontier_v2_first_step_prior_shrink,
         "frontier_v2_first_step_prior_floor": args.frontier_v2_first_step_prior_floor,
+        "frontier_v2_min_refinement_gain_observations": args.frontier_v2_min_refinement_gain_observations,
         "sample_seed": args.sample_seed,
         "seed": args.seed,
         "method": METHOD,
@@ -187,6 +189,7 @@ def run_dataset(args, dataset, problem_ids):
             "--frontier_v2_min_calibration_tokens", str(args.frontier_v2_min_calibration_tokens),
             "--frontier_v2_first_step_prior_shrink", str(args.frontier_v2_first_step_prior_shrink),
             "--frontier_v2_first_step_prior_floor", str(args.frontier_v2_first_step_prior_floor),
+            "--frontier_v2_min_refinement_gain_observations", str(args.frontier_v2_min_refinement_gain_observations),
             "--seed", str(args.seed),
             "--quiet_generation",
             "--disable_progress",

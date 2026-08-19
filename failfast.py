@@ -399,6 +399,7 @@ parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8
 parser.add_argument("--frontier_v2_min_calibration_tokens", type=int, default=64)
 parser.add_argument("--frontier_v2_first_step_prior_shrink", type=float, default=1.0)
 parser.add_argument("--frontier_v2_first_step_prior_floor", type=float, default=0.6)
+parser.add_argument("--frontier_v2_min_refinement_gain_observations", type=int, default=4)
 parser.add_argument("--frontier_calibration_prior", type=float, default=0.5)
 parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.0)
 parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
@@ -737,6 +738,8 @@ def ensure_frontier_runtime_state(args):
             "extension_offset": {},
             "extension_gain_by_block": {},
             "extension_gain_global": [0.0, 0.0, 0.0, 0],
+            "refinement_step_gain": {},
+            "refinement_step_gain_global": {},
             "total_checked_tokens": 0,
             "total_extension_tokens": 0,
         }
@@ -808,6 +811,11 @@ def update_gain_calibration(table, key, predicted_gain, actual_gain):
     ]
 
 
+def update_refinement_step_gain(table, key, gain):
+    gain_sum, total_count = table.get(key, [0.0, 0])
+    table[key] = [gain_sum + max(0.0, float(gain)), int(total_count) + 1]
+
+
 def frontier_v2_position_bin(position):
     if position < 2:
         return "0-1"
@@ -824,6 +832,17 @@ def frontier_v2_length_bin(length):
 
 def frontier_v2_context_bin(context_len):
     return str(max(0, int(context_len) // 256))
+
+
+def frontier_v2_refinement_gain_key(step):
+    from_step = int(step.get("step", 0))
+    masks_remaining = int(step.get("masks_remaining", 0))
+    frontier_k = int(step.get("frontier_k", 0))
+    frontier_score = float(step.get("frontier_score", 0.0))
+    masks_bin = str(min(8, max(0, masks_remaining)))
+    frontier_bin = str(min(8, max(0, frontier_k)))
+    score_bin = str(min(8, max(0, int(frontier_score))))
+    return f"{from_step}:{masks_bin}:{frontier_bin}:{score_bin}"
 
 
 def update_latency_bucket(table, key, value, alpha):
@@ -967,6 +986,23 @@ def update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcome
         if not accepted:
             break
         accepted_len += 1
+    steps = frontier_stats.get("steps", [])
+    for current_step, next_step in zip(steps, steps[1:]):
+        actual_gain = next_step.get("frontier_gain")
+        if actual_gain is None:
+            continue
+        step_key = frontier_v2_refinement_gain_key(current_step)
+        global_key = str(int(current_step.get("step", 0)))
+        update_refinement_step_gain(
+            calibration["refinement_step_gain"],
+            step_key,
+            actual_gain,
+        )
+        update_refinement_step_gain(
+            calibration["refinement_step_gain_global"],
+            global_key,
+            actual_gain,
+        )
     for event in frontier_stats.get("extension_events", []):
         if event.get("trigger") not in (
             "high_confidence_extend",
