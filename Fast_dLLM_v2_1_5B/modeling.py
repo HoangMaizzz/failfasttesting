@@ -1340,9 +1340,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         def first_step_marginal_gain(accept_probabilities, masks_remaining, unmasked_this_step):
             if masks_remaining <= 0:
                 return 0.0
-            shrink = float(getattr(args, "frontier_v2_first_step_prior_shrink", 0.2)) if args is not None else 0.2
+            shrink = float(getattr(args, "frontier_v2_first_step_prior_shrink", 1.0)) if args is not None else 1.0
+            floor = float(getattr(args, "frontier_v2_first_step_prior_floor", 0.6)) if args is not None else 0.6
             shrink = max(0.0, min(1.0, shrink))
-            prior = max(0.02, min(0.98, calibration_prior_probability() * shrink))
+            floor = max(0.02, min(0.98, floor))
+            prior = max(floor, calibration_prior_probability() * shrink)
+            prior = max(0.02, min(0.98, prior))
             expected_new_tokens = max(1, int(unmasked_this_step))
             replacement_budget = min(int(masks_remaining), expected_new_tokens)
             replaced = 0
