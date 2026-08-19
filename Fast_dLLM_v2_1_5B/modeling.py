@@ -1326,12 +1326,33 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 v2_token_hazard(confidence, margin, position)
                 for position, (confidence, margin) in enumerate(zip(confidences, margins))
             ]
+            score = expected_prefix_score_from_probabilities(probabilities)
+            return score, probabilities
+
+        def expected_prefix_score_from_probabilities(probabilities):
             score = 0.0
             survival = 1.0
             for probability in probabilities:
                 survival *= probability
                 score += survival
-            return score, probabilities
+            return score
+
+        def first_step_marginal_gain(accept_probabilities, masks_remaining, unmasked_this_step):
+            if masks_remaining <= 0:
+                return 0.0
+            prior = calibration_prior_probability()
+            expected_new_tokens = max(1, int(unmasked_this_step))
+            replacement_budget = min(int(masks_remaining), expected_new_tokens)
+            replaced = 0
+            next_probabilities = []
+            for probability in accept_probabilities:
+                if probability <= 0.0200001 and replaced < replacement_budget:
+                    next_probabilities.append(prior)
+                    replaced += 1
+                else:
+                    next_probabilities.append(probability)
+            next_score = expected_prefix_score_from_probabilities(next_probabilities)
+            return max(0.0, next_score - expected_prefix_score_from_probabilities(accept_probabilities))
 
         def v2_calibration_ready():
             calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
@@ -1815,8 +1836,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "cost_aware_v2_refinement_no_threshold",
                                 )
                             ):
-                                predicted_gain = max(0.0, frontier_score)
-                                predicted_gain_source = "first_step_frontier_score"
+                                predicted_gain = first_step_marginal_gain(
+                                    accept_probabilities,
+                                    masks_remaining,
+                                    unmasked_this_step,
+                                )
+                                predicted_gain_source = "first_step_marginal_gain"
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )
