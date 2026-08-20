@@ -13,7 +13,7 @@ from run_adaptive_unmask_only_benchmark import DATASET_SIZES
 from run_cost_aware_v2_benchmark import run_streaming
 
 
-BENCHMARK_VERSION = "oracle_refinement_profile_v1"
+BENCHMARK_VERSION = "oracle_refinement_profile_v2"
 METHOD_NAME = "failfast_oracle_profile"
 
 
@@ -49,6 +49,7 @@ def parse_args():
         default="INFO",
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--skip_archive", action="store_true")
     return parser.parse_args()
 
 
@@ -104,10 +105,18 @@ def results_complete(result_path, oracle_path, metadata_path, expected_metadata)
     except (OSError, ValueError, pd.errors.ParserError):
         return False
     expected_ids = expected_metadata["problem_ids"]
+    required_oracle_columns = {
+        "token_confidences",
+        "token_margins",
+        "token_forced",
+        "token_recoverable",
+        "actual_verify_latency_ms",
+    }
     return (
         metadata == expected_metadata
         and len(rows) == len(expected_ids)
         and not oracle.empty
+        and required_oracle_columns.issubset(oracle.columns)
         and sorted(rows["problem_id"].astype(int).tolist()) == expected_ids
     )
 
@@ -312,18 +321,21 @@ def main():
     dataset_summary.to_csv(output_dir / "oracle_dataset_summary.csv", index=False)
     write_manifest(args, output_dir, problem_ids)
 
-    archive_path = shutil.make_archive(
-        str(output_dir),
-        "zip",
-        root_dir=output_dir.parent,
-        base_dir=output_dir.name,
-    )
+    archive_path = None
+    if not args.skip_archive:
+        archive_path = shutil.make_archive(
+            str(output_dir),
+            "zip",
+            root_dir=output_dir.parent,
+            base_dir=output_dir.name,
+        )
     print("\nORACLE REFINEMENT DATASET SUMMARY")
     print(dataset_summary.to_string(index=False))
     print("\nORACLE REFINEMENT STEP SUMMARY")
     print(step_summary.head(40).to_string(index=False))
     print(f"\nSaved report: {output_dir}")
-    print(f"Saved archive: {archive_path}")
+    if archive_path:
+        print(f"Saved archive: {archive_path}")
 
 
 if __name__ == "__main__":

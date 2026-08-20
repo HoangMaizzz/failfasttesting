@@ -585,6 +585,15 @@ FRONTIER_ORACLE_REFINEMENT_COLUMNS = [
     "masks_remaining",
     "committed_tokens",
     "filled_tokens",
+    "frontier_k",
+    "frontier_score",
+    "unmasked_this_step",
+    "token_confidences",
+    "token_margins",
+    "token_forced",
+    "token_recoverable",
+    "context_len",
+    "actual_verify_latency_ms",
     "accepted_len_if_stop",
     "emitted_len_if_stop",
     "delta_accepted_len",
@@ -1395,6 +1404,7 @@ def append_oracle_refinement_rows(
     orig_model_inputs,
     current_token_ids,
     frontier_stats,
+    verify_latency_ms,
 ):
     if not args.collect_oracle_refinement:
         return
@@ -1429,6 +1439,15 @@ def append_oracle_refinement_rows(
             "masks_remaining": snapshot.get("masks_remaining"),
             "committed_tokens": snapshot.get("committed_tokens"),
             "filled_tokens": snapshot.get("filled_tokens"),
+            "frontier_k": snapshot.get("frontier_k"),
+            "frontier_score": snapshot.get("frontier_score"),
+            "unmasked_this_step": snapshot.get("unmasked_this_step"),
+            "token_confidences": json.dumps(snapshot.get("token_confidences") or []),
+            "token_margins": json.dumps(snapshot.get("token_margins") or []),
+            "token_forced": json.dumps(snapshot.get("token_forced") or []),
+            "token_recoverable": json.dumps(snapshot.get("token_recoverable") or []),
+            "context_len": int(orig_model_inputs["input_ids"].shape[1] + len(current_token_ids)),
+            "actual_verify_latency_ms": float(verify_latency_ms),
             "accepted_len_if_stop": accepted_len,
             "emitted_len_if_stop": emitted_len,
             "delta_accepted_len": delta_accepted,
@@ -1971,6 +1990,7 @@ for problem_id, is_warmup in tqdm(
                             orig_model_inputs,
                             current_token_ids,
                             frontier_stats_this_round,
+                            verify_time * 1000.0,
                         )
                     current_token_ids.extend(tokens_to_append)
                     

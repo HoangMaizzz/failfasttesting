@@ -1836,6 +1836,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "masks_remaining": int(masks_remaining),
                                         "committed_tokens": int(target_len - masks_remaining),
                                         "filled_tokens": int(masks_remaining),
+                                        "frontier_k": int(frontier_k),
+                                        "frontier_score": float(frontier_score),
+                                        "unmasked_this_step": int(unmasked_this_step),
+                                        "token_confidences": [float(value) for value in confidences],
+                                        "token_margins": [float(value) for value in margins],
+                                        "token_forced": [bool(value) for value in forced_flags],
+                                        "token_recoverable": [bool(value) for value in recoverable],
                                         "draft_proposal": oracle_x[
                                             0,
                                             draft_token_start_idx:draft_end_idx,
