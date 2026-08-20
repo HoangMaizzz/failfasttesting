@@ -1706,6 +1706,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             target_len = int(spec_len)
                             draft_end_idx = draft_token_start_idx + target_len
                             block_abs_start = x_t.shape[1] - block_size
+                            current_step_token_ids = {}
                             current_step_confidences = {}
                             current_step_margins = {}
                             unmasked_this_step = int(unmask_idx.sum().item())
@@ -1725,6 +1726,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             for local_idx in range(x1_p.shape[1]):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
+                                    current_step_token_ids[int(absolute_pos)] = int(
+                                        x_1[0, local_idx].item()
+                                    )
                                     current_step_confidences[int(absolute_pos)] = float(max(x1_p[0, local_idx].float().item(), 0.0))
                                     current_step_margins[int(absolute_pos)] = float(max(x1_margin[0, local_idx].float().item(), 0.0))
 
@@ -1808,23 +1812,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 oracle_mask = (
                                     oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
                                 )
-                                if oracle_mask.any():
-                                    with torch.inference_mode():
-                                        oracle_logits = self.forward(
-                                            input_ids=oracle_x[:, -block_size:],
-                                            use_cache=True,
-                                            past_key_values=past_key_values,
-                                            update_past_key_values=False,
-                                        ).logits
-                                    oracle_logits = torch.cat(
-                                        [oracle_logits[:, :1, :], oracle_logits[:, :-1, :]],
-                                        dim=1,
-                                    )
-                                    for rel_pos in oracle_mask[0].nonzero(as_tuple=False).flatten().tolist():
-                                        absolute_pos = draft_token_start_idx + rel_pos
-                                        local_pos = absolute_pos - block_abs_start
-                                        if 0 <= local_pos < oracle_logits.shape[1]:
-                                            oracle_x[:, absolute_pos] = oracle_logits[:, local_pos, :].argmax(dim=-1)
+                                for rel_pos in oracle_mask[0].nonzero(as_tuple=False).flatten().tolist():
+                                    absolute_pos = draft_token_start_idx + rel_pos
+                                    if absolute_pos in current_step_token_ids:
+                                        oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
                                 if not (
                                     oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
                                 ).any():
@@ -1916,14 +1907,33 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 extension_cost_margin = float(
                                     getattr(args, "frontier_v2_extension_cost_margin", 0.05)
                                 )
+                                remaining_absolute_positions = [
+                                    draft_token_start_idx + int(rel_pos)
+                                    for rel_pos in (
+                                        x_t[:, draft_token_start_idx:draft_end_idx] == mask_id
+                                    )[0].nonzero(as_tuple=False).flatten().tolist()
+                                ]
+                                zero_cost_fill_available = all(
+                                    absolute_pos in current_step_token_ids
+                                    for absolute_pos in remaining_absolute_positions
+                                )
+                                stop_fill_ms = (
+                                    0.0
+                                    if not remaining_absolute_positions or zero_cost_fill_available
+                                    else draft_forward_ms
+                                )
                                 stop_ms_per_output = (
-                                    elapsed_draft_ms + verify_round_ms + controller_ms
+                                    elapsed_draft_ms
+                                    + stop_fill_ms
+                                    + verify_round_ms
+                                    + controller_ms
                                 ) / max(expected_output, 1e-6)
                                 step_record.update({
                                     "v2_expected_output": expected_output,
                                     "v2_draft_forward_ms": draft_forward_ms,
                                     "v2_verify_round_ms": verify_round_ms,
                                     "v2_controller_ms": controller_ms,
+                                    "v2_stop_fill_ms": stop_fill_ms,
                                     "v2_stop_ms_per_output": stop_ms_per_output,
                                     "v2_fallback": not v2_ready,
                                 })
@@ -1934,7 +1944,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         sum(frontier_recent_unmasked[-patience:])
                                         / max(1, len(frontier_recent_unmasked[-patience:])),
                                     )
-                                    next_fill_ms = draft_forward_ms if masks_remaining > expected_unmask else 0.0
+                                    next_fill_ms = (
+                                        0.0
+                                        if zero_cost_fill_available
+                                        else draft_forward_ms
+                                        if masks_remaining > expected_unmask
+                                        else 0.0
+                                    )
                                     next_expected_output = expected_output + float(predicted_gain)
                                     continue_ms_per_output = (
                                         elapsed_draft_ms
@@ -2079,33 +2095,53 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "masks_remaining": masks_remaining,
                                 })
                                 if masks_remaining > 0:
-                                    fill_start_time = torch.cuda.Event(enable_timing=True)
-                                    fill_start_time.record()
-                                    fill_logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
-                                    fill_logits = torch.cat([fill_logits[:, :1, :], fill_logits[:, :-1, :]], dim=1)
-                                    fill_end_time = torch.cuda.Event(enable_timing=True)
-                                    fill_end_time.record()
-                                    torch.cuda.synchronize()
-                                    forward_pass_latencies.append(fill_start_time.elapsed_time(fill_end_time))
-                                    num_forward_passes += 1
-                                    frontier_stats["forward_pass_breakdown"]["fill"] += 1
-
-                                    fill_probs = torch.softmax(fill_logits, dim=-1)
-                                    fill_top2_probs = torch.topk(fill_probs, k=2, dim=-1).values
-                                    fill_margins = (fill_top2_probs[..., 0] - fill_top2_probs[..., 1]).float()
                                     draft_mask = (x_t[:, draft_token_start_idx:draft_end_idx] == mask_id)
-                                    for rel_pos in draft_mask[0].nonzero(as_tuple=False).flatten().tolist():
-                                        absolute_pos = draft_token_start_idx + rel_pos
-                                        local_pos = absolute_pos - block_abs_start
-                                        if 0 <= local_pos < fill_logits.shape[1]:
+                                    remaining_absolute_positions = [
+                                        draft_token_start_idx + int(rel_pos)
+                                        for rel_pos in draft_mask[0].nonzero(as_tuple=False).flatten().tolist()
+                                    ]
+                                    cached_fill_available = all(
+                                        absolute_pos in current_step_token_ids
+                                        for absolute_pos in remaining_absolute_positions
+                                    )
+                                    if not cached_fill_available:
+                                        fill_start_time = torch.cuda.Event(enable_timing=True)
+                                        fill_start_time.record()
+                                        fill_logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                                        fill_logits = torch.cat([fill_logits[:, :1, :], fill_logits[:, :-1, :]], dim=1)
+                                        fill_end_time = torch.cuda.Event(enable_timing=True)
+                                        fill_end_time.record()
+                                        torch.cuda.synchronize()
+                                        forward_pass_latencies.append(fill_start_time.elapsed_time(fill_end_time))
+                                        num_forward_passes += 1
+                                        frontier_stats["forward_pass_breakdown"]["fill"] += 1
+                                        fill_probs = torch.softmax(fill_logits, dim=-1)
+                                        fill_top2_probs = torch.topk(fill_probs, k=2, dim=-1).values
+                                        fill_margins = (fill_top2_probs[..., 0] - fill_top2_probs[..., 1]).float()
+
+                                    for absolute_pos in remaining_absolute_positions:
+                                        if cached_fill_available:
+                                            token_id = torch.tensor(
+                                                [current_step_token_ids[absolute_pos]],
+                                                device=x_t.device,
+                                                dtype=x_t.dtype,
+                                            )
+                                            token_confidence = current_step_confidences[absolute_pos]
+                                            token_margin = current_step_margins[absolute_pos]
+                                        else:
+                                            local_pos = absolute_pos - block_abs_start
+                                            if not 0 <= local_pos < fill_logits.shape[1]:
+                                                continue
                                             token_id = fill_logits[:, local_pos, :].argmax(dim=-1)
                                             token_conf = torch.gather(fill_probs[:, local_pos, :], dim=-1, index=token_id.unsqueeze(-1)).squeeze(-1)
-                                            x_t[:, absolute_pos] = token_id
-                                            committed_confidences[int(absolute_pos)] = float(token_conf[0].float().item())
-                                            committed_margins[int(absolute_pos)] = float(fill_margins[0, local_pos].float().item())
-                                            committed_forced[int(absolute_pos)] = True
-                                            filled_on_stop_positions.add(int(absolute_pos))
-                                            conf_of_unmasked_tokens.append(float(token_conf[0].float().item()))
+                                            token_confidence = float(token_conf[0].float().item())
+                                            token_margin = float(fill_margins[0, local_pos].float().item())
+                                        x_t[:, absolute_pos] = token_id
+                                        committed_confidences[int(absolute_pos)] = float(token_confidence)
+                                        committed_margins[int(absolute_pos)] = float(token_margin)
+                                        committed_forced[int(absolute_pos)] = True
+                                        filled_on_stop_positions.add(int(absolute_pos))
+                                        conf_of_unmasked_tokens.append(float(token_confidence))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")

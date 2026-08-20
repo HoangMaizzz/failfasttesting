@@ -13,7 +13,7 @@ from run_adaptive_unmask_only_benchmark import DATASET_SIZES
 from run_cost_aware_v2_benchmark import run_streaming
 
 
-BENCHMARK_VERSION = "oracle_refinement_profile_v2"
+BENCHMARK_VERSION = "oracle_refinement_profile_v3"
 METHOD_NAME = "failfast_oracle_profile"
 
 

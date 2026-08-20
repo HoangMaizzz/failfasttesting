@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-BENCHMARK_VERSION = "online_unmask_calibration_validation_v1"
+BENCHMARK_VERSION = "online_unmask_calibration_validation_v2"
 
 
 def parse_args():
@@ -313,6 +313,8 @@ def evaluate_dataset(oracle, args, dataset):
         for index in range(len(group) - 1):
             current_row = group.iloc[index]
             next_row = group.iloc[index + 1]
+            if int(current_row["target_len"]) != int(next_row["target_len"]):
+                continue
             current_state = states[index]
             next_state = states[index + 1]
             predicted_next_state = predict_next_state(transition_model, current_state)
@@ -355,7 +357,14 @@ def evaluate_dataset(oracle, args, dataset):
                     "round_id": int(round_id),
                     "from_step": int(current_row["step"]),
                     "to_step": int(next_row["step"]),
-                    "target_len": int(current_row["target_len"]),
+                    "from_refinement_step": int(
+                        (
+                            group.loc[:index, "target_len"].astype(int)
+                            == int(current_row["target_len"])
+                        ).sum()
+                    ),
+                    "from_target_len": int(current_row["target_len"]),
+                    "to_target_len": int(next_row["target_len"]),
                     "predicted_current_y": predicted_current_y,
                     "actual_current_y": actual_current_y,
                     "predicted_next_y": predicted_next_y,
@@ -401,7 +410,7 @@ def summarize_predictions(predictions, group_columns):
         record = dict(zip(group_columns, keys))
         record.update({
             "transitions": len(group),
-            "problems": group["problem_id"].nunique(),
+            "problems": len(group[["dataset", "problem_id"]].drop_duplicates()),
             "predicted_gain_mean": group["predicted_gain"].mean(),
             "actual_gain_mean": group["actual_gain"].mean(),
             "gain_bias": gain_error.mean(),
@@ -509,8 +518,9 @@ def write_manifest(args, output_dir):
         "arguments": vars(args),
         "purpose": (
             "Chronological validation of online acceptance, denoising transition, "
-            "latency, and stop/continue cost predictions. Intermediate verifier "
-            "labels are used only as diagnostic ground truth."
+            "latency, and stop/continue cost predictions for same-length unmask "
+            "transitions. Intermediate verifier labels are used only as diagnostic "
+            "ground truth."
         ),
     }
     (output_dir / "benchmark_manifest.json").write_text(
@@ -546,7 +556,10 @@ def main():
 
     predictions = pd.concat(prediction_frames, ignore_index=True)
     dataset_summary = summarize_predictions(predictions, ["dataset"])
-    step_summary = summarize_predictions(predictions, ["dataset", "from_step"])
+    step_summary = summarize_predictions(
+        predictions,
+        ["dataset", "from_refinement_step"],
+    )
     overall_summary = summarize_predictions(
         predictions.assign(scope="all_datasets"),
         ["scope"],

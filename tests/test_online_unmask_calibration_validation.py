@@ -44,6 +44,15 @@ class OnlineUnmaskCalibrationValidationTests(unittest.TestCase):
             snapshot(0, 0, 2, [0.8, 0.7, 0.7, 0.6], [0, 0, 0, 0], 4, 80.0),
             snapshot(1, 0, 1, [0.9, 0.8, 0.5, 0.4], [0, 0, 1, 1], 3, 42.0),
             snapshot(1, 0, 2, [0.9, 0.8, 0.8, 0.7], [0, 0, 0, 0], 5, 82.0),
+            snapshot(
+                1,
+                0,
+                3,
+                [0.9, 0.8, 0.8, 0.7, 0.6, 0.5],
+                [0, 0, 0, 0, 0, 0],
+                6,
+                122.0,
+            ),
         ]
         args = SimpleNamespace(
             warmup_questions=1,
@@ -59,6 +68,8 @@ class OnlineUnmaskCalibrationValidationTests(unittest.TestCase):
         self.assertGreater(result.iloc[0]["hazard_observations_before"], 0)
         self.assertGreater(result.iloc[0]["transition_observations_before"], 0)
         self.assertEqual(result.iloc[0]["actual_gain"], 2)
+        self.assertEqual(result.iloc[0]["from_target_len"], 4)
+        self.assertEqual(result.iloc[0]["to_target_len"], 4)
 
     def test_summary_reports_gain_and_decision_metrics(self):
         predictions = pd.DataFrame({
