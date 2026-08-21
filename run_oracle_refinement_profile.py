@@ -13,7 +13,7 @@ from run_adaptive_unmask_only_benchmark import DATASET_SIZES
 from run_cost_aware_v2_benchmark import run_streaming
 
 
-BENCHMARK_VERSION = "oracle_refinement_profile_v3"
+BENCHMARK_VERSION = "oracle_refinement_profile_v4"
 METHOD_NAME = "failfast_oracle_profile"
 
 
@@ -111,6 +111,10 @@ def results_complete(result_path, oracle_path, metadata_path, expected_metadata)
         "token_forced",
         "token_recoverable",
         "actual_verify_latency_ms",
+        "draft_passes_elapsed",
+        "oracle_current_fill_tokens",
+        "oracle_cached_fill_tokens",
+        "oracle_missing_fill_tokens",
     }
     return (
         metadata == expected_metadata

@@ -1118,6 +1118,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         committed_confidences = {}
         committed_margins = {}
         committed_forced = {}
+        oracle_candidate_token_ids = {}
         filled_on_stop_positions = set()
         frontier_scores = []
         frontier_recent_unmasked = []
@@ -1645,11 +1646,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         ##################Start of timer##################
                         start_time = torch.cuda.Event(enable_timing=True)
                         start_time.record()
+                        oracle_full_block_logits = None
                         if use_block_cache:
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                oracle_full_block_logits = logits
                                 logits = logits[:, start:end]
                             else:
                                 logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
@@ -1657,6 +1660,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         else:
                             logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                            oracle_full_block_logits = logits
                             logits = logits[:, start:end]  # NOTE(ruipan): only looking at logits in the current small block region
                         end_time = torch.cuda.Event(enable_timing=True)
                         end_time.record()
@@ -1711,6 +1715,18 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             current_step_margins = {}
                             unmasked_this_step = int(unmask_idx.sum().item())
 
+                            if (
+                                bool(getattr(args, "collect_oracle_refinement", False))
+                                and oracle_full_block_logits is not None
+                            ):
+                                full_block_tokens = oracle_full_block_logits.argmax(dim=-1)[0]
+                                for local_idx in range(full_block_tokens.shape[0]):
+                                    absolute_pos = block_abs_start + local_idx
+                                    if draft_token_start_idx <= absolute_pos < draft_end_idx:
+                                        oracle_candidate_token_ids[int(absolute_pos)] = int(
+                                            full_block_tokens[local_idx].item()
+                                        )
+
                             for batch_idx, local_idx in unmask_idx.nonzero(as_tuple=False).tolist():
                                 if batch_idx != 0:
                                     continue
@@ -1727,6 +1743,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     current_step_token_ids[int(absolute_pos)] = int(
+                                        x_1[0, local_idx].item()
+                                    )
+                                    oracle_candidate_token_ids[int(absolute_pos)] = int(
                                         x_1[0, local_idx].item()
                                     )
                                     current_step_confidences[int(absolute_pos)] = float(max(x1_p[0, local_idx].float().item(), 0.0))
@@ -1812,10 +1831,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 oracle_mask = (
                                     oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
                                 )
+                                current_fill_tokens = 0
+                                cached_fill_tokens = 0
                                 for rel_pos in oracle_mask[0].nonzero(as_tuple=False).flatten().tolist():
                                     absolute_pos = draft_token_start_idx + rel_pos
                                     if absolute_pos in current_step_token_ids:
                                         oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
+                                        current_fill_tokens += 1
+                                    elif absolute_pos in oracle_candidate_token_ids:
+                                        oracle_x[:, absolute_pos] = oracle_candidate_token_ids[absolute_pos]
+                                        cached_fill_tokens += 1
+                                missing_fill_tokens = int((
+                                    oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
+                                ).sum().item())
                                 if not (
                                     oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
                                 ).any():
@@ -1827,6 +1855,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "masks_remaining": int(masks_remaining),
                                         "committed_tokens": int(target_len - masks_remaining),
                                         "filled_tokens": int(masks_remaining),
+                                        "oracle_current_fill_tokens": int(current_fill_tokens),
+                                        "oracle_cached_fill_tokens": int(cached_fill_tokens),
+                                        "oracle_missing_fill_tokens": int(missing_fill_tokens),
                                         "frontier_k": int(frontier_k),
                                         "frontier_score": float(frontier_score),
                                         "unmasked_this_step": int(unmasked_this_step),

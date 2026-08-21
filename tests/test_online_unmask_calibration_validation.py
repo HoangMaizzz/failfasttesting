@@ -6,6 +6,7 @@ import pandas as pd
 
 from run_online_unmask_calibration_validation import (
     evaluate_dataset,
+    summarize_coverage,
     summarize_predictions,
 )
 
@@ -18,6 +19,7 @@ def snapshot(problem_id, round_id, step, confidences, recoverable, emitted, draf
         "problem_id": problem_id,
         "round_id": round_id,
         "step": step,
+        "draft_passes_elapsed": step,
         "target_len": target_len,
         "draft_latency_elapsed_ms": draft_ms,
         "masks_remaining": sum(recoverable),
@@ -90,6 +92,12 @@ class OnlineUnmaskCalibrationValidationTests(unittest.TestCase):
             "oracle_action": ["continue", "stop"],
             "decision_correct": [1, 1],
             "decision_regret_ms_per_token": [0.0, 0.0],
+            "token_brier_score": [0.1, 0.2],
+            "token_log_loss": [0.3, 0.4],
+            "confidence_transition_mae": [0.05, 0.03],
+            "margin_transition_mae": [0.04, 0.02],
+            "recoverable_transition_mae": [0.1, 0.0],
+            "recoverable_transition_accuracy": [0.75, 1.0],
         })
 
         summary = summarize_predictions(predictions, ["dataset"]).iloc[0]
@@ -97,6 +105,44 @@ class OnlineUnmaskCalibrationValidationTests(unittest.TestCase):
         self.assertEqual(summary["transitions"], 2)
         self.assertAlmostEqual(summary["gain_mae"], 0.5)
         self.assertAlmostEqual(summary["decision_accuracy_percent"], 100.0)
+
+    def test_evaluation_rejects_extension_and_multi_pass_pairs(self):
+        rows = [
+            snapshot(1, 0, 1, [0.8] * 4, [0, 0, 1, 1], 3, 40.0),
+            snapshot(1, 0, 2, [0.9] * 4, [0, 0, 0, 0], 4, 80.0),
+            snapshot(1, 0, 3, [0.9] * 6, [0, 0, 0, 0, 0, 0], 5, 120.0),
+            snapshot(1, 0, 4, [0.9] * 6, [0, 0, 0, 0, 0, 0], 5, 160.0),
+        ]
+        rows[-1]["draft_passes_elapsed"] = 5
+        args = SimpleNamespace(
+            warmup_questions=1,
+            initial_draft_latency_ms=40.0,
+            initial_verify_latency_ms=100.0,
+            ema_alpha=0.2,
+        )
+
+        result = evaluate_dataset(pd.DataFrame(rows), args, "gsm8k")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["from_step"], 1)
+        self.assertEqual(result.iloc[0]["draft_pass_delta"], 1)
+
+    def test_coverage_counts_exact_unmask_transitions(self):
+        rows = [
+            snapshot(1, 0, 1, [0.8] * 4, [0, 0, 1, 1], 3, 40.0),
+            snapshot(1, 0, 2, [0.9] * 4, [0, 0, 0, 0], 4, 80.0),
+            snapshot(1, 0, 3, [0.9] * 6, [0, 0, 0, 0, 0, 0], 5, 120.0),
+        ]
+        frame = pd.DataFrame(rows)
+        frame["oracle_cached_fill_tokens"] = 0
+        frame["oracle_missing_fill_tokens"] = 0
+        args = SimpleNamespace(warmup_questions=1)
+
+        coverage = summarize_coverage(frame, args).iloc[0]
+
+        self.assertEqual(coverage["adjacent_snapshot_pairs"], 2)
+        self.assertEqual(coverage["same_length_pairs"], 1)
+        self.assertEqual(coverage["exact_one_pass_unmask_transitions"], 1)
 
 
 if __name__ == "__main__":

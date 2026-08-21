@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 
-BENCHMARK_VERSION = "online_unmask_calibration_validation_v2"
+BENCHMARK_VERSION = "online_unmask_calibration_validation_v3"
 
 
 def parse_args():
@@ -223,9 +223,27 @@ def transition_features(state):
     ])
 
 
+def token_acceptance_probabilities(hazard_model, state):
+    return np.clip(
+        hazard_model.predict(hazard_features(state)),
+        1e-4,
+        1.0 - 1e-4,
+    )
+
+
 def expected_emitted_tokens(hazard_model, state):
-    token_acceptance = np.clip(hazard_model.predict(hazard_features(state)), 1e-4, 1.0 - 1e-4)
+    token_acceptance = token_acceptance_probabilities(hazard_model, state)
     return float(1.0 + np.cumprod(token_acceptance).sum())
+
+
+def observed_acceptance_labels(accepted_len, target_len):
+    observed = min(int(accepted_len) + 1, int(target_len))
+    if observed <= 0:
+        return np.empty(0, dtype=np.float64)
+    labels = np.ones(observed, dtype=np.float64)
+    if int(accepted_len) < int(target_len):
+        labels[-1] = 0.0
+    return labels
 
 
 def predict_next_state(transition_model, state):
@@ -276,13 +294,10 @@ def update_transition_model(transition_model, current_state, next_state):
 
 def update_hazard_model(hazard_model, final_row, final_state):
     accepted_len = int(final_row["accepted_len_if_stop"])
-    observed = min(accepted_len + 1, final_state["target_len"])
-    if observed <= 0:
+    labels = observed_acceptance_labels(accepted_len, final_state["target_len"])
+    if len(labels) == 0:
         return
-    labels = np.ones(observed, dtype=np.float64)
-    if accepted_len < final_state["target_len"]:
-        labels[-1] = 0.0
-    hazard_model.update_batch(hazard_features(final_state)[:observed], labels)
+    hazard_model.update_batch(hazard_features(final_state)[:len(labels)], labels)
 
 
 def safe_correlation(left, right):
@@ -315,16 +330,58 @@ def evaluate_dataset(oracle, args, dataset):
             next_row = group.iloc[index + 1]
             if int(current_row["target_len"]) != int(next_row["target_len"]):
                 continue
+            draft_pass_delta = int(next_row["draft_passes_elapsed"]) - int(
+                current_row["draft_passes_elapsed"]
+            )
+            if draft_pass_delta != 1:
+                continue
             current_state = states[index]
             next_state = states[index + 1]
             predicted_next_state = predict_next_state(transition_model, current_state)
 
-            predicted_current_y = expected_emitted_tokens(hazard_model, current_state)
+            current_token_probabilities = token_acceptance_probabilities(
+                hazard_model,
+                current_state,
+            )
+            predicted_current_y = float(1.0 + np.cumprod(current_token_probabilities).sum())
             predicted_next_y = expected_emitted_tokens(hazard_model, predicted_next_state)
             predicted_gain = predicted_next_y - predicted_current_y
             actual_current_y = float(current_row["emitted_len_if_stop"])
             actual_next_y = float(next_row["emitted_len_if_stop"])
             actual_gain = actual_next_y - actual_current_y
+            acceptance_labels = observed_acceptance_labels(
+                int(current_row["accepted_len_if_stop"]),
+                current_state["target_len"],
+            )
+            observed_probabilities = current_token_probabilities[:len(acceptance_labels)]
+            token_brier = float(np.mean((observed_probabilities - acceptance_labels) ** 2))
+            token_log_loss = float(-np.mean(
+                acceptance_labels * np.log(observed_probabilities)
+                + (1.0 - acceptance_labels) * np.log(1.0 - observed_probabilities)
+            ))
+            active = current_state["recoverable"] > 0.5
+            if active.any():
+                confidence_transition_mae = float(np.mean(np.abs(
+                    predicted_next_state["confidence"][active]
+                    - next_state["confidence"][active]
+                )))
+                margin_transition_mae = float(np.mean(np.abs(
+                    predicted_next_state["margin"][active]
+                    - next_state["margin"][active]
+                )))
+                recoverable_transition_mae = float(np.mean(np.abs(
+                    predicted_next_state["recoverable"][active]
+                    - next_state["recoverable"][active]
+                )))
+                recoverable_transition_accuracy = float(np.mean(
+                    (predicted_next_state["recoverable"][active] >= 0.5)
+                    == (next_state["recoverable"][active] >= 0.5)
+                ))
+            else:
+                confidence_transition_mae = 0.0
+                margin_transition_mae = 0.0
+                recoverable_transition_mae = 0.0
+                recoverable_transition_accuracy = 1.0
             actual_next_draft_ms = max(
                 0.0,
                 float(next_row["draft_latency_elapsed_ms"])
@@ -372,6 +429,14 @@ def evaluate_dataset(oracle, args, dataset):
                     "predicted_gain": predicted_gain,
                     "actual_gain": actual_gain,
                     "gain_error": predicted_gain - actual_gain,
+                    "token_brier_score": token_brier,
+                    "token_log_loss": token_log_loss,
+                    "observed_acceptance_tokens": len(acceptance_labels),
+                    "confidence_transition_mae": confidence_transition_mae,
+                    "margin_transition_mae": margin_transition_mae,
+                    "recoverable_transition_mae": recoverable_transition_mae,
+                    "recoverable_transition_accuracy": recoverable_transition_accuracy,
+                    "draft_pass_delta": draft_pass_delta,
                     "predicted_next_draft_ms": predicted_next_draft_ms,
                     "actual_next_draft_ms": actual_next_draft_ms,
                     "predicted_verify_ms": predicted_verify_ms,
@@ -407,6 +472,33 @@ def summarize_predictions(predictions, group_columns):
         if not isinstance(keys, tuple):
             keys = (keys,)
         gain_error = group["gain_error"].to_numpy(dtype=np.float64)
+        predicted_continue = group["predicted_action"].eq("continue")
+        oracle_continue = group["oracle_action"].eq("continue")
+        true_continue = int((predicted_continue & oracle_continue).sum())
+        false_continue = int((predicted_continue & ~oracle_continue).sum())
+        false_stop = int((~predicted_continue & oracle_continue).sum())
+        true_stop = int((~predicted_continue & ~oracle_continue).sum())
+        continue_precision = (
+            true_continue / (true_continue + false_continue)
+            if true_continue + false_continue
+            else float("nan")
+        )
+        continue_recall = (
+            true_continue / (true_continue + false_stop)
+            if true_continue + false_stop
+            else float("nan")
+        )
+        stop_recall = (
+            true_stop / (true_stop + false_continue)
+            if true_stop + false_continue
+            else float("nan")
+        )
+        balanced_accuracy = (
+            0.5 * (continue_recall + stop_recall)
+            if np.isfinite(continue_recall) and np.isfinite(stop_recall)
+            else float("nan")
+        )
+        regrets = group["decision_regret_ms_per_token"].to_numpy(dtype=np.float64)
         record = dict(zip(group_columns, keys))
         record.update({
             "transitions": len(group),
@@ -429,17 +521,84 @@ def summarize_predictions(predictions, group_columns):
             "verify_latency_mae_ms": np.abs(
                 group["predicted_verify_ms"] - group["actual_verify_ms"]
             ).mean(),
+            "token_brier_score": group["token_brier_score"].mean(),
+            "token_log_loss": group["token_log_loss"].mean(),
+            "confidence_transition_mae": group["confidence_transition_mae"].mean(),
+            "margin_transition_mae": group["margin_transition_mae"].mean(),
+            "recoverable_transition_mae": group["recoverable_transition_mae"].mean(),
+            "recoverable_transition_accuracy_percent": 100.0
+            * group["recoverable_transition_accuracy"].mean(),
             "predicted_continue_rate_percent": 100.0
-            * (group["predicted_action"] == "continue").mean(),
+            * predicted_continue.mean(),
             "oracle_continue_rate_percent": 100.0
-            * (group["oracle_action"] == "continue").mean(),
+            * oracle_continue.mean(),
             "decision_accuracy_percent": 100.0 * group["decision_correct"].mean(),
-            "mean_decision_regret_ms_per_token": group[
-                "decision_regret_ms_per_token"
-            ].mean(),
+            "continue_true_positive": true_continue,
+            "continue_false_positive": false_continue,
+            "continue_false_negative": false_stop,
+            "stop_true_positive": true_stop,
+            "continue_precision_percent": 100.0 * continue_precision,
+            "continue_recall_percent": 100.0 * continue_recall,
+            "stop_recall_percent": 100.0 * stop_recall,
+            "balanced_decision_accuracy_percent": 100.0 * balanced_accuracy,
+            "mean_decision_regret_ms_per_token": regrets.mean(),
+            "p95_decision_regret_ms_per_token": float(np.quantile(regrets, 0.95)),
+            "max_decision_regret_ms_per_token": regrets.max(),
         })
         records.append(record)
     return pd.DataFrame(records)
+
+
+def summarize_coverage(oracle, args):
+    records = []
+    for dataset, dataset_rows in oracle.groupby("dataset", sort=True):
+        measured = dataset_rows[dataset_rows["problem_id"].astype(int) >= args.warmup_questions]
+        snapshots = 0
+        adjacent_pairs = 0
+        same_length_pairs = 0
+        exact_one_pass_pairs = 0
+        rounds = 0
+        for _, group in measured.groupby(["problem_id", "round_id"], sort=False):
+            group = group.sort_values("step").reset_index(drop=True)
+            rounds += 1
+            snapshots += len(group)
+            for index in range(len(group) - 1):
+                current_row = group.iloc[index]
+                next_row = group.iloc[index + 1]
+                adjacent_pairs += 1
+                if int(current_row["target_len"]) != int(next_row["target_len"]):
+                    continue
+                same_length_pairs += 1
+                if int(next_row["draft_passes_elapsed"]) - int(
+                    current_row["draft_passes_elapsed"]
+                ) == 1:
+                    exact_one_pass_pairs += 1
+        records.append({
+            "dataset": dataset,
+            "problems": measured["problem_id"].nunique(),
+            "rounds": rounds,
+            "snapshots": snapshots,
+            "adjacent_snapshot_pairs": adjacent_pairs,
+            "same_length_pairs": same_length_pairs,
+            "exact_one_pass_unmask_transitions": exact_one_pass_pairs,
+            "transition_coverage_percent": 100.0 * exact_one_pass_pairs / max(1, adjacent_pairs),
+            "nonfinal_snapshots": int((measured["masks_remaining"] > 0).sum()),
+            "cached_fill_tokens": int(measured["oracle_cached_fill_tokens"].sum())
+            if "oracle_cached_fill_tokens" in measured else 0,
+            "missing_fill_tokens": int(measured["oracle_missing_fill_tokens"].sum())
+            if "oracle_missing_fill_tokens" in measured else 0,
+        })
+    return pd.DataFrame(records)
+
+
+def summarize_history(predictions):
+    frame = predictions.copy()
+    frame["history_bin"] = pd.cut(
+        frame["transition_observations_before"],
+        bins=[-1, 0, 9, 49, 199, np.inf],
+        labels=["0", "1-9", "10-49", "50-199", "200+"],
+    )
+    return summarize_predictions(frame, ["dataset", "history_bin"])
 
 
 def calibration_curve(predictions):
@@ -543,6 +702,7 @@ def main():
         "token_forced",
         "token_recoverable",
         "actual_verify_latency_ms",
+        "draft_passes_elapsed",
     }
     missing = required.difference(oracle.columns)
     if missing:
@@ -555,6 +715,10 @@ def main():
         prediction_frames.append(predictions)
 
     predictions = pd.concat(prediction_frames, ignore_index=True)
+    if predictions.empty:
+        raise ValueError(
+            "No exact one-forward-pass, same-length unmask transitions were collected"
+        )
     dataset_summary = summarize_predictions(predictions, ["dataset"])
     step_summary = summarize_predictions(
         predictions,
@@ -565,12 +729,19 @@ def main():
         ["scope"],
     )
     curve = calibration_curve(predictions)
+    coverage = summarize_coverage(oracle, args)
+    history_summary = summarize_history(predictions)
 
     predictions.to_csv(output_dir / "online_calibration_predictions.csv", index=False)
     dataset_summary.to_csv(output_dir / "online_calibration_dataset_summary.csv", index=False)
     step_summary.to_csv(output_dir / "online_calibration_step_summary.csv", index=False)
     overall_summary.to_csv(output_dir / "online_calibration_overall_summary.csv", index=False)
     curve.to_csv(output_dir / "online_calibration_curve.csv", index=False)
+    coverage.to_csv(output_dir / "online_calibration_coverage.csv", index=False)
+    history_summary.to_csv(
+        output_dir / "online_calibration_history_summary.csv",
+        index=False,
+    )
     write_manifest(args, output_dir)
 
     archive_path = shutil.make_archive(
@@ -583,6 +754,8 @@ def main():
     print(dataset_summary.to_string(index=False))
     print("\nONLINE CALIBRATION OVERALL SUMMARY")
     print(overall_summary.to_string(index=False))
+    print("\nONLINE CALIBRATION COVERAGE")
+    print(coverage.to_string(index=False))
     print(f"\nSaved report: {output_dir}")
     print(f"Saved archive: {archive_path}")
 
