@@ -1716,14 +1716,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             unmasked_this_step = int(unmask_idx.sum().item())
 
                             if (
-                                (
-                                    bool(getattr(args, "collect_oracle_refinement", False))
-                                    or frontier_mode in (
-                                        "cost_aware_v2",
-                                        "cost_aware_v2_refinement_only",
-                                        "cost_aware_v2_refinement_no_threshold",
-                                    )
-                                )
+                                bool(getattr(args, "collect_oracle_refinement", False))
                                 and oracle_full_block_logits is not None
                             ):
                                 full_block_tokens = oracle_full_block_logits.argmax(dim=-1)[0]
@@ -1952,7 +1945,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )[0].nonzero(as_tuple=False).flatten().tolist()
                                 ]
                                 zero_cost_fill_available = all(
-                                    absolute_pos in oracle_candidate_token_ids
+                                    absolute_pos in current_step_token_ids
                                     for absolute_pos in remaining_absolute_positions
                                 )
                                 stop_fill_ms = (
@@ -2139,39 +2132,47 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         for rel_pos in draft_mask[0].nonzero(as_tuple=False).flatten().tolist()
                                     ]
                                     cached_fill_available = all(
-                                        absolute_pos in oracle_candidate_token_ids
+                                        absolute_pos in current_step_token_ids
                                         for absolute_pos in remaining_absolute_positions
                                     )
                                     if not cached_fill_available:
-                                        frontier_force_stop = False
-                                        frontier_stats["refinement_actions"].append({
-                                            "step": len(frontier_scores),
-                                            "action": "zero_cost_fill_unavailable_continue",
-                                            "phase": "refinement",
-                                            "target_len": target_len,
-                                            "masks_remaining": masks_remaining,
-                                        })
-                                    else:
-                                        for absolute_pos in remaining_absolute_positions:
+                                        fill_start_time = torch.cuda.Event(enable_timing=True)
+                                        fill_start_time.record()
+                                        fill_logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                                        fill_logits = torch.cat([fill_logits[:, :1, :], fill_logits[:, :-1, :]], dim=1)
+                                        fill_end_time = torch.cuda.Event(enable_timing=True)
+                                        fill_end_time.record()
+                                        torch.cuda.synchronize()
+                                        forward_pass_latencies.append(fill_start_time.elapsed_time(fill_end_time))
+                                        num_forward_passes += 1
+                                        frontier_stats["forward_pass_breakdown"]["fill"] += 1
+                                        fill_probs = torch.softmax(fill_logits, dim=-1)
+                                        fill_top2_probs = torch.topk(fill_probs, k=2, dim=-1).values
+                                        fill_margins = (fill_top2_probs[..., 0] - fill_top2_probs[..., 1]).float()
+
+                                    for absolute_pos in remaining_absolute_positions:
+                                        if cached_fill_available:
                                             token_id = torch.tensor(
-                                                [oracle_candidate_token_ids[absolute_pos]],
+                                                [current_step_token_ids[absolute_pos]],
                                                 device=x_t.device,
                                                 dtype=x_t.dtype,
                                             )
-                                            token_confidence = current_step_confidences.get(
-                                                absolute_pos,
-                                                0.0,
-                                            )
-                                            token_margin = current_step_margins.get(
-                                                absolute_pos,
-                                                0.0,
-                                            )
-                                            x_t[:, absolute_pos] = token_id
-                                            committed_confidences[int(absolute_pos)] = float(token_confidence)
-                                            committed_margins[int(absolute_pos)] = float(token_margin)
-                                            committed_forced[int(absolute_pos)] = True
-                                            filled_on_stop_positions.add(int(absolute_pos))
-                                            conf_of_unmasked_tokens.append(float(token_confidence))
+                                            token_confidence = current_step_confidences[absolute_pos]
+                                            token_margin = current_step_margins[absolute_pos]
+                                        else:
+                                            local_pos = absolute_pos - block_abs_start
+                                            if not 0 <= local_pos < fill_logits.shape[1]:
+                                                continue
+                                            token_id = fill_logits[:, local_pos, :].argmax(dim=-1)
+                                            token_conf = torch.gather(fill_probs[:, local_pos, :], dim=-1, index=token_id.unsqueeze(-1)).squeeze(-1)
+                                            token_confidence = float(token_conf[0].float().item())
+                                            token_margin = float(fill_margins[0, local_pos].float().item())
+                                        x_t[:, absolute_pos] = token_id
+                                        committed_confidences[int(absolute_pos)] = float(token_confidence)
+                                        committed_margins[int(absolute_pos)] = float(token_margin)
+                                        committed_forced[int(absolute_pos)] = True
+                                        filled_on_stop_positions.add(int(absolute_pos))
+                                        conf_of_unmasked_tokens.append(float(token_confidence))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")
