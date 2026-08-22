@@ -52,6 +52,10 @@ class AdaptiveTDBenchmarkTests(unittest.TestCase):
             "adaptive_stop_available_decisions": [3],
             "adaptive_candidate_coverage_decisions": [4],
             "adaptive_outer_verify_eligible_decisions": [3],
+            "adaptive_stop_then_extend_actions": [1],
+            "adaptive_stop_then_verify_actions": [0],
+            "adaptive_outer_action_matches": [1],
+            "adaptive_outer_action_mismatches": [0],
             "adaptive_mean_refinement_step": [1.5],
             "adaptive_controller_ms": [0.2],
         })
@@ -59,6 +63,8 @@ class AdaptiveTDBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["adaptive_stop_available_rate_percent"], 75.0)
         self.assertEqual(summary["adaptive_candidate_coverage_rate_percent"], 100.0)
         self.assertEqual(summary["adaptive_outer_verify_eligible_rate_percent"], 75.0)
+        self.assertEqual(summary["adaptive_stop_then_extend_actions"], 1)
+        self.assertEqual(summary["adaptive_outer_action_match_rate_percent"], 100.0)
 
     def test_stop_availability_is_not_outer_verify_eligibility(self):
         decisions = pd.DataFrame({

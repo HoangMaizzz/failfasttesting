@@ -544,6 +544,10 @@ BENCHMARK_CSV_COLUMNS = [
     "adaptive_stop_available_decisions",
     "adaptive_candidate_coverage_decisions",
     "adaptive_outer_verify_eligible_decisions",
+    "adaptive_stop_then_extend_actions",
+    "adaptive_stop_then_verify_actions",
+    "adaptive_outer_action_matches",
+    "adaptive_outer_action_mismatches",
     "modeled_ms_per_output_token",
     "modeled_speedup",
     "output_token_hash",
@@ -742,6 +746,24 @@ def summarize_frontier_diagnostics(stats_each_round):
         ),
         "adaptive_outer_verify_eligible_decisions": sum(
             bool(item.get("outer_failfast_verify_eligible"))
+            for item in adaptive_decisions
+        ),
+        "adaptive_stop_then_extend_actions": sum(
+            item.get("action") == "stop"
+            and item.get("realized_post_stop_outer_action") == "extend"
+            for item in adaptive_decisions
+        ),
+        "adaptive_stop_then_verify_actions": sum(
+            item.get("action") == "stop"
+            and item.get("realized_post_stop_outer_action") == "verify"
+            for item in adaptive_decisions
+        ),
+        "adaptive_outer_action_matches": sum(
+            item.get("outer_action_matches_plan") is True
+            for item in adaptive_decisions
+        ),
+        "adaptive_outer_action_mismatches": sum(
+            item.get("outer_action_matches_plan") is False
             for item in adaptive_decisions
         ),
         "adaptive_rho_tokens_per_ms": (
@@ -990,14 +1012,46 @@ def record_adaptive_td_decisions(
     logging_started = time.perf_counter()
     if not hasattr(args, "adaptive_decision_rows"):
         args.adaptive_decision_rows = []
+    final_draft_length = int(frontier_stats.get("actual_spec_len") or 0)
+    extension_events = frontier_stats.get("extension_events") or []
     for decision_id, item in enumerate(frontier_stats.get("adaptive_decisions") or []):
+        target_len = int(item.get("target_len", 0))
+        matching_extensions = [
+            event
+            for event in extension_events
+            if int(event.get("from_len", -1)) == target_len
+            and event.get("trigger") == "high_confidence_extend"
+        ]
+        high_confidence_extension = sum(
+            int(event.get("extension_size", 0))
+            for event in matching_extensions
+        )
+        finalized_fields = {
+            "final_draft_length": final_draft_length,
+            "draft_length_delta_after_decision": final_draft_length - target_len,
+            "high_confidence_extension_realized": bool(
+                high_confidence_extension
+            ),
+            "high_confidence_extension_size": int(high_confidence_extension),
+            "realized_post_stop_outer_action": None,
+            "outer_action_matches_plan": None,
+        }
+        if item.get("action") == "stop":
+            realized_action = (
+                "extend" if high_confidence_extension else "verify"
+            )
+            finalized_fields["realized_post_stop_outer_action"] = realized_action
+            finalized_fields["outer_action_matches_plan"] = (
+                realized_action == item.get("post_stop_outer_action")
+            )
+        item.update(finalized_fields)
         args.adaptive_decision_rows.append({
             "problem_id": int(problem_id),
             "round_id": int(round_id),
             "decision_id": int(decision_id),
             **item,
             "features": json.dumps(item.get("features") or []),
-            "draft_length": int(item.get("target_len", 0)),
+            "draft_length": target_len,
             "remaining_mask_ratio": float((item.get("features") or [0.0, 0.0])[1]),
             "newly_unmasked_ratio": float((item.get("features") or [0.0, 0.0, 0.0])[2]),
             "accepted_draft_tokens": int(accepted_draft_tokens),

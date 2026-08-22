@@ -139,7 +139,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_decoupled_stop_v3",
+        "version": "online_td_v1_decoupled_stop_v4",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -329,6 +329,22 @@ def aggregate(rows):
             "adaptive_outer_verify_eligible_decisions",
             pd.Series(0, index=group.index),
         )
+        stop_then_extend = group.get(
+            "adaptive_stop_then_extend_actions",
+            pd.Series(0, index=group.index),
+        )
+        stop_then_verify = group.get(
+            "adaptive_stop_then_verify_actions",
+            pd.Series(0, index=group.index),
+        )
+        outer_action_matches = group.get(
+            "adaptive_outer_action_matches",
+            pd.Series(0, index=group.index),
+        )
+        outer_action_mismatches = group.get(
+            "adaptive_outer_action_mismatches",
+            pd.Series(0, index=group.index),
+        )
         decision_count = adaptive_decisions.sum()
         weighted_step = (
             group.get(
@@ -362,6 +378,9 @@ def aggregate(rows):
             "adaptive_stop_available_rate_percent": 100.0 * stop_available_decisions.sum() / max(1, decision_count),
             "adaptive_candidate_coverage_rate_percent": 100.0 * candidate_coverage_decisions.sum() / max(1, decision_count),
             "adaptive_outer_verify_eligible_rate_percent": 100.0 * outer_verify_eligible_decisions.sum() / max(1, decision_count),
+            "adaptive_stop_then_extend_actions": stop_then_extend.sum(),
+            "adaptive_stop_then_verify_actions": stop_then_verify.sum(),
+            "adaptive_outer_action_match_rate_percent": 100.0 * outer_action_matches.sum() / max(1, outer_action_matches.sum() + outer_action_mismatches.sum()),
             "adaptive_mean_decision_step": weighted_step / max(1, decision_count),
             "adaptive_controller_ms": group.get("adaptive_controller_ms", pd.Series(0, index=group.index)).sum(),
             "adaptive_controller_ms_per_output_token": group.get("adaptive_controller_ms", pd.Series(0, index=group.index)).sum() / output_tokens,
