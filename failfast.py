@@ -266,6 +266,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
     return_frontier_stats = (
         controller_enabled
         or getattr(args, "collect_draft_diagnostics", False)
+        or getattr(args, "collect_bucket_oracle", False)
     )
     frontier_stats = None
 
@@ -395,6 +396,8 @@ parser.add_argument("--bucket_prior_strength", type=float, default=8.0)
 parser.add_argument("--bucket_min_observations", type=int, default=8)
 parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
+parser.add_argument("--collect_bucket_oracle", action="store_true")
+parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--quiet_generation", action="store_true")
 parser.add_argument("--disable_progress", action="store_true")
 parser.add_argument("--skip_artifacts", action="store_true")
@@ -531,6 +534,36 @@ FRONTIER_GAIN_DIAGNOSTIC_COLUMNS = [
     "stop_ms_per_output",
     "continue_ms_per_output",
     "calibration_tokens",
+]
+
+BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
+    "problem_id",
+    "mode",
+    "round_id",
+    "step",
+    "target_len",
+    "draft_passes_elapsed",
+    "draft_latency_elapsed_ms",
+    "masks_remaining",
+    "committed_tokens",
+    "filled_tokens",
+    "draft_proposal",
+    "accept_probabilities",
+    "predicted_expected_output",
+    "predicted_next_gain",
+    "predicted_stop_ms_per_output",
+    "predicted_continue_ms_per_output",
+    "predicted_should_continue",
+    "predicted_gain_source",
+    "gain_bucket_count",
+    "gain_bucket_weight",
+    "calibration_tokens",
+    "accepted_len_if_stop",
+    "emitted_len_if_stop",
+    "actual_verify_latency_ms",
+    "actual_accept_check_latency_ms",
+    "actual_shared_post_verify_overhead_ms",
+    "actual_post_verify_latency_ms",
 ]
 
 def safe_div(numerator, denominator):
@@ -1025,6 +1058,120 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
         gain_rows,
     )
 
+
+def evaluate_oracle_proposal(
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    draft_proposal,
+):
+    combined_ids = current_token_ids + draft_proposal
+    proposal_tensor = torch.tensor(
+        [combined_ids],
+        device=target_model.device,
+        dtype=torch.long,
+    )
+    full_input_ids = torch.cat(
+        [orig_model_inputs["input_ids"], proposal_tensor],
+        dim=1,
+    )
+    full_attention_mask = torch.cat(
+        [orig_model_inputs["attention_mask"], torch.ones_like(proposal_tensor)],
+        dim=1,
+    )
+    if proposal_tensor.is_cuda:
+        torch.cuda.synchronize(proposal_tensor.device)
+    verify_start = time.perf_counter()
+    with torch.inference_mode():
+        oracle_outputs = target_model(
+            input_ids=full_input_ids,
+            attention_mask=full_attention_mask,
+            use_cache=False,
+            logits_to_keep=len(draft_proposal) + 1,
+        )
+    if proposal_tensor.is_cuda:
+        torch.cuda.synchronize(proposal_tensor.device)
+    verify_latency_ms = (time.perf_counter() - verify_start) * 1000.0
+
+    post_verify_start = time.perf_counter()
+    verify_logits = oracle_outputs.logits[0, :len(draft_proposal)]
+    accepted_len = 0
+    for index, draft_token_id in enumerate(draft_proposal):
+        target_token_id = int(torch.argmax(verify_logits[index], dim=-1).item())
+        if int(draft_token_id) != target_token_id:
+            break
+        accepted_len += 1
+    post_verify_latency_ms = (time.perf_counter() - post_verify_start) * 1000.0
+    del verify_logits, oracle_outputs
+    return accepted_len, accepted_len + 1, verify_latency_ms, post_verify_latency_ms
+
+
+def append_bucket_oracle_rows(
+    args,
+    problem_id,
+    mode,
+    round_id,
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    frontier_stats,
+    shared_post_verify_overhead_ms,
+):
+    if not args.collect_bucket_oracle:
+        return
+    snapshots = (frontier_stats or {}).get("oracle_refinement_snapshots") or []
+    rows = []
+    for snapshot in snapshots:
+        draft_proposal = [int(token_id) for token_id in snapshot["draft_proposal"]]
+        accepted_len, emitted_len, verify_ms, accept_check_ms = evaluate_oracle_proposal(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            draft_proposal,
+        )
+        rows.append({
+            "problem_id": problem_id,
+            "mode": mode,
+            "round_id": round_id,
+            "step": snapshot.get("step"),
+            "target_len": snapshot.get("target_len"),
+            "draft_passes_elapsed": snapshot.get("draft_passes_elapsed"),
+            "draft_latency_elapsed_ms": snapshot.get("draft_latency_elapsed_ms"),
+            "masks_remaining": snapshot.get("masks_remaining"),
+            "committed_tokens": snapshot.get("committed_tokens"),
+            "filled_tokens": snapshot.get("filled_tokens"),
+            "draft_proposal": json.dumps(draft_proposal),
+            "accept_probabilities": json.dumps(
+                snapshot.get("accept_probabilities") or []
+            ),
+            "predicted_expected_output": snapshot.get("predicted_expected_output"),
+            "predicted_next_gain": snapshot.get("predicted_next_gain"),
+            "predicted_stop_ms_per_output": snapshot.get(
+                "predicted_stop_ms_per_output"
+            ),
+            "predicted_continue_ms_per_output": snapshot.get(
+                "predicted_continue_ms_per_output"
+            ),
+            "predicted_should_continue": snapshot.get("predicted_should_continue"),
+            "predicted_gain_source": snapshot.get("predicted_gain_source"),
+            "gain_bucket_count": snapshot.get("gain_bucket_count"),
+            "gain_bucket_weight": snapshot.get("gain_bucket_weight"),
+            "calibration_tokens": snapshot.get("calibration_tokens"),
+            "accepted_len_if_stop": accepted_len,
+            "emitted_len_if_stop": emitted_len,
+            "actual_verify_latency_ms": verify_ms,
+            "actual_accept_check_latency_ms": accept_check_ms,
+            "actual_shared_post_verify_overhead_ms": shared_post_verify_overhead_ms,
+            "actual_post_verify_latency_ms": (
+                accept_check_ms + shared_post_verify_overhead_ms
+            ),
+        })
+    append_csv_rows(
+        os.path.join(args.output_dir, "bucket_oracle_snapshots.csv"),
+        BUCKET_ORACLE_SNAPSHOT_COLUMNS,
+        rows,
+    )
+
 apply_mode_settings(args)
 args.target_model_name_clean = args.target_model_name.split("/", 1)[1]
 logging.basicConfig(
@@ -1232,6 +1379,7 @@ for problem_id, is_warmup in tqdm(
             draft_time_total = 0.0
             verify_time_total = 0.0
             post_verify_time_total = 0.0
+            oracle_diagnostic_time_total = 0.0
             pickled_data = {
                 "orig_model_inputs": orig_model_inputs["input_ids"][0].tolist(),
                 "raw_data": raw_data,
@@ -1419,7 +1567,8 @@ for problem_id, is_warmup in tqdm(
                     bonus_token = None
                     target_tokens = [] # Dành cho logging tương thích cũ
                     checked_outcomes = []
-                    
+
+                    accept_check_start = time.perf_counter()
                     generation_print(args, f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
                     for i in range(len(draft_proposal)):
                         if draft_type == "ar" and args.decoding_strategy == "sampling":
@@ -1504,6 +1653,9 @@ for problem_id, is_warmup in tqdm(
                         if not args.quiet_generation:
                             bonus_word = target_tokenizer.decode([final_token])
                             generation_print(args, f"   👉 Trúng phóc 100%! Verifier tặng kèm 1 token bonus: [{bonus_word!r}]", flush=True)
+                    accept_check_time_ms = (
+                        time.perf_counter() - accept_check_start
+                    ) * 1000.0
                     
                     generation_print(args, f"🎯 TỔNG KẾT VÒNG {num_speculation_rounds}: Chấp nhận {accepted_len}/{len(draft_proposal)} token.\n" + "-"*50, flush=True)
                     # ---------------------------------------------------------
@@ -1518,6 +1670,7 @@ for problem_id, is_warmup in tqdm(
                     remaining_tokens = num_target_tokens - len(current_token_ids)
                     tokens_to_append = tokens_to_append[:remaining_tokens]
                     frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
+                    oracle_prefix_token_ids = list(current_token_ids)
                     current_token_ids.extend(tokens_to_append)
                     
                     accepted_tokens += accepted_len
@@ -1543,6 +1696,30 @@ for problem_id, is_warmup in tqdm(
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
+
+                    if (
+                        draft_type == "dllm"
+                        and args.collect_bucket_oracle
+                        and not is_warmup
+                    ):
+                        oracle_diagnostic_start = time.perf_counter()
+                        del verify_logits, outputs
+                        if bonus_token is not None:
+                            del final_token_logits
+                        append_bucket_oracle_rows(
+                            args,
+                            problem_id,
+                            benchmark_mode,
+                            num_speculation_rounds,
+                            target_model,
+                            orig_model_inputs,
+                            oracle_prefix_token_ids,
+                            frontier_stats_this_round,
+                            max(0.0, post_verify_time * 1000.0 - accept_check_time_ms),
+                        )
+                        oracle_diagnostic_time_total += (
+                            time.perf_counter() - oracle_diagnostic_start
+                        )
                     
                     info_this_round = {
                         "target_tokens": target_tokens,
@@ -1572,7 +1749,11 @@ for problem_id, is_warmup in tqdm(
 
             if orig_model_inputs["input_ids"].is_cuda:
                 torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
-            actual_e2e_time = time.perf_counter() - generation_start
+            actual_e2e_time = (
+                time.perf_counter()
+                - generation_start
+                - oracle_diagnostic_time_total
+            )
 
             if inner_bar is not None:
                 inner_bar.close()
@@ -1657,6 +1838,7 @@ for problem_id, is_warmup in tqdm(
         if not is_warmup and draft_type == "dllm" and (
             frontier_stop_enabled(args)
             or args.collect_draft_diagnostics
+            or args.collect_bucket_oracle
         ):
             append_frontier_diagnostic_rows(
                 args,

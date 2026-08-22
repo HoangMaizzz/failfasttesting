@@ -87,3 +87,19 @@ The command runs only bucket-renewal `N=8`. Its deterministic problem IDs match
 the saved FailFast `N=8` benchmark generated with sample seed 2026. Pass that
 report's `per_observation.csv` through `--reference_csv` to produce paired
 comparisons without rerunning FailFast.
+
+Validate gain and stop/continue cost predictions against measured
+counterfactuals with:
+
+```bash
+python run_bucket_renewal_oracle_validation.py \
+  --num_questions 15 \
+  --max_new_tokens 1024 \
+  --target_model_name Qwen/Qwen2.5-7B-Instruct \
+  --dllm_dir /content/failfasttesting/Fast_dLLM_v2_1.5B
+```
+
+The shadow-oracle run evaluates the proposal produced by every denoising step
+with greedy verification, including steps where the controller predicted
+`continue`. It then forces refinement to continue so the next-step outcome is
+also observed. Diagnostic verifier calls are excluded from the method timing.

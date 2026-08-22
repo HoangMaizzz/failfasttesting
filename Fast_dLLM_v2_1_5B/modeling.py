@@ -1114,6 +1114,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "draft_token_stats": [],
             "refinement_actions": [],
             "extension_events": [],
+            "oracle_refinement_snapshots": [],
             "forward_pass_breakdown": {
                 "prefill": 0,
                 "cache_update": 0,
@@ -1662,6 +1663,69 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     and not decision.should_continue
                                 ):
                                     stop_reason = "bucket_renewal_lower_cost"
+
+                            if bool(getattr(args, "collect_bucket_oracle", False)):
+                                remaining_absolute_positions = [
+                                    draft_token_start_idx + int(rel_pos)
+                                    for rel_pos in (
+                                        x_t[:, draft_token_start_idx:draft_end_idx] == mask_id
+                                    )[0].nonzero(as_tuple=False).flatten().tolist()
+                                ]
+                                missing_fill_positions = [
+                                    absolute_pos
+                                    for absolute_pos in remaining_absolute_positions
+                                    if absolute_pos not in current_step_token_ids
+                                ]
+                                if not missing_fill_positions:
+                                    oracle_x = x_t.clone()
+                                    for absolute_pos in remaining_absolute_positions:
+                                        oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
+                                    frontier_stats["oracle_refinement_snapshots"].append({
+                                        "step": current_step,
+                                        "target_len": int(target_len),
+                                        "draft_passes_elapsed": int(num_forward_passes),
+                                        "draft_latency_elapsed_ms": float(sum(forward_pass_latencies)),
+                                        "masks_remaining": int(masks_remaining),
+                                        "committed_tokens": int(target_len - masks_remaining),
+                                        "filled_tokens": int(masks_remaining),
+                                        "draft_proposal": oracle_x[
+                                            0,
+                                            draft_token_start_idx:draft_end_idx,
+                                        ].tolist(),
+                                        "predicted_expected_output": step_record.get(
+                                            "bucket_expected_output"
+                                        ),
+                                        "predicted_next_gain": step_record.get(
+                                            "predicted_next_gain"
+                                        ),
+                                        "predicted_stop_ms_per_output": step_record.get(
+                                            "bucket_stop_ms_per_output"
+                                        ),
+                                        "predicted_continue_ms_per_output": step_record.get(
+                                            "bucket_continue_ms_per_output"
+                                        ),
+                                        "predicted_should_continue": step_record.get(
+                                            "bucket_should_continue"
+                                        ),
+                                        "predicted_gain_source": step_record.get(
+                                            "predicted_next_gain_source"
+                                        ),
+                                        "gain_bucket_count": step_record.get(
+                                            "gain_bucket_count"
+                                        ),
+                                        "gain_bucket_weight": step_record.get(
+                                            "gain_bucket_weight"
+                                        ),
+                                        "calibration_tokens": int(bucket_calibration_tokens),
+                                        "accept_probabilities": list(accept_probabilities),
+                                    })
+
+                            if (
+                                stop_reason is not None
+                                and bool(getattr(args, "bucket_oracle_force_continue", False))
+                            ):
+                                step_record["oracle_overrode_stop"] = True
+                                stop_reason = None
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
                                 frontier_force_stop = frontier_mode == "bucket_renewal"
