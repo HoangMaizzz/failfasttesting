@@ -614,13 +614,20 @@ def frontier_stop_enabled(args):
 
 def ensure_frontier_runtime_state(args):
     if not hasattr(args, "bucket_acceptance_calibration"):
-        args.bucket_acceptance_calibration = {
-            "token_position_confidence_margin": {},
-            "token_position_confidence": {},
-            "token_confidence_margin": {},
-            "token_confidence": {},
-            "total_checked_tokens": 0,
-        }
+        args.bucket_acceptance_calibration = {}
+    calibration = args.bucket_acceptance_calibration
+    for table_name in (
+        "token_step_position_confidence_margin",
+        "token_step_confidence_margin",
+        "token_step_position_confidence",
+        "token_step_confidence",
+        "token_position_confidence_margin",
+        "token_position_confidence",
+        "token_confidence_margin",
+        "token_confidence",
+    ):
+        calibration.setdefault(table_name, {})
+    calibration.setdefault("total_checked_tokens", 0)
     if not hasattr(args, "bucket_gain_calibration"):
         args.bucket_gain_calibration = {
             "length_score_masks": {},
@@ -753,6 +760,27 @@ def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcom
         confidence_bin = calibration_bin(confidence)
         margin_bin = calibration_bin(margin)
         position_bin = position_bucket(idx)
+        commit_step = str(max(1, int(token_stats.get("commit_step", 1))))
+        update_calibration_bucket(
+            calibration["token_step_position_confidence_margin"],
+            f"{commit_step}:{position_bin}:{confidence_bin}:{margin_bin}",
+            accepted,
+        )
+        update_calibration_bucket(
+            calibration["token_step_confidence_margin"],
+            f"{commit_step}:{confidence_bin}:{margin_bin}",
+            accepted,
+        )
+        update_calibration_bucket(
+            calibration["token_step_position_confidence"],
+            f"{commit_step}:{position_bin}:{confidence_bin}",
+            accepted,
+        )
+        update_calibration_bucket(
+            calibration["token_step_confidence"],
+            f"{commit_step}:{confidence_bin}",
+            accepted,
+        )
         update_calibration_bucket(
             calibration["token_position_confidence_margin"],
             f"{position_bin}:{confidence_bin}:{margin_bin}",

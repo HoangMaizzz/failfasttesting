@@ -25,6 +25,7 @@ from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from einops import rearrange, repeat
 
 from bucket_renewal import (
+    calibrated_acceptance_probability,
     compare_renewal_costs,
     expected_accepted_prefix,
     position_bucket,
@@ -1123,6 +1124,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         }
         committed_confidences = {}
         committed_margins = {}
+        committed_accept_probabilities = {}
+        committed_steps = {}
         frontier_scores = []
         frontier_states = []
         frontier_score_target_len = None
@@ -1154,16 +1157,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         def bucket_context_bin(context_len):
             return str(max(0, int(context_len) // 256))
 
-        def bucket_posterior(table, key, prior, prior_strength):
-            stats = table.get(key)
-            if not stats:
-                return None
-            accepted, total = stats
-            total = float(total)
-            probability = (float(accepted) + prior_strength * prior) / (total + prior_strength)
-            return max(0.02, min(0.98, probability))
-
-        def bucket_acceptance_probability(confidence, margin, position):
+        def bucket_acceptance_probability(confidence, margin, position, step):
             raw_probability = max(0.02, min(0.98, float(confidence)))
             calibration = getattr(args, "bucket_acceptance_calibration", {}) if args is not None else {}
             min_observations = int(getattr(args, "bucket_min_observations", 8))
@@ -1171,7 +1165,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             confidence_key = frontier_bin(confidence)
             margin_key = frontier_bin(margin)
             position_key = position_bucket(position)
+            step_key = str(max(1, int(step)))
             candidates = (
+                (
+                    "token_step_position_confidence_margin",
+                    f"{step_key}:{position_key}:{confidence_key}:{margin_key}",
+                ),
+                (
+                    "token_step_confidence_margin",
+                    f"{step_key}:{confidence_key}:{margin_key}",
+                ),
+                (
+                    "token_step_position_confidence",
+                    f"{step_key}:{position_key}:{confidence_key}",
+                ),
+                ("token_step_confidence", f"{step_key}:{confidence_key}"),
                 (
                     "token_position_confidence_margin",
                     f"{position_key}:{confidence_key}:{margin_key}",
@@ -1180,29 +1188,36 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 ("token_position_confidence", f"{position_key}:{confidence_key}"),
                 ("token_confidence", confidence_key),
             )
-            fallback = None
-            for table_name, key in candidates:
-                table = calibration.get(table_name, {})
-                probability = bucket_posterior(
-                    table,
-                    key,
-                    raw_probability,
-                    prior_strength,
-                )
-                if probability is not None:
-                    total = float(table[key][1])
-                    if total >= min_observations:
-                        return probability
-                    candidate = (total, probability)
-                    if fallback is None or candidate[0] > fallback[0]:
-                        fallback = candidate
-            return raw_probability if fallback is None else fallback[1]
-
-        def bucket_expected_prefix_score(confidences, margins):
-            probabilities = [
-                bucket_acceptance_probability(confidence, margin, position)
-                for position, (confidence, margin) in enumerate(zip(confidences, margins))
+            bucket_counts = [
+                calibration.get(table_name, {}).get(key)
+                for table_name, key in candidates
             ]
+            return calibrated_acceptance_probability(
+                raw_probability,
+                bucket_counts,
+                min_observations=min_observations,
+                prior_strength=prior_strength,
+            )
+
+        def bucket_expected_prefix_score(
+            confidences,
+            margins,
+            calibration_steps,
+            fixed_probabilities,
+        ):
+            probabilities = []
+            for position, (confidence, margin, step, fixed_probability) in enumerate(
+                zip(confidences, margins, calibration_steps, fixed_probabilities)
+            ):
+                probability = fixed_probability
+                if probability is None:
+                    probability = bucket_acceptance_probability(
+                        confidence,
+                        margin,
+                        position,
+                        step,
+                    )
+                probabilities.append(float(probability))
             score = expected_accepted_prefix(probabilities)
             return score, probabilities
 
@@ -1454,6 +1469,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_scores.clear()
                                 frontier_states.clear()
                                 frontier_score_target_len = target_len
+                            current_step = len(frontier_scores) + 1
                             draft_end_idx = draft_token_start_idx + target_len
                             block_abs_start = x_t.shape[1] - block_size
                             current_step_token_ids = {}
@@ -1466,8 +1482,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     continue
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
-                                    committed_confidences[int(absolute_pos)] = float(x1_p[batch_idx, local_idx].float().item())
-                                    committed_margins[int(absolute_pos)] = float(x1_margin[batch_idx, local_idx].float().item())
+                                    absolute_pos = int(absolute_pos)
+                                    token_confidence = float(x1_p[batch_idx, local_idx].float().item())
+                                    token_margin = float(x1_margin[batch_idx, local_idx].float().item())
+                                    committed_confidences[absolute_pos] = token_confidence
+                                    committed_margins[absolute_pos] = token_margin
+                                    committed_steps[absolute_pos] = current_step
+                                    committed_accept_probabilities.setdefault(
+                                        absolute_pos,
+                                        bucket_acceptance_probability(
+                                            token_confidence,
+                                            token_margin,
+                                            absolute_pos - draft_token_start_idx,
+                                            current_step,
+                                        ),
+                                    )
 
                             for local_idx in range(x1_p.shape[1]):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
@@ -1480,23 +1509,35 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                             confidences = []
                             margins = []
+                            calibration_steps = []
+                            fixed_accept_probabilities = []
                             recoverable = []
                             for absolute_pos in range(draft_token_start_idx, draft_end_idx):
                                 if absolute_pos in committed_confidences:
                                     confidences.append(committed_confidences[absolute_pos])
                                     margins.append(committed_margins.get(absolute_pos, 0.0))
+                                    calibration_steps.append(committed_steps.get(absolute_pos, current_step))
+                                    fixed_accept_probabilities.append(
+                                        committed_accept_probabilities.get(absolute_pos)
+                                    )
                                     recoverable.append(False)
                                 elif x_t[0, absolute_pos].item() != mask_id:
                                     confidences.append(1.0)
                                     margins.append(1.0)
+                                    calibration_steps.append(current_step)
+                                    fixed_accept_probabilities.append(None)
                                     recoverable.append(False)
                                 elif absolute_pos in current_step_confidences:
                                     confidences.append(current_step_confidences[absolute_pos])
                                     margins.append(current_step_margins.get(absolute_pos, 0.0))
+                                    calibration_steps.append(current_step)
+                                    fixed_accept_probabilities.append(None)
                                     recoverable.append(True)
                                 else:
                                     confidences.append(0.0)
                                     margins.append(0.0)
+                                    calibration_steps.append(current_step)
+                                    fixed_accept_probabilities.append(None)
                                     recoverable.append(True)
 
                             frontier_k = 0
@@ -1509,6 +1550,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             frontier_score, accept_probabilities = bucket_expected_prefix_score(
                                 confidences,
                                 margins,
+                                calibration_steps,
+                                fixed_accept_probabilities,
                             )
                             bucket_calibration_tokens = bucket_calibration_size()
                             if frontier_k >= target_len:
@@ -1522,7 +1565,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             frontier_gain = None if previous_score is None else frontier_score - previous_score
                             masks_remaining = int((x_t[:, draft_token_start_idx:draft_end_idx] == mask_id).sum().item())
                             current_gain_state = bucket_gain_state(
-                                len(frontier_scores) + 1,
+                                current_step,
                                 target_len,
                                 frontier_score,
                                 masks_remaining,
@@ -1532,7 +1575,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             frontier_scores.append(frontier_score)
                             frontier_states.append(current_gain_state)
                             step_record = {
-                                "step": len(frontier_scores),
+                                "step": current_step,
                                 "target_len": target_len,
                                 "frontier_k": int(frontier_k),
                                 "frontier_score": float(frontier_score),
@@ -1646,6 +1689,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         x_t[:, absolute_pos] = token_id
                                         committed_confidences[int(absolute_pos)] = float(token_confidence)
                                         committed_margins[int(absolute_pos)] = float(token_margin)
+                                        committed_steps[int(absolute_pos)] = current_step
+                                        committed_accept_probabilities.setdefault(
+                                            int(absolute_pos),
+                                            bucket_acceptance_probability(
+                                                token_confidence,
+                                                token_margin,
+                                                int(absolute_pos) - draft_token_start_idx,
+                                                current_step,
+                                            ),
+                                        )
                                         conf_of_unmasked_tokens.append(float(token_confidence))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
@@ -1733,6 +1786,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     "token_id": int(input_ids[0, absolute_pos].item()),
                     "confidence": float(committed_confidences.get(absolute_pos, 0.0)),
                     "margin": float(committed_margins.get(absolute_pos, 0.0)),
+                    "commit_step": int(committed_steps.get(absolute_pos, 1)),
+                    "accept_probability": float(
+                        committed_accept_probabilities.get(absolute_pos, 0.0)
+                    ),
                 })
             frontier_stats["draft_token_stats"] = draft_token_stats
         if return_prefill_kvs:

@@ -9,14 +9,37 @@ Proposal extension remains unchanged. FailFast extends only when every committed
 draft confidence passes `--sweep_lowconf_threshold`; the bucket-renewal policy
 does not control proposal length.
 
-For token position `i`, the controller estimates verifier acceptance with the
-backoff hierarchy:
+For a token committed at refinement step `s` and proposal position `i`, the
+controller estimates verifier acceptance with the backoff hierarchy:
 
-1. position, confidence, and margin bucket;
-2. confidence and margin bucket;
-3. position and confidence bucket;
-4. confidence bucket;
-5. raw drafter confidence.
+1. step, position, confidence, and margin bucket;
+2. step, confidence, and margin bucket;
+3. step, position, and confidence bucket;
+4. step and confidence bucket;
+5. position, confidence, and margin bucket;
+6. confidence and margin bucket;
+7. position and confidence bucket;
+8. confidence bucket;
+9. raw drafter confidence.
+
+For a selected bucket with `A_b` accepted observations and `N_b` total
+observations, the calibrated probability is
+
+```text
+p_i = clip((A_b + prior_strength * c_i) / (N_b + prior_strength), 0.02, 0.98)
+```
+
+where `c_i` is the raw drafter confidence and `prior_strength=8` by default. A
+bucket is authoritative after eight observations. Before that, the most-observed
+available bucket supplies a smoothed fallback; raw confidence is used when no
+history exists.
+
+The probability is computed once when a token is committed and stored with its
+confidence, margin, position, and commit step. Later denoising steps reuse that
+stored probability exactly. They only estimate new probabilities for positions
+that remain masked, so previously committed token probabilities cannot drift.
+Verifier outcomes update the step-conditioned calibration tables after the
+round and affect future proposals only.
 
 The expected accepted prefix is
 

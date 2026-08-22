@@ -38,6 +38,31 @@ def expected_accepted_prefix(probabilities: Sequence[float]) -> float:
     return expected_prefix
 
 
+def calibrated_acceptance_probability(
+    raw_probability: float,
+    bucket_counts: Sequence[Sequence[float] | None],
+    *,
+    min_observations: int = 8,
+    prior_strength: float = 8.0,
+) -> float:
+    raw_probability = min(0.98, max(0.02, float(raw_probability)))
+    fallback = None
+    for stats in bucket_counts:
+        if not stats:
+            continue
+        accepted, total = stats
+        total = float(total)
+        probability = (
+            float(accepted) + float(prior_strength) * raw_probability
+        ) / (total + float(prior_strength))
+        probability = min(0.98, max(0.02, probability))
+        if total >= int(min_observations):
+            return probability
+        if fallback is None or total > fallback[0]:
+            fallback = (total, probability)
+    return raw_probability if fallback is None else fallback[1]
+
+
 def predict_next_gain(
     expected_prefix_history: Sequence[float],
     bucket_estimate: float | None = None,

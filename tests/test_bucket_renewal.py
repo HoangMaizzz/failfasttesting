@@ -1,6 +1,7 @@
 import unittest
 
 from bucket_renewal import (
+    calibrated_acceptance_probability,
     compare_renewal_costs,
     expected_accepted_prefix,
     position_bucket,
@@ -9,6 +10,34 @@ from bucket_renewal import (
 
 
 class BucketRenewalTests(unittest.TestCase):
+    def test_acceptance_calibration_uses_first_populated_backoff_bucket(self):
+        self.assertAlmostEqual(
+            calibrated_acceptance_probability(
+                0.6,
+                ([7.0, 10.0], [1.0, 20.0]),
+                min_observations=8,
+                prior_strength=2.0,
+            ),
+            (7.0 + 2.0 * 0.6) / 12.0,
+        )
+
+    def test_acceptance_calibration_uses_largest_sparse_fallback(self):
+        self.assertAlmostEqual(
+            calibrated_acceptance_probability(
+                0.6,
+                ([1.0, 2.0], [3.0, 5.0]),
+                min_observations=8,
+                prior_strength=2.0,
+            ),
+            (3.0 + 2.0 * 0.6) / 7.0,
+        )
+
+    def test_acceptance_calibration_falls_back_to_raw_confidence(self):
+        self.assertAlmostEqual(
+            calibrated_acceptance_probability(0.6, (None, None)),
+            0.6,
+        )
+
     def test_expected_prefix_uses_left_to_right_survival(self):
         self.assertAlmostEqual(
             expected_accepted_prefix([0.5, 0.5, 0.5]),

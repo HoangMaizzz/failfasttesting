@@ -111,7 +111,7 @@ def run_streaming(command, cwd):
 
 def metadata_for(args, dataset, method, problem_ids):
     return {
-        "version": "bucket_renewal_v3_step_buckets",
+        "version": "bucket_renewal_v4_frozen_step_acceptance",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
