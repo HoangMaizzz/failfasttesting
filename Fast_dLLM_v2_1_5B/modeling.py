@@ -1,5 +1,6 @@
 from typing import Callable, Optional, Union
 from dataclasses import dataclass
+import time
 
 import torch
 from torch import nn
@@ -1099,6 +1100,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         prefill_output = None
         conf_of_unmasked_tokens = []
         frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
+        adaptive_enabled = bool(getattr(args, "adaptive_td", False)) if args is not None else False
+        adaptive_controller = getattr(args, "adaptive_td_controller", None) if adaptive_enabled else None
         frontier_stats = {
             "enabled": bool(return_frontier_stats),
             "mode": frontier_mode,
@@ -1115,6 +1118,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "refinement_actions": [],
             "extension_events": [],
             "oracle_refinement_snapshots": [],
+            "oracle_snapshot_attempts": 0,
+            "oracle_snapshot_skipped_missing_fill": 0,
+            "adaptive_enabled": adaptive_enabled,
+            "adaptive_decisions": [],
+            "adaptive_trajectory": [],
+            "adaptive_last_features": None,
             "forward_pass_breakdown": {
                 "prefill": 0,
                 "cache_update": 0,
@@ -1132,6 +1141,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         frontier_score_target_len = None
         frontier_force_stop = False
         accept_probabilities = None
+        adaptive_pending_continue = None
+        adaptive_previous_proposal = None
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
@@ -1443,12 +1454,37 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # Select tokens with probability greater than threshold from p_1t
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
-                        top2_probs = torch.topk(p_1t, k=2, dim=-1).values
-                        x1_margin = (top2_probs[..., 0] - top2_probs[..., 1]).float()
-                        x1_margin = torch.where(mask_idx[:, start:end], x1_margin, torch.zeros_like(x1_margin))
+                        margin_required = (
+                            not adaptive_enabled
+                            or frontier_mode not in ("disabled", "none", "off")
+                            or bool(getattr(args, "collect_bucket_oracle", False))
+                            or bool(getattr(args, "adaptive_use_margin_feature", True))
+                        )
+                        if margin_required:
+                            top2_probs = torch.topk(p_1t, k=2, dim=-1).values
+                            x1_margin = (top2_probs[..., 0] - top2_probs[..., 1]).float()
+                            x1_margin = torch.where(
+                                mask_idx[:, start:end],
+                                x1_margin,
+                                torch.zeros_like(x1_margin),
+                            )
+                        else:
+                            x1_margin = torch.zeros_like(x1_p)
                         
-                        # record the confidence of already-unmasked tokens
-                        conf_of_unmasked_tokens.extend(x1_p[x1_p != -torch.inf].float().cpu().numpy().tolist())  # FIXME TODO(ruipan): n=5, small blk size 8 -- might include non-drafted tokens?!
+                        collect_step_stats = (
+                            is_drafter
+                            and return_frontier_stats
+                            and (
+                                frontier_stats["mode"] not in ("disabled", "none", "off")
+                                or adaptive_enabled
+                            )
+                            and lowconf_threshold is not None
+                            and draft_token_end_idx <= x_t.shape[1]
+                        )
+                        if not collect_step_stats:
+                            conf_of_unmasked_tokens.extend(
+                                x1_p[x1_p != -torch.inf].float().cpu().numpy().tolist()
+                            )
 
                         unmask_idx = (x1_p > threshold)
                         max_prob_idx = x1_p.argmax(dim=-1)
@@ -1456,19 +1492,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         unmask_idx = unmask_idx & mask_idx[:, start:end]  # only allowed to update MASK tokens
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
-                        if (
-                            is_drafter
-                            and return_frontier_stats
-                            and frontier_stats["mode"] not in ("disabled", "none", "off")
-                            and lowconf_threshold is not None
-                            and draft_token_end_idx <= x_t.shape[1]
-                        ):
+                        if collect_step_stats:
                             frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
                             tau_f = float(lowconf_threshold)
                             target_len = int(spec_len)
+                            adaptive_feature_started = (
+                                time.perf_counter()
+                                if adaptive_enabled
+                                and adaptive_controller is not None
+                                and adaptive_controller.config.profile_overhead
+                                else None
+                            )
                             if frontier_score_target_len != target_len:
                                 frontier_scores.clear()
                                 frontier_states.clear()
+                                adaptive_previous_proposal = None
                                 frontier_score_target_len = target_len
                             current_step = len(frontier_scores) + 1
                             draft_end_idx = draft_token_start_idx + target_len
@@ -1476,38 +1514,70 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             current_step_token_ids = {}
                             current_step_confidences = {}
                             current_step_margins = {}
-                            unmasked_this_step = int(unmask_idx.sum().item())
+                            unmasked_this_step = 0
+                            local_snapshot = torch.stack(
+                                (
+                                    x_1[0].float(),
+                                    torch.clamp(x1_p[0].float(), min=0.0),
+                                    torch.clamp(x1_margin[0].float(), min=0.0),
+                                    unmask_idx[0].float(),
+                                    mask_idx[:, start:end][0].float(),
+                                ),
+                                dim=0,
+                            ).cpu().tolist()
+                            local_token_ids = [int(value) for value in local_snapshot[0]]
+                            local_confidences = local_snapshot[1]
+                            local_margins = local_snapshot[2]
+                            local_unmask_flags = local_snapshot[3]
+                            local_mask_flags = local_snapshot[4]
+                            conf_of_unmasked_tokens.extend(
+                                float(confidence)
+                                for confidence, was_masked in zip(
+                                    local_confidences,
+                                    local_mask_flags,
+                                )
+                                if was_masked
+                            )
 
-                            for batch_idx, local_idx in unmask_idx.nonzero(as_tuple=False).tolist():
-                                if batch_idx != 0:
+                            for local_idx, selected in enumerate(local_unmask_flags):
+                                if not selected:
                                     continue
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     absolute_pos = int(absolute_pos)
-                                    token_confidence = float(x1_p[batch_idx, local_idx].float().item())
-                                    token_margin = float(x1_margin[batch_idx, local_idx].float().item())
+                                    unmasked_this_step += 1
+                                    token_confidence = float(local_confidences[local_idx])
+                                    token_margin = float(local_margins[local_idx])
                                     committed_confidences[absolute_pos] = token_confidence
                                     committed_margins[absolute_pos] = token_margin
                                     committed_steps[absolute_pos] = current_step
-                                    committed_accept_probabilities.setdefault(
-                                        absolute_pos,
-                                        bucket_acceptance_probability(
-                                            token_confidence,
-                                            token_margin,
-                                            absolute_pos - draft_token_start_idx,
-                                            current_step,
-                                        ),
-                                    )
+                                    if not adaptive_enabled or bool(
+                                        getattr(args, "collect_bucket_oracle", False)
+                                    ):
+                                        committed_accept_probabilities.setdefault(
+                                            absolute_pos,
+                                            bucket_acceptance_probability(
+                                                token_confidence,
+                                                token_margin,
+                                                absolute_pos - draft_token_start_idx,
+                                                current_step,
+                                            ),
+                                        )
 
-                            for local_idx in range(x1_p.shape[1]):
+                            for local_idx, token_id in enumerate(local_token_ids):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
-                                    current_step_token_ids[int(absolute_pos)] = int(
-                                        x_1[0, local_idx].item()
+                                    current_step_token_ids[int(absolute_pos)] = token_id
+                                    current_step_confidences[int(absolute_pos)] = float(
+                                        local_confidences[local_idx]
                                     )
-                                    current_step_confidences[int(absolute_pos)] = float(max(x1_p[0, local_idx].float().item(), 0.0))
-                                    current_step_margins[int(absolute_pos)] = float(max(x1_margin[0, local_idx].float().item(), 0.0))
+                                    current_step_margins[int(absolute_pos)] = float(
+                                        local_margins[local_idx]
+                                    )
 
+                            current_draft_tokens = x_t[
+                                0, draft_token_start_idx:draft_end_idx
+                            ].tolist()
                             confidences = []
                             margins = []
                             calibration_steps = []
@@ -1522,7 +1592,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         committed_accept_probabilities.get(absolute_pos)
                                     )
                                     recoverable.append(False)
-                                elif x_t[0, absolute_pos].item() != mask_id:
+                                elif current_draft_tokens[
+                                    absolute_pos - draft_token_start_idx
+                                ] != mask_id:
                                     confidences.append(1.0)
                                     margins.append(1.0)
                                     calibration_steps.append(current_step)
@@ -1548,13 +1620,20 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 else:
                                     break
 
-                            frontier_score, accept_probabilities = bucket_expected_prefix_score(
-                                confidences,
-                                margins,
-                                calibration_steps,
-                                fixed_accept_probabilities,
-                            )
-                            bucket_calibration_tokens = bucket_calibration_size()
+                            if adaptive_enabled and not bool(
+                                getattr(args, "collect_bucket_oracle", False)
+                            ):
+                                frontier_score = 0.0
+                                accept_probabilities = []
+                                bucket_calibration_tokens = 0
+                            else:
+                                frontier_score, accept_probabilities = bucket_expected_prefix_score(
+                                    confidences,
+                                    margins,
+                                    calibration_steps,
+                                    fixed_accept_probabilities,
+                                )
+                                bucket_calibration_tokens = bucket_calibration_size()
                             if frontier_k >= target_len:
                                 frontier_confidence = None
                                 frontier_recoverable = False
@@ -1564,14 +1643,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                             previous_score = frontier_scores[-1] if frontier_scores else None
                             frontier_gain = None if previous_score is None else frontier_score - previous_score
-                            masks_remaining = int((x_t[:, draft_token_start_idx:draft_end_idx] == mask_id).sum().item())
+                            masks_remaining = sum(
+                                int(token_id == mask_id)
+                                for token_id in current_draft_tokens
+                            )
                             current_gain_state = bucket_gain_state(
                                 current_step,
                                 target_len,
                                 frontier_score,
                                 masks_remaining,
                             )
-                            if frontier_gain is not None and frontier_states:
+                            if (
+                                not adaptive_enabled
+                                and frontier_gain is not None
+                                and frontier_states
+                            ):
                                 bucket_update_gain(frontier_states[-1], frontier_gain)
                             frontier_scores.append(frontier_score)
                             frontier_states.append(current_gain_state)
@@ -1583,7 +1669,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "frontier_gain": None if frontier_gain is None else float(frontier_gain),
                                 "frontier_confidence": frontier_confidence,
                                 "frontier_recoverable": bool(frontier_recoverable),
-                                "expected_accept_prob_frontier": None if frontier_k >= target_len else float(accept_probabilities[frontier_k]),
+                                "expected_accept_prob_frontier": (
+                                    None
+                                    if frontier_k >= target_len or not accept_probabilities
+                                    else float(accept_probabilities[frontier_k])
+                                ),
                                 "unmasked_this_step": unmasked_this_step,
                                 "masks_remaining": masks_remaining,
                                 "bucket_calibration_tokens": int(bucket_calibration_tokens),
@@ -1592,39 +1682,207 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             frontier_stats["final_frontier_score"] = float(frontier_score)
                             min_steps = int(getattr(args, "bucket_renewal_min_steps", 1)) if args is not None else 1
                             stop_reason = None
-                            bucket_gain, gain_bucket_source, gain_bucket_count = (
-                                bucket_gain_estimate(current_gain_state)
-                            )
-                            gain_bucket_weight = (
-                                0.0
-                                if bucket_gain is None
-                                else float(gain_bucket_count)
-                                / (
-                                    float(gain_bucket_count)
-                                    + float(getattr(args, "bucket_prior_strength", 8.0))
+                            if adaptive_enabled and adaptive_controller is not None:
+                                remaining_relative_positions = [
+                                    position
+                                    for position, token_id in enumerate(current_draft_tokens)
+                                    if token_id == mask_id
+                                ]
+                                remaining_absolute_positions = [
+                                    draft_token_start_idx + int(position)
+                                    for position in remaining_relative_positions
+                                ]
+                                provisional_tokens = []
+                                for relative_pos, current_token in enumerate(current_draft_tokens):
+                                    absolute_pos = draft_token_start_idx + relative_pos
+                                    if int(current_token) != mask_id:
+                                        provisional_tokens.append(int(current_token))
+                                    else:
+                                        provisional_tokens.append(
+                                            current_step_token_ids.get(int(absolute_pos))
+                                        )
+                                changed_positions = []
+                                if (
+                                    adaptive_previous_proposal is not None
+                                    and len(adaptive_previous_proposal) == len(provisional_tokens)
+                                ):
+                                    changed_positions = [
+                                        index
+                                        for index, (previous_token, current_token) in enumerate(
+                                            zip(adaptive_previous_proposal, provisional_tokens)
+                                        )
+                                        if previous_token is not None
+                                        and current_token is not None
+                                        and previous_token != current_token
+                                    ]
+                                recoverable_positions = {
+                                    index
+                                    for index, token_id in enumerate(current_draft_tokens)
+                                    if token_id == mask_id
+                                    and draft_token_start_idx + index
+                                    in current_step_confidences
+                                }
+                                recoverable_confidences = [
+                                    confidences[index] for index in sorted(recoverable_positions)
+                                ]
+                                recoverable_margins = [
+                                    margins[index] for index in sorted(recoverable_positions)
+                                ]
+                                features = adaptive_controller.build_features(
+                                    proposal_length=target_len,
+                                    remaining_masks=masks_remaining,
+                                    newly_unmasked=unmasked_this_step,
+                                    recoverable_confidences=recoverable_confidences,
+                                    recoverable_margins=recoverable_margins,
+                                    first_remaining_position=(
+                                        None
+                                        if not remaining_relative_positions
+                                        else int(remaining_relative_positions[0])
+                                    ),
+                                    frontier_length=frontier_k,
+                                    proposal_change_ratio=(
+                                        len(changed_positions) / max(1, target_len)
+                                    ),
+                                    recoverable_change_ratio=(
+                                        len(recoverable_positions.intersection(changed_positions))
+                                        / max(1, len(recoverable_positions))
+                                    ),
+                                    refinement_step=current_step,
+                                    use_margin=bool(getattr(args, "adaptive_use_margin_feature", True)),
+                                    use_stability=bool(getattr(args, "adaptive_use_stability_feature", True)),
+                                    use_step=bool(getattr(args, "adaptive_use_step_feature", False)),
                                 )
-                            )
-                            predicted_gain = predict_next_gain(
-                                frontier_scores,
-                                bucket_estimate=bucket_gain,
-                                bucket_weight=gain_bucket_weight,
-                            )
-                            predicted_gain_source = (
-                                gain_bucket_source
-                                if len(frontier_scores) == 1
-                                else (
-                                    "acceptance_trajectory"
+                                if adaptive_feature_started is not None:
+                                    adaptive_controller.record_profile(
+                                        "feature_extraction",
+                                        (
+                                            time.perf_counter()
+                                            - adaptive_feature_started
+                                        )
+                                        * 1000.0,
+                                    )
+                                frontier_stats["adaptive_last_features"] = list(features)
+                                step_record["adaptive_features"] = list(features)
+
+                                zero_cost_fill_available = all(
+                                    absolute_pos in current_step_token_ids
+                                    for absolute_pos in remaining_absolute_positions
+                                )
+                                baseline_would_verify = (
+                                    (
+                                        max_spec_len is not None
+                                        and int(spec_len) >= int(max_spec_len)
+                                    )
+                                    or any(
+                                        float(value) < tau_f
+                                        for value in conf_of_unmasked_tokens
+                                    )
+                                )
+                                stop_available = (
+                                    zero_cost_fill_available and baseline_would_verify
+                                )
+
+                                if adaptive_pending_continue is not None:
+                                    next_forward_latency_ms = float(forward_pass_latencies[-1])
+                                    adaptive_pending_continue[
+                                        "next_forward_latency_ms"
+                                    ] = next_forward_latency_ms
+                                    adaptive_controller.observe_continue_transition(
+                                        adaptive_pending_continue["features"],
+                                        features,
+                                        next_forward_latency_ms,
+                                        next_stop_available=stop_available,
+                                    )
+                                    adaptive_pending_continue = None
+
+                                if masks_remaining > 0:
+                                    decision = adaptive_controller.choose(
+                                        features,
+                                        allow_stop=stop_available,
+                                        refinement_step=current_step,
+                                    )
+                                    adaptive_record = {
+                                        "step": int(current_step),
+                                        "target_len": int(target_len),
+                                        "features": list(features),
+                                        "action": decision.action,
+                                        "reason": decision.reason,
+                                        "remaining_masks": int(masks_remaining),
+                                        "newly_unmasked": int(unmasked_this_step),
+                                        "rho_tokens_per_ms": float(decision.rho_tokens_per_ms),
+                                        "q_stop_mean": float(decision.stop.mean),
+                                        "q_stop_risk": float(decision.stop.risk),
+                                        "q_stop_lcb": float(decision.stop.lower),
+                                        "q_stop_ucb": float(decision.stop.upper),
+                                        "q_continue_mean": float(decision.continue_.mean),
+                                        "q_continue_risk": float(decision.continue_.risk),
+                                        "q_continue_lcb": float(decision.continue_.lower),
+                                        "q_continue_ucb": float(decision.continue_.upper),
+                                        "exploration_used": bool(decision.exploration_used),
+                                        "controller_latency_ms": float(decision.latency_ms),
+                                        "completed_rounds_before": int(
+                                            adaptive_controller.completed_rounds
+                                        ),
+                                        "next_forward_latency_ms": 0.0,
+                                    }
+                                    frontier_stats["adaptive_decisions"].append(adaptive_record)
+                                    frontier_stats["adaptive_trajectory"].append(adaptive_record)
+                                    step_record.update({
+                                        "adaptive_action": decision.action,
+                                        "adaptive_action_reason": decision.reason,
+                                        "adaptive_controller_latency_ms": decision.latency_ms,
+                                    })
+                                    if decision.action == "stop":
+                                        stop_reason = "adaptive_td_stop"
+                                    else:
+                                        adaptive_pending_continue = adaptive_record
+                                adaptive_previous_proposal = provisional_tokens
+
+                            if adaptive_enabled:
+                                bucket_gain = None
+                                gain_bucket_source = "disabled_for_adaptive_td"
+                                gain_bucket_count = 0
+                                gain_bucket_weight = 0.0
+                                predicted_gain = None
+                                predicted_gain_source = "adaptive_td_q_values"
+                            else:
+                                bucket_gain, gain_bucket_source, gain_bucket_count = (
+                                    bucket_gain_estimate(current_gain_state)
+                                )
+                                gain_bucket_weight = (
+                                    0.0
                                     if bucket_gain is None
-                                    else f"acceptance_trajectory+{gain_bucket_source}"
+                                    else float(gain_bucket_count)
+                                    / (
+                                        float(gain_bucket_count)
+                                        + float(getattr(args, "bucket_prior_strength", 8.0))
+                                    )
                                 )
-                            )
+                                predicted_gain = predict_next_gain(
+                                    frontier_scores,
+                                    bucket_estimate=bucket_gain,
+                                    bucket_weight=gain_bucket_weight,
+                                )
+                                predicted_gain_source = (
+                                    gain_bucket_source
+                                    if len(frontier_scores) == 1
+                                    else (
+                                        "acceptance_trajectory"
+                                        if bucket_gain is None
+                                        else f"acceptance_trajectory+{gain_bucket_source}"
+                                    )
+                                )
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )
                             step_record["predicted_next_gain_source"] = predicted_gain_source
                             step_record["gain_bucket_count"] = int(gain_bucket_count)
                             step_record["gain_bucket_weight"] = float(gain_bucket_weight)
-                            if len(frontier_scores) >= min_steps and frontier_mode == "bucket_renewal":
+                            if (
+                                not adaptive_enabled
+                                and len(frontier_scores) >= min_steps
+                                and frontier_mode == "bucket_renewal"
+                            ):
                                 draft_forward_ms, verify_round_ms, controller_ms = bucket_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
                                 hysteresis = float(getattr(args, "bucket_renewal_hysteresis", 0.0))
@@ -1665,6 +1923,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     stop_reason = "bucket_renewal_lower_cost"
 
                             if bool(getattr(args, "collect_bucket_oracle", False)):
+                                frontier_stats["oracle_snapshot_attempts"] += 1
                                 remaining_absolute_positions = [
                                     draft_token_start_idx + int(rel_pos)
                                     for rel_pos in (
@@ -1719,6 +1978,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "calibration_tokens": int(bucket_calibration_tokens),
                                         "accept_probabilities": list(accept_probabilities),
                                     })
+                                else:
+                                    frontier_stats[
+                                        "oracle_snapshot_skipped_missing_fill"
+                                    ] += 1
 
                             if (
                                 stop_reason is not None
@@ -1727,7 +1990,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 step_record["oracle_overrode_stop"] = True
                                 stop_reason = None
 
-                            if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
+                            if stop_reason is not None and (
+                                frontier_mode not in ("disabled", "none", "off")
+                                or adaptive_enabled
+                            ):
                                 frontier_force_stop = frontier_mode == "bucket_renewal"
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),
@@ -1754,15 +2020,18 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         committed_confidences[int(absolute_pos)] = float(token_confidence)
                                         committed_margins[int(absolute_pos)] = float(token_margin)
                                         committed_steps[int(absolute_pos)] = current_step
-                                        committed_accept_probabilities.setdefault(
-                                            int(absolute_pos),
-                                            bucket_acceptance_probability(
-                                                token_confidence,
-                                                token_margin,
-                                                int(absolute_pos) - draft_token_start_idx,
-                                                current_step,
-                                            ),
-                                        )
+                                        if not adaptive_enabled or bool(
+                                            getattr(args, "collect_bucket_oracle", False)
+                                        ):
+                                            committed_accept_probabilities.setdefault(
+                                                int(absolute_pos),
+                                                bucket_acceptance_probability(
+                                                    token_confidence,
+                                                    token_margin,
+                                                    int(absolute_pos) - draft_token_start_idx,
+                                                    current_step,
+                                                ),
+                                            )
                                         conf_of_unmasked_tokens.append(float(token_confidence))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
@@ -1838,10 +2107,27 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             stop_token_idx = (input_ids[:, original_input_length:] == stop_token).nonzero()[0][1]
             input_ids = input_ids[:, :stop_token_idx+original_input_length+1]
         logger.debug(f"{Colors.YELLOW}forward_pass_latencies: {[f'{latency:.2f}ms' for latency in forward_pass_latencies]}{Colors.RESET}")
+
+        if adaptive_enabled and frontier_stats.get("adaptive_last_features") is not None:
+            adaptive_trajectory = frontier_stats["adaptive_trajectory"]
+            if not adaptive_trajectory or adaptive_trajectory[-1].get("action") != "stop":
+                adaptive_trajectory.append({
+                    "step": int(len(frontier_scores)),
+                    "target_len": int(spec_len),
+                    "features": list(frontier_stats["adaptive_last_features"]),
+                    "action": "stop",
+                    "reason": "factual_terminal_verification",
+                    "remaining_masks": 0,
+                    "newly_unmasked": 0,
+                    "next_forward_latency_ms": 0.0,
+                })
         
         frontier_stats["actual_spec_len"] = int(spec_len)
         frontier_stats["forward_pass_breakdown"]["total"] = int(num_forward_passes)
-        if return_frontier_stats and is_drafter and frontier_stats["mode"] not in ("disabled", "none", "off"):
+        if return_frontier_stats and is_drafter and (
+            frontier_stats["mode"] not in ("disabled", "none", "off")
+            or adaptive_enabled
+        ):
             draft_token_stats = []
             draft_end_idx = min(draft_token_start_idx + int(spec_len), input_ids.shape[1])
             for absolute_pos in range(draft_token_start_idx, draft_end_idx):

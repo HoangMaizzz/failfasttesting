@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
 from bucket_renewal import position_bucket
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -398,6 +399,38 @@ parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--collect_bucket_oracle", action="store_true")
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
+parser.add_argument("--adaptive-td", action="store_true")
+parser.add_argument("--adaptive-max-refinement-steps", type=int, default=16)
+parser.add_argument("--adaptive-fixed-refinement-steps", type=int)
+parser.add_argument("--adaptive-learning-rate", type=float, default=0.02)
+parser.add_argument("--adaptive-mc-learning-rate", type=float, default=0.01)
+parser.add_argument("--adaptive-mc-mix", type=float, default=0.5)
+parser.add_argument(
+    "--adaptive-update-mode",
+    choices=["td", "factual_return", "mixed"],
+    default="mixed",
+)
+parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
+parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
+parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
+parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.03)
+parser.add_argument("--adaptive-explore-min", type=float, default=0.005)
+parser.add_argument("--adaptive-explore-decay", type=float, default=0.999)
+parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
+parser.add_argument("--adaptive-use-step-feature", action="store_true")
+parser.add_argument(
+    "--adaptive-use-margin-feature",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+)
+parser.add_argument(
+    "--adaptive-use-stability-feature",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+)
+parser.add_argument("--adaptive-force-continue", action="store_true")
+parser.add_argument("--adaptive-log-decisions", action="store_true")
+parser.add_argument("--adaptive-profile-overhead", action="store_true")
 parser.add_argument("--quiet_generation", action="store_true")
 parser.add_argument("--disable_progress", action="store_true")
 parser.add_argument("--skip_artifacts", action="store_true")
@@ -415,6 +448,40 @@ args, _ = parser.parse_known_args()
 
 if args.target_model_name is None:
     args.target_model_name = args.verifier_model_name
+if args.adaptive_td and args.frontier_stop_mode != "disabled":
+    raise ValueError("--adaptive-td cannot be combined with --frontier_stop_mode")
+if args.adaptive_td and args.bucket_oracle_force_continue:
+    raise ValueError(
+        "--bucket_oracle_force_continue would invalidate adaptive TD trajectories"
+    )
+if args.adaptive_force_continue and args.adaptive_fixed_refinement_steps is not None:
+    raise ValueError(
+        "--adaptive-force-continue cannot be combined with fixed refinement depth"
+    )
+args.adaptive_td_controller = (
+    OnlineTDRefinementController(
+        AdaptiveTDConfig(
+            learning_rate=args.adaptive_learning_rate,
+            mc_learning_rate=args.adaptive_mc_learning_rate,
+            mc_mix=args.adaptive_mc_mix,
+            update_mode=args.adaptive_update_mode,
+            rho_alpha=args.adaptive_rho_alpha,
+            risk_beta=args.adaptive_risk_beta,
+            q_margin=args.adaptive_q_margin,
+            explore_epsilon=args.adaptive_explore_epsilon,
+            explore_min=args.adaptive_explore_min,
+            explore_decay=args.adaptive_explore_decay,
+            warmup_rounds=args.adaptive_warmup_rounds,
+            max_refinement_steps=args.adaptive_max_refinement_steps,
+            fixed_refinement_steps=args.adaptive_fixed_refinement_steps,
+            force_continue=args.adaptive_force_continue,
+            profile_overhead=args.adaptive_profile_overhead,
+            seed=args.seed,
+        )
+    )
+    if args.adaptive_td
+    else None
+)
 
 def apply_mode_settings(args):
     if args.mode == "verifier_ar":
@@ -468,6 +535,12 @@ BENCHMARK_CSV_COLUMNS = [
     "bucket_continue_ms_per_output_mean",
     "bucket_fill_forward_passes",
     "bucket_denoising_forward_passes",
+    "adaptive_decisions",
+    "adaptive_stop_actions",
+    "adaptive_exploration_actions",
+    "adaptive_mean_refinement_step",
+    "adaptive_controller_ms",
+    "adaptive_rho_tokens_per_ms",
     "modeled_ms_per_output_token",
     "modeled_speedup",
     "output_token_hash",
@@ -601,11 +674,13 @@ def summarize_frontier_diagnostics(stats_each_round):
     expected_outputs = []
     stop_costs = []
     continue_costs = []
+    adaptive_decisions = []
     for round_stats in stats_each_round:
         frontier_stats = round_stats.get("frontier_stats") or {}
         breakdown = frontier_stats.get("forward_pass_breakdown") or {}
         fill_passes += int(breakdown.get("fill", 0))
         denoising_passes += int(breakdown.get("denoising", 0))
+        adaptive_decisions.extend(frontier_stats.get("adaptive_decisions") or [])
         for action in frontier_stats.get("refinement_actions", []):
             stop_actions += int(action.get("action") == "bucket_renewal_lower_cost")
         bucket_steps = [
@@ -640,10 +715,33 @@ def summarize_frontier_diagnostics(stats_each_round):
         "bucket_continue_ms_per_output_mean": safe_div(sum(continue_costs), len(continue_costs)),
         "bucket_fill_forward_passes": fill_passes,
         "bucket_denoising_forward_passes": denoising_passes,
+        "adaptive_decisions": len(adaptive_decisions),
+        "adaptive_stop_actions": sum(
+            item.get("action") == "stop" for item in adaptive_decisions
+        ),
+        "adaptive_exploration_actions": sum(
+            bool(item.get("exploration_used")) for item in adaptive_decisions
+        ),
+        "adaptive_mean_refinement_step": safe_div(
+            sum(float(item.get("step", 0)) for item in adaptive_decisions),
+            len(adaptive_decisions),
+        ),
+        "adaptive_controller_ms": sum(
+            float(item.get("controller_latency_ms", 0.0))
+            for item in adaptive_decisions
+        ),
+        "adaptive_rho_tokens_per_ms": (
+            args.adaptive_td_controller.rho
+            if getattr(args, "adaptive_td", False)
+            else 0.0
+        ),
     }
 
 def frontier_stop_enabled(args):
-    return getattr(args, "frontier_stop_mode", "disabled") not in (None, "disabled", "none", "off")
+    return bool(getattr(args, "adaptive_td", False)) or (
+        getattr(args, "frontier_stop_mode", "disabled")
+        not in (None, "disabled", "none", "off")
+    )
 
 def ensure_frontier_runtime_state(args):
     if not hasattr(args, "bucket_acceptance_calibration"):
@@ -835,6 +933,69 @@ def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcom
             accepted,
         )
         calibration["total_checked_tokens"] += 1
+
+
+def complete_adaptive_td_trajectory(
+    args,
+    frontier_stats,
+    *,
+    emitted_tokens,
+    verifier_latency_ms,
+):
+    if not getattr(args, "adaptive_td", False) or not frontier_stats:
+        return
+    controller = args.adaptive_td_controller
+    trajectory = frontier_stats.get("adaptive_trajectory") or []
+    controller.complete_trajectory(
+        trajectory,
+        emitted_tokens=int(emitted_tokens),
+        verifier_latency_ms=float(verifier_latency_ms),
+    )
+
+
+def record_adaptive_td_decisions(
+    args,
+    frontier_stats,
+    *,
+    problem_id,
+    round_id,
+    accepted_draft_tokens,
+    emitted_tokens,
+    verifier_latency_ms,
+    round_total_latency_ms,
+):
+    if (
+        not getattr(args, "adaptive_td", False)
+        or not args.adaptive_log_decisions
+        or not frontier_stats
+    ):
+        return
+    controller = args.adaptive_td_controller
+    round_total_latency_ms = max(0.0, float(round_total_latency_ms))
+    round_throughput = safe_div(emitted_tokens, round_total_latency_ms)
+    logging_started = time.perf_counter()
+    if not hasattr(args, "adaptive_decision_rows"):
+        args.adaptive_decision_rows = []
+    for decision_id, item in enumerate(frontier_stats.get("adaptive_decisions") or []):
+        args.adaptive_decision_rows.append({
+            "problem_id": int(problem_id),
+            "round_id": int(round_id),
+            "decision_id": int(decision_id),
+            **item,
+            "features": json.dumps(item.get("features") or []),
+            "draft_length": int(item.get("target_len", 0)),
+            "remaining_mask_ratio": float((item.get("features") or [0.0, 0.0])[1]),
+            "newly_unmasked_ratio": float((item.get("features") or [0.0, 0.0, 0.0])[2]),
+            "accepted_draft_tokens": int(accepted_draft_tokens),
+            "emitted_tokens": int(emitted_tokens),
+            "verifier_latency_ms": float(verifier_latency_ms),
+            "round_total_latency_ms": round_total_latency_ms,
+            "round_throughput_tokens_per_ms": round_throughput,
+        })
+    controller.record_profile(
+        "logging",
+        (time.perf_counter() - logging_started) * 1000.0,
+    )
 
 def build_benchmark_drafter_configs(args):
     dllm_config = (
@@ -1675,7 +1836,10 @@ for problem_id, is_warmup in tqdm(
                     
                     accepted_tokens += accepted_len
                     rejected_tokens += len(draft_proposal) - accepted_len
-                    if draft_type == "dllm" and frontier_stop_enabled(args):
+                    if (
+                        draft_type == "dllm"
+                        and args.frontier_stop_mode == "bucket_renewal"
+                    ):
                         update_frontier_latency_cost(
                             args,
                             forward_pass_latencies,
@@ -1689,13 +1853,42 @@ for problem_id, is_warmup in tqdm(
                             checked_outcomes,
                         )
 
-                    if draft_type == "dllm" and frontier_stop_enabled(args):
+                    if draft_type == "dllm" and args.adaptive_td:
+                        complete_adaptive_td_trajectory(
+                            args,
+                            frontier_stats_this_round,
+                            emitted_tokens=len(tokens_to_append),
+                            verifier_latency_ms=verify_time * 1000.0,
+                        )
+
+                    if (
+                        draft_type == "dllm"
+                        and args.frontier_stop_mode == "bucket_renewal"
+                    ):
                         observed_post_verify_time = time.perf_counter() - post_verify_start
                         update_frontier_controller_cost(args, observed_post_verify_time)
                     if verify_input_tensor.is_cuda:
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
+                    if draft_type == "dllm" and args.adaptive_td:
+                        args.adaptive_td_controller.observe_round(
+                            len(tokens_to_append),
+                            (draft_time + verify_time + post_verify_time) * 1000.0,
+                        )
+                        record_adaptive_td_decisions(
+                            args,
+                            frontier_stats_this_round,
+                            problem_id=problem_id,
+                            round_id=num_speculation_rounds,
+                            accepted_draft_tokens=accepted_len,
+                            emitted_tokens=len(tokens_to_append),
+                            verifier_latency_ms=verify_time * 1000.0,
+                            round_total_latency_ms=(
+                                draft_time + verify_time + post_verify_time
+                            )
+                            * 1000.0,
+                        )
 
                     if (
                         draft_type == "dllm"
@@ -1898,3 +2091,26 @@ if args.frontier_stop_mode == "bucket_renewal":
         encoding="utf-8",
     ) as handle:
         json.dump(runtime_report, handle, indent=2)
+
+if args.adaptive_td:
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(
+        os.path.join(args.output_dir, "adaptive_td_runtime_state.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(args.adaptive_td_controller.snapshot(), handle, indent=2)
+    decision_rows = getattr(args, "adaptive_decision_rows", [])
+    if decision_rows:
+        decision_columns = sorted(
+            {column for row in decision_rows for column in row}
+        )
+        with open(
+            os.path.join(args.output_dir, "adaptive_td_decisions.csv"),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=decision_columns)
+            writer.writeheader()
+            writer.writerows(decision_rows)
