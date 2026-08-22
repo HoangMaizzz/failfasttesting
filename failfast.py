@@ -412,6 +412,8 @@ parser.add_argument(
 )
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
 parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
+parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
+parser.add_argument("--adaptive-epistemic-scale", type=float, default=0.1)
 parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
 parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.03)
 parser.add_argument("--adaptive-explore-min", type=float, default=0.005)
@@ -467,6 +469,8 @@ args.adaptive_td_controller = (
             update_mode=args.adaptive_update_mode,
             rho_alpha=args.adaptive_rho_alpha,
             risk_beta=args.adaptive_risk_beta,
+            uncertainty_prior=args.adaptive_uncertainty_prior,
+            epistemic_scale=args.adaptive_epistemic_scale,
             q_margin=args.adaptive_q_margin,
             explore_epsilon=args.adaptive_explore_epsilon,
             explore_min=args.adaptive_explore_min,

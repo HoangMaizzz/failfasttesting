@@ -11,10 +11,10 @@ With `--adaptive-td`, the generation loop remains unchanged until a Fast-dLLM
 forward and the original unmask operation have completed. The controller then
 observes the current refinement state and chooses `STOP` or `CONTINUE`.
 `CONTINUE` resumes from the current `x_t`, masks, KV state, and block state.
-`STOP` is eligible only when all remaining proposal positions have current
-top-1 candidates and the original FailFast gate would verify rather than extend
-the proposal. Remaining masks are filled with those candidates without another
-forward pass.
+`STOP` is eligible when all remaining proposal positions have current top-1
+candidates. Remaining masks are filled without another forward pass, then the
+unchanged outer FailFast gate independently chooses verification or length
+extension.
 
 ## State
 
@@ -59,12 +59,15 @@ TD because it would invalidate the factual trajectory.
 
 ## Risk and exploration
 
-Each action tracks residual variance and diagonal feature precision. Decisions
-use lower and upper confidence proxies. A stop is selected only when its lower
-bound exceeds the continue upper bound plus the configured margin. Overlapping
-intervals default to continue, except for optional low-rate factual stop
-exploration. Parameters reset for every `failfast.py` process and persist across
-samples within that dataset run.
+Each action tracks residual variance and diagonal feature precision. Mean-value
+uncertainty is estimated as residual variance multiplied by diagonal leverage,
+so it contracts as matching observations accumulate. A stop is selected only
+when its lower bound exceeds the continue upper bound plus the configured
+margin. Overlapping intervals default to continue, except for optional low-rate
+factual stop exploration. Mixed TD/return updates count each executed
+state-action pair once in precision and residual statistics. Parameters reset
+for every `failfast.py` process and persist across samples within that dataset
+run.
 
 ## Baseline preservation
 
@@ -110,10 +113,11 @@ final controller state with overhead percentiles.
 
 ## Architectural constraints
 
-The model computes logits one small block at a time. For proposals spanning
-multiple small blocks, a complete zero-forward provisional proposal is not
-always available. Such states force `CONTINUE`; this is necessary to avoid
-inventing candidates or adding an extra dLLM forward to the `STOP` action.
+The default model path computes a full 32-token block and applies unmasking to
+the active 8-token small block. Adaptive TD retains top-1 candidates only for
+proposal positions already covered by that forward. Positions outside the
+computed block still force `CONTINUE`; this avoids inventing candidates or
+adding a dLLM forward to `STOP`.
 
 The controller hook is implemented at the existing inner-loop iteration
 boundary instead of exposing the model's cache-rich refinement state through a
@@ -122,10 +126,9 @@ but full token-hash equivalence still requires a GPU model run.
 
 ## Known limitations
 
-- `STOP` is exposed only when the current top-1 values cover every remaining
-  proposal mask and the unchanged outer FailFast policy would verify that
-  proposal. Allowing a terminal `STOP` earlier would either require another
-  dLLM forward or alter FailFast's proposal-extension policy.
+- `STOP` is exposed only when current top-1 values cover every remaining
+  proposal mask. The outer FailFast extension policy runs afterward and is not
+  part of inner refinement-stop availability.
 - The maximum refinement depth is a guardrail only when zero-forward
   finalization is available. A proposal spanning an unseen small block may run
   past the nominal guard until that block has current candidates.

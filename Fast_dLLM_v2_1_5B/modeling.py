@@ -1899,12 +1899,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     adaptive_pending_continue[
                                         "next_forward_latency_ms"
                                     ] = next_forward_latency_ms
-                                    adaptive_controller.observe_continue_transition(
+                                    transition_residual = adaptive_controller.observe_continue_transition(
                                         adaptive_pending_continue["features"],
                                         features,
                                         next_forward_latency_ms,
                                         next_stop_available=stop_available,
                                     )
+                                    adaptive_pending_continue[
+                                        "td_observation_counted"
+                                    ] = transition_residual is not None
                                     adaptive_pending_continue = None
 
                                 if masks_remaining > 0:

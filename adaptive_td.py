@@ -126,7 +126,7 @@ class _LinearActionValue:
         )
 
     def risk(self, features: Sequence[float]) -> float:
-        epistemic = sum(
+        leverage = sum(
             value * value / (precision + self.config.uncertainty_prior)
             for value, precision in zip(features, self.precision)
         )
@@ -134,7 +134,8 @@ class _LinearActionValue:
             max(
                 0.0,
                 self.residual_variance()
-                + self.config.epistemic_scale * epistemic,
+                * self.config.epistemic_scale
+                * leverage,
             )
         )
     def estimate(
@@ -148,7 +149,14 @@ class _LinearActionValue:
         width = self.config.risk_beta * risk
         return ActionEstimate(mean, risk, mean - width, mean + width)
 
-    def update(self, features: Sequence[float], target: float, rate: float) -> float:
+    def update(
+        self,
+        features: Sequence[float],
+        target: float,
+        rate: float,
+        *,
+        count_observation: bool = True,
+    ) -> float:
         prediction = self.mean(features)
         raw_residual = float(target) - prediction
         update_residual = _clip(
@@ -158,11 +166,13 @@ class _LinearActionValue:
         )
         for index, value in enumerate(features):
             self.theta[index] += float(rate) * update_residual * value
-            self.precision[index] += value * value
-        self.sample_count += 1
-        delta = raw_residual - self.residual_mean
-        self.residual_mean += delta / self.sample_count
-        self.residual_m2 += delta * (raw_residual - self.residual_mean)
+            if count_observation:
+                self.precision[index] += value * value
+        if count_observation:
+            self.sample_count += 1
+            delta = raw_residual - self.residual_mean
+            self.residual_mean += delta / self.sample_count
+            self.residual_m2 += delta * (raw_residual - self.residual_mean)
         return raw_residual
 
 
@@ -368,6 +378,7 @@ class OnlineTDRefinementController:
             )
             rho = max(0.0, float(emitted_tokens) / observed_future_ms)
 
+        td_counted_items = set()
         if self.config.update_mode in {"td", "mixed"}:
             for item in reversed(trajectory):
                 if item.get("action") == STOP:
@@ -377,6 +388,7 @@ class OnlineTDRefinementController:
                         target,
                         self.config.learning_rate,
                     )
+                    td_counted_items.add(id(item))
                     break
 
         if self.config.update_mode in {"factual_return", "mixed"}:
@@ -391,7 +403,18 @@ class OnlineTDRefinementController:
                         float(item.get("next_forward_latency_ms", 0.0)),
                     )
                 target = float(emitted_tokens) - rho * future_ms
-                self.values[item["action"]].update(item["features"], target, rate)
+                self.values[item["action"]].update(
+                    item["features"],
+                    target,
+                    rate,
+                    count_observation=(
+                        self.config.update_mode != "mixed"
+                        or (
+                            id(item) not in td_counted_items
+                            and not item.get("td_observation_counted", False)
+                        )
+                    ),
+                )
         if started is not None:
             self.record_profile(
                 "reverse_factual_update",

@@ -63,6 +63,8 @@ def parse_args():
     )
     parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
     parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
+    parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
+    parser.add_argument("--adaptive-epistemic-scale", type=float, default=0.1)
     parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
     parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.03)
     parser.add_argument("--adaptive-explore-min", type=float, default=0.005)
@@ -139,7 +141,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_decoupled_stop_v4",
+        "version": "online_td_v1_mean_uncertainty_v5",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -161,6 +163,8 @@ def metadata(args, dataset, method, problem_ids):
             "update_mode": args.adaptive_update_mode,
             "rho_alpha": args.adaptive_rho_alpha,
             "risk_beta": args.adaptive_risk_beta,
+            "uncertainty_prior": args.adaptive_uncertainty_prior,
+            "epistemic_scale": args.adaptive_epistemic_scale,
             "q_margin": args.adaptive_q_margin,
             "explore_epsilon": args.adaptive_explore_epsilon,
             "explore_min": args.adaptive_explore_min,
@@ -247,6 +251,8 @@ def run_method(args, dataset, method, problem_ids):
                 "--adaptive-update-mode", args.adaptive_update_mode,
                 "--adaptive-rho-alpha", str(args.adaptive_rho_alpha),
                 "--adaptive-risk-beta", str(args.adaptive_risk_beta),
+                "--adaptive-uncertainty-prior", str(args.adaptive_uncertainty_prior),
+                "--adaptive-epistemic-scale", str(args.adaptive_epistemic_scale),
                 "--adaptive-q-margin", str(args.adaptive_q_margin),
                 "--adaptive-explore-epsilon", str(args.adaptive_explore_epsilon),
                 "--adaptive-explore-min", str(args.adaptive_explore_min),

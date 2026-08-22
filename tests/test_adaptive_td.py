@@ -114,6 +114,64 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertEqual(controller.values[STOP].sample_count, 0)
         self.assertEqual(controller.values[CONTINUE].sample_count, 0)
 
+    def test_mean_uncertainty_shrinks_with_repeated_observations(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                warmup_rounds=0,
+                epistemic_scale=1.0,
+                explore_epsilon=0.0,
+                explore_min=0.0,
+            )
+        )
+        features = synthetic_features(1, 3)
+        value = controller.values[STOP]
+        initial_risk = value.risk(features)
+        for index in range(200):
+            value.update(features, float(index % 2), rate=0.0)
+        self.assertGreater(value.residual_variance(), 0.1)
+        self.assertLess(value.risk(features), initial_risk)
+
+    def test_mixed_terminal_update_counts_one_factual_observation(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(update_mode="mixed", warmup_rounds=0)
+        )
+        controller.y_ema = 1.0
+        controller.t_ema_ms = 1.0
+        controller.complete_trajectory(
+            [{
+                "features": synthetic_features(1, 1),
+                "action": STOP,
+                "next_forward_latency_ms": 0.0,
+            }],
+            emitted_tokens=2,
+            verifier_latency_ms=1.0,
+        )
+        self.assertEqual(controller.values[STOP].sample_count, 1)
+
+    def test_mixed_fallback_counts_continue_when_td_was_unavailable(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(update_mode="mixed", warmup_rounds=0)
+        )
+        controller.complete_trajectory(
+            [
+                {
+                    "features": synthetic_features(1, 2),
+                    "action": CONTINUE,
+                    "next_forward_latency_ms": 1.0,
+                    "td_observation_counted": False,
+                },
+                {
+                    "features": synthetic_features(2, 2),
+                    "action": STOP,
+                    "next_forward_latency_ms": 0.0,
+                },
+            ],
+            emitted_tokens=3,
+            verifier_latency_ms=1.0,
+        )
+        self.assertEqual(controller.values[CONTINUE].sample_count, 1)
+        self.assertEqual(controller.values[STOP].sample_count, 1)
+
     def test_td_target_masks_unavailable_stop_action(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(warmup_rounds=0, learning_rate=0.1)
