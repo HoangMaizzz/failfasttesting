@@ -66,9 +66,9 @@ def parse_args():
     parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
     parser.add_argument("--adaptive-epistemic-scale", type=float, default=0.1)
     parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
-    parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.03)
-    parser.add_argument("--adaptive-explore-min", type=float, default=0.005)
-    parser.add_argument("--adaptive-explore-decay", type=float, default=0.999)
+    parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.10)
+    parser.add_argument("--adaptive-explore-min", type=float, default=0.01)
+    parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
     parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
     parser.add_argument("--adaptive-use-step-feature", action="store_true")
     parser.add_argument(
@@ -141,7 +141,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_mean_uncertainty_v5",
+        "version": "online_td_v1_mean_uncertainty_exploration_v6",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,

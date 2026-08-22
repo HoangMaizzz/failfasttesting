@@ -39,9 +39,9 @@ class AdaptiveTDConfig:
     uncertainty_prior: float = 1.0
     epistemic_scale: float = 0.1
     residual_prior_variance: float = 1.0
-    explore_epsilon: float = 0.03
-    explore_min: float = 0.005
-    explore_decay: float = 0.999
+    explore_epsilon: float = 0.10
+    explore_min: float = 0.01
+    explore_decay: float = 0.998
     warmup_rounds: int = 20
     max_refinement_steps: int = 16
     fixed_refinement_steps: int | None = None

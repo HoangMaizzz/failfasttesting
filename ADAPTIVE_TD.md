@@ -69,6 +69,11 @@ state-action pair once in precision and residual statistics. Parameters reset
 for every `failfast.py` process and persist across samples within that dataset
 run.
 
+The default online schedule starts stop exploration at `0.10`, decays it by
+`0.998` per eligible decision, and retains a `0.01` floor. This supplies early
+STOP outcomes during a 50-sample run while keeping exploration explicitly
+separate from learned `stop_interval_dominates` actions in the decision log.
+
 ## Baseline preservation
 
 Adaptive TD is disabled by default. `--adaptive-force-continue` executes the

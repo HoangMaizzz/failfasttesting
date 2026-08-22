@@ -28,6 +28,12 @@ def synthetic_features(step, preferred_depth):
 
 
 class AdaptiveTDTests(unittest.TestCase):
+    def test_default_exploration_schedule_supports_online_stop_learning(self):
+        config = AdaptiveTDConfig()
+        self.assertEqual(config.explore_epsilon, 0.10)
+        self.assertEqual(config.explore_min, 0.01)
+        self.assertEqual(config.explore_decay, 0.998)
+
     def test_features_are_fixed_width_and_normalized(self):
         features = synthetic_features(2, 3)
         self.assertEqual(len(features), 13)
