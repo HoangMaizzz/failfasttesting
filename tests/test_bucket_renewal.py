@@ -17,6 +17,12 @@ class BucketRenewalTests(unittest.TestCase):
     def test_gain_forecast_decays_when_recent_improvement_shrinks(self):
         self.assertAlmostEqual(predict_next_gain([2.0, 4.0, 5.0]), 0.5)
 
+    def test_first_step_uses_online_bucket_estimate(self):
+        self.assertAlmostEqual(
+            predict_next_gain([2.0], first_step_estimate=0.4),
+            0.4,
+        )
+
     def test_renewal_cost_continues_when_gain_avoids_verifier_rounds(self):
         decision = compare_renewal_costs(
             elapsed_draft_ms=12.0,
@@ -40,7 +46,7 @@ class BucketRenewalTests(unittest.TestCase):
         )
         self.assertFalse(decision.should_continue)
 
-    def test_first_refinement_step_is_mandatory_without_gain_history(self):
+    def test_first_step_bootstraps_when_gain_bucket_is_empty(self):
         decision = compare_renewal_costs(
             elapsed_draft_ms=5.0,
             next_draft_ms=5.0,

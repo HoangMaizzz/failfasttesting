@@ -387,7 +387,7 @@ parser.add_argument(
     default="disabled",
     choices=["disabled", "bucket_renewal"],
 )
-parser.add_argument("--bucket_renewal_min_steps", type=int, default=2)
+parser.add_argument("--bucket_renewal_min_steps", type=int, default=1)
 parser.add_argument("--bucket_renewal_hysteresis", type=float, default=0.0)
 parser.add_argument("--bucket_prior_strength", type=float, default=8.0)
 parser.add_argument("--bucket_min_observations", type=int, default=8)
@@ -518,6 +518,8 @@ FRONTIER_GAIN_DIAGNOSTIC_COLUMNS = [
     "to_target_len",
     "same_target_len",
     "predicted_next_gain",
+    "predicted_gain_source",
+    "gain_bucket_count",
     "actual_next_gain",
     "prediction_error",
     "decision_should_continue",
@@ -616,6 +618,15 @@ def ensure_frontier_runtime_state(args):
             "token_confidence": {},
             "total_checked_tokens": 0,
         }
+    if not hasattr(args, "bucket_gain_calibration"):
+        args.bucket_gain_calibration = {
+            "length_score_masks": {},
+            "score_masks": {},
+            "length_score": {},
+            "score": {},
+            "step": {},
+            "global": [0.0, 0],
+        }
     if not hasattr(args, "bucket_ema_dllm_forward_ms"):
         args.bucket_ema_dllm_forward_ms = None
     if not hasattr(args, "bucket_ema_target_round_ms"):
@@ -641,6 +652,7 @@ def reset_frontier_runtime_state(args, preserve_hardware_latency=False):
                 preserved[name] = getattr(args, name)
     for name in (
         "bucket_acceptance_calibration",
+        "bucket_gain_calibration",
         "bucket_ema_dllm_forward_ms",
         "bucket_ema_target_round_ms",
         "bucket_ema_post_verify_ms",
@@ -963,6 +975,8 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "to_target_len": to_target_len,
                 "same_target_len": int(from_target_len == to_target_len),
                 "predicted_next_gain": float(predicted_gain),
+                "predicted_gain_source": current_step.get("predicted_next_gain_source"),
+                "gain_bucket_count": current_step.get("gain_bucket_count"),
                 "actual_next_gain": float(actual_gain),
                 "prediction_error": float(predicted_gain) - float(actual_gain),
                 "decision_should_continue": int(bool(current_step.get("bucket_should_continue"))),
@@ -1666,6 +1680,7 @@ if args.frontier_stop_mode == "bucket_renewal":
     ensure_frontier_runtime_state(args)
     runtime_report = {
         "acceptance_calibration": args.bucket_acceptance_calibration,
+        "gain_calibration": args.bucket_gain_calibration,
         "verify_latency_bins": args.bucket_verify_latency_bins,
         "draft_latency_bins": args.bucket_draft_latency_bins,
         "ema_dllm_forward_ms": args.bucket_ema_dllm_forward_ms,

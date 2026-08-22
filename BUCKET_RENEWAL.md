@@ -25,10 +25,13 @@ E_t = p_1 + p_1 p_2 + ... + p_1 ... p_L
 ```
 
 and the expected emitted output is `Y_t = 1 + E_t`, including the verifier
-replacement or bonus token. After at least two denoising passes in the same
-block, the next gain is extrapolated from the observed trajectory of `E_t`.
-The trajectory resets whenever FailFast starts a new block, so block-start gain
-is never mixed with refinement gain.
+replacement or bonus token. The first-step decision uses an online gain bucket
+conditioned on refinement step, proposal length, expected-prefix ratio, and
+remaining-mask ratio. Until eight valid transitions have bootstrapped that
+bucket hierarchy, the controller continues to step two. Later steps extrapolate
+gain from the observed trajectory of `E_t`. The trajectory resets whenever
+FailFast starts a new block, so block-start gain is never mixed with refinement
+gain.
 
 The decision compares renewal costs:
 

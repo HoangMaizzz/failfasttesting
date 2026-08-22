@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--max_spec_len", type=int, default=60)
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--small_block_size", type=int, default=8)
-    parser.add_argument("--bucket_renewal_min_steps", type=int, default=2)
+    parser.add_argument("--bucket_renewal_min_steps", type=int, default=1)
     parser.add_argument("--bucket_renewal_hysteresis", type=float, default=0.0)
     parser.add_argument("--bucket_prior_strength", type=float, default=8.0)
     parser.add_argument("--bucket_min_observations", type=int, default=8)
@@ -71,8 +71,8 @@ def validate_args(args):
         raise ValueError("--num_questions must be positive")
     if args.warmup_questions < 1:
         raise ValueError("--warmup_questions must be at least 1")
-    if args.bucket_renewal_min_steps < 2:
-        raise ValueError("--bucket_renewal_min_steps must be at least 2")
+    if args.bucket_renewal_min_steps < 1:
+        raise ValueError("--bucket_renewal_min_steps must be at least 1")
     if not 0.0 <= args.bucket_renewal_hysteresis < 1.0:
         raise ValueError("--bucket_renewal_hysteresis must be in [0, 1)")
     for dataset in args.datasets:
@@ -111,7 +111,7 @@ def run_streaming(command, cwd):
 
 def metadata_for(args, dataset, method, problem_ids):
     return {
-        "version": "bucket_renewal_v1",
+        "version": "bucket_renewal_v2_min1",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -401,11 +401,14 @@ def gain_calibration_summary(output_dir, datasets):
     )
     observations = observations.dropna(subset=["predicted_next_gain", "actual_next_gain"])
     records = []
-    for dataset, group in observations.groupby("dataset", sort=False):
+    for (dataset, from_step), group in observations.groupby(
+        ["dataset", "from_step"], sort=False
+    ):
         error = group["predicted_next_gain"] - group["actual_next_gain"]
         correlation = group[["predicted_next_gain", "actual_next_gain"]].corr().iloc[0, 1]
         records.append({
             "dataset": dataset,
+            "from_step": int(from_step),
             "num_transitions": len(group),
             "predicted_gain_mean": group["predicted_next_gain"].mean(),
             "actual_gain_mean": group["actual_next_gain"].mean(),
@@ -427,7 +430,7 @@ def write_manifest(args, output_dir, problem_ids):
     except subprocess.SubprocessError:
         commit = None
     manifest = {
-        "benchmark_version": "bucket_renewal_v1",
+        "benchmark_version": "bucket_renewal_v2_min1",
         "git_commit": commit,
         "python": sys.version,
         "platform": platform.platform(),

@@ -1123,6 +1123,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         committed_confidences = {}
         committed_margins = {}
         frontier_scores = []
+        frontier_states = []
         frontier_score_target_len = None
         frontier_force_stop = False
         accept_probabilities = None
@@ -1212,6 +1213,56 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             ]
             score = expected_accepted_prefix(probabilities)
             return score, probabilities
+
+        def bucket_gain_state(step, target_len, score, masks_remaining):
+            step_key = str(max(1, int(step)))
+            length_key = bucket_length_bin(target_len)
+            score_key = frontier_bin(float(score) / max(1, int(target_len)))
+            masks_key = frontier_bin(
+                float(masks_remaining) / max(1, int(target_len))
+            )
+            return {
+                "length_score_masks": f"{step_key}:{length_key}:{score_key}:{masks_key}",
+                "score_masks": f"{step_key}:{score_key}:{masks_key}",
+                "length_score": f"{step_key}:{length_key}:{score_key}",
+                "score": f"{step_key}:{score_key}",
+                "step": step_key,
+            }
+
+        def bucket_update_gain(state, gain):
+            calibration = getattr(args, "bucket_gain_calibration", None)
+            if calibration is None:
+                return
+            gain = max(0.0, float(gain))
+            for table_name, key in state.items():
+                gain_sum, count = calibration[table_name].get(key, [0.0, 0])
+                calibration[table_name][key] = [
+                    float(gain_sum) + gain,
+                    int(count) + 1,
+                ]
+            gain_sum, count = calibration.get("global", [0.0, 0])
+            calibration["global"] = [float(gain_sum) + gain, int(count) + 1]
+
+        def bucket_first_step_gain(state):
+            calibration = getattr(args, "bucket_gain_calibration", {})
+            min_observations = int(getattr(args, "bucket_min_observations", 8))
+            for table_name in (
+                "length_score_masks",
+                "score_masks",
+                "length_score",
+                "score",
+                "step",
+            ):
+                gain_sum, count = calibration.get(table_name, {}).get(
+                    state[table_name],
+                    [0.0, 0],
+                )
+                if int(count) >= min_observations:
+                    return float(gain_sum) / int(count), table_name, int(count)
+            gain_sum, count = calibration.get("global", [0.0, 0])
+            if int(count) >= min_observations:
+                return float(gain_sum) / int(count), "global", int(count)
+            return None, "bootstrap", int(count)
 
         def bucket_calibration_size():
             calibration = getattr(args, "bucket_acceptance_calibration", {}) if args is not None else {}
@@ -1409,6 +1460,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             target_len = int(spec_len)
                             if frontier_score_target_len != target_len:
                                 frontier_scores.clear()
+                                frontier_states.clear()
                                 frontier_score_target_len = target_len
                             draft_end_idx = draft_token_start_idx + target_len
                             block_abs_start = x_t.shape[1] - block_size
@@ -1476,8 +1528,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                             previous_score = frontier_scores[-1] if frontier_scores else None
                             frontier_gain = None if previous_score is None else frontier_score - previous_score
-                            frontier_scores.append(frontier_score)
                             masks_remaining = int((x_t[:, draft_token_start_idx:draft_end_idx] == mask_id).sum().item())
+                            current_gain_state = bucket_gain_state(
+                                len(frontier_scores) + 1,
+                                target_len,
+                                frontier_score,
+                                masks_remaining,
+                            )
+                            if frontier_gain is not None and frontier_states:
+                                bucket_update_gain(frontier_states[-1], frontier_gain)
+                            frontier_scores.append(frontier_score)
+                            frontier_states.append(current_gain_state)
                             step_record = {
                                 "step": len(frontier_scores),
                                 "target_len": target_len,
@@ -1493,16 +1554,25 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             }
                             frontier_stats["steps"].append(step_record)
                             frontier_stats["final_frontier_score"] = float(frontier_score)
-                            min_steps = int(getattr(args, "bucket_renewal_min_steps", 2)) if args is not None else 2
+                            min_steps = int(getattr(args, "bucket_renewal_min_steps", 1)) if args is not None else 1
                             stop_reason = None
-                            predicted_gain = predict_next_gain(frontier_scores)
+                            first_step_gain, first_step_source, gain_bucket_count = (
+                                bucket_first_step_gain(current_gain_state)
+                            )
+                            predicted_gain = predict_next_gain(
+                                frontier_scores,
+                                first_step_estimate=first_step_gain,
+                            )
                             predicted_gain_source = (
-                                None if predicted_gain is None else "acceptance_trajectory"
+                                "acceptance_trajectory"
+                                if len(frontier_scores) >= 2
+                                else first_step_source
                             )
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )
                             step_record["predicted_next_gain_source"] = predicted_gain_source
+                            step_record["gain_bucket_count"] = int(gain_bucket_count)
                             if len(frontier_scores) >= min_steps and frontier_mode == "bucket_renewal":
                                 draft_forward_ms, verify_round_ms, controller_ms = bucket_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))

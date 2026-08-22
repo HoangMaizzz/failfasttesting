@@ -21,9 +21,16 @@ def expected_accepted_prefix(probabilities: Sequence[float]) -> float:
     return expected_prefix
 
 
-def predict_next_gain(expected_prefix_history: Sequence[float]) -> float | None:
+def predict_next_gain(
+    expected_prefix_history: Sequence[float],
+    first_step_estimate: float | None = None,
+) -> float | None:
     if len(expected_prefix_history) < 2:
-        return None
+        return (
+            None
+            if first_step_estimate is None
+            else max(0.0, float(first_step_estimate))
+        )
     current_gain = max(
         0.0,
         float(expected_prefix_history[-1]) - float(expected_prefix_history[-2]),
