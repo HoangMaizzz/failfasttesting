@@ -12,6 +12,23 @@ class RenewalDecision:
     should_continue: bool
 
 
+def position_bucket(position: int) -> str:
+    position = max(0, int(position))
+    if position < 2:
+        return "0-1"
+    if position < 4:
+        return "2-3"
+    if position < 8:
+        return "4-7"
+    if position < 16:
+        return "8-15"
+    if position < 24:
+        return "16-23"
+    if position < 32:
+        return "24-31"
+    return "32+"
+
+
 def expected_accepted_prefix(probabilities: Sequence[float]) -> float:
     expected_prefix = 0.0
     survival = 1.0
@@ -23,28 +40,37 @@ def expected_accepted_prefix(probabilities: Sequence[float]) -> float:
 
 def predict_next_gain(
     expected_prefix_history: Sequence[float],
-    first_step_estimate: float | None = None,
+    bucket_estimate: float | None = None,
+    bucket_weight: float = 0.0,
 ) -> float | None:
     if len(expected_prefix_history) < 2:
         return (
             None
-            if first_step_estimate is None
-            else max(0.0, float(first_step_estimate))
+            if bucket_estimate is None
+            else max(0.0, float(bucket_estimate))
         )
     current_gain = max(
         0.0,
         float(expected_prefix_history[-1]) - float(expected_prefix_history[-2]),
     )
-    if len(expected_prefix_history) < 3:
-        return current_gain
-    previous_gain = max(
-        0.0,
-        float(expected_prefix_history[-2]) - float(expected_prefix_history[-3]),
+    trajectory_estimate = current_gain
+    if len(expected_prefix_history) >= 3:
+        previous_gain = max(
+            0.0,
+            float(expected_prefix_history[-2]) - float(expected_prefix_history[-3]),
+        )
+        if previous_gain <= 0.0:
+            trajectory_estimate = 0.0
+        else:
+            decay = min(1.0, current_gain / previous_gain)
+            trajectory_estimate = current_gain * decay
+    if bucket_estimate is None:
+        return trajectory_estimate
+    weight = min(1.0, max(0.0, float(bucket_weight)))
+    return (
+        weight * max(0.0, float(bucket_estimate))
+        + (1.0 - weight) * trajectory_estimate
     )
-    if previous_gain <= 0.0:
-        return 0.0
-    decay = min(1.0, current_gain / previous_gain)
-    return current_gain * decay
 
 
 def compare_renewal_costs(

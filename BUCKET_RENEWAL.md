@@ -28,10 +28,15 @@ and the expected emitted output is `Y_t = 1 + E_t`, including the verifier
 replacement or bonus token. The first-step decision uses an online gain bucket
 conditioned on refinement step, proposal length, expected-prefix ratio, and
 remaining-mask ratio. Until eight valid transitions have bootstrapped that
-bucket hierarchy, the controller continues to step two. Later steps extrapolate
-gain from the observed trajectory of `E_t`. The trajectory resets whenever
-FailFast starts a new block, so block-start gain is never mixed with refinement
-gain.
+bucket hierarchy, the controller continues to step two. Every later transition
+also updates and queries its own step-conditioned gain buckets. When both a
+matching bucket and the current trajectory are available, their estimates are
+blended with weight `count / (count + prior_strength)`. The trajectory resets
+whenever FailFast starts a new block, so block-start gain is never mixed with
+refinement gain.
+
+Acceptance position buckets are `0-1`, `2-3`, `4-7`, `8-15`, `16-23`,
+`24-31`, and `32+`.
 
 The decision compares renewal costs:
 

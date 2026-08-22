@@ -19,6 +19,8 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from bucket_renewal import position_bucket
+
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -520,6 +522,7 @@ FRONTIER_GAIN_DIAGNOSTIC_COLUMNS = [
     "predicted_next_gain",
     "predicted_gain_source",
     "gain_bucket_count",
+    "gain_bucket_weight",
     "actual_next_gain",
     "prediction_error",
     "decision_should_continue",
@@ -678,16 +681,6 @@ def update_calibration_bucket(table, key, accepted):
     table[key] = [accepted_count + float(accepted), total_count + 1.0]
 
 
-def bucket_position_bin(position):
-    if position < 2:
-        return "0-1"
-    if position < 4:
-        return "2-3"
-    if position < 8:
-        return "4-7"
-    return "8+"
-
-
 def bucket_length_bin(length):
     return str(max(1, math.ceil(int(length) / 8)))
 
@@ -759,7 +752,7 @@ def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcom
         margin = float(token_stats.get("margin", 0.0))
         confidence_bin = calibration_bin(confidence)
         margin_bin = calibration_bin(margin)
-        position_bin = bucket_position_bin(idx)
+        position_bin = position_bucket(idx)
         update_calibration_bucket(
             calibration["token_position_confidence_margin"],
             f"{position_bin}:{confidence_bin}:{margin_bin}",
@@ -977,6 +970,7 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "predicted_next_gain": float(predicted_gain),
                 "predicted_gain_source": current_step.get("predicted_next_gain_source"),
                 "gain_bucket_count": current_step.get("gain_bucket_count"),
+                "gain_bucket_weight": current_step.get("gain_bucket_weight"),
                 "actual_next_gain": float(actual_gain),
                 "prediction_error": float(predicted_gain) - float(actual_gain),
                 "decision_should_continue": int(bool(current_step.get("bucket_should_continue"))),

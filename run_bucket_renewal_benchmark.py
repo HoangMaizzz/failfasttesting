@@ -111,7 +111,7 @@ def run_streaming(command, cwd):
 
 def metadata_for(args, dataset, method, problem_ids):
     return {
-        "version": "bucket_renewal_v2_min1",
+        "version": "bucket_renewal_v3_step_buckets",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -430,7 +430,7 @@ def write_manifest(args, output_dir, problem_ids):
     except subprocess.SubprocessError:
         commit = None
     manifest = {
-        "benchmark_version": "bucket_renewal_v2_min1",
+        "benchmark_version": "bucket_renewal_v3_step_buckets",
         "git_commit": commit,
         "python": sys.version,
         "platform": platform.platform(),

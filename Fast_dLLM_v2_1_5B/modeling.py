@@ -27,6 +27,7 @@ from einops import rearrange, repeat
 from bucket_renewal import (
     compare_renewal_costs,
     expected_accepted_prefix,
+    position_bucket,
     predict_next_gain,
 )
 
@@ -1147,15 +1148,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 "extension_size": extension,
             })
 
-        def bucket_position_bin(position):
-            if position < 2:
-                return "0-1"
-            if position < 4:
-                return "2-3"
-            if position < 8:
-                return "4-7"
-            return "8+"
-
         def bucket_length_bin(length):
             return str(max(1, (int(length) + 7) // 8))
 
@@ -1178,7 +1170,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             prior_strength = float(getattr(args, "bucket_prior_strength", 8.0))
             confidence_key = frontier_bin(confidence)
             margin_key = frontier_bin(margin)
-            position_key = bucket_position_bin(position)
+            position_key = position_bucket(position)
             candidates = (
                 (
                     "token_position_confidence_margin",
@@ -1243,7 +1235,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             gain_sum, count = calibration.get("global", [0.0, 0])
             calibration["global"] = [float(gain_sum) + gain, int(count) + 1]
 
-        def bucket_first_step_gain(state):
+        def bucket_gain_estimate(state):
             calibration = getattr(args, "bucket_gain_calibration", {})
             min_observations = int(getattr(args, "bucket_min_observations", 8))
             for table_name in (
@@ -1556,23 +1548,38 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             frontier_stats["final_frontier_score"] = float(frontier_score)
                             min_steps = int(getattr(args, "bucket_renewal_min_steps", 1)) if args is not None else 1
                             stop_reason = None
-                            first_step_gain, first_step_source, gain_bucket_count = (
-                                bucket_first_step_gain(current_gain_state)
+                            bucket_gain, gain_bucket_source, gain_bucket_count = (
+                                bucket_gain_estimate(current_gain_state)
+                            )
+                            gain_bucket_weight = (
+                                0.0
+                                if bucket_gain is None
+                                else float(gain_bucket_count)
+                                / (
+                                    float(gain_bucket_count)
+                                    + float(getattr(args, "bucket_prior_strength", 8.0))
+                                )
                             )
                             predicted_gain = predict_next_gain(
                                 frontier_scores,
-                                first_step_estimate=first_step_gain,
+                                bucket_estimate=bucket_gain,
+                                bucket_weight=gain_bucket_weight,
                             )
                             predicted_gain_source = (
-                                "acceptance_trajectory"
-                                if len(frontier_scores) >= 2
-                                else first_step_source
+                                gain_bucket_source
+                                if len(frontier_scores) == 1
+                                else (
+                                    "acceptance_trajectory"
+                                    if bucket_gain is None
+                                    else f"acceptance_trajectory+{gain_bucket_source}"
+                                )
                             )
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )
                             step_record["predicted_next_gain_source"] = predicted_gain_source
                             step_record["gain_bucket_count"] = int(gain_bucket_count)
+                            step_record["gain_bucket_weight"] = float(gain_bucket_weight)
                             if len(frontier_scores) >= min_steps and frontier_mode == "bucket_renewal":
                                 draft_forward_ms, verify_round_ms, controller_ms = bucket_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
