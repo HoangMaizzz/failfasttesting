@@ -245,10 +245,12 @@ def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec
 def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_len, output_seqlen, small_block_size, threshold, is_drafter, prev_prefill_output=None,
                         lowconf_threshold=None,
                         max_spec_len=None,
-                        incr_len=None,
-                        last_round_rejected=None,
+        incr_len=None,
+        last_round_rejected=None,
     ):
-    ensure_frontier_runtime_state(args)
+    controller_enabled = frontier_stop_enabled(args)
+    if controller_enabled:
+        ensure_frontier_runtime_state(args)
     num_tokens_in_prompt = orig_model_inputs['input_ids'].shape[1]
     new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
@@ -257,11 +259,11 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
         'input_ids': torch.cat([orig_model_inputs['input_ids'], new_tokens], dim=1),
         'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
     }
-    args.frontier_current_context_len = int(new_model_inputs['input_ids'].shape[1])
+    if controller_enabled:
+        args.bucket_current_context_len = int(new_model_inputs['input_ids'].shape[1])
     return_frontier_stats = (
-        frontier_stop_enabled(args)
+        controller_enabled
         or getattr(args, "collect_draft_diagnostics", False)
-        or getattr(args, "collect_oracle_refinement", False)
     )
     frontier_stats = None
 
@@ -379,32 +381,18 @@ parser.add_argument("--log_level", type=str, default="DEBUG", choices=["DEBUG", 
 parser.add_argument("--sweep_lowconf_threshold", type=float, nargs="+", default=[0.45])
 parser.add_argument("--sweep_max_spec_len", type=int, nargs="+", default=[60])
 parser.add_argument("--sweep_incr_len", type=int, nargs="+", default=[10])
-parser.add_argument("--frontier_stop_mode", type=str, default="disabled", choices=["disabled", "mask_efficiency", "frontier", "cost_aware", "cost_aware_no_extend", "cost_aware_v2", "cost_aware_v2_refinement_only", "cost_aware_v2_refinement_no_threshold"])
-parser.add_argument("--frontier_min_steps", type=int, default=2)
-parser.add_argument("--frontier_patience", type=int, default=2)
-parser.add_argument("--frontier_gain_epsilon", type=float, default=0.0)
-parser.add_argument("--frontier_cost_token_equiv", type=float, default=0.2)
-parser.add_argument("--frontier_cost_ema_alpha", type=float, default=0.2)
-parser.add_argument("--frontier_v2_hysteresis", type=float, default=0.03)
-parser.add_argument("--frontier_v2_extension_cost_margin", type=float, default=0.05)
-parser.add_argument("--frontier_v2_gain_calibration_prior_strength", type=float, default=8.0)
-parser.add_argument("--frontier_v2_min_gain_calibration_observations", type=int, default=8)
-parser.add_argument("--frontier_v2_gain_ucb_beta", type=float, default=1.0)
-parser.add_argument("--frontier_v2_gain_prior_std", type=float, default=2.0)
-parser.add_argument("--frontier_v2_counterfactual_rate", type=float, default=0.0)
-parser.add_argument("--frontier_v2_counterfactual_seed", type=int)
-parser.add_argument("--frontier_v2_hazard_prior_strength", type=float, default=8.0)
-parser.add_argument("--frontier_v2_extension_prior_strength", type=float, default=2.0)
-parser.add_argument("--frontier_v2_min_hazard_observations", type=int, default=8)
-parser.add_argument("--frontier_v2_min_calibration_tokens", type=int, default=64)
-parser.add_argument("--frontier_v2_first_step_prior_shrink", type=float, default=1.0)
-parser.add_argument("--frontier_v2_first_step_prior_floor", type=float, default=0.6)
-parser.add_argument("--frontier_v2_min_refinement_gain_observations", type=int, default=4)
-parser.add_argument("--frontier_calibration_prior", type=float, default=0.5)
-parser.add_argument("--frontier_calibration_prior_count", type=float, default=2.0)
-parser.add_argument("--frontier_aggressive_irrecoverable", action="store_true")
+parser.add_argument(
+    "--frontier_stop_mode",
+    type=str,
+    default="disabled",
+    choices=["disabled", "bucket_renewal"],
+)
+parser.add_argument("--bucket_renewal_min_steps", type=int, default=2)
+parser.add_argument("--bucket_renewal_hysteresis", type=float, default=0.0)
+parser.add_argument("--bucket_prior_strength", type=float, default=8.0)
+parser.add_argument("--bucket_min_observations", type=int, default=8)
+parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
-parser.add_argument("--collect_oracle_refinement", action="store_true")
 parser.add_argument("--quiet_generation", action="store_true")
 parser.add_argument("--disable_progress", action="store_true")
 parser.add_argument("--skip_artifacts", action="store_true")
@@ -467,21 +455,14 @@ BENCHMARK_CSV_COLUMNS = [
     "drafted_tokens",
     "num_speculation_rounds",
     "total_num_forward_passes",
-    "frontier_v2_extend_actions",
-    "frontier_v2_counterfactual_actions",
-    "frontier_v2_verify_actions",
-    "frontier_v2_refinement_stop_actions",
-    "frontier_v2_extension_stop_actions",
-    "frontier_v2_fallback_steps",
-    "frontier_v2_hazard_ready_steps",
-    "frontier_v2_extension_history_ready_steps",
-    "frontier_v2_predicted_extension_gain_mean",
-    "frontier_v2_raw_extension_gain_mean",
-    "frontier_v2_extension_gain_correction_mean",
-    "frontier_fill_forward_passes",
-    "frontier_denoising_forward_passes",
-    "frontier_expected_output_mean",
-    "frontier_stop_ms_per_output_mean",
+    "bucket_stop_actions",
+    "bucket_decision_steps",
+    "bucket_predicted_gain_mean",
+    "bucket_expected_output_mean",
+    "bucket_stop_ms_per_output_mean",
+    "bucket_continue_ms_per_output_mean",
+    "bucket_fill_forward_passes",
+    "bucket_denoising_forward_passes",
     "modeled_ms_per_output_token",
     "modeled_speedup",
     "output_token_hash",
@@ -504,20 +485,12 @@ FRONTIER_ROUND_DIAGNOSTIC_COLUMNS = [
     "extension_capacity",
     "full_accept_with_extension_capacity",
     "extension_count",
-    "cost_stop_requested",
+    "bucket_stop_requested",
+    "bucket_decision_steps",
     "stop_reason",
     "predicted_accepted_tokens",
     "actual_accepted_tokens",
     "prediction_error",
-    "v2_extend_actions",
-    "v2_refinement_stop_actions",
-    "v2_extension_stop_actions",
-    "v2_fallback_steps",
-    "v2_hazard_ready_steps",
-    "v2_extension_history_ready_steps",
-    "v2_predicted_extension_gain_mean",
-    "v2_raw_extension_gain_mean",
-    "v2_extension_gain_correction_mean",
 ]
 
 FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
@@ -530,32 +503,7 @@ FRONTIER_EXTENSION_DIAGNOSTIC_COLUMNS = [
     "from_len",
     "to_len",
     "extension_size",
-    "prefix_survival_probability",
-    "prefix_survival_raw_confidence",
-    "prefix_survival_without_confidence_bucket",
-    "prefix_survival_without_margin_bucket",
-    "prefix_survival_without_forced_bucket",
-    "extension_prior_probability",
-    "predicted_extension_gain",
-    "raw_predicted_extension_gain",
-    "extension_gain_correction",
-    "extension_gain_uncertainty",
-    "extension_gain_ucb_bonus",
-    "gain_calibration_source",
-    "gain_calibration_count",
-    "counterfactual_selected",
-    "counterfactual_original_action",
-    "counterfactual_draw",
-    "decision_expected_output",
-    "stop_ms_per_output",
-    "predicted_extend_ms_per_output",
-    "estimated_extension_total_ms",
-    "predicted_extension_gain_raw_confidence",
-    "predicted_extension_gain_without_confidence_bucket",
-    "predicted_extension_gain_without_margin_bucket",
-    "predicted_extension_gain_without_forced_bucket",
     "actual_extension_accepted_tokens",
-    "extension_gain_error",
     "original_prefix_fully_accepted",
 ]
 
@@ -572,39 +520,12 @@ FRONTIER_GAIN_DIAGNOSTIC_COLUMNS = [
     "predicted_next_gain",
     "actual_next_gain",
     "prediction_error",
-]
-
-FRONTIER_ORACLE_REFINEMENT_COLUMNS = [
-    "problem_id",
-    "mode",
-    "round_id",
-    "step",
-    "target_len",
-    "draft_passes_elapsed",
-    "draft_latency_elapsed_ms",
+    "decision_should_continue",
     "masks_remaining",
-    "committed_tokens",
-    "filled_tokens",
-    "oracle_current_fill_tokens",
-    "oracle_cached_fill_tokens",
-    "oracle_missing_fill_tokens",
-    "frontier_k",
-    "frontier_score",
-    "unmasked_this_step",
-    "token_confidences",
-    "token_margins",
-    "token_forced",
-    "token_recoverable",
-    "context_len",
-    "actual_verify_latency_ms",
-    "accepted_len_if_stop",
-    "emitted_len_if_stop",
-    "delta_accepted_len",
-    "delta_emitted_len",
-    "accepted_gain_per_draft_pass",
-    "emitted_gain_per_draft_pass",
-    "is_oracle_best_accept",
-    "is_oracle_best_emitted_per_ms",
+    "expected_output",
+    "stop_ms_per_output",
+    "continue_ms_per_output",
+    "calibration_tokens",
 ]
 
 def safe_div(numerator, denominator):
@@ -634,160 +555,98 @@ def extract_reference_answer(raw_data):
     return normalize_math_answer(answer.rsplit("####", 1)[-1])
 
 def summarize_frontier_diagnostics(stats_each_round):
-    extend_actions = 0
-    counterfactual_actions = 0
-    verify_actions = 0
+    stop_actions = 0
+    decision_steps = 0
     fill_passes = 0
     denoising_passes = 0
+    predicted_gains = []
     expected_outputs = []
     stop_costs = []
-    refinement_stop_actions = 0
-    extension_stop_actions = 0
-    fallback_steps = 0
-    hazard_ready_steps = 0
-    extension_history_ready_steps = 0
-    predicted_extension_gains = []
-    raw_extension_gains = []
-    extension_gain_corrections = []
+    continue_costs = []
     for round_stats in stats_each_round:
         frontier_stats = round_stats.get("frontier_stats") or {}
         breakdown = frontier_stats.get("forward_pass_breakdown") or {}
         fill_passes += int(breakdown.get("fill", 0))
         denoising_passes += int(breakdown.get("denoising", 0))
         for action in frontier_stats.get("refinement_actions", []):
-            action_name = action.get("action")
-            extend_actions += int(action_name == "cost_aware_v2_extend")
-            counterfactual_actions += int(
-                action_name == "cost_aware_v2_counterfactual_extend"
-            )
-            verify_actions += int(action_name == "cost_aware_v2_verify_lower_cost")
-            if action_name == "cost_aware_v2_verify_lower_cost":
-                refinement_stop_actions += int(action.get("phase") == "refinement")
-                extension_stop_actions += int(action.get("phase") == "extension")
-        v2_steps = [
+            stop_actions += int(action.get("action") == "bucket_renewal_lower_cost")
+        bucket_steps = [
             step for step in frontier_stats.get("steps", [])
-            if step.get("v2_expected_output") is not None
+            if step.get("bucket_expected_output") is not None
         ]
-        if v2_steps:
-            fallback_steps += sum(bool(step.get("v2_fallback")) for step in v2_steps)
-            hazard_ready_steps += sum(bool(step.get("v2_hazard_ready")) for step in v2_steps)
-            extension_history_ready_steps += sum(
-                bool(step.get("v2_extension_history_ready")) for step in v2_steps
+        if bucket_steps:
+            decision_steps += len(bucket_steps)
+            predicted_gains.extend(
+                float(step["predicted_next_gain"])
+                for step in bucket_steps
+                if step.get("predicted_next_gain") is not None
             )
-            predicted_extension_gains.extend(
-                float(step["v2_extension_gain"])
-                for step in v2_steps
-                if step.get("v2_extension_gain") is not None
+            final_step = bucket_steps[-1]
+            expected_outputs.append(float(final_step["bucket_expected_output"]))
+            stop_costs.extend(
+                float(step["bucket_stop_ms_per_output"])
+                for step in bucket_steps
+                if step.get("bucket_stop_ms_per_output") is not None
             )
-            raw_extension_gains.extend(
-                float(step["v2_raw_extension_gain"])
-                for step in v2_steps
-                if step.get("v2_raw_extension_gain") is not None
+            continue_costs.extend(
+                float(step["bucket_continue_ms_per_output"])
+                for step in bucket_steps
+                if step.get("bucket_continue_ms_per_output") is not None
             )
-            extension_gain_corrections.extend(
-                float(step["v2_extension_gain_correction"])
-                for step in v2_steps
-                if step.get("v2_extension_gain_correction") is not None
-            )
-            final_step = v2_steps[-1]
-            expected_outputs.append(float(final_step["v2_expected_output"]))
-            if final_step.get("v2_stop_ms_per_output") is not None:
-                stop_costs.append(float(final_step["v2_stop_ms_per_output"]))
     return {
-        "frontier_v2_extend_actions": extend_actions,
-        "frontier_v2_counterfactual_actions": counterfactual_actions,
-        "frontier_v2_verify_actions": verify_actions,
-        "frontier_v2_refinement_stop_actions": refinement_stop_actions,
-        "frontier_v2_extension_stop_actions": extension_stop_actions,
-        "frontier_v2_fallback_steps": fallback_steps,
-        "frontier_v2_hazard_ready_steps": hazard_ready_steps,
-        "frontier_v2_extension_history_ready_steps": extension_history_ready_steps,
-        "frontier_v2_predicted_extension_gain_mean": safe_div(
-            sum(predicted_extension_gains), len(predicted_extension_gains)
-        ),
-        "frontier_v2_raw_extension_gain_mean": safe_div(
-            sum(raw_extension_gains), len(raw_extension_gains)
-        ),
-        "frontier_v2_extension_gain_correction_mean": safe_div(
-            sum(extension_gain_corrections), len(extension_gain_corrections)
-        ),
-        "frontier_fill_forward_passes": fill_passes,
-        "frontier_denoising_forward_passes": denoising_passes,
-        "frontier_expected_output_mean": safe_div(sum(expected_outputs), len(expected_outputs)),
-        "frontier_stop_ms_per_output_mean": safe_div(sum(stop_costs), len(stop_costs)),
+        "bucket_stop_actions": stop_actions,
+        "bucket_decision_steps": decision_steps,
+        "bucket_predicted_gain_mean": safe_div(sum(predicted_gains), len(predicted_gains)),
+        "bucket_expected_output_mean": safe_div(sum(expected_outputs), len(expected_outputs)),
+        "bucket_stop_ms_per_output_mean": safe_div(sum(stop_costs), len(stop_costs)),
+        "bucket_continue_ms_per_output_mean": safe_div(sum(continue_costs), len(continue_costs)),
+        "bucket_fill_forward_passes": fill_passes,
+        "bucket_denoising_forward_passes": denoising_passes,
     }
 
 def frontier_stop_enabled(args):
     return getattr(args, "frontier_stop_mode", "disabled") not in (None, "disabled", "none", "off")
 
 def ensure_frontier_runtime_state(args):
-    if not hasattr(args, "frontier_acceptance_calibration"):
-        args.frontier_acceptance_calibration = {
-            "confidence_bins": {},
-            "margin_bins": {},
-            "forced": {},
-            "prior": [0.0, 0.0],
-            "verifier_margin_sum": 0.0,
-            "verifier_margin_count": 0.0,
-        }
-    if not hasattr(args, "frontier_ema_dllm_forward_ms"):
-        args.frontier_ema_dllm_forward_ms = None
-    if not hasattr(args, "frontier_ema_target_token_ms"):
-        args.frontier_ema_target_token_ms = None
-    if not hasattr(args, "frontier_ema_target_round_ms"):
-        args.frontier_ema_target_round_ms = None
-    if not hasattr(args, "frontier_ema_controller_ms"):
-        args.frontier_ema_controller_ms = None
-    if not hasattr(args, "frontier_dynamic_cost_token_equiv"):
-        args.frontier_dynamic_cost_token_equiv = args.frontier_cost_token_equiv
-    if not hasattr(args, "frontier_v2_hazard_calibration"):
-        args.frontier_v2_hazard_calibration = {
+    if not hasattr(args, "bucket_acceptance_calibration"):
+        args.bucket_acceptance_calibration = {
             "token_position_confidence_margin": {},
             "token_position_confidence": {},
             "token_confidence_margin": {},
             "token_confidence": {},
-            "extension_block_offset": {},
-            "extension_offset": {},
-            "extension_gain_by_block": {},
-            "extension_gain_global": [0.0, 0.0, 0.0, 0],
-            "refinement_step_gain": {},
-            "refinement_step_gain_global": {},
             "total_checked_tokens": 0,
-            "total_extension_tokens": 0,
         }
-    if not hasattr(args, "frontier_v2_verify_latency_bins"):
-        args.frontier_v2_verify_latency_bins = {}
-    if not hasattr(args, "frontier_v2_draft_latency_bins"):
-        args.frontier_v2_draft_latency_bins = {}
-    if not hasattr(args, "frontier_v2_counterfactual_counter"):
-        args.frontier_v2_counterfactual_counter = 0
+    if not hasattr(args, "bucket_ema_dllm_forward_ms"):
+        args.bucket_ema_dllm_forward_ms = None
+    if not hasattr(args, "bucket_ema_target_round_ms"):
+        args.bucket_ema_target_round_ms = None
+    if not hasattr(args, "bucket_ema_post_verify_ms"):
+        args.bucket_ema_post_verify_ms = None
+    if not hasattr(args, "bucket_verify_latency_bins"):
+        args.bucket_verify_latency_bins = {}
+    if not hasattr(args, "bucket_draft_latency_bins"):
+        args.bucket_draft_latency_bins = {}
 
 def reset_frontier_runtime_state(args, preserve_hardware_latency=False):
     preserved = {}
     if preserve_hardware_latency:
         for name in (
-            "frontier_ema_dllm_forward_ms",
-            "frontier_ema_target_token_ms",
-            "frontier_ema_target_round_ms",
-            "frontier_ema_controller_ms",
-            "frontier_dynamic_cost_token_equiv",
-            "frontier_v2_verify_latency_bins",
-            "frontier_v2_draft_latency_bins",
+            "bucket_ema_dllm_forward_ms",
+            "bucket_ema_target_round_ms",
+            "bucket_ema_post_verify_ms",
+            "bucket_verify_latency_bins",
+            "bucket_draft_latency_bins",
         ):
             if hasattr(args, name):
                 preserved[name] = getattr(args, name)
     for name in (
-        "frontier_acceptance_calibration",
-        "frontier_ema_dllm_forward_ms",
-        "frontier_ema_target_token_ms",
-        "frontier_ema_target_round_ms",
-        "frontier_ema_controller_ms",
-        "frontier_dynamic_cost_token_equiv",
-        "frontier_v2_hazard_calibration",
-        "frontier_v2_verify_latency_bins",
-        "frontier_v2_draft_latency_bins",
+        "bucket_acceptance_calibration",
+        "bucket_ema_dllm_forward_ms",
+        "bucket_ema_target_round_ms",
+        "bucket_ema_post_verify_ms",
+        "bucket_verify_latency_bins",
+        "bucket_draft_latency_bins",
         "last_frontier_stats",
-        "frontier_v2_counterfactual_counter",
     ):
         if hasattr(args, name):
             delattr(args, name)
@@ -807,28 +666,7 @@ def update_calibration_bucket(table, key, accepted):
     table[key] = [accepted_count + float(accepted), total_count + 1.0]
 
 
-def update_gain_calibration(table, key, predicted_gain, actual_gain):
-    stats = table.get(key, [0.0, 0.0, 0.0, 0])
-    if len(stats) == 3:
-        predicted_sum, actual_sum, count = stats
-        squared_error_sum = 0.0
-    else:
-        predicted_sum, actual_sum, squared_error_sum, count = stats
-    error = float(actual_gain) - float(predicted_gain)
-    table[key] = [
-        predicted_sum + float(predicted_gain),
-        actual_sum + float(actual_gain),
-        squared_error_sum + error * error,
-        int(count) + 1,
-    ]
-
-
-def update_refinement_step_gain(table, key, gain):
-    gain_sum, total_count = table.get(key, [0.0, 0])
-    table[key] = [gain_sum + max(0.0, float(gain)), int(total_count) + 1]
-
-
-def frontier_v2_position_bin(position):
+def bucket_position_bin(position):
     if position < 2:
         return "0-1"
     if position < 4:
@@ -838,37 +676,17 @@ def frontier_v2_position_bin(position):
     return "8+"
 
 
-def frontier_v2_length_bin(length):
+def bucket_length_bin(length):
     return str(max(1, math.ceil(int(length) / 8)))
 
 
-def frontier_v2_context_bin(context_len):
+def bucket_context_bin(context_len):
     return str(max(0, int(context_len) // 256))
-
-
-def frontier_v2_refinement_gain_key(step):
-    from_step = int(step.get("step", 0))
-    masks_remaining = int(step.get("masks_remaining", 0))
-    frontier_k = int(step.get("frontier_k", 0))
-    frontier_score = float(step.get("frontier_score", 0.0))
-    masks_bin = str(min(8, max(0, masks_remaining)))
-    frontier_bin = str(min(8, max(0, frontier_k)))
-    score_bin = str(min(8, max(0, int(frontier_score))))
-    return f"{from_step}:{masks_bin}:{frontier_bin}:{score_bin}"
 
 
 def update_latency_bucket(table, key, value, alpha):
     current_value, count = table.get(key, [None, 0])
     table[key] = [update_ema(current_value, value, alpha), int(count) + 1]
-
-def verifier_logit_margin(logits, draft_token_id):
-    topk = torch.topk(logits.float(), k=2)
-    best_id = topk.indices[0].item()
-    best_logit = topk.values[0].item()
-    second_logit = topk.values[1].item()
-    draft_logit = logits[draft_token_id].float().item()
-    best_other = second_logit if best_id == draft_token_id else best_logit
-    return draft_logit - best_other
 
 def update_frontier_latency_cost(
     args,
@@ -878,36 +696,29 @@ def update_frontier_latency_cost(
     context_len=None,
 ):
     ensure_frontier_runtime_state(args)
-    alpha = args.frontier_cost_ema_alpha
+    alpha = args.bucket_latency_ema_alpha
     if forward_pass_latencies:
         avg_forward_ms = sum(forward_pass_latencies) / len(forward_pass_latencies)
-        args.frontier_ema_dllm_forward_ms = update_ema(args.frontier_ema_dllm_forward_ms, avg_forward_ms, alpha)
+        args.bucket_ema_dllm_forward_ms = update_ema(args.bucket_ema_dllm_forward_ms, avg_forward_ms, alpha)
     if draft_len > 0 and verify_time > 0:
-        target_token_ms = verify_time * 1000.0 / draft_len
-        args.frontier_ema_target_token_ms = update_ema(args.frontier_ema_target_token_ms, target_token_ms, alpha)
-        args.frontier_ema_target_round_ms = update_ema(
-            args.frontier_ema_target_round_ms,
+        args.bucket_ema_target_round_ms = update_ema(
+            args.bucket_ema_target_round_ms,
             verify_time * 1000.0,
             alpha,
         )
-    if args.frontier_ema_dllm_forward_ms and args.frontier_ema_target_token_ms:
-        args.frontier_dynamic_cost_token_equiv = safe_div(
-            args.frontier_ema_dllm_forward_ms,
-            args.frontier_ema_target_token_ms,
-        )
     if context_len is not None:
-        context_key = frontier_v2_context_bin(context_len)
+        context_key = bucket_context_bin(context_len)
         if forward_pass_latencies:
             update_latency_bucket(
-                args.frontier_v2_draft_latency_bins,
+                args.bucket_draft_latency_bins,
                 context_key,
                 sum(forward_pass_latencies) / len(forward_pass_latencies),
                 alpha,
             )
         if draft_len > 0 and verify_time > 0:
-            verify_key = f"{context_key}:{frontier_v2_length_bin(draft_len)}"
+            verify_key = f"{context_key}:{bucket_length_bin(draft_len)}"
             update_latency_bucket(
-                args.frontier_v2_verify_latency_bins,
+                args.bucket_verify_latency_bins,
                 verify_key,
                 verify_time * 1000.0,
                 alpha,
@@ -916,61 +727,27 @@ def update_frontier_latency_cost(
 def update_frontier_controller_cost(args, controller_time):
     ensure_frontier_runtime_state(args)
     if controller_time > 0:
-        args.frontier_ema_controller_ms = update_ema(
-            args.frontier_ema_controller_ms,
+        args.bucket_ema_post_verify_ms = update_ema(
+            args.bucket_ema_post_verify_ms,
             controller_time * 1000.0,
-            args.frontier_cost_ema_alpha,
+            args.bucket_latency_ema_alpha,
         )
 
-def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcomes, verifier_margins):
+def update_frontier_acceptance_calibration(args, frontier_stats, accepted_outcomes):
     if not frontier_stats or not accepted_outcomes:
         return
     ensure_frontier_runtime_state(args)
-    calibration = args.frontier_acceptance_calibration
+    calibration = args.bucket_acceptance_calibration
     draft_token_stats = frontier_stats.get("draft_token_stats", [])
-    verifier_token_stats = []
     for idx, accepted in enumerate(accepted_outcomes):
         if idx >= len(draft_token_stats):
             break
         token_stats = draft_token_stats[idx]
         confidence = float(token_stats.get("confidence", 0.0))
         margin = float(token_stats.get("margin", 0.0))
-        forced = bool(token_stats.get("forced", False))
-        update_calibration_bucket(calibration["confidence_bins"], calibration_bin(confidence), accepted)
-        update_calibration_bucket(calibration["margin_bins"], calibration_bin(margin), accepted)
-        update_calibration_bucket(calibration["forced"], "1" if forced else "0", accepted)
-        calibration["prior"][0] += float(accepted)
-        calibration["prior"][1] += 1.0
-        verifier_margin = verifier_margins[idx] if idx < len(verifier_margins) else None
-        if verifier_margin is not None:
-            calibration["verifier_margin_sum"] += float(verifier_margin)
-            calibration["verifier_margin_count"] += 1.0
-        verifier_token_stats.append({
-            "relative_pos": idx,
-            "accepted": bool(accepted),
-            "verifier_margin": verifier_margin,
-            "draft_confidence": confidence,
-            "draft_margin": margin,
-            "forced": forced,
-        })
-    frontier_stats["verifier_token_stats"] = verifier_token_stats
-    frontier_stats["dynamic_cost_token_equiv"] = getattr(args, "frontier_dynamic_cost_token_equiv", None)
-    update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcomes)
-
-
-def update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcomes):
-    if not frontier_stats or not accepted_outcomes:
-        return
-    ensure_frontier_runtime_state(args)
-    calibration = args.frontier_v2_hazard_calibration
-    draft_token_stats = frontier_stats.get("draft_token_stats", [])
-    for index, accepted in enumerate(accepted_outcomes):
-        if index >= len(draft_token_stats):
-            break
-        token_stats = draft_token_stats[index]
-        confidence_bin = calibration_bin(float(token_stats.get("confidence", 0.0)))
-        margin_bin = calibration_bin(float(token_stats.get("margin", 0.0)))
-        position_bin = frontier_v2_position_bin(index)
+        confidence_bin = calibration_bin(confidence)
+        margin_bin = calibration_bin(margin)
+        position_bin = bucket_position_bin(idx)
         update_calibration_bucket(
             calibration["token_position_confidence_margin"],
             f"{position_bin}:{confidence_bin}:{margin_bin}",
@@ -992,81 +769,6 @@ def update_frontier_v2_hazard_calibration(args, frontier_stats, accepted_outcome
             accepted,
         )
         calibration["total_checked_tokens"] += 1
-
-    accepted_len = 0
-    for accepted in accepted_outcomes:
-        if not accepted:
-            break
-        accepted_len += 1
-    steps = frontier_stats.get("steps", [])
-    for current_step, next_step in zip(steps, steps[1:]):
-        actual_gain = next_step.get("frontier_gain")
-        if actual_gain is None:
-            continue
-        step_key = frontier_v2_refinement_gain_key(current_step)
-        global_key = str(int(current_step.get("step", 0)))
-        update_refinement_step_gain(
-            calibration["refinement_step_gain"],
-            step_key,
-            actual_gain,
-        )
-        update_refinement_step_gain(
-            calibration["refinement_step_gain_global"],
-            global_key,
-            actual_gain,
-        )
-    for event in frontier_stats.get("extension_events", []):
-        if event.get("trigger") not in (
-            "high_confidence_extend",
-            "cost_aware_v2_extend",
-            "cost_aware_v2_counterfactual_extend",
-        ):
-            continue
-        from_len = int(event.get("from_len", 0))
-        extension_size = int(event.get("extension_size", 0))
-        raw_predicted_gain = event.get("raw_predicted_extension_gain")
-        if raw_predicted_gain is not None:
-            actual_gain = max(0, min(extension_size, accepted_len - from_len))
-            block_key = frontier_v2_length_bin(from_len)
-            update_gain_calibration(
-                calibration["extension_gain_by_block"],
-                block_key,
-                raw_predicted_gain,
-                actual_gain,
-            )
-            global_stats = calibration["extension_gain_global"]
-            if len(global_stats) == 3:
-                global_predicted, global_actual, global_count = global_stats
-                global_squared_error = 0.0
-            else:
-                global_predicted, global_actual, global_squared_error, global_count = global_stats
-            error = float(actual_gain) - float(raw_predicted_gain)
-            calibration["extension_gain_global"] = [
-                global_predicted + float(raw_predicted_gain),
-                global_actual + float(actual_gain),
-                global_squared_error + error * error,
-                int(global_count) + 1,
-            ]
-        if accepted_len < from_len:
-            continue
-        block_bin = frontier_v2_length_bin(from_len)
-        for offset in range(1, extension_size + 1):
-            if accepted_len < from_len + offset - 1:
-                break
-            accepted = accepted_len >= from_len + offset
-            update_calibration_bucket(
-                calibration["extension_block_offset"],
-                f"{block_bin}:{offset}",
-                accepted,
-            )
-            update_calibration_bucket(
-                calibration["extension_offset"],
-                str(offset),
-                accepted,
-            )
-            calibration["total_extension_tokens"] += 1
-            if not accepted:
-                break
 
 def build_benchmark_drafter_configs(args):
     dllm_config = (
@@ -1191,26 +893,11 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
         extension_capacity = draft_len < max_spec_len
         actions = frontier_stats.get("refinement_actions") or []
         cost_stop_requested = any(
-            action.get("action") == "cost_aware_low_expected_gain"
+            action.get("action") == "bucket_renewal_lower_cost"
             for action in actions
         )
         predicted_accepted = frontier_stats.get("final_frontier_score")
         steps = frontier_stats.get("steps") or []
-        v2_extension_gains = [
-            float(step["v2_extension_gain"])
-            for step in steps
-            if step.get("v2_extension_gain") is not None
-        ]
-        v2_raw_extension_gains = [
-            float(step["v2_raw_extension_gain"])
-            for step in steps
-            if step.get("v2_raw_extension_gain") is not None
-        ]
-        v2_extension_gain_corrections = [
-            float(step["v2_extension_gain_correction"])
-            for step in steps
-            if step.get("v2_extension_gain_correction") is not None
-        ]
         prediction_error = (
             float(predicted_accepted) - accepted_len
             if predicted_accepted is not None
@@ -1230,57 +917,19 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
             "extension_capacity": int(extension_capacity),
             "full_accept_with_extension_capacity": int(full_accept and extension_capacity),
             "extension_count": len(extension_events),
-            "cost_stop_requested": int(cost_stop_requested),
+            "bucket_stop_requested": int(cost_stop_requested),
+            "bucket_decision_steps": sum(
+                step.get("predicted_next_gain") is not None for step in steps
+            ),
             "stop_reason": frontier_stats.get("stop_reason"),
             "predicted_accepted_tokens": predicted_accepted,
             "actual_accepted_tokens": accepted_len,
             "prediction_error": prediction_error,
-            "v2_extend_actions": sum(
-                action.get("action") == "cost_aware_v2_extend" for action in actions
-            ),
-            "v2_refinement_stop_actions": sum(
-                action.get("action") == "cost_aware_v2_verify_lower_cost"
-                and action.get("phase") == "refinement"
-                for action in actions
-            ),
-            "v2_extension_stop_actions": sum(
-                action.get("action") == "cost_aware_v2_verify_lower_cost"
-                and action.get("phase") == "extension"
-                for action in actions
-            ),
-            "v2_fallback_steps": sum(bool(step.get("v2_fallback")) for step in steps),
-            "v2_hazard_ready_steps": sum(bool(step.get("v2_hazard_ready")) for step in steps),
-            "v2_extension_history_ready_steps": sum(
-                bool(step.get("v2_extension_history_ready")) for step in steps
-            ),
-            "v2_predicted_extension_gain_mean": safe_div(
-                sum(v2_extension_gains), len(v2_extension_gains)
-            ),
-            "v2_raw_extension_gain_mean": safe_div(
-                sum(v2_raw_extension_gains), len(v2_raw_extension_gains)
-            ),
-            "v2_extension_gain_correction_mean": safe_div(
-                sum(v2_extension_gain_corrections), len(v2_extension_gain_corrections)
-            ),
         })
 
         for event_id, event in enumerate(extension_events):
-            predicted_gain = event.get("predicted_extension_gain")
-            survival = event.get("prefix_survival_probability")
-            survival_variants = event.get("prefix_survival_by_variant") or {}
-            gain_variants = event.get("predicted_extension_gain_by_variant") or {}
-            extension_probability = event.get("extension_prior_probability")
             from_len = int(event.get("from_len", 0))
             extension_size = int(event.get("extension_size", 0))
-            accept_probabilities = event.get("accept_probabilities")
-            if predicted_gain is None and accept_probabilities is not None and extension_probability is not None:
-                survival = 1.0
-                for accept_probability in accept_probabilities:
-                    survival *= float(accept_probability)
-                predicted_gain = sum(
-                    survival * (float(extension_probability) ** offset)
-                    for offset in range(1, extension_size + 1)
-                )
             actual_gain = max(0, min(extension_size, accepted_len - from_len))
             extension_rows.append({
                 "problem_id": problem_id,
@@ -1292,40 +941,7 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "from_len": from_len,
                 "to_len": event.get("to_len"),
                 "extension_size": extension_size,
-                "prefix_survival_probability": survival,
-                "prefix_survival_raw_confidence": survival_variants.get("raw_confidence"),
-                "prefix_survival_without_confidence_bucket": survival_variants.get("without_confidence_bucket"),
-                "prefix_survival_without_margin_bucket": survival_variants.get("without_margin_bucket"),
-                "prefix_survival_without_forced_bucket": survival_variants.get("without_forced_bucket"),
-                "extension_prior_probability": extension_probability,
-                "predicted_extension_gain": predicted_gain,
-                "raw_predicted_extension_gain": event.get("raw_predicted_extension_gain"),
-                "extension_gain_correction": event.get("extension_gain_correction"),
-                "extension_gain_uncertainty": event.get("extension_gain_uncertainty"),
-                "extension_gain_ucb_bonus": event.get("extension_gain_ucb_bonus"),
-                "gain_calibration_source": event.get("gain_calibration_source"),
-                "gain_calibration_count": event.get("gain_calibration_count"),
-                "counterfactual_selected": int(bool(event.get("counterfactual_selected"))),
-                "counterfactual_original_action": event.get("counterfactual_original_action"),
-                "counterfactual_draw": event.get("counterfactual_draw"),
-                "decision_expected_output": event.get("decision_expected_output"),
-                "stop_ms_per_output": event.get("stop_ms_per_output"),
-                "predicted_extend_ms_per_output": event.get(
-                    "predicted_extend_ms_per_output"
-                ),
-                "estimated_extension_total_ms": event.get(
-                    "estimated_extension_total_ms"
-                ),
-                "predicted_extension_gain_raw_confidence": gain_variants.get("raw_confidence"),
-                "predicted_extension_gain_without_confidence_bucket": gain_variants.get("without_confidence_bucket"),
-                "predicted_extension_gain_without_margin_bucket": gain_variants.get("without_margin_bucket"),
-                "predicted_extension_gain_without_forced_bucket": gain_variants.get("without_forced_bucket"),
                 "actual_extension_accepted_tokens": actual_gain,
-                "extension_gain_error": (
-                    float(predicted_gain) - actual_gain
-                    if predicted_gain is not None
-                    else None
-                ),
                 "original_prefix_fully_accepted": int(accepted_len >= from_len),
             })
 
@@ -1349,6 +965,12 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
                 "predicted_next_gain": float(predicted_gain),
                 "actual_next_gain": float(actual_gain),
                 "prediction_error": float(predicted_gain) - float(actual_gain),
+                "decision_should_continue": int(bool(current_step.get("bucket_should_continue"))),
+                "masks_remaining": current_step.get("masks_remaining"),
+                "expected_output": current_step.get("bucket_expected_output"),
+                "stop_ms_per_output": current_step.get("bucket_stop_ms_per_output"),
+                "continue_ms_per_output": current_step.get("bucket_continue_ms_per_output"),
+                "calibration_tokens": current_step.get("bucket_calibration_tokens"),
             })
 
     append_csv_rows(
@@ -1365,125 +987,6 @@ def append_frontier_diagnostic_rows(args, problem_id, mode, stats_each_round):
         os.path.join(args.output_dir, "frontier_gain_diagnostics.csv"),
         FRONTIER_GAIN_DIAGNOSTIC_COLUMNS,
         gain_rows,
-    )
-
-def compute_greedy_acceptance_for_proposal(
-    target_model,
-    orig_model_inputs,
-    current_token_ids,
-    draft_proposal,
-):
-    combined_ids = current_token_ids + draft_proposal
-    verify_input_tensor = torch.tensor(
-        [combined_ids],
-        device=target_model.device,
-        dtype=torch.long,
-    )
-    full_input_ids = torch.cat([orig_model_inputs["input_ids"], verify_input_tensor], dim=1)
-    verify_mask_tensor = torch.ones_like(verify_input_tensor)
-    full_attention_mask = torch.cat([orig_model_inputs["attention_mask"], verify_mask_tensor], dim=1)
-    with torch.inference_mode():
-        outputs = target_model(
-            input_ids=full_input_ids,
-            attention_mask=full_attention_mask,
-            use_cache=False,
-            logits_to_keep=len(draft_proposal) + 1,
-        )
-    verify_logits = outputs.logits[0, :len(draft_proposal)]
-    accepted_len = 0
-    for index, draft_token_id in enumerate(draft_proposal):
-        target_pred = torch.argmax(verify_logits[index, :], dim=-1).item()
-        if draft_token_id != target_pred:
-            return accepted_len, accepted_len + 1
-        accepted_len += 1
-    return accepted_len, accepted_len + 1
-
-def append_oracle_refinement_rows(
-    args,
-    problem_id,
-    mode,
-    round_id,
-    target_model,
-    orig_model_inputs,
-    current_token_ids,
-    frontier_stats,
-    verify_latency_ms,
-):
-    if not args.collect_oracle_refinement:
-        return
-    snapshots = (frontier_stats or {}).get("oracle_refinement_snapshots") or []
-    if not snapshots:
-        return
-
-    rows = []
-    previous_accepted = 0
-    previous_emitted = 0
-    accepted_values = []
-    emitted_efficiencies = []
-    for snapshot in snapshots:
-        draft_proposal = [int(token_id) for token_id in snapshot["draft_proposal"]]
-        accepted_len, emitted_len = compute_greedy_acceptance_for_proposal(
-            target_model,
-            orig_model_inputs,
-            current_token_ids,
-            draft_proposal,
-        )
-        delta_accepted = accepted_len - previous_accepted
-        delta_emitted = emitted_len - previous_emitted
-        draft_latency_elapsed_ms = float(snapshot.get("draft_latency_elapsed_ms") or 0.0)
-        rows.append({
-            "problem_id": problem_id,
-            "mode": mode,
-            "round_id": round_id,
-            "step": snapshot.get("step"),
-            "target_len": snapshot.get("target_len"),
-            "draft_passes_elapsed": snapshot.get("draft_passes_elapsed"),
-            "draft_latency_elapsed_ms": draft_latency_elapsed_ms,
-            "masks_remaining": snapshot.get("masks_remaining"),
-            "committed_tokens": snapshot.get("committed_tokens"),
-            "filled_tokens": snapshot.get("filled_tokens"),
-            "oracle_current_fill_tokens": snapshot.get("oracle_current_fill_tokens", 0),
-            "oracle_cached_fill_tokens": snapshot.get("oracle_cached_fill_tokens", 0),
-            "oracle_missing_fill_tokens": snapshot.get("oracle_missing_fill_tokens", 0),
-            "frontier_k": snapshot.get("frontier_k"),
-            "frontier_score": snapshot.get("frontier_score"),
-            "unmasked_this_step": snapshot.get("unmasked_this_step"),
-            "token_confidences": json.dumps(snapshot.get("token_confidences") or []),
-            "token_margins": json.dumps(snapshot.get("token_margins") or []),
-            "token_forced": json.dumps(snapshot.get("token_forced") or []),
-            "token_recoverable": json.dumps(snapshot.get("token_recoverable") or []),
-            "context_len": int(orig_model_inputs["input_ids"].shape[1] + len(current_token_ids)),
-            "actual_verify_latency_ms": float(verify_latency_ms),
-            "accepted_len_if_stop": accepted_len,
-            "emitted_len_if_stop": emitted_len,
-            "delta_accepted_len": delta_accepted,
-            "delta_emitted_len": delta_emitted,
-            "accepted_gain_per_draft_pass": safe_div(
-                delta_accepted,
-                1,
-            ),
-            "emitted_gain_per_draft_pass": safe_div(
-                delta_emitted,
-                1,
-            ),
-            "is_oracle_best_accept": 0,
-            "is_oracle_best_emitted_per_ms": 0,
-        })
-        accepted_values.append(accepted_len)
-        emitted_efficiencies.append(safe_div(emitted_len, draft_latency_elapsed_ms))
-        previous_accepted = accepted_len
-        previous_emitted = emitted_len
-
-    if rows:
-        best_accept = max(accepted_values)
-        best_efficiency = max(emitted_efficiencies)
-        for row, efficiency in zip(rows, emitted_efficiencies):
-            row["is_oracle_best_accept"] = int(row["accepted_len_if_stop"] == best_accept)
-            row["is_oracle_best_emitted_per_ms"] = int(efficiency == best_efficiency)
-    append_csv_rows(
-        os.path.join(args.output_dir, "frontier_oracle_refinement_diagnostics.csv"),
-        FRONTIER_ORACLE_REFINEMENT_COLUMNS,
-        rows,
     )
 
 apply_mode_settings(args)
@@ -1633,11 +1136,7 @@ for problem_id, is_warmup in tqdm(
     if not is_warmup and not measured_run_started:
         reset_frontier_runtime_state(
             args,
-            preserve_hardware_latency=args.frontier_stop_mode in (
-                "cost_aware_v2",
-                "cost_aware_v2_refinement_only",
-                "cost_aware_v2_refinement_no_threshold",
-            ),
+            preserve_hardware_latency=args.frontier_stop_mode == "bucket_renewal",
         )
         measured_run_started = True
     transformers.set_seed(args.seed)
@@ -1884,7 +1383,6 @@ for problem_id, is_warmup in tqdm(
                     bonus_token = None
                     target_tokens = [] # Dành cho logging tương thích cũ
                     checked_outcomes = []
-                    verifier_margins = []
                     
                     generation_print(args, f"🔍 BƯỚC CHẤM BÀI CỦA VERIFIER:", flush=True)
                     for i in range(len(draft_proposal)):
@@ -1939,9 +1437,7 @@ for problem_id, is_warmup in tqdm(
                             target_pred = torch.argmax(verify_logits[i, :], dim=-1).item()
                             is_match = (draft_proposal[i] == target_pred)
                             if frontier_stop_enabled(args):
-                                verifier_margin = verifier_logit_margin(verify_logits[i, :], draft_proposal[i])
                                 checked_outcomes.append(is_match)
-                                verifier_margins.append(verifier_margin)
 
                             if not args.quiet_generation:
                                 draft_word = target_tokenizer.decode([draft_proposal[i]])
@@ -1986,25 +1482,11 @@ for problem_id, is_warmup in tqdm(
                     remaining_tokens = num_target_tokens - len(current_token_ids)
                     tokens_to_append = tokens_to_append[:remaining_tokens]
                     frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
-                    if draft_type == "dllm" and args.collect_oracle_refinement:
-                        append_oracle_refinement_rows(
-                            args,
-                            problem_id,
-                            benchmark_mode,
-                            num_speculation_rounds,
-                            target_model,
-                            orig_model_inputs,
-                            current_token_ids,
-                            frontier_stats_this_round,
-                            verify_time * 1000.0,
-                        )
                     current_token_ids.extend(tokens_to_append)
                     
                     accepted_tokens += accepted_len
                     rejected_tokens += len(draft_proposal) - accepted_len
-                    if draft_type == "dllm" and (
-                        frontier_stop_enabled(args) or args.collect_draft_diagnostics
-                    ):
+                    if draft_type == "dllm" and frontier_stop_enabled(args):
                         update_frontier_latency_cost(
                             args,
                             forward_pass_latencies,
@@ -2016,15 +1498,15 @@ for problem_id, is_warmup in tqdm(
                             args,
                             frontier_stats_this_round,
                             checked_outcomes,
-                            verifier_margins,
                         )
 
+                    if draft_type == "dllm" and frontier_stop_enabled(args):
+                        observed_post_verify_time = time.perf_counter() - post_verify_start
+                        update_frontier_controller_cost(args, observed_post_verify_time)
                     if verify_input_tensor.is_cuda:
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
-                    if draft_type == "dllm" and frontier_stop_enabled(args):
-                        update_frontier_controller_cost(args, post_verify_time)
                     
                     info_this_round = {
                         "target_tokens": target_tokens,
@@ -2041,8 +1523,6 @@ for problem_id, is_warmup in tqdm(
                         "bonus_token": bonus_token,
                         "emitted_tokens": tokens_to_append,
                         "frontier_stats": frontier_stats_this_round,
-                        "verifier_margins": verifier_margins if draft_type == "dllm" else None,
-                        "frontier_dynamic_cost_token_equiv": getattr(args, "frontier_dynamic_cost_token_equiv", None) if draft_type == "dllm" else None,
                     }
                     pickled_data["stats_each_round"].append(info_this_round)
                     
@@ -2141,7 +1621,6 @@ for problem_id, is_warmup in tqdm(
         if not is_warmup and draft_type == "dllm" and (
             frontier_stop_enabled(args)
             or args.collect_draft_diagnostics
-            or args.collect_oracle_refinement
         ):
             append_frontier_diagnostic_rows(
                 args,
@@ -2183,19 +1662,19 @@ for problem_id, is_warmup in tqdm(
     if not is_warmup:
         append_benchmark_rows(args, problem_benchmark_rows)
 
-if args.frontier_stop_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only", "cost_aware_v2_refinement_no_threshold"):
+if args.frontier_stop_mode == "bucket_renewal":
     ensure_frontier_runtime_state(args)
     runtime_report = {
-        "hazard_calibration": args.frontier_v2_hazard_calibration,
-        "verify_latency_bins": args.frontier_v2_verify_latency_bins,
-        "draft_latency_bins": args.frontier_v2_draft_latency_bins,
-        "ema_dllm_forward_ms": args.frontier_ema_dllm_forward_ms,
-        "ema_target_round_ms": args.frontier_ema_target_round_ms,
-        "ema_controller_ms": args.frontier_ema_controller_ms,
+        "acceptance_calibration": args.bucket_acceptance_calibration,
+        "verify_latency_bins": args.bucket_verify_latency_bins,
+        "draft_latency_bins": args.bucket_draft_latency_bins,
+        "ema_dllm_forward_ms": args.bucket_ema_dllm_forward_ms,
+        "ema_target_round_ms": args.bucket_ema_target_round_ms,
+        "ema_post_verify_ms": args.bucket_ema_post_verify_ms,
     }
     os.makedirs(args.output_dir, exist_ok=True)
     with open(
-        os.path.join(args.output_dir, "frontier_v2_runtime_state.json"),
+        os.path.join(args.output_dir, "bucket_renewal_runtime_state.json"),
         "w",
         encoding="utf-8",
     ) as handle:

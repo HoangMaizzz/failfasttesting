@@ -24,6 +24,12 @@ from .configuration import Fast_dLLM_QwenConfig
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from einops import rearrange, repeat
 
+from bucket_renewal import (
+    compare_renewal_costs,
+    expected_accepted_prefix,
+    predict_next_gain,
+)
+
 logging.set_verbosity_error()
 # logging.set_verbosity_warning()
 # logging.set_verbosity_debug()
@@ -1106,7 +1112,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "draft_token_stats": [],
             "refinement_actions": [],
             "extension_events": [],
-            "oracle_refinement_snapshots": [],
             "forward_pass_breakdown": {
                 "prefill": 0,
                 "cache_update": 0,
@@ -1117,152 +1122,31 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         }
         committed_confidences = {}
         committed_margins = {}
-        committed_forced = {}
-        oracle_candidate_token_ids = {}
-        filled_on_stop_positions = set()
         frontier_scores = []
-        frontier_recent_unmasked = []
+        frontier_score_target_len = None
         frontier_force_stop = False
-        frontier_force_extend = False
         accept_probabilities = None
-        probability_variants = None
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
 
-        def acceptance_probability_variants(confidence, margin, forced):
-            confidence = max(0.0, min(1.0, float(confidence)))
-            margin = max(0.0, min(1.0, float(margin)))
-            calibration = getattr(args, "frontier_acceptance_calibration", None) if args is not None else None
-            raw_confidence = max(0.02, min(0.98, confidence))
-            if not calibration:
-                return {
-                    "full_calibration": raw_confidence,
-                    "raw_confidence": raw_confidence,
-                    "without_confidence_bucket": raw_confidence,
-                    "without_margin_bucket": raw_confidence,
-                    "without_forced_bucket": raw_confidence,
-                }
-
-            prior = float(getattr(args, "frontier_calibration_prior", 0.5)) if args is not None else 0.5
-            prior_count = float(getattr(args, "frontier_calibration_prior_count", 2.0)) if args is not None else 2.0
-            bucket_values = []
-
-            for table_name, key in (
-                ("confidence_bins", frontier_bin(confidence)),
-                ("margin_bins", frontier_bin(margin)),
-                ("forced", "1" if forced else "0"),
-            ):
-                accepted, total = calibration.get(table_name, {}).get(key, (0.0, 0.0))
-                total = float(total)
-                if total > 0:
-                    estimate = (float(accepted) + prior * prior_count) / (total + prior_count)
-                    bucket_values.append((
-                        table_name,
-                        max(0.02, min(0.98, estimate)),
-                        min(4.0, total),
-                    ))
-
-            def weighted_probability(excluded_bucket=None):
-                weighted_sum = raw_confidence
-                total_weight = 1.0
-                for table_name, estimate, weight in bucket_values:
-                    if table_name == excluded_bucket:
-                        continue
-                    weighted_sum += estimate * weight
-                    total_weight += weight
-                return weighted_sum / total_weight
-
-            return {
-                "full_calibration": weighted_probability(),
-                "raw_confidence": raw_confidence,
-                "without_confidence_bucket": weighted_probability("confidence_bins"),
-                "without_margin_bucket": weighted_probability("margin_bins"),
-                "without_forced_bucket": weighted_probability("forced"),
-            }
-
-        def calibrated_acceptance_probability(confidence, margin, forced):
-            return acceptance_probability_variants(confidence, margin, forced)["full_calibration"]
-
-        def expected_prefix_score(confidences, margins, forced_flags):
-            score = 0.0
-            survival = 1.0
-            probabilities = []
-            probabilities_by_variant = {
-                "full_calibration": [],
-                "raw_confidence": [],
-                "without_confidence_bucket": [],
-                "without_margin_bucket": [],
-                "without_forced_bucket": [],
-            }
-            for confidence, margin, forced in zip(confidences, margins, forced_flags):
-                variants = acceptance_probability_variants(confidence, margin, forced)
-                accept_prob = variants["full_calibration"]
-                probabilities.append(accept_prob)
-                for name, probability in variants.items():
-                    probabilities_by_variant[name].append(probability)
-                survival *= accept_prob
-                score += survival
-            return score, probabilities, probabilities_by_variant
-
-        def calibration_prior_probability():
-            calibration = getattr(args, "frontier_acceptance_calibration", None) if args is not None else None
-            prior = float(getattr(args, "frontier_calibration_prior", 0.5)) if args is not None else 0.5
-            prior_count = float(getattr(args, "frontier_calibration_prior_count", 2.0)) if args is not None else 2.0
-            if not calibration:
-                return prior
-            accepted, total = calibration.get("prior", (0.0, 0.0))
-            return max(0.02, min(0.98, (float(accepted) + prior * prior_count) / (float(total) + prior_count)))
-
         def record_extension_event(
             trigger,
             extension,
-            accept_probabilities=None,
-            probability_variants=None,
-            extension_details=None,
+            *_unused,
         ):
             extension = int(extension)
             if extension <= 0:
                 return
             from_len = int(spec_len)
-            event = {
+            frontier_stats["extension_events"].append({
                 "trigger": trigger,
                 "from_len": from_len,
                 "to_len": from_len + extension,
                 "extension_size": extension,
-                "predicted_extension_gain": None,
-                "prefix_survival_probability": None,
-                "extension_prior_probability": None,
-                "accept_probabilities": None,
-                "prefix_survival_by_variant": None,
-                "predicted_extension_gain_by_variant": None,
-            }
-            if extension_details:
-                event.update(extension_details)
-            if accept_probabilities is not None:
-                extension_probability = calibration_prior_probability()
-                event.update({
-                    "extension_prior_probability": float(extension_probability),
-                    "accept_probabilities": list(accept_probabilities),
-                })
-                if probability_variants is not None:
-                    prefix_survival_by_variant = {}
-                    predicted_gain_by_variant = {}
-                    extension_multiplier = sum(
-                        extension_probability ** offset
-                        for offset in range(1, extension + 1)
-                    )
-                    for name, probabilities in probability_variants.items():
-                        survival = 1.0
-                        for probability in probabilities:
-                            survival *= probability
-                        prefix_survival_by_variant[name] = float(survival)
-                        predicted_gain_by_variant[name] = float(survival * extension_multiplier)
-                    event["prefix_survival_by_variant"] = prefix_survival_by_variant
-                    event["predicted_extension_gain_by_variant"] = predicted_gain_by_variant
-            frontier_stats["extension_events"].append(event)
+            })
 
-        def v2_position_bin(position):
+        def bucket_position_bin(position):
             if position < 2:
                 return "0-1"
             if position < 4:
@@ -1271,13 +1155,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 return "4-7"
             return "8+"
 
-        def v2_length_bin(length):
+        def bucket_length_bin(length):
             return str(max(1, (int(length) + 7) // 8))
 
-        def v2_context_bin(context_len):
+        def bucket_context_bin(context_len):
             return str(max(0, int(context_len) // 256))
 
-        def v2_posterior(table, key, prior, prior_strength, min_observations):
+        def bucket_posterior(table, key, prior, prior_strength):
             stats = table.get(key)
             if not stats:
                 return None
@@ -1286,14 +1170,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             probability = (float(accepted) + prior_strength * prior) / (total + prior_strength)
             return max(0.02, min(0.98, probability))
 
-        def v2_token_hazard(confidence, margin, position):
+        def bucket_acceptance_probability(confidence, margin, position):
             raw_probability = max(0.02, min(0.98, float(confidence)))
-            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
-            min_observations = int(getattr(args, "frontier_v2_min_hazard_observations", 8))
-            prior_strength = float(getattr(args, "frontier_v2_hazard_prior_strength", 8.0))
+            calibration = getattr(args, "bucket_acceptance_calibration", {}) if args is not None else {}
+            min_observations = int(getattr(args, "bucket_min_observations", 8))
+            prior_strength = float(getattr(args, "bucket_prior_strength", 8.0))
             confidence_key = frontier_bin(confidence)
             margin_key = frontier_bin(margin)
-            position_key = v2_position_bin(position)
+            position_key = bucket_position_bin(position)
             candidates = (
                 (
                     "token_position_confidence_margin",
@@ -1306,12 +1190,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             fallback = None
             for table_name, key in candidates:
                 table = calibration.get(table_name, {})
-                probability = v2_posterior(
+                probability = bucket_posterior(
                     table,
                     key,
                     raw_probability,
                     prior_strength,
-                    min_observations,
                 )
                 if probability is not None:
                     total = float(table[key][1])
@@ -1322,195 +1205,24 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         fallback = candidate
             return raw_probability if fallback is None else fallback[1]
 
-        def v2_expected_prefix_score(confidences, margins):
+        def bucket_expected_prefix_score(confidences, margins):
             probabilities = [
-                v2_token_hazard(confidence, margin, position)
+                bucket_acceptance_probability(confidence, margin, position)
                 for position, (confidence, margin) in enumerate(zip(confidences, margins))
             ]
-            score = expected_prefix_score_from_probabilities(probabilities)
+            score = expected_accepted_prefix(probabilities)
             return score, probabilities
 
-        def expected_prefix_score_from_probabilities(probabilities):
-            score = 0.0
-            survival = 1.0
-            for probability in probabilities:
-                survival *= probability
-                score += survival
-            return score
-
-        def refinement_gain_key(from_step, masks_remaining, frontier_k, frontier_score):
-            masks_bin = str(min(8, max(0, int(masks_remaining))))
-            frontier_bin = str(min(8, max(0, int(frontier_k))))
-            score_bin = str(min(8, max(0, int(float(frontier_score)))))
-            return f"{int(from_step)}:{masks_bin}:{frontier_bin}:{score_bin}"
-
-        def refinement_gain_estimate(from_step, masks_remaining, frontier_k, frontier_score):
-            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
-            min_observations = int(getattr(args, "frontier_v2_min_refinement_gain_observations", 4)) if args is not None else 4
-            table = calibration.get("refinement_step_gain", {})
-            key = refinement_gain_key(from_step, masks_remaining, frontier_k, frontier_score)
-            stats = table.get(key)
-            if stats:
-                gain_sum, count = float(stats[0]), int(stats[1])
-                if count >= min_observations:
-                    return max(0.0, gain_sum / max(1, count)), "bucket_refinement_gain"
-            global_stats = calibration.get("refinement_step_gain_global", {}).get(str(int(from_step)))
-            if global_stats:
-                gain_sum, count = float(global_stats[0]), int(global_stats[1])
-                if count > 0:
-                    return max(0.0, gain_sum / max(1, count)), "global_refinement_gain"
-            return None, None
-
-        def first_step_marginal_gain(accept_probabilities, masks_remaining, unmasked_this_step, frontier_k, frontier_score):
-            if masks_remaining <= 0:
-                return 0.0, "no_masks_remaining"
-            empirical_gain, empirical_source = refinement_gain_estimate(
-                1,
-                masks_remaining,
-                frontier_k,
-                frontier_score,
-            )
-            if empirical_gain is not None:
-                return empirical_gain, empirical_source
-            shrink = float(getattr(args, "frontier_v2_first_step_prior_shrink", 1.0)) if args is not None else 1.0
-            floor = float(getattr(args, "frontier_v2_first_step_prior_floor", 0.6)) if args is not None else 0.6
-            shrink = max(0.0, min(1.0, shrink))
-            floor = max(0.02, min(0.98, floor))
-            prior = max(floor, calibration_prior_probability() * shrink)
-            prior = max(0.02, min(0.98, prior))
-            expected_new_tokens = max(1, int(unmasked_this_step))
-            replacement_budget = min(int(masks_remaining), expected_new_tokens)
-            replaced = 0
-            next_probabilities = []
-            for probability in accept_probabilities:
-                if probability <= 0.0200001 and replaced < replacement_budget:
-                    next_probabilities.append(prior)
-                    replaced += 1
-                else:
-                    next_probabilities.append(probability)
-            next_score = expected_prefix_score_from_probabilities(next_probabilities)
-            return max(0.0, next_score - expected_prefix_score_from_probabilities(accept_probabilities)), "simulated_prior_gain"
-
-        def v2_calibration_ready():
-            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
+        def bucket_calibration_size():
+            calibration = getattr(args, "bucket_acceptance_calibration", {}) if args is not None else {}
             total = int(calibration.get("total_checked_tokens", 0))
-            return True, total
+            return total
 
-        def v2_extension_hazards(from_len, extension):
-            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
-            min_observations = int(getattr(args, "frontier_v2_min_hazard_observations", 8))
-            prior_strength = float(getattr(args, "frontier_v2_extension_prior_strength", 2.0))
-            block_key = v2_length_bin(from_len)
-            prior = calibration_prior_probability()
-            hazards = []
-            for offset in range(1, extension + 1):
-                block_table = calibration.get("extension_block_offset", {})
-                global_table = calibration.get("extension_offset", {})
-                block_key_offset = f"{block_key}:{offset}"
-                probability = v2_posterior(
-                    block_table,
-                    block_key_offset,
-                    prior,
-                    prior_strength,
-                    min_observations,
-                )
-                block_total = float(block_table.get(block_key_offset, (0.0, 0.0))[1])
-                if probability is None or block_total < min_observations:
-                    global_probability = v2_posterior(
-                        global_table,
-                        str(offset),
-                        prior,
-                        prior_strength,
-                        min_observations,
-                    )
-                    global_total = float(global_table.get(str(offset), (0.0, 0.0))[1])
-                    if global_probability is not None and (
-                        probability is None or global_total >= block_total
-                    ):
-                        probability = global_probability
-                if probability is None:
-                    probability = v2_posterior(
-                        global_table,
-                        str(offset),
-                        prior,
-                        prior_strength,
-                        min_observations,
-                    )
-                if probability is None:
-                    probability = prior
-                hazards.append(probability)
-            return hazards
-
-        def v2_extension_gain_adjustment(from_len):
-            calibration = getattr(args, "frontier_v2_hazard_calibration", {}) if args is not None else {}
-            min_observations = int(
-                getattr(args, "frontier_v2_min_gain_calibration_observations", 8)
-            )
-            prior_strength = float(
-                getattr(args, "frontier_v2_gain_calibration_prior_strength", 8.0)
-            )
-            prior_std = float(getattr(args, "frontier_v2_gain_prior_std", 2.0))
-            ucb_beta = float(getattr(args, "frontier_v2_gain_ucb_beta", 1.0))
-            candidates = (
-                (
-                    "block",
-                    calibration.get("extension_gain_by_block", {}).get(
-                        v2_length_bin(from_len)
-                    ),
-                ),
-                ("global", calibration.get("extension_gain_global")),
-            )
-            fallback = None
-            for source, stats in candidates:
-                if not stats:
-                    continue
-                if len(stats) == 3:
-                    predicted_sum, actual_sum, count = map(float, stats)
-                    squared_error_sum = 0.0
-                else:
-                    predicted_sum, actual_sum, squared_error_sum, count = map(float, stats)
-                if count <= 0.0 or predicted_sum <= 0.0:
-                    continue
-                observed_ratio = actual_sum / predicted_sum
-                weight = count / (count + prior_strength)
-                correction = 1.0 + weight * (observed_ratio - 1.0)
-                uncertainty = (
-                    (squared_error_sum + prior_strength * prior_std * prior_std) ** 0.5
-                    / (count + prior_strength)
-                )
-                result = (
-                    max(0.5, min(2.0, correction)),
-                    max(0.0, uncertainty),
-                    max(0.0, ucb_beta * uncertainty),
-                    source,
-                    int(count),
-                )
-                if count >= min_observations:
-                    return result
-                if fallback is None or count > fallback[0]:
-                    fallback = (count, result)
-            if fallback is not None:
-                return fallback[1]
-            uncertainty = prior_std / max(prior_strength ** 0.5, 1e-6)
-            return 1.0, uncertainty, max(0.0, ucb_beta * uncertainty), "prior", 0
-
-        def v2_counterfactual_draw():
-            rate = float(getattr(args, "frontier_v2_counterfactual_rate", 0.0))
-            if rate <= 0.0:
-                return False, None
-            counter = int(getattr(args, "frontier_v2_counterfactual_counter", 0))
-            setattr(args, "frontier_v2_counterfactual_counter", counter + 1)
-            seed = getattr(args, "frontier_v2_counterfactual_seed", None)
-            if seed is None:
-                seed = int(getattr(args, "seed", 42))
-            value = ((int(seed) ^ ((counter + 1) * 2654435761)) & 0xFFFFFFFF) / 4294967296.0
-            return value < rate, value
-
-        def v2_nearest_latency(table, context_len, proposal_len=None):
+        def bucket_nearest_latency(table, context_len, proposal_len=None):
             if not table:
                 return None
-            context_index = int(v2_context_bin(context_len))
-            proposal_index = int(v2_length_bin(proposal_len)) if proposal_len is not None else None
+            context_index = int(bucket_context_bin(context_len))
+            proposal_index = int(bucket_length_bin(proposal_len)) if proposal_len is not None else None
             best = None
             for key, value in table.items():
                 parts = str(key).split(":")
@@ -1526,27 +1238,27 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     best = candidate
             return None if best is None else best[2]
 
-        def v2_latency_estimates(proposal_len):
+        def bucket_latency_estimates(proposal_len):
             recent_forward_ms = forward_pass_latencies[-1] if forward_pass_latencies else 6.1
-            context_len = int(getattr(args, "frontier_current_context_len", input_ids.shape[1]))
-            draft_forward_ms = v2_nearest_latency(
-                getattr(args, "frontier_v2_draft_latency_bins", {}),
+            context_len = int(getattr(args, "bucket_current_context_len", input_ids.shape[1]))
+            draft_forward_ms = bucket_nearest_latency(
+                getattr(args, "bucket_draft_latency_bins", {}),
                 context_len,
             )
             if draft_forward_ms is None:
                 draft_forward_ms = float(
-                    getattr(args, "frontier_ema_dllm_forward_ms", None) or recent_forward_ms
+                    getattr(args, "bucket_ema_dllm_forward_ms", None) or recent_forward_ms
                 )
-            verify_round_ms = v2_nearest_latency(
-                getattr(args, "frontier_v2_verify_latency_bins", {}),
+            verify_round_ms = bucket_nearest_latency(
+                getattr(args, "bucket_verify_latency_bins", {}),
                 context_len,
                 proposal_len,
             )
             if verify_round_ms is None:
-                verify_round_ms = getattr(args, "frontier_ema_target_round_ms", None)
+                verify_round_ms = getattr(args, "bucket_ema_target_round_ms", None)
             if verify_round_ms is None:
                 verify_round_ms = max(draft_forward_ms, 13.5)
-            controller_ms = float(getattr(args, "frontier_ema_controller_ms", None) or 0.0)
+            controller_ms = float(getattr(args, "bucket_ema_post_verify_ms", None) or 0.0)
             return (
                 max(float(draft_forward_ms), 1e-6),
                 max(float(verify_round_ms), 1e-6),
@@ -1646,13 +1358,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         ##################Start of timer##################
                         start_time = torch.cuda.Event(enable_timing=True)
                         start_time.record()
-                        oracle_full_block_logits = None
                         if use_block_cache:
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-                                oracle_full_block_logits = logits
                                 logits = logits[:, start:end]
                             else:
                                 logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
@@ -1660,7 +1370,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         else:
                             logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-                            oracle_full_block_logits = logits
                             logits = logits[:, start:end]  # NOTE(ruipan): only looking at logits in the current small block region
                         end_time = torch.cuda.Event(enable_timing=True)
                         end_time.record()
@@ -1682,14 +1391,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # record the confidence of already-unmasked tokens
                         conf_of_unmasked_tokens.extend(x1_p[x1_p != -torch.inf].float().cpu().numpy().tolist())  # FIXME TODO(ruipan): n=5, small blk size 8 -- might include non-drafted tokens?!
 
-                        threshold_free_refinement = (
-                            is_drafter
-                            and frontier_mode == "cost_aware_v2_refinement_no_threshold"
-                        )
-                        if threshold_free_refinement:
-                            unmask_idx = torch.zeros_like(x1_p, dtype=torch.bool)
-                        else:
-                            unmask_idx = (x1_p > threshold)
+                        unmask_idx = (x1_p > threshold)
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
                         unmask_idx = unmask_idx & mask_idx[:, start:end]  # only allowed to update MASK tokens
@@ -1698,34 +1400,22 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         if (
                             is_drafter
                             and return_frontier_stats
-                            and (
-                                frontier_stats["mode"] not in ("disabled", "none", "off")
-                                or bool(getattr(args, "collect_oracle_refinement", False))
-                            )
+                            and frontier_stats["mode"] not in ("disabled", "none", "off")
                             and lowconf_threshold is not None
                             and draft_token_end_idx <= x_t.shape[1]
                         ):
                             frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
                             tau_f = float(lowconf_threshold)
                             target_len = int(spec_len)
+                            if frontier_score_target_len != target_len:
+                                frontier_scores.clear()
+                                frontier_score_target_len = target_len
                             draft_end_idx = draft_token_start_idx + target_len
                             block_abs_start = x_t.shape[1] - block_size
                             current_step_token_ids = {}
                             current_step_confidences = {}
                             current_step_margins = {}
                             unmasked_this_step = int(unmask_idx.sum().item())
-
-                            if (
-                                bool(getattr(args, "collect_oracle_refinement", False))
-                                and oracle_full_block_logits is not None
-                            ):
-                                full_block_tokens = oracle_full_block_logits.argmax(dim=-1)[0]
-                                for local_idx in range(full_block_tokens.shape[0]):
-                                    absolute_pos = block_abs_start + local_idx
-                                    if draft_token_start_idx <= absolute_pos < draft_end_idx:
-                                        oracle_candidate_token_ids[int(absolute_pos)] = int(
-                                            full_block_tokens[local_idx].item()
-                                        )
 
                             for batch_idx, local_idx in unmask_idx.nonzero(as_tuple=False).tolist():
                                 if batch_idx != 0:
@@ -1734,10 +1424,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     committed_confidences[int(absolute_pos)] = float(x1_p[batch_idx, local_idx].float().item())
                                     committed_margins[int(absolute_pos)] = float(x1_margin[batch_idx, local_idx].float().item())
-                                    committed_forced[int(absolute_pos)] = bool(
-                                        threshold_free_refinement
-                                        or x1_p[batch_idx, local_idx].float().item() <= threshold
-                                    )
 
                             for local_idx in range(x1_p.shape[1]):
                                 absolute_pos = block_abs_start + small_block_start_idx + local_idx
@@ -1745,36 +1431,28 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     current_step_token_ids[int(absolute_pos)] = int(
                                         x_1[0, local_idx].item()
                                     )
-                                    oracle_candidate_token_ids[int(absolute_pos)] = int(
-                                        x_1[0, local_idx].item()
-                                    )
                                     current_step_confidences[int(absolute_pos)] = float(max(x1_p[0, local_idx].float().item(), 0.0))
                                     current_step_margins[int(absolute_pos)] = float(max(x1_margin[0, local_idx].float().item(), 0.0))
 
                             confidences = []
                             margins = []
-                            forced_flags = []
                             recoverable = []
                             for absolute_pos in range(draft_token_start_idx, draft_end_idx):
                                 if absolute_pos in committed_confidences:
                                     confidences.append(committed_confidences[absolute_pos])
                                     margins.append(committed_margins.get(absolute_pos, 0.0))
-                                    forced_flags.append(committed_forced.get(absolute_pos, False))
                                     recoverable.append(False)
                                 elif x_t[0, absolute_pos].item() != mask_id:
                                     confidences.append(1.0)
                                     margins.append(1.0)
-                                    forced_flags.append(False)
                                     recoverable.append(False)
                                 elif absolute_pos in current_step_confidences:
                                     confidences.append(current_step_confidences[absolute_pos])
                                     margins.append(current_step_margins.get(absolute_pos, 0.0))
-                                    forced_flags.append(False)
                                     recoverable.append(True)
                                 else:
                                     confidences.append(0.0)
                                     margins.append(0.0)
-                                    forced_flags.append(False)
                                     recoverable.append(True)
 
                             frontier_k = 0
@@ -1784,17 +1462,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 else:
                                     break
 
-                            frontier_score, accept_probabilities, probability_variants = expected_prefix_score(
+                            frontier_score, accept_probabilities = bucket_expected_prefix_score(
                                 confidences,
                                 margins,
-                                forced_flags,
                             )
-                            v2_ready, v2_calibration_tokens = v2_calibration_ready()
-                            if frontier_mode in ("cost_aware_v2", "cost_aware_v2_refinement_only", "cost_aware_v2_refinement_no_threshold"):
-                                frontier_score, accept_probabilities = v2_expected_prefix_score(
-                                    confidences,
-                                    margins,
-                                )
+                            bucket_calibration_tokens = bucket_calibration_size()
                             if frontier_k >= target_len:
                                 frontier_confidence = None
                                 frontier_recoverable = False
@@ -1805,10 +1477,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             previous_score = frontier_scores[-1] if frontier_scores else None
                             frontier_gain = None if previous_score is None else frontier_score - previous_score
                             frontier_scores.append(frontier_score)
-                            frontier_recent_unmasked.append(unmasked_this_step)
-                            if args is not None:
-                                frontier_recent_unmasked = frontier_recent_unmasked[-max(1, int(getattr(args, "frontier_patience", 2))):]
-
                             masks_remaining = int((x_t[:, draft_token_start_idx:draft_end_idx] == mask_id).sum().item())
                             step_record = {
                                 "step": len(frontier_scores),
@@ -1821,123 +1489,24 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "expected_accept_prob_frontier": None if frontier_k >= target_len else float(accept_probabilities[frontier_k]),
                                 "unmasked_this_step": unmasked_this_step,
                                 "masks_remaining": masks_remaining,
-                                "v2_hazard_ready": bool(v2_ready),
-                                "v2_calibration_tokens": int(v2_calibration_tokens),
+                                "bucket_calibration_tokens": int(bucket_calibration_tokens),
                             }
                             frontier_stats["steps"].append(step_record)
                             frontier_stats["final_frontier_score"] = float(frontier_score)
-                            if bool(getattr(args, "collect_oracle_refinement", False)):
-                                oracle_x = x_t.clone()
-                                oracle_mask = (
-                                    oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
-                                )
-                                current_fill_tokens = 0
-                                cached_fill_tokens = 0
-                                for rel_pos in oracle_mask[0].nonzero(as_tuple=False).flatten().tolist():
-                                    absolute_pos = draft_token_start_idx + rel_pos
-                                    if absolute_pos in current_step_token_ids:
-                                        oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
-                                        current_fill_tokens += 1
-                                    elif absolute_pos in oracle_candidate_token_ids:
-                                        oracle_x[:, absolute_pos] = oracle_candidate_token_ids[absolute_pos]
-                                        cached_fill_tokens += 1
-                                missing_fill_tokens = int((
-                                    oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
-                                ).sum().item())
-                                if not (
-                                    oracle_x[:, draft_token_start_idx:draft_end_idx] == mask_id
-                                ).any():
-                                    frontier_stats["oracle_refinement_snapshots"].append({
-                                        "step": len(frontier_scores),
-                                        "target_len": int(target_len),
-                                        "draft_passes_elapsed": int(num_forward_passes),
-                                        "draft_latency_elapsed_ms": float(sum(forward_pass_latencies)),
-                                        "masks_remaining": int(masks_remaining),
-                                        "committed_tokens": int(target_len - masks_remaining),
-                                        "filled_tokens": int(masks_remaining),
-                                        "oracle_current_fill_tokens": int(current_fill_tokens),
-                                        "oracle_cached_fill_tokens": int(cached_fill_tokens),
-                                        "oracle_missing_fill_tokens": int(missing_fill_tokens),
-                                        "frontier_k": int(frontier_k),
-                                        "frontier_score": float(frontier_score),
-                                        "unmasked_this_step": int(unmasked_this_step),
-                                        "token_confidences": [float(value) for value in confidences],
-                                        "token_margins": [float(value) for value in margins],
-                                        "token_forced": [bool(value) for value in forced_flags],
-                                        "token_recoverable": [bool(value) for value in recoverable],
-                                        "draft_proposal": oracle_x[
-                                            0,
-                                            draft_token_start_idx:draft_end_idx,
-                                        ].tolist(),
-                                    })
-
-                            min_steps = int(getattr(args, "frontier_min_steps", 2)) if args is not None else 2
-                            patience = int(getattr(args, "frontier_patience", 2)) if args is not None else 2
-                            gain_epsilon = float(getattr(args, "frontier_gain_epsilon", 0.0)) if args is not None else 0.0
-                            max_unmask = 1
-                            cost_token_equiv = float(getattr(args, "frontier_dynamic_cost_token_equiv", getattr(args, "frontier_cost_token_equiv", 0.2))) if args is not None else 0.2
-                            aggressive_irrecoverable = bool(getattr(args, "frontier_aggressive_irrecoverable", False)) if args is not None else False
-                            force_stop_modes = ("mask_efficiency", "frontier", "cost_aware_no_extend")
-
+                            min_steps = int(getattr(args, "bucket_renewal_min_steps", 2)) if args is not None else 2
                             stop_reason = None
-                            frontier_force_extend = False
-                            predicted_gain = None
-                            predicted_gain_source = None
-                            if frontier_gain is not None:
-                                if len(frontier_scores) >= 3:
-                                    prev_gain = frontier_scores[-2] - frontier_scores[-3]
-                                    ratio = max(0.0, min(1.0, frontier_gain / max(prev_gain, 1e-12)))
-                                    predicted_gain = max(0.0, frontier_gain * ratio)
-                                    predicted_gain_source = "decayed_frontier_gain"
-                                else:
-                                    predicted_gain = max(0.0, frontier_gain)
-                                    predicted_gain_source = "frontier_gain"
-                            elif (
-                                min_steps <= 1
-                                and len(frontier_scores) == 1
-                                and frontier_mode in (
-                                    "cost_aware_v2",
-                                    "cost_aware_v2_refinement_only",
-                                    "cost_aware_v2_refinement_no_threshold",
-                                )
-                            ):
-                                predicted_gain, predicted_gain_source = first_step_marginal_gain(
-                                    accept_probabilities,
-                                    masks_remaining,
-                                    unmasked_this_step,
-                                    frontier_k,
-                                    frontier_score,
-                                )
+                            predicted_gain = predict_next_gain(frontier_scores)
+                            predicted_gain_source = (
+                                None if predicted_gain is None else "acceptance_trajectory"
+                            )
                             step_record["predicted_next_gain"] = (
                                 None if predicted_gain is None else float(predicted_gain)
                             )
                             step_record["predicted_next_gain_source"] = predicted_gain_source
-                            if frontier_k >= target_len and frontier_mode in force_stop_modes:
-                                stop_reason = "frontier_all_pass"
-                            elif aggressive_irrecoverable and frontier_k < target_len and not frontier_recoverable and frontier_confidence is not None and frontier_confidence < tau_f:
-                                stop_reason = "frontier_irrecoverable_low_conf"
-                            elif len(frontier_scores) >= min_steps and frontier_mode == "mask_efficiency":
-                                if len(frontier_recent_unmasked) >= patience and all(x <= max_unmask for x in frontier_recent_unmasked[-patience:]):
-                                    stop_reason = "mask_efficiency_stall"
-                            elif len(frontier_scores) >= min_steps and frontier_mode == "frontier":
-                                if frontier_gain is not None and frontier_gain <= gain_epsilon and unmasked_this_step <= max_unmask:
-                                    stop_reason = "frontier_stall"
-                            elif len(frontier_scores) >= min_steps and frontier_mode in ("cost_aware", "cost_aware_no_extend"):
-                                if predicted_gain is not None:
-                                    if predicted_gain <= cost_token_equiv:
-                                        stop_reason = "cost_aware_low_expected_gain"
-                            elif len(frontier_scores) >= min_steps and frontier_mode in (
-                                "cost_aware_v2",
-                                "cost_aware_v2_refinement_only",
-                                "cost_aware_v2_refinement_no_threshold",
-                            ):
-                                draft_forward_ms, verify_round_ms, controller_ms = v2_latency_estimates(target_len)
+                            if len(frontier_scores) >= min_steps and frontier_mode == "bucket_renewal":
+                                draft_forward_ms, verify_round_ms, controller_ms = bucket_latency_estimates(target_len)
                                 elapsed_draft_ms = float(sum(forward_pass_latencies))
-                                expected_output = 1.0 + float(frontier_score)
-                                hysteresis = float(getattr(args, "frontier_v2_hysteresis", 0.03))
-                                extension_cost_margin = float(
-                                    getattr(args, "frontier_v2_extension_cost_margin", 0.05)
-                                )
+                                hysteresis = float(getattr(args, "bucket_renewal_hysteresis", 0.0))
                                 remaining_absolute_positions = [
                                     draft_token_start_idx + int(rel_pos)
                                     for rel_pos in (
@@ -1948,176 +1517,34 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     absolute_pos in current_step_token_ids
                                     for absolute_pos in remaining_absolute_positions
                                 )
-                                stop_fill_ms = (
-                                    0.0
-                                    if not remaining_absolute_positions or zero_cost_fill_available
-                                    else draft_forward_ms
+                                decision = compare_renewal_costs(
+                                    elapsed_draft_ms=elapsed_draft_ms,
+                                    next_draft_ms=draft_forward_ms,
+                                    verify_round_ms=verify_round_ms,
+                                    controller_ms=controller_ms,
+                                    expected_prefix=frontier_score,
+                                    predicted_gain=predicted_gain,
+                                    hysteresis=hysteresis,
                                 )
-                                stop_ms_per_output = (
-                                    elapsed_draft_ms
-                                    + stop_fill_ms
-                                    + verify_round_ms
-                                    + controller_ms
-                                ) / max(expected_output, 1e-6)
                                 step_record.update({
-                                    "v2_expected_output": expected_output,
-                                    "v2_draft_forward_ms": draft_forward_ms,
-                                    "v2_verify_round_ms": verify_round_ms,
-                                    "v2_controller_ms": controller_ms,
-                                    "v2_stop_fill_ms": stop_fill_ms,
-                                    "v2_stop_ms_per_output": stop_ms_per_output,
-                                    "v2_fallback": not v2_ready,
+                                    "bucket_expected_output": 1.0 + float(frontier_score),
+                                    "bucket_draft_forward_ms": draft_forward_ms,
+                                    "bucket_verify_round_ms": verify_round_ms,
+                                    "bucket_controller_ms": controller_ms,
+                                    "bucket_stop_fill_ms": 0.0,
+                                    "bucket_stop_ms_per_output": decision.stop_ms_per_output,
+                                    "bucket_continue_ms_per_output": decision.continue_ms_per_output,
+                                    "bucket_should_continue": bool(decision.should_continue),
                                 })
-
-                                if v2_ready and masks_remaining > 0 and predicted_gain is not None:
-                                    expected_unmask = max(
-                                        1.0,
-                                        sum(frontier_recent_unmasked[-patience:])
-                                        / max(1, len(frontier_recent_unmasked[-patience:])),
-                                    )
-                                    next_fill_ms = (
-                                        0.0
-                                        if zero_cost_fill_available
-                                        else draft_forward_ms
-                                        if masks_remaining > expected_unmask
-                                        else 0.0
-                                    )
-                                    next_expected_output = expected_output + float(predicted_gain)
-                                    continue_ms_per_output = (
-                                        elapsed_draft_ms
-                                        + draft_forward_ms
-                                        + next_fill_ms
-                                        + verify_round_ms
-                                        + controller_ms
-                                    ) / max(next_expected_output, 1e-6)
-                                    step_record["v2_continue_ms_per_output"] = continue_ms_per_output
-                                    if continue_ms_per_output >= stop_ms_per_output * (1.0 - hysteresis):
-                                        stop_reason = "cost_aware_v2_verify_lower_cost"
-                                elif (
-                                    frontier_mode == "cost_aware_v2"
-                                    and v2_ready
-                                    and masks_remaining == 0
-                                    and frontier_k >= target_len
+                                if (
+                                    masks_remaining > 0
+                                    and zero_cost_fill_available
+                                    and not decision.should_continue
                                 ):
-                                    extension = min(incr_len, max_spec_len - spec_len)
-                                    extension_hazards = v2_extension_hazards(target_len, extension)
-                                    calibration = getattr(args, "frontier_v2_hazard_calibration", {})
-                                    step_record["v2_extension_history_ready"] = bool(
-                                        calibration.get("total_extension_tokens", 0)
-                                    )
-                                    if extension <= 0:
-                                        stop_reason = "cost_aware_v2_max_spec_len"
-                                    else:
-                                        raw_prefix_survival = 1.0
-                                        for probability in accept_probabilities:
-                                            raw_prefix_survival *= probability
-                                        raw_extension_gain = 0.0
-                                        extension_survival = 1.0
-                                        for probability in extension_hazards:
-                                            extension_survival *= probability
-                                            raw_extension_gain += (
-                                                raw_prefix_survival * extension_survival
-                                            )
-                                        gain_correction, gain_uncertainty, gain_ucb_bonus, gain_source, gain_count = (
-                                            v2_extension_gain_adjustment(target_len)
-                                        )
-                                        extension_gain = min(
-                                            raw_prefix_survival * float(extension),
-                                            raw_extension_gain * gain_correction + gain_ucb_bonus,
-                                        )
-                                        blocks_generated = max(
-                                            1,
-                                            (target_len + small_block_size - 1) // small_block_size,
-                                        )
-                                        extension_blocks = max(
-                                            1,
-                                            (extension + small_block_size - 1) // small_block_size,
-                                        )
-                                        denoising_passes = frontier_stats["forward_pass_breakdown"]["denoising"]
-                                        estimated_extension_passes = max(
-                                            1.0,
-                                            denoising_passes * extension_blocks / blocks_generated,
-                                        )
-                                        _, extended_verify_ms, _ = v2_latency_estimates(target_len + extension)
-                                        estimated_extension_total_ms = (
-                                            elapsed_draft_ms
-                                            + estimated_extension_passes * draft_forward_ms
-                                            + extended_verify_ms
-                                            + controller_ms
-                                        )
-                                        extend_ms_per_output = estimated_extension_total_ms / max(
-                                            expected_output + extension_gain, 1e-6
-                                        )
-                                        step_record.update({
-                                            "v2_extension_size": int(extension),
-                                            "v2_extension_hazards": list(extension_hazards),
-                                            "v2_prefix_survival": float(raw_prefix_survival),
-                                            "v2_raw_extension_gain": raw_extension_gain,
-                                            "v2_extension_gain": float(extension_gain),
-                                            "v2_extension_gain_correction": gain_correction,
-                                            "v2_extension_gain_uncertainty": gain_uncertainty,
-                                            "v2_extension_gain_ucb_bonus": gain_ucb_bonus,
-                                            "v2_gain_calibration_source": gain_source,
-                                            "v2_gain_calibration_count": gain_count,
-                                            "v2_extend_ms_per_output": float(extend_ms_per_output),
-                                            "v2_extended_verify_round_ms": float(extended_verify_ms),
-                                            "v2_extension_cost_margin": float(extension_cost_margin),
-                                        })
-                                        should_extend = (
-                                            extend_ms_per_output
-                                            <= stop_ms_per_output * (1.0 + extension_cost_margin)
-                                        )
-                                        counterfactual_selected = False
-                                        counterfactual_draw = None
-                                        if not should_extend:
-                                            counterfactual_selected, counterfactual_draw = (
-                                                v2_counterfactual_draw()
-                                            )
-                                        if should_extend or counterfactual_selected:
-                                            frontier_force_extend = True
-                                            action = (
-                                                "cost_aware_v2_counterfactual_extend"
-                                                if counterfactual_selected
-                                                else "cost_aware_v2_extend"
-                                            )
-                                            frontier_stats["refinement_actions"].append({
-                                                "step": len(frontier_scores),
-                                                "action": action,
-                                                "phase": "extension",
-                                                "target_len": target_len,
-                                                "masks_remaining": masks_remaining,
-                                                "extension": int(extension),
-                                                "raw_predicted_extension_gain": raw_extension_gain,
-                                                "predicted_extension_gain": float(extension_gain),
-                                                "extension_gain_correction": gain_correction,
-                                                "extension_gain_uncertainty": gain_uncertainty,
-                                                "extension_gain_ucb_bonus": gain_ucb_bonus,
-                                                "gain_calibration_source": gain_source,
-                                                "gain_calibration_count": gain_count,
-                                                "counterfactual_selected": counterfactual_selected,
-                                                "counterfactual_original_action": (
-                                                    "cost_aware_v2_verify_lower_cost"
-                                                    if counterfactual_selected
-                                                    else None
-                                                ),
-                                                "counterfactual_draw": counterfactual_draw,
-                                                "decision_expected_output": float(expected_output),
-                                                "estimated_extension_total_ms": float(
-                                                    estimated_extension_total_ms
-                                                ),
-                                                "stop_ms_per_output": float(stop_ms_per_output),
-                                                "extend_ms_per_output": float(extend_ms_per_output),
-                                                "extension_cost_margin": float(extension_cost_margin),
-                                            })
-                                        else:
-                                            stop_reason = "cost_aware_v2_verify_lower_cost"
+                                    stop_reason = "bucket_renewal_lower_cost"
 
                             if stop_reason is not None and frontier_mode not in ("disabled", "none", "off"):
-                                frontier_force_stop = frontier_mode in force_stop_modes or frontier_mode in (
-                                    "cost_aware_v2",
-                                    "cost_aware_v2_refinement_only",
-                                    "cost_aware_v2_refinement_no_threshold",
-                                )
+                                frontier_force_stop = frontier_mode == "bucket_renewal"
                                 frontier_stats["refinement_actions"].append({
                                     "step": len(frontier_scores),
                                     "action": stop_reason,
@@ -2131,47 +1558,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         draft_token_start_idx + int(rel_pos)
                                         for rel_pos in draft_mask[0].nonzero(as_tuple=False).flatten().tolist()
                                     ]
-                                    cached_fill_available = all(
-                                        absolute_pos in current_step_token_ids
-                                        for absolute_pos in remaining_absolute_positions
-                                    )
-                                    if not cached_fill_available:
-                                        fill_start_time = torch.cuda.Event(enable_timing=True)
-                                        fill_start_time.record()
-                                        fill_logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
-                                        fill_logits = torch.cat([fill_logits[:, :1, :], fill_logits[:, :-1, :]], dim=1)
-                                        fill_end_time = torch.cuda.Event(enable_timing=True)
-                                        fill_end_time.record()
-                                        torch.cuda.synchronize()
-                                        forward_pass_latencies.append(fill_start_time.elapsed_time(fill_end_time))
-                                        num_forward_passes += 1
-                                        frontier_stats["forward_pass_breakdown"]["fill"] += 1
-                                        fill_probs = torch.softmax(fill_logits, dim=-1)
-                                        fill_top2_probs = torch.topk(fill_probs, k=2, dim=-1).values
-                                        fill_margins = (fill_top2_probs[..., 0] - fill_top2_probs[..., 1]).float()
-
                                     for absolute_pos in remaining_absolute_positions:
-                                        if cached_fill_available:
-                                            token_id = torch.tensor(
-                                                [current_step_token_ids[absolute_pos]],
-                                                device=x_t.device,
-                                                dtype=x_t.dtype,
-                                            )
-                                            token_confidence = current_step_confidences[absolute_pos]
-                                            token_margin = current_step_margins[absolute_pos]
-                                        else:
-                                            local_pos = absolute_pos - block_abs_start
-                                            if not 0 <= local_pos < fill_logits.shape[1]:
-                                                continue
-                                            token_id = fill_logits[:, local_pos, :].argmax(dim=-1)
-                                            token_conf = torch.gather(fill_probs[:, local_pos, :], dim=-1, index=token_id.unsqueeze(-1)).squeeze(-1)
-                                            token_confidence = float(token_conf[0].float().item())
-                                            token_margin = float(fill_margins[0, local_pos].float().item())
+                                        token_id = torch.tensor(
+                                            [current_step_token_ids[absolute_pos]],
+                                            device=x_t.device,
+                                            dtype=x_t.dtype,
+                                        )
+                                        token_confidence = current_step_confidences[absolute_pos]
+                                        token_margin = current_step_margins[absolute_pos]
                                         x_t[:, absolute_pos] = token_id
                                         committed_confidences[int(absolute_pos)] = float(token_confidence)
                                         committed_margins[int(absolute_pos)] = float(token_margin)
-                                        committed_forced[int(absolute_pos)] = True
-                                        filled_on_stop_positions.add(int(absolute_pos))
                                         conf_of_unmasked_tokens.append(float(token_confidence))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
@@ -2186,74 +1583,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or frontier_stats["refinement_actions"][-1]["action"]
                                 logger.debug(f"{Colors.GREEN}Frontier controller stopped refinement. reason={frontier_stats.get('stop_reason')} spec_len={spec_len}{Colors.RESET}")
                                 draft_tokens_unmasked = True
-                            elif frontier_force_extend:
-                                extension = min(incr_len, max_spec_len - spec_len)
-                                if extension > 0:
-                                    extension_action = frontier_stats["refinement_actions"][-1]
-                                    extension_trigger = extension_action.get(
-                                        "action", "cost_aware_v2_extend"
-                                    )
-                                    record_extension_event(
-                                        extension_trigger,
-                                        extension,
-                                        accept_probabilities,
-                                        probability_variants,
-                                        {
-                                            "raw_predicted_extension_gain": frontier_stats["steps"][-1].get(
-                                                "v2_raw_extension_gain"
-                                            ),
-                                            "predicted_extension_gain": frontier_stats["steps"][-1].get(
-                                                "v2_extension_gain"
-                                            ),
-                                            "extension_gain_correction": frontier_stats["steps"][-1].get(
-                                                "v2_extension_gain_correction"
-                                            ),
-                                            "extension_gain_uncertainty": frontier_stats["steps"][-1].get(
-                                                "v2_extension_gain_uncertainty"
-                                            ),
-                                            "extension_gain_ucb_bonus": frontier_stats["steps"][-1].get(
-                                                "v2_extension_gain_ucb_bonus"
-                                            ),
-                                            "gain_calibration_source": frontier_stats["steps"][-1].get(
-                                                "v2_gain_calibration_source"
-                                            ),
-                                            "gain_calibration_count": frontier_stats["steps"][-1].get(
-                                                "v2_gain_calibration_count"
-                                            ),
-                                            "prefix_survival_probability": frontier_stats["steps"][-1].get(
-                                                "v2_prefix_survival"
-                                            ),
-                                            "counterfactual_selected": extension_action.get(
-                                                "counterfactual_selected", False
-                                            ),
-                                            "counterfactual_original_action": extension_action.get(
-                                                "counterfactual_original_action"
-                                            ),
-                                            "counterfactual_draw": extension_action.get(
-                                                "counterfactual_draw"
-                                            ),
-                                            "decision_expected_output": extension_action.get(
-                                                "decision_expected_output"
-                                            ),
-                                            "stop_ms_per_output": extension_action.get(
-                                                "stop_ms_per_output"
-                                            ),
-                                            "predicted_extend_ms_per_output": extension_action.get(
-                                                "extend_ms_per_output"
-                                            ),
-                                            "estimated_extension_total_ms": extension_action.get(
-                                                "estimated_extension_total_ms"
-                                            ),
-                                        },
-                                    )
-                                    draft_token_end_idx += extension
-                                    spec_len += extension
-                                    draft_tokens_unmasked = False
-                                    frontier_force_extend = False
-                                    logger.debug(f"{Colors.GREEN}Cost-aware v2 extended proposal by {extension} tokens. spec_len={spec_len}{Colors.RESET}")
-                                else:
-                                    frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "cost_aware_v2_max_spec_len"
-                                    draft_tokens_unmasked = True
                             elif any([x < lowconf_threshold for x in conf_of_unmasked_tokens]):
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_low_confidence"
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. Some are low-confidence, stop speculating. spec_len is {spec_len}{Colors.RESET}")
@@ -2284,24 +1613,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             logger.info(f"{Colors.YELLOW}Reusing: {len(curr_proposal)}->{spec_len}. Current num_forward_passes {num_forward_passes}{Colors.RESET}")
                                     ###end of logic of reusing rejected drafts from the last round###
                                 
-                            elif (
-                                frontier_mode in ("disabled", "none", "off")
-                                and len(conf_of_unmasked_tokens) >= max_spec_len
-                            ) or (
-                                frontier_mode not in ("disabled", "none", "off")
-                                and spec_len >= max_spec_len
-                            ):
+                            elif spec_len >= max_spec_len:
                                 frontier_stats["stop_reason"] = frontier_stats["stop_reason"] or "failfast_max_spec_len"
                                 logger.debug(f"{Colors.GREEN}Already drafted {len(conf_of_unmasked_tokens)}>{max_spec_len} high-confidence tokens, stopping just in case.{Colors.RESET}")
                                 draft_tokens_unmasked = True
                             else:
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. All are high-confidence, continue speculating.{Colors.RESET}")
-                                extension = incr_len if frontier_mode in ("disabled", "none", "off") else min(incr_len, max_spec_len - spec_len)
+                                extension = min(incr_len, max_spec_len - spec_len)
                                 record_extension_event(
                                     "high_confidence_extend",
                                     extension,
-                                    accept_probabilities,
-                                    probability_variants,
                                 )
                                 draft_token_end_idx += extension
                                 spec_len += extension
@@ -2335,8 +1656,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     "token_id": int(input_ids[0, absolute_pos].item()),
                     "confidence": float(committed_confidences.get(absolute_pos, 0.0)),
                     "margin": float(committed_margins.get(absolute_pos, 0.0)),
-                    "forced": bool(committed_forced.get(absolute_pos, False)),
-                    "filled_on_stop": bool(absolute_pos in filled_on_stop_positions),
                 })
             frontier_stats["draft_token_stats"] = draft_token_stats
         if return_prefill_kvs:
