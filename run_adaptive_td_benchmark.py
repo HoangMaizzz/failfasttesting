@@ -139,7 +139,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_stop_feasibility_v2",
+        "version": "online_td_v1_decoupled_stop_v3",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,

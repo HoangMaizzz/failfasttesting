@@ -1858,15 +1858,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         for value in confidences
                                     )
                                 )
-                                stop_available = (
-                                    zero_cost_fill_available and baseline_would_verify
-                                )
+                                stop_available = zero_cost_fill_available
                                 if not zero_cost_fill_available:
                                     stop_availability_reason = "candidate_coverage_unavailable"
-                                elif not baseline_would_verify:
-                                    stop_availability_reason = "outer_failfast_would_extend"
                                 else:
                                     stop_availability_reason = "available"
+                                post_stop_outer_action = (
+                                    "verify" if baseline_would_verify else "extend"
+                                )
                                 availability_fields = {
                                     "candidate_coverage_available": bool(
                                         zero_cost_fill_available
@@ -1874,6 +1873,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "outer_failfast_verify_eligible": bool(
                                         baseline_would_verify
                                     ),
+                                    "post_stop_outer_action": post_stop_outer_action,
                                     "stop_available": bool(stop_available),
                                     "stop_availability_reason": stop_availability_reason,
                                     "provisional_positions": int(

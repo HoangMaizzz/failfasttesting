@@ -60,6 +60,19 @@ class AdaptiveTDBenchmarkTests(unittest.TestCase):
         self.assertEqual(summary["adaptive_candidate_coverage_rate_percent"], 100.0)
         self.assertEqual(summary["adaptive_outer_verify_eligible_rate_percent"], 75.0)
 
+    def test_stop_availability_is_not_outer_verify_eligibility(self):
+        decisions = pd.DataFrame({
+            "candidate_coverage_available": [True, True],
+            "outer_failfast_verify_eligible": [True, False],
+            "stop_available": [True, True],
+            "post_stop_outer_action": ["verify", "extend"],
+        })
+        self.assertTrue(decisions["stop_available"].all())
+        self.assertEqual(
+            decisions["post_stop_outer_action"].tolist(),
+            ["verify", "extend"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
