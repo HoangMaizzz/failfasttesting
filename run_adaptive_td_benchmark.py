@@ -139,7 +139,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1",
+        "version": "online_td_v1_stop_feasibility_v2",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -317,6 +317,18 @@ def aggregate(rows):
             "adaptive_exploration_actions",
             pd.Series(0, index=group.index),
         )
+        stop_available_decisions = group.get(
+            "adaptive_stop_available_decisions",
+            pd.Series(0, index=group.index),
+        )
+        candidate_coverage_decisions = group.get(
+            "adaptive_candidate_coverage_decisions",
+            pd.Series(0, index=group.index),
+        )
+        outer_verify_eligible_decisions = group.get(
+            "adaptive_outer_verify_eligible_decisions",
+            pd.Series(0, index=group.index),
+        )
         decision_count = adaptive_decisions.sum()
         weighted_step = (
             group.get(
@@ -347,6 +359,9 @@ def aggregate(rows):
             "adaptive_stop_actions": adaptive_stop_actions.sum(),
             "adaptive_stop_rate_percent": 100.0 * adaptive_stop_actions.sum() / max(1, decision_count),
             "adaptive_exploration_rate_percent": 100.0 * adaptive_exploration_actions.sum() / max(1, decision_count),
+            "adaptive_stop_available_rate_percent": 100.0 * stop_available_decisions.sum() / max(1, decision_count),
+            "adaptive_candidate_coverage_rate_percent": 100.0 * candidate_coverage_decisions.sum() / max(1, decision_count),
+            "adaptive_outer_verify_eligible_rate_percent": 100.0 * outer_verify_eligible_decisions.sum() / max(1, decision_count),
             "adaptive_mean_decision_step": weighted_step / max(1, decision_count),
             "adaptive_controller_ms": group.get("adaptive_controller_ms", pd.Series(0, index=group.index)).sum(),
             "adaptive_controller_ms_per_output_token": group.get("adaptive_controller_ms", pd.Series(0, index=group.index)).sum() / output_tokens,
@@ -442,6 +457,15 @@ def learning_curves(output_dir, datasets):
             "mean_q_continue": group["q_continue_mean"].mean(),
             "mean_controller_latency_ms": group["controller_latency_ms"].mean(),
             "mean_rho_tokens_per_ms": group["rho_tokens_per_ms"].mean(),
+            "stop_available_rate_percent": 100.0 * group[
+                "stop_available"
+            ].astype(str).str.lower().eq("true").mean(),
+            "candidate_coverage_rate_percent": 100.0 * group[
+                "candidate_coverage_available"
+            ].astype(str).str.lower().eq("true").mean(),
+            "outer_verify_eligible_rate_percent": 100.0 * group[
+                "outer_failfast_verify_eligible"
+            ].astype(str).str.lower().eq("true").mean(),
         })
     return decisions, pd.DataFrame(records)
 

@@ -1428,11 +1428,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         ##################Start of timer##################
                         start_time = torch.cuda.Event(enable_timing=True)
                         start_time.record()
+                        adaptive_full_block_logits = None
                         if use_block_cache:
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                adaptive_full_block_logits = logits if adaptive_enabled else None
                                 logits = logits[:, start:end]
                             else:
                                 logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
@@ -1440,6 +1442,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         else:
                             logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                            adaptive_full_block_logits = logits if adaptive_enabled else None
                             logits = logits[:, start:end]  # NOTE(ruipan): only looking at logits in the current small block region
                         end_time = torch.cuda.Event(enable_timing=True)
                         end_time.record()
@@ -1574,6 +1577,83 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     current_step_margins[int(absolute_pos)] = float(
                                         local_margins[local_idx]
                                     )
+
+                            provisional_extract_started = (
+                                time.perf_counter()
+                                if adaptive_controller.config.profile_overhead
+                                else None
+                            )
+                            if adaptive_full_block_logits is not None and temperature <= 0:
+                                missing_absolute_positions = [
+                                    absolute_pos
+                                    for absolute_pos in range(draft_token_start_idx, draft_end_idx)
+                                    if int(x_t[0, absolute_pos].item()) == mask_id
+                                    and absolute_pos not in current_step_token_ids
+                                    and 0 <= absolute_pos - block_abs_start < block_size
+                                ]
+                                if missing_absolute_positions:
+                                    missing_local_positions = [
+                                        absolute_pos - block_abs_start
+                                        for absolute_pos in missing_absolute_positions
+                                    ]
+                                    provisional_logits = adaptive_full_block_logits[
+                                        :, missing_local_positions, :
+                                    ]
+                                    provisional_probabilities = torch.softmax(
+                                        provisional_logits,
+                                        dim=-1,
+                                    )
+                                    provisional_token_ids = provisional_probabilities.argmax(
+                                        dim=-1
+                                    )
+                                    provisional_confidences = torch.gather(
+                                        provisional_probabilities,
+                                        dim=-1,
+                                        index=provisional_token_ids.unsqueeze(-1),
+                                    ).squeeze(-1)
+                                    if margin_required:
+                                        provisional_top2 = torch.topk(
+                                            provisional_probabilities,
+                                            k=2,
+                                            dim=-1,
+                                        ).values
+                                        provisional_margins = (
+                                            provisional_top2[..., 0]
+                                            - provisional_top2[..., 1]
+                                        )
+                                    else:
+                                        provisional_margins = torch.zeros_like(
+                                            provisional_confidences
+                                        )
+                                    provisional_snapshot = torch.stack(
+                                        (
+                                            provisional_token_ids[0].float(),
+                                            provisional_confidences[0].float(),
+                                            provisional_margins[0].float(),
+                                        ),
+                                        dim=0,
+                                    ).cpu().tolist()
+                                    for index, absolute_pos in enumerate(
+                                        missing_absolute_positions
+                                    ):
+                                        current_step_token_ids[int(absolute_pos)] = int(
+                                            provisional_snapshot[0][index]
+                                        )
+                                        current_step_confidences[int(absolute_pos)] = float(
+                                            provisional_snapshot[1][index]
+                                        )
+                                        current_step_margins[int(absolute_pos)] = float(
+                                            provisional_snapshot[2][index]
+                                        )
+                            if provisional_extract_started is not None:
+                                adaptive_controller.record_profile(
+                                    "provisional_fill",
+                                    (
+                                        time.perf_counter()
+                                        - provisional_extract_started
+                                    )
+                                    * 1000.0,
+                                )
 
                             current_draft_tokens = x_t[
                                 0, draft_token_start_idx:draft_end_idx
@@ -1775,12 +1855,44 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )
                                     or any(
                                         float(value) < tau_f
-                                        for value in conf_of_unmasked_tokens
+                                        for value in confidences
                                     )
                                 )
                                 stop_available = (
                                     zero_cost_fill_available and baseline_would_verify
                                 )
+                                if not zero_cost_fill_available:
+                                    stop_availability_reason = "candidate_coverage_unavailable"
+                                elif not baseline_would_verify:
+                                    stop_availability_reason = "outer_failfast_would_extend"
+                                else:
+                                    stop_availability_reason = "available"
+                                availability_fields = {
+                                    "candidate_coverage_available": bool(
+                                        zero_cost_fill_available
+                                    ),
+                                    "outer_failfast_verify_eligible": bool(
+                                        baseline_would_verify
+                                    ),
+                                    "stop_available": bool(stop_available),
+                                    "stop_availability_reason": stop_availability_reason,
+                                    "provisional_positions": int(
+                                        sum(
+                                            absolute_pos in current_step_token_ids
+                                            for absolute_pos in remaining_absolute_positions
+                                        )
+                                    ),
+                                    "missing_provisional_positions": int(
+                                        sum(
+                                            absolute_pos not in current_step_token_ids
+                                            for absolute_pos in remaining_absolute_positions
+                                        )
+                                    ),
+                                }
+                                step_record.update({
+                                    f"adaptive_{key}": value
+                                    for key, value in availability_fields.items()
+                                })
 
                                 if adaptive_pending_continue is not None:
                                     next_forward_latency_ms = float(forward_pass_latencies[-1])
@@ -1824,6 +1936,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             adaptive_controller.completed_rounds
                                         ),
                                         "next_forward_latency_ms": 0.0,
+                                        **availability_fields,
                                     }
                                     frontier_stats["adaptive_decisions"].append(adaptive_record)
                                     frontier_stats["adaptive_trajectory"].append(adaptive_record)

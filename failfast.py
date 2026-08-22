@@ -541,6 +541,9 @@ BENCHMARK_CSV_COLUMNS = [
     "adaptive_mean_refinement_step",
     "adaptive_controller_ms",
     "adaptive_rho_tokens_per_ms",
+    "adaptive_stop_available_decisions",
+    "adaptive_candidate_coverage_decisions",
+    "adaptive_outer_verify_eligible_decisions",
     "modeled_ms_per_output_token",
     "modeled_speedup",
     "output_token_hash",
@@ -728,6 +731,17 @@ def summarize_frontier_diagnostics(stats_each_round):
         ),
         "adaptive_controller_ms": sum(
             float(item.get("controller_latency_ms", 0.0))
+            for item in adaptive_decisions
+        ),
+        "adaptive_stop_available_decisions": sum(
+            bool(item.get("stop_available")) for item in adaptive_decisions
+        ),
+        "adaptive_candidate_coverage_decisions": sum(
+            bool(item.get("candidate_coverage_available"))
+            for item in adaptive_decisions
+        ),
+        "adaptive_outer_verify_eligible_decisions": sum(
+            bool(item.get("outer_failfast_verify_eligible"))
             for item in adaptive_decisions
         ),
         "adaptive_rho_tokens_per_ms": (
