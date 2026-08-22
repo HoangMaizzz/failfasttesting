@@ -81,9 +81,13 @@ python run_adaptive_td_benchmark.py \
   --methods failfast adaptive_td \
   --num_questions 15 \
   --max_new_tokens 1024 \
-  --spec_len 8 \
-  --incr_len 8
+  --spec_len 10 \
+  --incr_len 10
 ```
+
+The primary comparison uses the same `spec_len=10` and `incr_len=10` outer
+FailFast policy for both methods. A matched `8/8` run is a separate sensitivity
+experiment for alignment with Fast-dLLM's eight-token small blocks.
 
 Primary timing runs leave decision logging and detailed profiling disabled.
 For learning curves and controller component percentiles, add
