@@ -398,6 +398,7 @@ parser.add_argument("--bucket_min_observations", type=int, default=8)
 parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--collect_bucket_oracle", action="store_true")
+parser.add_argument("--causal_oracle", action="store_true")
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
 parser.add_argument("--adaptive-max-refinement-steps", type=int, default=16)
@@ -478,6 +479,10 @@ if args.adaptive_counterfactual_replay and not args.collect_bucket_oracle:
     raise ValueError("--adaptive-counterfactual-replay requires --collect_bucket_oracle")
 if args.adaptive_counterfactual_replay and not args.adaptive_freeze:
     raise ValueError("--adaptive-counterfactual-replay requires --adaptive-freeze")
+if args.causal_oracle and not args.collect_bucket_oracle:
+    raise ValueError("--causal_oracle requires --collect_bucket_oracle")
+if args.causal_oracle and (args.adaptive_td or args.frontier_stop_mode != "disabled"):
+    raise ValueError("--causal_oracle requires the unmodified FailFast drafting policy")
 args.adaptive_td_controller = (
     OnlineTDRefinementController(
         AdaptiveTDConfig(
@@ -691,6 +696,57 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "actual_accept_check_latency_ms",
     "actual_shared_post_verify_overhead_ms",
     "actual_post_verify_latency_ms",
+]
+
+CAUSAL_ORACLE_CANDIDATE_COLUMNS = [
+    "problem_id",
+    "mode",
+    "round_id",
+    "context_len",
+    "candidate_index",
+    "step",
+    "target_len",
+    "draft_passes_elapsed",
+    "draft_latency_elapsed_ms",
+    "estimated_draft_overhead_ms",
+    "effective_draft_latency_ms",
+    "draft_proposal",
+    "accepted_len_if_stop",
+    "emitted_len_if_stop",
+    "counterfactual_verify_latency_ms",
+    "counterfactual_accept_check_latency_ms",
+    "counterfactual_total_latency_ms",
+    "counterfactual_ms_per_output_token",
+    "oracle_action",
+    "selected",
+]
+
+CAUSAL_ORACLE_DECISION_COLUMNS = [
+    "problem_id",
+    "mode",
+    "round_id",
+    "context_len",
+    "num_candidates",
+    "selected_candidate_index",
+    "selected_step",
+    "selected_target_len",
+    "selected_draft_passes",
+    "selected_draft_latency_ms",
+    "selected_expected_accepted_len",
+    "selected_expected_emitted_len",
+    "selected_counterfactual_verify_latency_ms",
+    "selected_counterfactual_accept_check_latency_ms",
+    "selected_counterfactual_ms_per_output_token",
+    "oracle_action_trace",
+    "physical_draft_passes",
+    "physical_draft_latency_ms",
+    "excluded_extra_draft_latency_ms",
+    "counterfactual_probe_wall_time_ms",
+    "executed_accepted_len",
+    "executed_emitted_len",
+    "executed_verify_latency_ms",
+    "executed_post_verify_latency_ms",
+    "counterfactual_matches_execution",
 ]
 
 def safe_div(numerator, denominator):
@@ -1432,6 +1488,126 @@ def evaluate_oracle_proposal(
     return accepted_len, accepted_len + 1, verify_latency_ms, post_verify_latency_ms
 
 
+def choose_causal_oracle_proposal(
+    args,
+    problem_id,
+    mode,
+    round_id,
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    frontier_stats,
+    physical_draft_latency_ms,
+    physical_draft_passes,
+    physical_forward_latency_ms,
+):
+    snapshots = (frontier_stats or {}).get("oracle_refinement_snapshots") or []
+    if not snapshots:
+        raise RuntimeError("Causal oracle requires at least one refinement snapshot")
+    context_len = int(orig_model_inputs["input_ids"].shape[1] + len(current_token_ids))
+    rows = []
+    total_draft_overhead_ms = max(
+        0.0,
+        float(physical_draft_latency_ms) - float(physical_forward_latency_ms),
+    )
+    probe_start = time.perf_counter()
+    for candidate_index, snapshot in enumerate(snapshots):
+        proposal = [int(token_id) for token_id in snapshot["draft_proposal"]]
+        accepted_len, emitted_len, verify_ms, accept_check_ms = evaluate_oracle_proposal(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            proposal,
+        )
+        draft_latency_ms = float(snapshot["draft_latency_elapsed_ms"])
+        draft_passes = int(snapshot["draft_passes_elapsed"])
+        estimated_draft_overhead_ms = (
+            total_draft_overhead_ms
+            * draft_passes
+            / max(1, int(physical_draft_passes))
+        )
+        effective_draft_latency_ms = draft_latency_ms + estimated_draft_overhead_ms
+        total_latency_ms = effective_draft_latency_ms + verify_ms + accept_check_ms
+        rows.append({
+            "problem_id": problem_id,
+            "mode": mode,
+            "round_id": round_id,
+            "context_len": context_len,
+            "candidate_index": candidate_index,
+            "step": int(snapshot["step"]),
+            "target_len": int(snapshot["target_len"]),
+            "draft_passes_elapsed": draft_passes,
+            "draft_latency_elapsed_ms": draft_latency_ms,
+            "estimated_draft_overhead_ms": estimated_draft_overhead_ms,
+            "effective_draft_latency_ms": effective_draft_latency_ms,
+            "draft_proposal": json.dumps(proposal),
+            "accepted_len_if_stop": accepted_len,
+            "emitted_len_if_stop": emitted_len,
+            "counterfactual_verify_latency_ms": verify_ms,
+            "counterfactual_accept_check_latency_ms": accept_check_ms,
+            "counterfactual_total_latency_ms": total_latency_ms,
+            "counterfactual_ms_per_output_token": total_latency_ms / max(1, emitted_len),
+            "selected": False,
+            "_snapshot": snapshot,
+            "_proposal": proposal,
+        })
+    probe_wall_time_ms = (time.perf_counter() - probe_start) * 1000.0
+    selected = min(
+        rows,
+        key=lambda row: (
+            row["counterfactual_ms_per_output_token"],
+            row["draft_passes_elapsed"],
+            row["target_len"],
+        ),
+    )
+    selected["selected"] = True
+    selected_passes = int(selected["draft_passes_elapsed"])
+    action_trace = []
+    stop_recorded = False
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            item["draft_passes_elapsed"],
+            item["target_len"],
+            item["candidate_index"],
+        ),
+    ):
+        if row is selected:
+            action = "stop"
+            stop_recorded = True
+        elif not stop_recorded and row["draft_passes_elapsed"] < selected_passes:
+            action = "continue"
+        else:
+            action = "not_reached"
+        row["oracle_action"] = action
+        if action != "not_reached":
+            action_trace.append({
+                "candidate_index": int(row["candidate_index"]),
+                "draft_passes": int(row["draft_passes_elapsed"]),
+                "target_len": int(row["target_len"]),
+                "action": action,
+            })
+    selected["_action_trace"] = action_trace
+    csv_rows = [
+        {key: value for key, value in row.items() if not key.startswith("_")}
+        for row in rows
+    ]
+    append_csv_rows(
+        os.path.join(args.output_dir, "causal_oracle_candidates.csv"),
+        CAUSAL_ORACLE_CANDIDATE_COLUMNS,
+        csv_rows,
+    )
+    return selected, probe_wall_time_ms
+
+
+def append_causal_oracle_decision(args, row):
+    append_csv_rows(
+        os.path.join(args.output_dir, "causal_oracle_decisions.csv"),
+        CAUSAL_ORACLE_DECISION_COLUMNS,
+        [row],
+    )
+
+
 def append_bucket_oracle_rows(
     args,
     problem_id,
@@ -1868,7 +2044,88 @@ for problem_id, is_warmup in tqdm(
 
                     if orig_model_inputs["input_ids"].is_cuda:
                         torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
-                    draft_time = time.perf_counter() - draft_start
+                    physical_draft_time = time.perf_counter() - draft_start
+                    draft_time = physical_draft_time
+                    frontier_stats_this_round = (
+                        getattr(args, "last_frontier_stats", None)
+                        if draft_type == "dllm"
+                        else None
+                    )
+                    causal_oracle_decision = None
+                    if args.causal_oracle and draft_type == "dllm" and not is_warmup:
+                        physical_draft_passes = int(num_forward_passes)
+                        selected, probe_wall_time_ms = choose_causal_oracle_proposal(
+                            args,
+                            problem_id,
+                            benchmark_mode,
+                            num_speculation_rounds,
+                            target_model,
+                            orig_model_inputs,
+                            current_token_ids,
+                            frontier_stats_this_round,
+                            physical_draft_time * 1000.0,
+                            physical_draft_passes,
+                            sum(forward_pass_latencies),
+                        )
+                        selected_snapshot = selected["_snapshot"]
+                        draft_proposal = selected["_proposal"]
+                        spec_len = len(draft_proposal)
+                        num_forward_passes = int(selected["draft_passes_elapsed"])
+                        forward_pass_latencies = forward_pass_latencies[
+                            :num_forward_passes
+                        ]
+                        draft_time = selected["effective_draft_latency_ms"] / 1000.0
+                        excluded_extra_draft_time = max(
+                            0.0,
+                            physical_draft_time - draft_time,
+                        )
+                        oracle_diagnostic_time_total += (
+                            probe_wall_time_ms / 1000.0 + excluded_extra_draft_time
+                        )
+                        prev_prefill_output = None
+                        causal_oracle_decision = {
+                            "problem_id": problem_id,
+                            "mode": benchmark_mode,
+                            "round_id": num_speculation_rounds,
+                            "context_len": int(
+                                orig_model_inputs["input_ids"].shape[1]
+                                + len(current_token_ids)
+                            ),
+                            "num_candidates": len(
+                                frontier_stats_this_round[
+                                    "oracle_refinement_snapshots"
+                                ]
+                            ),
+                            "selected_candidate_index": selected["candidate_index"],
+                            "selected_step": int(selected_snapshot["step"]),
+                            "selected_target_len": int(selected_snapshot["target_len"]),
+                            "selected_draft_passes": num_forward_passes,
+                            "selected_draft_latency_ms": draft_time * 1000.0,
+                            "selected_expected_accepted_len": selected[
+                                "accepted_len_if_stop"
+                            ],
+                            "selected_expected_emitted_len": selected[
+                                "emitted_len_if_stop"
+                            ],
+                            "selected_counterfactual_verify_latency_ms": selected[
+                                "counterfactual_verify_latency_ms"
+                            ],
+                            "selected_counterfactual_accept_check_latency_ms": selected[
+                                "counterfactual_accept_check_latency_ms"
+                            ],
+                            "selected_counterfactual_ms_per_output_token": selected[
+                                "counterfactual_ms_per_output_token"
+                            ],
+                            "oracle_action_trace": json.dumps(
+                                selected["_action_trace"]
+                            ),
+                            "physical_draft_passes": physical_draft_passes,
+                            "physical_draft_latency_ms": physical_draft_time * 1000.0,
+                            "excluded_extra_draft_latency_ms": (
+                                excluded_extra_draft_time * 1000.0
+                            ),
+                            "counterfactual_probe_wall_time_ms": probe_wall_time_ms,
+                        }
                     draft_time_total += draft_time
                     total_num_forward_passes += num_forward_passes
                     
@@ -2011,7 +2268,6 @@ for problem_id, is_warmup in tqdm(
                         tokens_to_append = tokens_to_append[:eos_index + 1]
                     remaining_tokens = num_target_tokens - len(current_token_ids)
                     tokens_to_append = tokens_to_append[:remaining_tokens]
-                    frontier_stats_this_round = getattr(args, "last_frontier_stats", None) if draft_type == "dllm" else None
                     oracle_prefix_token_ids = list(current_token_ids)
                     current_token_ids.extend(tokens_to_append)
                     
@@ -2052,6 +2308,30 @@ for problem_id, is_warmup in tqdm(
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
+                    if causal_oracle_decision is not None:
+                        causal_oracle_decision.update({
+                            "executed_accepted_len": accepted_len,
+                            "executed_emitted_len": len(tokens_to_append),
+                            "executed_verify_latency_ms": verify_time * 1000.0,
+                            "executed_post_verify_latency_ms": post_verify_time * 1000.0,
+                            "counterfactual_matches_execution": int(
+                                accepted_len
+                                == causal_oracle_decision[
+                                    "selected_expected_accepted_len"
+                                ]
+                                and len(tokens_to_append)
+                                == min(
+                                    causal_oracle_decision[
+                                        "selected_expected_emitted_len"
+                                    ],
+                                    remaining_tokens,
+                                )
+                            ),
+                        })
+                        append_causal_oracle_decision(
+                            args,
+                            causal_oracle_decision,
+                        )
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
@@ -2078,6 +2358,7 @@ for problem_id, is_warmup in tqdm(
                     if (
                         draft_type == "dllm"
                         and args.collect_bucket_oracle
+                        and not args.causal_oracle
                         and not is_warmup
                     ):
                         oracle_diagnostic_start = time.perf_counter()

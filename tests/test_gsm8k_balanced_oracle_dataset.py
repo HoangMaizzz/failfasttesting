@@ -6,8 +6,8 @@ import pandas as pd
 
 from run_gsm8k_balanced_oracle_dataset import (
     balanced_quotas,
+    causal_oracle_comparison,
     completed_oracle_batch,
-    local_oracle_upper_bound,
     pass_class,
     partition_problem_ids,
     problem_profiles,
@@ -101,34 +101,36 @@ class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot provide"):
             select_balanced_problems(profiles, rounds, 6, 1)
 
-    def test_upper_bound_uses_pooled_latency_per_output_token(self):
-        results = pd.DataFrame({
+    def test_causal_comparison_uses_executed_algorithm_times(self):
+        failfast = pd.DataFrame({
             "problem_id": [1],
+            "actual_algorithm_time": [0.06],
             "actual_draft_time": [0.04],
             "actual_verify_time": [0.02],
             "actual_post_verify_time": [0.0],
             "output_tokens": [3],
+            "theo_total_time": [30.0],
+            "total_num_forward_passes": [3],
+            "num_speculation_rounds": [1],
+            "accepted_tokens": [2],
+            "drafted_tokens": [3],
+            "output_token_hash": ["same"],
+            "is_correct": [True],
         })
-        rounds = pd.DataFrame({
-            "factual_latency_ms": [60.0],
-            "factual_output_tokens": [3],
-            "oracle_latency_ms": [30.0],
-            "oracle_output_tokens": [3],
-            "factual_draft_passes": [3],
-            "oracle_draft_passes": [1],
-            "factual_draft_latency_ms": [40.0],
-            "oracle_draft_latency_ms": [10.0],
-            "factual_verify_latency_ms": [20.0],
-            "oracle_verify_latency_ms": [20.0],
-            "factual_post_verify_latency_ms": [0.0],
-            "oracle_post_verify_latency_ms": [0.0],
+        causal = failfast.copy()
+        causal["actual_algorithm_time"] = 0.03
+        causal["actual_draft_time"] = 0.01
+        causal["theo_total_time"] = 15.0
+        causal["total_num_forward_passes"] = 1
+        decisions = pd.DataFrame({
+            "counterfactual_probe_wall_time_ms": [10.0],
+            "excluded_extra_draft_latency_ms": [5.0],
+            "counterfactual_matches_execution": [1],
         })
-        summary = local_oracle_upper_bound(results, rounds, "test").iloc[0]
-        self.assertEqual(
-            summary["local_oracle_upper_bound_speedup_vs_failfast_replay"],
-            2.0,
-        )
-        self.assertAlmostEqual(summary["draft_pass_reduction_percent"], 200.0 / 3.0)
+        summary = causal_oracle_comparison(failfast, causal, decisions).iloc[0]
+        self.assertEqual(summary["causal_oracle_speedup_vs_failfast"], 2.0)
+        self.assertEqual(summary["modeled_causal_oracle_speedup_vs_failfast"], 2.0)
+        self.assertEqual(summary["excluded_oracle_diagnostic_time_s"], 0.015)
         self.assertEqual(balanced_quotas(50), {"step1": 17, "step2": 17, "step3plus": 16})
 
 

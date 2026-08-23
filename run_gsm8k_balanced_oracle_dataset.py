@@ -20,7 +20,7 @@ from run_failfast_counterfactual_oracle import (
 )
 
 
-VERSION = "gsm8k_balanced_failfast_oracle_v1"
+VERSION = "gsm8k_balanced_failfast_causal_oracle_v2"
 PASS_CLASSES = ("step1", "step2", "step3plus")
 
 
@@ -46,8 +46,6 @@ def parse_args():
     )
     parser.add_argument("--drafter_threshold", type=float, default=0.05)
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
-    parser.add_argument("--theoretical_draft_forward_ms", type=float, default=6.1)
-    parser.add_argument("--theoretical_verify_round_ms", type=float, default=13.5)
     parser.add_argument("--sample_seed", type=int, default=2026)
     parser.add_argument("--selection_seed", type=int, default=2027)
     parser.add_argument("--seed", type=int, default=42)
@@ -55,7 +53,7 @@ def parse_args():
         "--output_dir",
         default=(
             "/content/failfasttesting/"
-            "outputs_gsm8k_balanced_oracle_pool300_test50"
+            "outputs_gsm8k_causal_oracle_pool300_test50"
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -162,6 +160,77 @@ def run_oracle_pool(args, pool_ids):
     return (
         pd.concat(result_frames, ignore_index=True),
         pd.concat(snapshot_frames, ignore_index=True),
+    )
+
+
+def completed_causal_batch(batch_dir, expected_problem_ids):
+    results_path = batch_dir / "benchmark_results.csv"
+    decisions_path = batch_dir / "causal_oracle_decisions.csv"
+    candidates_path = batch_dir / "causal_oracle_candidates.csv"
+    if not all(path.exists() for path in (results_path, decisions_path, candidates_path)):
+        return False
+    try:
+        results = pd.read_csv(results_path)
+        decisions = pd.read_csv(decisions_path, usecols=["problem_id"])
+        candidates = pd.read_csv(candidates_path, usecols=["problem_id"])
+    except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError):
+        return False
+    expected = set(map(int, expected_problem_ids))
+    result_ids = set(pd.to_numeric(results["problem_id"], errors="coerce").dropna().astype(int))
+    decision_ids = set(
+        pd.to_numeric(decisions["problem_id"], errors="coerce").dropna().astype(int)
+    )
+    candidate_ids = set(
+        pd.to_numeric(candidates["problem_id"], errors="coerce").dropna().astype(int)
+    )
+    return (
+        len(results) == len(expected)
+        and result_ids == expected
+        and decision_ids == expected
+        and candidate_ids == expected
+    )
+
+
+def run_causal_oracle(args, problem_ids):
+    result_frames = []
+    decision_frames = []
+    candidate_frames = []
+    batches = partition_problem_ids(problem_ids, args.batch_size)
+    required_files = (
+        "benchmark_results.csv",
+        "causal_oracle_decisions.csv",
+        "causal_oracle_candidates.csv",
+    )
+    for batch_index, batch_ids in enumerate(batches, start=1):
+        phase = f"causal_oracle_selected_batch_{batch_index:03d}"
+        batch_dir = Path(args.output_dir) / "raw" / phase
+        if args.resume and completed_causal_batch(batch_dir, batch_ids):
+            print(
+                f"RESUME {phase} | batch={batch_index}/{len(batches)} | "
+                f"samples={len(batch_ids)}",
+                flush=True,
+            )
+        else:
+            for filename in required_files:
+                path = batch_dir / filename
+                if path.exists():
+                    path.unlink()
+            run_phase(
+                args,
+                batch_ids,
+                phase,
+                ["--collect_bucket_oracle", "--causal_oracle"],
+                required_files,
+            )
+            if not completed_causal_batch(batch_dir, batch_ids):
+                raise RuntimeError(f"Incomplete causal oracle batch: {phase}")
+        result_frames.append(pd.read_csv(batch_dir / "benchmark_results.csv"))
+        decision_frames.append(pd.read_csv(batch_dir / "causal_oracle_decisions.csv"))
+        candidate_frames.append(pd.read_csv(batch_dir / "causal_oracle_candidates.csv"))
+    return (
+        pd.concat(result_frames, ignore_index=True),
+        pd.concat(decision_frames, ignore_index=True),
+        pd.concat(candidate_frames, ignore_index=True),
     )
 
 
@@ -331,85 +400,167 @@ def round_distribution_summary(rounds, scope):
     return pd.DataFrame(records)
 
 
-def local_oracle_upper_bound(
-    results,
-    rounds,
-    scope,
-    theoretical_draft_forward_ms=6.1,
-    theoretical_verify_round_ms=13.5,
-):
-    measured_total_ms = 1000.0 * (
-        results["actual_draft_time"].sum()
-        + results["actual_verify_time"].sum()
-        + results["actual_post_verify_time"].sum()
+def algorithm_ms_per_output_token(results):
+    total_ms = 1000.0 * results["actual_algorithm_time"].sum()
+    return total_ms / max(1.0, results["output_tokens"].sum())
+
+
+def causal_oracle_comparison(failfast, causal, decisions):
+    failfast_mspt = algorithm_ms_per_output_token(failfast)
+    causal_mspt = algorithm_ms_per_output_token(causal)
+    modeled_failfast_mspt = (
+        failfast["theo_total_time"].sum()
+        / max(1.0, failfast["output_tokens"].sum())
     )
-    measured_output_tokens = float(results["output_tokens"].sum())
-    factual_latency_ms = float(rounds["factual_latency_ms"].sum())
-    factual_output_tokens = float(rounds["factual_output_tokens"].sum())
-    oracle_latency_ms = float(rounds["oracle_latency_ms"].sum())
-    oracle_output_tokens = float(rounds["oracle_output_tokens"].sum())
-    measured_mspt = measured_total_ms / max(1.0, measured_output_tokens)
-    factual_mspt = factual_latency_ms / max(1.0, factual_output_tokens)
-    oracle_mspt = oracle_latency_ms / max(1.0, oracle_output_tokens)
-    speedup = factual_mspt / oracle_mspt
-    theoretical_factual_latency_ms = float(
-        rounds["factual_draft_passes"].sum() * theoretical_draft_forward_ms
-        + len(rounds) * theoretical_verify_round_ms
+    modeled_causal_mspt = (
+        causal["theo_total_time"].sum()
+        / max(1.0, causal["output_tokens"].sum())
     )
-    theoretical_oracle_latency_ms = float(
-        rounds["oracle_draft_passes"].sum() * theoretical_draft_forward_ms
-        + len(rounds) * theoretical_verify_round_ms
+    hashes = failfast[["problem_id", "output_token_hash"]].merge(
+        causal[["problem_id", "output_token_hash"]],
+        on="problem_id",
+        suffixes=("_failfast", "_causal"),
+        validate="one_to_one",
     )
-    theoretical_factual_mspt = (
-        theoretical_factual_latency_ms / max(1.0, factual_output_tokens)
+    paired_times = failfast[
+        ["problem_id", "actual_algorithm_time", "output_tokens"]
+    ].merge(
+        causal[["problem_id", "actual_algorithm_time", "output_tokens"]],
+        on="problem_id",
+        suffixes=("_failfast", "_causal"),
+        validate="one_to_one",
     )
-    theoretical_oracle_mspt = (
-        theoretical_oracle_latency_ms / max(1.0, oracle_output_tokens)
+    paired_speedups = (
+        paired_times["actual_algorithm_time_failfast"]
+        / paired_times["output_tokens_failfast"].clip(lower=1)
+    ) / (
+        paired_times["actual_algorithm_time_causal"]
+        / paired_times["output_tokens_causal"].clip(lower=1)
     )
-    theoretical_speedup = theoretical_factual_mspt / theoretical_oracle_mspt
+    diagnostic_time_s = (
+        decisions["counterfactual_probe_wall_time_ms"].sum()
+        + decisions["excluded_extra_draft_latency_ms"].sum()
+    ) / 1000.0
     return pd.DataFrame([{
-        "scope": scope,
-        "num_questions": int(results["problem_id"].nunique()),
-        "num_rounds": int(len(rounds)),
-        "measured_failfast_total_time_s": measured_total_ms / 1000.0,
-        "measured_failfast_output_tokens": int(measured_output_tokens),
-        "measured_failfast_ms_per_output_token": measured_mspt,
-        "replay_failfast_total_time_s": factual_latency_ms / 1000.0,
-        "replay_failfast_output_tokens": int(factual_output_tokens),
-        "replay_failfast_ms_per_output_token": factual_mspt,
-        "local_oracle_total_time_s": oracle_latency_ms / 1000.0,
-        "local_oracle_output_tokens": int(oracle_output_tokens),
-        "local_oracle_ms_per_output_token": oracle_mspt,
-        "local_oracle_upper_bound_speedup_vs_failfast_replay": speedup,
-        "local_oracle_upper_bound_latency_reduction_percent": 100.0 * (1.0 - 1.0 / speedup),
-        "measured_to_local_oracle_speedup": measured_mspt / oracle_mspt,
-        "theoretical_draft_forward_ms": theoretical_draft_forward_ms,
-        "theoretical_verify_round_ms": theoretical_verify_round_ms,
-        "theoretical_failfast_ms_per_output_token": theoretical_factual_mspt,
-        "theoretical_local_oracle_ms_per_output_token": theoretical_oracle_mspt,
-        "theoretical_local_oracle_upper_bound_speedup_vs_failfast": theoretical_speedup,
-        "theoretical_local_oracle_latency_reduction_percent": 100.0 * (
-            1.0 - 1.0 / theoretical_speedup
+        "num_questions": int(failfast["problem_id"].nunique()),
+        "failfast_algorithm_time_s": float(failfast["actual_algorithm_time"].sum()),
+        "causal_oracle_algorithm_time_s": float(causal["actual_algorithm_time"].sum()),
+        "failfast_output_tokens": int(failfast["output_tokens"].sum()),
+        "causal_oracle_output_tokens": int(causal["output_tokens"].sum()),
+        "failfast_ms_per_output_token": failfast_mspt,
+        "causal_oracle_ms_per_output_token": causal_mspt,
+        "causal_oracle_speedup_vs_failfast": failfast_mspt / causal_mspt,
+        "causal_oracle_geometric_mean_speedup_vs_failfast": float(
+            np.exp(np.log(paired_speedups.clip(lower=1e-12)).mean())
         ),
-        "factual_draft_passes": int(rounds["factual_draft_passes"].sum()),
-        "local_oracle_draft_passes": int(rounds["oracle_draft_passes"].sum()),
-        "draft_pass_reduction_percent": 100.0 * (
-            1.0
-            - rounds["oracle_draft_passes"].sum()
-            / max(1.0, rounds["factual_draft_passes"].sum())
+        "causal_oracle_win_rate_percent": 100.0 * float(
+            paired_speedups.gt(1.0).mean()
         ),
-        "factual_draft_latency_s": rounds["factual_draft_latency_ms"].sum() / 1000.0,
-        "local_oracle_draft_latency_s": rounds["oracle_draft_latency_ms"].sum() / 1000.0,
-        "factual_verify_latency_s": rounds["factual_verify_latency_ms"].sum() / 1000.0,
-        "local_oracle_verify_latency_s": rounds["oracle_verify_latency_ms"].sum() / 1000.0,
-        "factual_post_verify_latency_s": rounds[
-            "factual_post_verify_latency_ms"
-        ].sum() / 1000.0,
-        "local_oracle_post_verify_latency_s": rounds[
-            "oracle_post_verify_latency_ms"
-        ].sum() / 1000.0,
-        "round_oracle_choice_accuracy_percent": 100.0,
+        "causal_oracle_latency_reduction_percent": 100.0 * (
+            1.0 - causal_mspt / failfast_mspt
+        ),
+        "modeled_failfast_ms_per_output_token": modeled_failfast_mspt,
+        "modeled_causal_oracle_ms_per_output_token": modeled_causal_mspt,
+        "modeled_causal_oracle_speedup_vs_failfast": (
+            modeled_failfast_mspt / modeled_causal_mspt
+        ),
+        "failfast_draft_time_s": float(failfast["actual_draft_time"].sum()),
+        "causal_oracle_draft_time_s": float(causal["actual_draft_time"].sum()),
+        "failfast_verify_time_s": float(failfast["actual_verify_time"].sum()),
+        "causal_oracle_verify_time_s": float(causal["actual_verify_time"].sum()),
+        "failfast_post_verify_time_s": float(
+            failfast["actual_post_verify_time"].sum()
+        ),
+        "causal_oracle_post_verify_time_s": float(
+            causal["actual_post_verify_time"].sum()
+        ),
+        "failfast_draft_passes": int(failfast["total_num_forward_passes"].sum()),
+        "causal_oracle_draft_passes": int(
+            causal["total_num_forward_passes"].sum()
+        ),
+        "failfast_verifier_rounds": int(failfast["num_speculation_rounds"].sum()),
+        "causal_oracle_verifier_rounds": int(
+            causal["num_speculation_rounds"].sum()
+        ),
+        "failfast_acceptance_rate_percent": 100.0 * (
+            failfast["accepted_tokens"].sum()
+            / max(1.0, failfast["drafted_tokens"].sum())
+        ),
+        "causal_oracle_acceptance_rate_percent": 100.0 * (
+            causal["accepted_tokens"].sum()
+            / max(1.0, causal["drafted_tokens"].sum())
+        ),
+        "output_hash_match_percent": 100.0 * (
+            hashes["output_token_hash_failfast"]
+            == hashes["output_token_hash_causal"]
+        ).mean(),
+        "failfast_accuracy_percent": 100.0 * failfast["is_correct"].mean(),
+        "causal_oracle_accuracy_percent": 100.0 * causal["is_correct"].mean(),
+        "counterfactual_execution_match_percent": 100.0 * decisions[
+            "counterfactual_matches_execution"
+        ].mean(),
+        "excluded_oracle_diagnostic_time_s": diagnostic_time_s,
     }])
+
+
+def paired_causal_comparison(failfast, causal):
+    columns = [
+        "problem_id",
+        "actual_algorithm_time",
+        "output_tokens",
+        "actual_draft_time",
+        "actual_verify_time",
+        "actual_post_verify_time",
+        "num_speculation_rounds",
+        "total_num_forward_passes",
+        "acceptance_rate_percent",
+        "output_token_hash",
+        "is_correct",
+    ]
+    paired = failfast[columns].merge(
+        causal[columns],
+        on="problem_id",
+        suffixes=("_failfast", "_causal"),
+        validate="one_to_one",
+    )
+    paired["failfast_ms_per_output_token"] = 1000.0 * (
+        paired["actual_algorithm_time_failfast"]
+        / paired["output_tokens_failfast"].clip(lower=1)
+    )
+    paired["causal_oracle_ms_per_output_token"] = 1000.0 * (
+        paired["actual_algorithm_time_causal"]
+        / paired["output_tokens_causal"].clip(lower=1)
+    )
+    paired["causal_oracle_speedup_vs_failfast"] = (
+        paired["failfast_ms_per_output_token"]
+        / paired["causal_oracle_ms_per_output_token"]
+    )
+    paired["causal_oracle_wins"] = (
+        paired["causal_oracle_ms_per_output_token"]
+        < paired["failfast_ms_per_output_token"]
+    )
+    paired["output_hash_match"] = (
+        paired["output_token_hash_failfast"]
+        == paired["output_token_hash_causal"]
+    )
+    return paired.sort_values("problem_id")
+
+
+def causal_stop_distribution(decisions):
+    profiled = decisions.copy()
+    profiled["selected_pass_class"] = profiled["selected_draft_passes"].map(
+        pass_class
+    )
+    return profiled.groupby("selected_pass_class", sort=False).agg(
+        rounds=("round_id", "size"),
+        mean_selected_draft_passes=("selected_draft_passes", "mean"),
+        mean_candidates=("num_candidates", "mean"),
+        mean_expected_emitted_tokens=("selected_expected_emitted_len", "mean"),
+        mean_executed_emitted_tokens=("executed_emitted_len", "mean"),
+        mean_effective_draft_latency_ms=("selected_draft_latency_ms", "mean"),
+        mean_executed_verify_latency_ms=("executed_verify_latency_ms", "mean"),
+        execution_match_rate=("counterfactual_matches_execution", "mean"),
+    ).reset_index()
 
 
 def manifest(args, pool_ids, selected, quotas):
@@ -431,17 +582,18 @@ def manifest(args, pool_ids, selected, quotas):
         "balanced_class_quotas": quotas,
         "selection_definition": (
             "Each selected question contributes one randomly selected anchor round. "
-            "Anchor-round quotas are balanced across local-oracle total draft forward "
+            "Anchor-round quotas are balanced across counterfactual total draft forward "
             "passes: 1 is step1, 2 is step2, and >=3 is step3plus. Questions are "
             "unique across strata. The median class and complete round distribution "
             "for every question remain available as diagnostics. draft_passes_elapsed "
             "is used because the local step counter resets after proposal extension."
         ),
-        "upper_bound_interpretation": (
-            "The reported maximum is a local one-round replay upper bound that picks "
-            "the lowest measured latency per emitted token among observed snapshots. "
-            "It assumes every local choice is correct but does not regenerate the "
-            "causal future trajectory, so it is not a deployable end-to-end speedup."
+        "causal_oracle_interpretation": (
+            "The causal oracle chooses an observed refinement snapshot, executes that "
+            "proposal, commits its verified output, and generates the next round from "
+            "the resulting context. Counterfactual probes and draft work beyond the "
+            "chosen snapshot are excluded and reported separately as oracle-only "
+            "diagnostic cost. No local replay speedup is reported."
         ),
     }
 
@@ -456,6 +608,15 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    for stale_name in (
+        "local_oracle_upper_bound.csv",
+        "selected_oracle_snapshots.csv",
+        "selected_oracle_transitions.csv",
+        "selected_round_oracle_choices.csv",
+    ):
+        stale_path = output_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
     pool_ids = pool_problem_ids(args)
     results, raw_snapshots = run_oracle_pool(args, pool_ids)
     snapshots = add_latency_estimates(raw_snapshots)
@@ -465,9 +626,9 @@ def main():
     profiles = problem_profiles(rounds)
 
     results.to_csv(output_dir / "pool_failfast_results.csv", index=False)
-    snapshots.to_csv(output_dir / "pool_oracle_snapshots.csv", index=False)
-    transitions.to_csv(output_dir / "pool_oracle_transitions.csv", index=False)
-    rounds.to_csv(output_dir / "pool_round_oracle_choices.csv", index=False)
+    snapshots.to_csv(output_dir / "pool_selection_snapshots.csv", index=False)
+    transitions.to_csv(output_dir / "pool_selection_transitions.csv", index=False)
+    rounds.to_csv(output_dir / "pool_selection_round_choices.csv", index=False)
     profiles.to_csv(output_dir / "pool_problem_profiles.csv", index=False)
     distribution_summary(profiles, "pool").to_csv(
         output_dir / "pool_class_distribution.csv", index=False
@@ -482,25 +643,23 @@ def main():
         args.selected_size,
         args.selection_seed,
     )
-    selected_ids = set(selected["problem_id"].astype(int))
+    selected_ids = sorted(set(selected["problem_id"].astype(int)))
     selected_results = results[results["problem_id"].isin(selected_ids)].copy()
-    selected_snapshots = snapshots[
-        snapshots["problem_id"].isin(selected_ids)
-    ].copy()
-    selected_transitions = transitions[
-        transitions["problem_id"].isin(selected_ids)
-    ].copy()
     selected_rounds = rounds[rounds["problem_id"].isin(selected_ids)].copy()
+    causal_results, causal_decisions, causal_candidates = run_causal_oracle(
+        args,
+        selected_ids,
+    )
 
     selected.to_csv(output_dir / "selected_problem_profiles.csv", index=False)
     anchors.to_csv(output_dir / "selected_anchor_rounds.csv", index=False)
     selected_results.to_csv(output_dir / "selected_failfast_results.csv", index=False)
-    selected_snapshots.to_csv(output_dir / "selected_oracle_snapshots.csv", index=False)
-    selected_transitions.to_csv(
-        output_dir / "selected_oracle_transitions.csv", index=False
-    )
-    selected_rounds.to_csv(
-        output_dir / "selected_round_oracle_choices.csv", index=False
+    causal_results.to_csv(output_dir / "causal_oracle_results.csv", index=False)
+    causal_decisions.to_csv(output_dir / "causal_oracle_decisions.csv", index=False)
+    causal_candidates.to_csv(output_dir / "causal_oracle_candidates.csv", index=False)
+    causal_stop_distribution(causal_decisions).to_csv(
+        output_dir / "causal_oracle_stop_distribution.csv",
+        index=False,
     )
     distribution_summary(selected, "selected").to_csv(
         output_dir / "selected_class_distribution.csv", index=False
@@ -519,28 +678,18 @@ def main():
         ignore_index=True,
     ).to_csv(output_dir / "selected_round_class_distribution.csv", index=False)
 
-    upper_bounds = pd.concat(
-        [
-            local_oracle_upper_bound(
-                results,
-                rounds,
-                "pool",
-                args.theoretical_draft_forward_ms,
-                args.theoretical_verify_round_ms,
-            ),
-            local_oracle_upper_bound(
-                selected_results,
-                selected_rounds,
-                "balanced_selected",
-                args.theoretical_draft_forward_ms,
-                args.theoretical_verify_round_ms,
-            ),
-        ],
-        ignore_index=True,
+    causal_summary = causal_oracle_comparison(
+        selected_results,
+        causal_results,
+        causal_decisions,
     )
-    upper_bounds.to_csv(output_dir / "local_oracle_upper_bound.csv", index=False)
+    causal_summary.to_csv(output_dir / "causal_oracle_summary.csv", index=False)
+    paired_causal_comparison(selected_results, causal_results).to_csv(
+        output_dir / "causal_oracle_paired_results.csv",
+        index=False,
+    )
     (output_dir / "selected_problem_ids.json").write_text(
-        json.dumps(sorted(selected_ids), indent=2), encoding="utf-8"
+        json.dumps(selected_ids, indent=2), encoding="utf-8"
     )
     (output_dir / "benchmark_manifest.json").write_text(
         json.dumps(manifest(args, pool_ids, selected, quotas), indent=2),
@@ -555,8 +704,8 @@ def main():
     )
     print("\nBALANCED 50-QUESTION CLASS DISTRIBUTION")
     print(distribution_summary(selected, "selected").to_string(index=False))
-    print("\nLOCAL ORACLE UPPER BOUND")
-    print(upper_bounds.to_string(index=False))
+    print("\nEXECUTED CAUSAL ORACLE SUMMARY")
+    print(causal_summary.to_string(index=False))
     print(f"\nSaved report: {output_dir}")
     print(f"Saved archive: {archive_path}")
 
