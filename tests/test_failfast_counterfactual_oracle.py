@@ -4,6 +4,7 @@ import pandas as pd
 
 from run_failfast_counterfactual_oracle import (
     add_latency_estimates,
+    build_failfast_oracle_transitions,
     build_transitions,
     policy_summary,
     select_round_candidates,
@@ -46,6 +47,25 @@ class FailFastCounterfactualOracleTests(unittest.TestCase):
         self.assertEqual(first["decision_correct"], 1)
         self.assertEqual(second["oracle_action"], "stop")
         self.assertEqual(second["decision_correct"], 1)
+
+    def test_failfast_only_transition_does_not_require_controller_fields(self):
+        snapshots = self.snapshots().drop(
+            columns=[
+                "adaptive_policy_action",
+                "adaptive_policy_reason",
+                "adaptive_stop_probability",
+                "adaptive_q_stop_mean",
+                "adaptive_q_continue_mean",
+                "adaptive_rho_tokens_per_ms",
+                "adaptive_stop_available",
+            ]
+        )
+        transitions = build_failfast_oracle_transitions(
+            add_latency_estimates(snapshots)
+        )
+        self.assertEqual(len(transitions), 2)
+        self.assertEqual(transitions.iloc[0]["oracle_action"], "continue")
+        self.assertEqual(transitions.iloc[1]["oracle_action"], "stop")
 
     def test_policy_summary_reports_false_stops(self):
         transitions = pd.DataFrame({

@@ -38,6 +38,7 @@ def parse_args():
     parser.add_argument("--drafter_threshold", type=float, default=0.05)
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument("--adaptive_state_path")
+    parser.add_argument("--oracle_only", action="store_true")
     parser.add_argument("--sample_seed", type=int, default=2026)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -281,6 +282,61 @@ def build_transitions(snapshots, fallback_rho):
     return pd.DataFrame(records)
 
 
+def build_failfast_oracle_transitions(snapshots):
+    records = []
+    group_columns = ["problem_id", "round_id", "target_len"]
+    for keys, group in snapshots.groupby(group_columns, sort=False):
+        group = group.sort_values(["step", "draft_passes_elapsed"]).reset_index(drop=True)
+        for index in range(len(group) - 1):
+            current = group.iloc[index]
+            following = group.iloc[index + 1]
+            pass_delta = int(following["draft_passes_elapsed"]) - int(
+                current["draft_passes_elapsed"]
+            )
+            if int(following["step"]) != int(current["step"]) + 1 or pass_delta != 1:
+                continue
+            stop_output = float(current["emitted_len_if_stop"])
+            continue_output = float(following["emitted_len_if_stop"])
+            stop_total_ms = (
+                float(current["draft_latency_elapsed_ms"])
+                + float(current["estimated_verify_latency_ms"])
+                + float(current["estimated_post_verify_latency_ms"])
+            )
+            continue_total_ms = (
+                float(following["draft_latency_elapsed_ms"])
+                + float(following["estimated_verify_latency_ms"])
+                + float(following["estimated_post_verify_latency_ms"])
+            )
+            stop_ms_per_output = stop_total_ms / max(1.0, stop_output)
+            continue_ms_per_output = continue_total_ms / max(1.0, continue_output)
+            record = dict(zip(group_columns, keys))
+            record.update({
+                "from_step": int(current["step"]),
+                "to_step": int(following["step"]),
+                "draft_pass_delta": pass_delta,
+                "stop_output_tokens": stop_output,
+                "continue_output_tokens": continue_output,
+                "actual_next_gain_tokens": continue_output - stop_output,
+                "next_draft_latency_ms": max(
+                    0.0,
+                    float(following["draft_latency_elapsed_ms"])
+                    - float(current["draft_latency_elapsed_ms"]),
+                ),
+                "stop_ms_per_output_token": stop_ms_per_output,
+                "continue_ms_per_output_token": continue_ms_per_output,
+                "oracle_action": (
+                    "continue"
+                    if continue_ms_per_output < stop_ms_per_output
+                    else "stop"
+                ),
+                "oracle_advantage_ms_per_output_token": (
+                    stop_ms_per_output - continue_ms_per_output
+                ),
+            })
+            records.append(record)
+    return pd.DataFrame(records)
+
+
 def policy_summary(transitions):
     if transitions.empty:
         raise ValueError("No exact adjacent one-pass counterfactual transitions were found")
@@ -327,7 +383,11 @@ def select_round_candidates(snapshots):
         )
         factual = group.iloc[-1]
         oracle = group.loc[group["replay_ms_per_output_token"].idxmin()]
-        stop_rows = group[group["adaptive_policy_action"].astype(str).str.lower().eq("stop")]
+        stop_rows = (
+            group[group["adaptive_policy_action"].astype(str).str.lower().eq("stop")]
+            if "adaptive_policy_action" in group
+            else group.iloc[0:0]
+        )
         policy = stop_rows.iloc[0] if len(stop_rows) else factual
         records.append({
             "problem_id": keys[0],
@@ -389,6 +449,33 @@ def speed_summary(baseline_results, replay_results, rounds):
     }])
 
 
+def oracle_only_speed_summary(results, rounds, transitions):
+    measured_time_s = (
+        results["actual_draft_time"].sum()
+        + results["actual_verify_time"].sum()
+        + results["actual_post_verify_time"].sum()
+    )
+    measured_mspt = 1000.0 * measured_time_s / results["output_tokens"].sum()
+    factual_mspt = pooled_ms_per_token(rounds, "factual")
+    oracle_mspt = pooled_ms_per_token(rounds, "oracle")
+    return pd.DataFrame([{
+        "num_questions": results["problem_id"].nunique(),
+        "num_rounds": len(rounds),
+        "counterfactual_transitions": len(transitions),
+        "measured_instrumented_failfast_ms_per_output_token": measured_mspt,
+        "replay_factual_failfast_ms_per_output_token": factual_mspt,
+        "replay_oracle_ms_per_output_token": oracle_mspt,
+        "oracle_replay_speedup_vs_failfast_replay": factual_mspt / oracle_mspt,
+        "oracle_continue_rate_percent": 100.0
+        * transitions["oracle_action"].eq("continue").mean(),
+        "oracle_stop_rate_percent": 100.0
+        * transitions["oracle_action"].eq("stop").mean(),
+        "mean_oracle_advantage_ms_per_output_token": transitions[
+            "oracle_advantage_ms_per_output_token"
+        ].abs().mean(),
+    }])
+
+
 def calibration_table(transitions):
     evaluated = transitions.dropna(subset=["stop_probability"]).copy()
     evaluated["probability_bin"] = pd.cut(
@@ -440,6 +527,42 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     problem_ids = sampled_problem_ids(args)
+
+    if args.oracle_only:
+        oracle_dir = run_phase(
+            args,
+            problem_ids,
+            "failfast_oracle_only",
+            ["--collect_bucket_oracle"],
+            ["benchmark_results.csv", "bucket_oracle_snapshots.csv"],
+        )
+        results = pd.read_csv(oracle_dir / "benchmark_results.csv")
+        snapshots = add_latency_estimates(
+            pd.read_csv(oracle_dir / "bucket_oracle_snapshots.csv")
+        )
+        transitions = build_failfast_oracle_transitions(snapshots)
+        if transitions.empty:
+            raise ValueError("No adjacent one-pass FailFast transitions were collected")
+        rounds = select_round_candidates(snapshots)
+        speed = oracle_only_speed_summary(results, rounds, transitions)
+
+        results.to_csv(output_dir / "failfast_results.csv", index=False)
+        snapshots.to_csv(output_dir / "counterfactual_snapshots.csv", index=False)
+        transitions.to_csv(output_dir / "counterfactual_transitions.csv", index=False)
+        rounds.to_csv(output_dir / "round_oracle_choices.csv", index=False)
+        speed.to_csv(output_dir / "oracle_speed_summary.csv", index=False)
+        write_manifest(args, output_dir, problem_ids, "not_used_oracle_only")
+        archive_path = shutil.make_archive(
+            str(output_dir),
+            "zip",
+            root_dir=output_dir.parent,
+            base_dir=output_dir.name,
+        )
+        print("\nFAILFAST LOCAL ORACLE SPEED SUMMARY")
+        print(speed.to_string(index=False))
+        print(f"\nSaved report: {output_dir}")
+        print(f"Saved archive: {archive_path}")
+        return
 
     baseline_dir = run_phase(
         args,
