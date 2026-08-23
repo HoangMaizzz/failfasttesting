@@ -21,6 +21,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
 from bucket_renewal import position_bucket
+from causal_oracle_utils import prepare_causal_oracle_snapshots
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -704,6 +705,7 @@ CAUSAL_ORACLE_CANDIDATE_COLUMNS = [
     "round_id",
     "context_len",
     "candidate_index",
+    "candidate_source",
     "step",
     "target_len",
     "draft_passes_elapsed",
@@ -727,6 +729,9 @@ CAUSAL_ORACLE_DECISION_COLUMNS = [
     "round_id",
     "context_len",
     "num_candidates",
+    "snapshot_fallback_used",
+    "oracle_snapshot_attempts",
+    "oracle_snapshot_skipped_missing_fill",
     "selected_candidate_index",
     "selected_step",
     "selected_target_len",
@@ -1500,10 +1505,14 @@ def choose_causal_oracle_proposal(
     physical_draft_latency_ms,
     physical_draft_passes,
     physical_forward_latency_ms,
+    factual_proposal,
 ):
-    snapshots = (frontier_stats or {}).get("oracle_refinement_snapshots") or []
-    if not snapshots:
-        raise RuntimeError("Causal oracle requires at least one refinement snapshot")
+    snapshots, fallback_used = prepare_causal_oracle_snapshots(
+        frontier_stats,
+        factual_proposal,
+        physical_draft_passes,
+        physical_forward_latency_ms,
+    )
     context_len = int(orig_model_inputs["input_ids"].shape[1] + len(current_token_ids))
     rows = []
     total_draft_overhead_ms = max(
@@ -1534,6 +1543,7 @@ def choose_causal_oracle_proposal(
             "round_id": round_id,
             "context_len": context_len,
             "candidate_index": candidate_index,
+            "candidate_source": snapshot["candidate_source"],
             "step": int(snapshot["step"]),
             "target_len": int(snapshot["target_len"]),
             "draft_passes_elapsed": draft_passes,
@@ -1588,6 +1598,8 @@ def choose_causal_oracle_proposal(
                 "action": action,
             })
     selected["_action_trace"] = action_trace
+    selected["_num_candidates"] = len(rows)
+    selected["_snapshot_fallback_used"] = int(fallback_used)
     csv_rows = [
         {key: value for key, value in row.items() if not key.startswith("_")}
         for row in rows
@@ -2066,6 +2078,7 @@ for problem_id, is_warmup in tqdm(
                             physical_draft_time * 1000.0,
                             physical_draft_passes,
                             sum(forward_pass_latencies),
+                            draft_proposal,
                         )
                         selected_snapshot = selected["_snapshot"]
                         draft_proposal = selected["_proposal"]
@@ -2091,10 +2104,19 @@ for problem_id, is_warmup in tqdm(
                                 orig_model_inputs["input_ids"].shape[1]
                                 + len(current_token_ids)
                             ),
-                            "num_candidates": len(
-                                frontier_stats_this_round[
-                                    "oracle_refinement_snapshots"
-                                ]
+                            "num_candidates": selected["_num_candidates"],
+                            "snapshot_fallback_used": selected[
+                                "_snapshot_fallback_used"
+                            ],
+                            "oracle_snapshot_attempts": int(
+                                (frontier_stats_this_round or {}).get(
+                                    "oracle_snapshot_attempts", 0
+                                )
+                            ),
+                            "oracle_snapshot_skipped_missing_fill": int(
+                                (frontier_stats_this_round or {}).get(
+                                    "oracle_snapshot_skipped_missing_fill", 0
+                                )
                             ),
                             "selected_candidate_index": selected["candidate_index"],
                             "selected_step": int(selected_snapshot["step"]),

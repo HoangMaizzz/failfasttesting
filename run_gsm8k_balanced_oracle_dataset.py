@@ -17,7 +17,7 @@ from run_failfast_counterfactual_oracle import (
 )
 
 
-VERSION = "gsm8k_balanced_failfast_causal_oracle_v3"
+VERSION = "gsm8k_balanced_failfast_causal_oracle_v4"
 PASS_CLASSES = ("step1", "step2", "step3plus")
 
 
@@ -435,6 +435,12 @@ def causal_oracle_comparison(failfast, causal, decisions):
         decisions["counterfactual_probe_wall_time_ms"].sum()
         + decisions["excluded_extra_draft_latency_ms"].sum()
     ) / 1000.0
+    fallback_rounds = int(
+        pd.to_numeric(
+            decisions.get("snapshot_fallback_used", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0).sum()
+    )
     return pd.DataFrame([{
         "num_questions": int(failfast["problem_id"].nunique()),
         "failfast_algorithm_time_s": float(failfast["actual_algorithm_time"].sum()),
@@ -494,6 +500,10 @@ def causal_oracle_comparison(failfast, causal, decisions):
             "counterfactual_matches_execution"
         ].mean(),
         "excluded_oracle_diagnostic_time_s": diagnostic_time_s,
+        "causal_oracle_snapshot_fallback_rounds": fallback_rounds,
+        "causal_oracle_snapshot_fallback_rate_percent": (
+            100.0 * fallback_rounds / max(1, len(decisions))
+        ),
     }])
 
 
