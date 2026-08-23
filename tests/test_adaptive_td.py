@@ -68,6 +68,46 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertFalse(decision.calibration_active)
         self.assertGreater(decision.stop_probability, 0.75)
 
+    def test_frozen_decision_can_disable_exploration(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                warmup_rounds=0,
+                early_stop_min_observations=10,
+                explore_epsilon=1.0,
+                explore_min=1.0,
+            )
+        )
+        decision = controller.choose(
+            synthetic_features(1, 3),
+            allow_stop=True,
+            refinement_step=1,
+            allow_exploration=False,
+        )
+        self.assertEqual(decision.action, CONTINUE)
+        self.assertFalse(decision.exploration_used)
+
+    def test_snapshot_round_trip_restores_predictions_and_runtime_state(self):
+        original = OnlineTDRefinementController(AdaptiveTDConfig())
+        features = synthetic_features(2, 3)
+        original.values[STOP].update(features, 3.0, rate=0.1)
+        original.values[CONTINUE].update(features, 1.0, rate=0.1)
+        original.early_stop_uncertainty.update(features, 2.0, rate=0.0)
+        original.y_ema = 4.0
+        original.t_ema_ms = 20.0
+        original.completed_rounds = 12
+        original.early_stop_observations = 7
+
+        restored = OnlineTDRefinementController(AdaptiveTDConfig())
+        restored.load_snapshot(original.snapshot())
+
+        self.assertAlmostEqual(
+            restored.values[STOP].mean(features),
+            original.values[STOP].mean(features),
+        )
+        self.assertAlmostEqual(restored.rho, original.rho)
+        self.assertEqual(restored.completed_rounds, 12)
+        self.assertEqual(restored.early_stop_observations, 7)
+
     def test_only_factual_early_stop_increments_calibration_count(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(update_mode="factual_return")

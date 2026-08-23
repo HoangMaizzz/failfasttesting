@@ -433,6 +433,9 @@ parser.add_argument(
     default=True,
 )
 parser.add_argument("--adaptive-force-continue", action="store_true")
+parser.add_argument("--adaptive-state-path", type=str)
+parser.add_argument("--adaptive-freeze", action="store_true")
+parser.add_argument("--adaptive-counterfactual-replay", action="store_true")
 parser.add_argument("--adaptive-log-decisions", action="store_true")
 parser.add_argument("--adaptive-profile-overhead", action="store_true")
 parser.add_argument("--quiet_generation", action="store_true")
@@ -462,6 +465,12 @@ if args.adaptive_force_continue and args.adaptive_fixed_refinement_steps is not 
     raise ValueError(
         "--adaptive-force-continue cannot be combined with fixed refinement depth"
     )
+if (args.adaptive_state_path or args.adaptive_freeze or args.adaptive_counterfactual_replay) and not args.adaptive_td:
+    raise ValueError("adaptive replay options require --adaptive-td")
+if args.adaptive_counterfactual_replay and not args.collect_bucket_oracle:
+    raise ValueError("--adaptive-counterfactual-replay requires --collect_bucket_oracle")
+if args.adaptive_counterfactual_replay and not args.adaptive_freeze:
+    raise ValueError("--adaptive-counterfactual-replay requires --adaptive-freeze")
 args.adaptive_td_controller = (
     OnlineTDRefinementController(
         AdaptiveTDConfig(
@@ -490,6 +499,9 @@ args.adaptive_td_controller = (
     if args.adaptive_td
     else None
 )
+if args.adaptive_state_path:
+    with open(args.adaptive_state_path, "r", encoding="utf-8") as handle:
+        args.adaptive_td_controller.load_snapshot(json.load(handle))
 
 def apply_mode_settings(args):
     if args.mode == "verifier_ar":
@@ -632,6 +644,7 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "problem_id",
     "mode",
     "round_id",
+    "context_len",
     "step",
     "target_len",
     "draft_passes_elapsed",
@@ -650,6 +663,15 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "gain_bucket_count",
     "gain_bucket_weight",
     "calibration_tokens",
+    "adaptive_policy_action",
+    "adaptive_policy_reason",
+    "adaptive_stop_probability",
+    "adaptive_advantage_mean",
+    "adaptive_advantage_risk",
+    "adaptive_q_stop_mean",
+    "adaptive_q_continue_mean",
+    "adaptive_rho_tokens_per_ms",
+    "adaptive_stop_available",
     "accepted_len_if_stop",
     "emitted_len_if_stop",
     "actual_verify_latency_ms",
@@ -1011,7 +1033,11 @@ def complete_adaptive_td_trajectory(
     emitted_tokens,
     verifier_latency_ms,
 ):
-    if not getattr(args, "adaptive_td", False) or not frontier_stats:
+    if (
+        not getattr(args, "adaptive_td", False)
+        or getattr(args, "adaptive_freeze", False)
+        or not frontier_stats
+    ):
         return
     controller = args.adaptive_td_controller
     trajectory = frontier_stats.get("adaptive_trajectory") or []
@@ -1398,6 +1424,9 @@ def append_bucket_oracle_rows(
             "problem_id": problem_id,
             "mode": mode,
             "round_id": round_id,
+            "context_len": int(
+                orig_model_inputs["input_ids"].shape[1] + len(current_token_ids)
+            ),
             "step": snapshot.get("step"),
             "target_len": snapshot.get("target_len"),
             "draft_passes_elapsed": snapshot.get("draft_passes_elapsed"),
@@ -1422,6 +1451,19 @@ def append_bucket_oracle_rows(
             "gain_bucket_count": snapshot.get("gain_bucket_count"),
             "gain_bucket_weight": snapshot.get("gain_bucket_weight"),
             "calibration_tokens": snapshot.get("calibration_tokens"),
+            "adaptive_policy_action": snapshot.get("adaptive_policy_action"),
+            "adaptive_policy_reason": snapshot.get("adaptive_policy_reason"),
+            "adaptive_stop_probability": snapshot.get(
+                "adaptive_stop_probability"
+            ),
+            "adaptive_advantage_mean": snapshot.get("adaptive_advantage_mean"),
+            "adaptive_advantage_risk": snapshot.get("adaptive_advantage_risk"),
+            "adaptive_q_stop_mean": snapshot.get("adaptive_q_stop_mean"),
+            "adaptive_q_continue_mean": snapshot.get("adaptive_q_continue_mean"),
+            "adaptive_rho_tokens_per_ms": snapshot.get(
+                "adaptive_rho_tokens_per_ms"
+            ),
+            "adaptive_stop_available": snapshot.get("adaptive_stop_available"),
             "accepted_len_if_stop": accepted_len,
             "emitted_len_if_stop": emitted_len,
             "actual_verify_latency_ms": verify_ms,
@@ -1975,7 +2017,11 @@ for problem_id, is_warmup in tqdm(
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
-                    if draft_type == "dllm" and args.adaptive_td:
+                    if (
+                        draft_type == "dllm"
+                        and args.adaptive_td
+                        and not args.adaptive_freeze
+                    ):
                         args.adaptive_td_controller.observe_round(
                             len(tokens_to_append),
                             (draft_time + verify_time + post_verify_time) * 1000.0,

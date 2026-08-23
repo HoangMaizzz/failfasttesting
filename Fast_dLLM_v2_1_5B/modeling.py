@@ -1435,7 +1435,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-                                adaptive_full_block_logits = logits if adaptive_enabled else None
+                                adaptive_full_block_logits = (
+                                    logits
+                                    if adaptive_enabled
+                                    or bool(getattr(args, "collect_bucket_oracle", False))
+                                    else None
+                                )
                                 logits = logits[:, start:end]
                             else:
                                 logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
@@ -1443,7 +1448,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         else:
                             logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
-                            adaptive_full_block_logits = logits if adaptive_enabled else None
+                            adaptive_full_block_logits = (
+                                logits
+                                if adaptive_enabled
+                                or bool(getattr(args, "collect_bucket_oracle", False))
+                                else None
+                            )
                             logits = logits[:, start:end]  # NOTE(ruipan): only looking at logits in the current small block region
                         end_time = torch.cuda.Event(enable_timing=True)
                         end_time.record()
@@ -1481,6 +1491,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             and (
                                 frontier_stats["mode"] not in ("disabled", "none", "off")
                                 or adaptive_enabled
+                                or bool(getattr(args, "collect_bucket_oracle", False))
                             )
                             and lowconf_threshold is not None
                             and draft_token_end_idx <= x_t.shape[1]
@@ -1581,7 +1592,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                             provisional_extract_started = (
                                 time.perf_counter()
-                                if adaptive_controller.config.profile_overhead
+                                if adaptive_controller is not None
+                                and adaptive_controller.config.profile_overhead
                                 else None
                             )
                             if adaptive_full_block_logits is not None and temperature <= 0:
@@ -1763,6 +1775,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             frontier_stats["final_frontier_score"] = float(frontier_score)
                             min_steps = int(getattr(args, "bucket_renewal_min_steps", 1)) if args is not None else 1
                             stop_reason = None
+                            adaptive_record = None
                             if adaptive_enabled and adaptive_controller is not None:
                                 remaining_relative_positions = [
                                     position
@@ -1895,7 +1908,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     for key, value in availability_fields.items()
                                 })
 
-                                if adaptive_pending_continue is not None:
+                                if (
+                                    adaptive_pending_continue is not None
+                                    and not bool(getattr(args, "adaptive_freeze", False))
+                                ):
                                     next_forward_latency_ms = float(forward_pass_latencies[-1])
                                     adaptive_pending_continue[
                                         "next_forward_latency_ms"
@@ -1911,7 +1927,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ] = transition_residual is not None
                                     adaptive_pending_continue = None
 
-                                if adaptive_pending_stop_extension is not None:
+                                if (
+                                    adaptive_pending_stop_extension is not None
+                                    and not bool(getattr(args, "adaptive_freeze", False))
+                                ):
                                     next_forward_latency_ms = float(
                                         forward_pass_latencies[-1]
                                     )
@@ -1935,6 +1954,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         features,
                                         allow_stop=stop_available,
                                         refinement_step=current_step,
+                                        allow_exploration=not bool(
+                                            getattr(
+                                                args,
+                                                "adaptive_counterfactual_replay",
+                                                False,
+                                            )
+                                        ),
                                     )
                                     adaptive_record = {
                                         "step": int(current_step),
@@ -1989,6 +2015,20 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             adaptive_pending_stop_extension = adaptive_record
                                     else:
                                         adaptive_pending_continue = adaptive_record
+                                    if bool(
+                                        getattr(
+                                            args,
+                                            "adaptive_counterfactual_replay",
+                                            False,
+                                        )
+                                    ):
+                                        adaptive_record["executed_action"] = "continue"
+                                        adaptive_record[
+                                            "counterfactual_replay_overrode_action"
+                                        ] = decision.action == "stop"
+                                        adaptive_pending_continue = None
+                                        adaptive_pending_stop_extension = None
+                                        stop_reason = None
                                 adaptive_previous_proposal = provisional_tokens
 
                             if adaptive_enabled:
@@ -2130,6 +2170,51 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "calibration_tokens": int(bucket_calibration_tokens),
                                         "accept_probabilities": list(accept_probabilities),
+                                        "adaptive_policy_action": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("action")
+                                        ),
+                                        "adaptive_policy_reason": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("reason")
+                                        ),
+                                        "adaptive_stop_probability": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("stop_probability")
+                                        ),
+                                        "adaptive_advantage_mean": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("advantage_mean")
+                                        ),
+                                        "adaptive_advantage_risk": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("advantage_risk")
+                                        ),
+                                        "adaptive_q_stop_mean": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("q_stop_mean")
+                                        ),
+                                        "adaptive_q_continue_mean": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("q_continue_mean")
+                                        ),
+                                        "adaptive_rho_tokens_per_ms": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("rho_tokens_per_ms")
+                                        ),
+                                        "adaptive_stop_available": (
+                                            None
+                                            if adaptive_record is None
+                                            else adaptive_record.get("stop_available")
+                                        ),
                                     })
                                 else:
                                     frontier_stats[

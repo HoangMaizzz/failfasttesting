@@ -255,6 +255,7 @@ class OnlineTDRefinementController:
         *,
         allow_stop: bool,
         refinement_step: int,
+        allow_exploration: bool = True,
     ) -> AdaptiveDecision:
         started = time.perf_counter()
         profiling = self.config.profile_overhead
@@ -349,7 +350,7 @@ class OnlineTDRefinementController:
                 self.config.explore_epsilon
                 * (self.config.explore_decay ** self.decision_count),
             )
-            if epsilon > 0.0 and self.rng.random() < epsilon:
+            if allow_exploration and epsilon > 0.0 and self.rng.random() < epsilon:
                 action, reason = STOP, "early_stop_calibration_exploration"
                 exploration_used = True
                 self.exploration_count += 1
@@ -365,7 +366,7 @@ class OnlineTDRefinementController:
                 self.config.explore_epsilon
                 * (self.config.explore_decay ** self.decision_count),
             )
-            if epsilon > 0.0 and self.rng.random() < epsilon:
+            if allow_exploration and epsilon > 0.0 and self.rng.random() < epsilon:
                 action, reason = STOP, "uncertain_exploration"
                 exploration_used = True
                 self.exploration_count += 1
@@ -625,6 +626,77 @@ class OnlineTDRefinementController:
             },
             "overhead": self.profile_summary(),
         }
+
+    def load_snapshot(self, snapshot: dict) -> None:
+        actions = snapshot.get("actions") or {}
+        for action in (STOP, CONTINUE):
+            state = actions.get(action)
+            if not state:
+                raise ValueError(f"snapshot is missing action state: {action}")
+            value = self.values[action]
+            theta = [float(item) for item in state["theta"]]
+            precision = [float(item) for item in state["precision"]]
+            covariance = [
+                [float(item) for item in row]
+                for row in state["inverse_covariance"]
+            ]
+            if (
+                len(theta) != self.config.feature_dim
+                or len(precision) != self.config.feature_dim
+                or len(covariance) != self.config.feature_dim
+                or any(len(row) != self.config.feature_dim for row in covariance)
+            ):
+                raise ValueError("snapshot feature dimension does not match controller")
+            value.theta = theta
+            value.precision = precision
+            value.inverse_covariance = covariance
+            value.sample_count = int(state.get("sample_count", 0))
+            value.residual_mean = float(state.get("residual_mean", 0.0))
+            residual_variance = float(
+                state.get("residual_variance", value.config.residual_prior_variance)
+            )
+            value.residual_m2 = residual_variance * max(0, value.sample_count - 1)
+
+        uncertainty_state = snapshot.get("early_stop_uncertainty") or {}
+        uncertainty = self.early_stop_uncertainty
+        if uncertainty_state:
+            precision = [float(item) for item in uncertainty_state["precision"]]
+            covariance = [
+                [float(item) for item in row]
+                for row in uncertainty_state["inverse_covariance"]
+            ]
+            if (
+                len(precision) != self.config.feature_dim
+                or len(covariance) != self.config.feature_dim
+                or any(len(row) != self.config.feature_dim for row in covariance)
+            ):
+                raise ValueError("snapshot uncertainty dimension does not match controller")
+            uncertainty.precision = precision
+            uncertainty.inverse_covariance = covariance
+            uncertainty.sample_count = int(uncertainty_state.get("sample_count", 0))
+            uncertainty.residual_mean = float(
+                uncertainty_state.get("residual_mean", 0.0)
+            )
+            residual_variance = float(
+                uncertainty_state.get(
+                    "residual_variance",
+                    uncertainty.config.residual_prior_variance,
+                )
+            )
+            uncertainty.residual_m2 = residual_variance * max(
+                0,
+                uncertainty.sample_count - 1,
+            )
+
+        self.completed_rounds = int(snapshot.get("completed_rounds", 0))
+        self.decision_count = int(snapshot.get("decision_count", 0))
+        self.exploration_count = int(snapshot.get("exploration_count", 0))
+        self.early_stop_observations = int(
+            snapshot.get("early_stop_observations", 0)
+        )
+        self.y_ema = snapshot.get("y_ema")
+        self.t_ema_ms = snapshot.get("t_ema_ms")
+        self.forward_latency_ema_ms = snapshot.get("forward_latency_ema_ms")
 
 
 def build_state_features(
