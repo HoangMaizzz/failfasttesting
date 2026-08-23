@@ -1,17 +1,37 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pandas as pd
 
 from run_gsm8k_balanced_oracle_dataset import (
     balanced_quotas,
+    completed_oracle_batch,
     local_oracle_upper_bound,
     pass_class,
+    partition_problem_ids,
     problem_profiles,
     select_balanced_problems,
 )
 
 
 class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
+    def test_problem_ids_are_partitioned_without_loss(self):
+        batches = partition_problem_ids(list(range(7)), 3)
+        self.assertEqual(batches, [[0, 1, 2], [3, 4, 5], [6]])
+
+    def test_resume_requires_every_expected_problem(self):
+        with TemporaryDirectory() as directory:
+            batch_dir = Path(directory)
+            pd.DataFrame({"problem_id": [1, 2]}).to_csv(
+                batch_dir / "benchmark_results.csv", index=False
+            )
+            pd.DataFrame({"problem_id": [1, 2]}).to_csv(
+                batch_dir / "bucket_oracle_snapshots.csv", index=False
+            )
+            self.assertTrue(completed_oracle_batch(batch_dir, [1, 2]))
+            self.assertFalse(completed_oracle_batch(batch_dir, [1, 2, 3]))
+
     def test_pass_classes_use_total_draft_passes(self):
         self.assertEqual(pass_class(1), "step1")
         self.assertEqual(pass_class(1.5), "step2")

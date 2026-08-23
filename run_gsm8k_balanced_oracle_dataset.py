@@ -28,6 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pool_size", type=int, default=300)
     parser.add_argument("--selected_size", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=50)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--spec_len", type=int, default=8)
@@ -72,6 +73,8 @@ def validate_args(args):
         raise ValueError(f"--pool_size must be in [1, {available}]")
     if args.selected_size <= 0 or args.selected_size > args.pool_size:
         raise ValueError("--selected_size must be in [1, pool_size]")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
     if args.spec_len <= 0 or args.incr_len <= 0:
         raise ValueError("proposal lengths must be positive")
 
@@ -96,6 +99,70 @@ def pass_class(value):
 def pool_problem_ids(args):
     population = list(range(args.warmup_questions, DATASET_SIZES["gsm8k"]))
     return sorted(random.Random(args.sample_seed).sample(population, args.pool_size))
+
+
+def partition_problem_ids(problem_ids, batch_size):
+    return [
+        problem_ids[start:start + batch_size]
+        for start in range(0, len(problem_ids), batch_size)
+    ]
+
+
+def completed_oracle_batch(batch_dir, expected_problem_ids):
+    results_path = batch_dir / "benchmark_results.csv"
+    snapshots_path = batch_dir / "bucket_oracle_snapshots.csv"
+    if not results_path.exists() or not snapshots_path.exists():
+        return False
+    try:
+        results = pd.read_csv(results_path)
+        snapshots = pd.read_csv(snapshots_path, usecols=["problem_id"])
+    except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError):
+        return False
+    expected = set(map(int, expected_problem_ids))
+    result_ids = set(pd.to_numeric(results["problem_id"], errors="coerce").dropna().astype(int))
+    snapshot_ids = set(
+        pd.to_numeric(snapshots["problem_id"], errors="coerce").dropna().astype(int)
+    )
+    return (
+        len(results) == len(expected)
+        and result_ids == expected
+        and snapshot_ids == expected
+    )
+
+
+def run_oracle_pool(args, pool_ids):
+    result_frames = []
+    snapshot_frames = []
+    batches = partition_problem_ids(pool_ids, args.batch_size)
+    for batch_index, batch_ids in enumerate(batches, start=1):
+        phase = f"failfast_oracle_pool_batch_{batch_index:03d}"
+        batch_dir = Path(args.output_dir) / "raw" / phase
+        if args.resume and completed_oracle_batch(batch_dir, batch_ids):
+            print(
+                f"RESUME {phase} | batch={batch_index}/{len(batches)} | "
+                f"samples={len(batch_ids)}",
+                flush=True,
+            )
+        else:
+            for filename in ("benchmark_results.csv", "bucket_oracle_snapshots.csv"):
+                path = batch_dir / filename
+                if path.exists():
+                    path.unlink()
+            run_phase(
+                args,
+                batch_ids,
+                phase,
+                ["--collect_bucket_oracle"],
+                ["benchmark_results.csv", "bucket_oracle_snapshots.csv"],
+            )
+            if not completed_oracle_batch(batch_dir, batch_ids):
+                raise RuntimeError(f"Incomplete oracle batch: {phase}")
+        result_frames.append(pd.read_csv(batch_dir / "benchmark_results.csv"))
+        snapshot_frames.append(pd.read_csv(batch_dir / "bucket_oracle_snapshots.csv"))
+    return (
+        pd.concat(result_frames, ignore_index=True),
+        pd.concat(snapshot_frames, ignore_index=True),
+    )
 
 
 def problem_profiles(rounds):
@@ -390,18 +457,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     pool_ids = pool_problem_ids(args)
-    raw_dir = run_phase(
-        args,
-        pool_ids,
-        "failfast_oracle_pool",
-        ["--collect_bucket_oracle"],
-        ["benchmark_results.csv", "bucket_oracle_snapshots.csv"],
-    )
-
-    results = pd.read_csv(raw_dir / "benchmark_results.csv")
-    snapshots = add_latency_estimates(
-        pd.read_csv(raw_dir / "bucket_oracle_snapshots.csv")
-    )
+    results, raw_snapshots = run_oracle_pool(args, pool_ids)
+    snapshots = add_latency_estimates(raw_snapshots)
     transitions = build_failfast_oracle_transitions(snapshots)
     rounds = select_round_candidates(snapshots)
     rounds["oracle_pass_class"] = rounds["oracle_draft_passes"].map(pass_class)
