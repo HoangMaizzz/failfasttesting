@@ -7,7 +7,7 @@ import pandas as pd
 from run_gsm8k_balanced_oracle_dataset import (
     balanced_quotas,
     causal_oracle_comparison,
-    completed_oracle_batch,
+    completed_failfast_batch,
     pass_class,
     partition_problem_ids,
     problem_profiles,
@@ -26,11 +26,8 @@ class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
             pd.DataFrame({"problem_id": [1, 2]}).to_csv(
                 batch_dir / "benchmark_results.csv", index=False
             )
-            pd.DataFrame({"problem_id": [1, 2]}).to_csv(
-                batch_dir / "bucket_oracle_snapshots.csv", index=False
-            )
-            self.assertTrue(completed_oracle_batch(batch_dir, [1, 2]))
-            self.assertFalse(completed_oracle_batch(batch_dir, [1, 2, 3]))
+            self.assertTrue(completed_failfast_batch(batch_dir, [1, 2]))
+            self.assertFalse(completed_failfast_batch(batch_dir, [1, 2, 3]))
 
     def test_pass_classes_use_total_draft_passes(self):
         self.assertEqual(pass_class(1), "step1")

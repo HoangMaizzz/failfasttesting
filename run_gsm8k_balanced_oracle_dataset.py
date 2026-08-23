@@ -13,14 +13,11 @@ import pandas as pd
 
 from run_failfast_counterfactual_oracle import (
     DATASET_SIZES,
-    add_latency_estimates,
-    build_failfast_oracle_transitions,
     run_phase,
-    select_round_candidates,
 )
 
 
-VERSION = "gsm8k_balanced_failfast_causal_oracle_v2"
+VERSION = "gsm8k_balanced_failfast_causal_oracle_v3"
 PASS_CLASSES = ("step1", "step2", "step3plus")
 
 
@@ -106,61 +103,46 @@ def partition_problem_ids(problem_ids, batch_size):
     ]
 
 
-def completed_oracle_batch(batch_dir, expected_problem_ids):
+def completed_failfast_batch(batch_dir, expected_problem_ids):
     results_path = batch_dir / "benchmark_results.csv"
-    snapshots_path = batch_dir / "bucket_oracle_snapshots.csv"
-    if not results_path.exists() or not snapshots_path.exists():
+    if not results_path.exists():
         return False
     try:
         results = pd.read_csv(results_path)
-        snapshots = pd.read_csv(snapshots_path, usecols=["problem_id"])
     except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError):
         return False
     expected = set(map(int, expected_problem_ids))
     result_ids = set(pd.to_numeric(results["problem_id"], errors="coerce").dropna().astype(int))
-    snapshot_ids = set(
-        pd.to_numeric(snapshots["problem_id"], errors="coerce").dropna().astype(int)
-    )
-    return (
-        len(results) == len(expected)
-        and result_ids == expected
-        and snapshot_ids == expected
-    )
+    return len(results) == len(expected) and result_ids == expected
 
 
-def run_oracle_pool(args, pool_ids):
+def run_failfast_pool(args, pool_ids):
     result_frames = []
-    snapshot_frames = []
     batches = partition_problem_ids(pool_ids, args.batch_size)
     for batch_index, batch_ids in enumerate(batches, start=1):
-        phase = f"failfast_oracle_pool_batch_{batch_index:03d}"
+        phase = f"failfast_pool_batch_{batch_index:03d}"
         batch_dir = Path(args.output_dir) / "raw" / phase
-        if args.resume and completed_oracle_batch(batch_dir, batch_ids):
+        if args.resume and completed_failfast_batch(batch_dir, batch_ids):
             print(
                 f"RESUME {phase} | batch={batch_index}/{len(batches)} | "
                 f"samples={len(batch_ids)}",
                 flush=True,
             )
         else:
-            for filename in ("benchmark_results.csv", "bucket_oracle_snapshots.csv"):
-                path = batch_dir / filename
-                if path.exists():
-                    path.unlink()
+            results_path = batch_dir / "benchmark_results.csv"
+            if results_path.exists():
+                results_path.unlink()
             run_phase(
                 args,
                 batch_ids,
                 phase,
-                ["--collect_bucket_oracle"],
-                ["benchmark_results.csv", "bucket_oracle_snapshots.csv"],
+                [],
+                ["benchmark_results.csv"],
             )
-            if not completed_oracle_batch(batch_dir, batch_ids):
-                raise RuntimeError(f"Incomplete oracle batch: {phase}")
+            if not completed_failfast_batch(batch_dir, batch_ids):
+                raise RuntimeError(f"Incomplete FailFast batch: {phase}")
         result_frames.append(pd.read_csv(batch_dir / "benchmark_results.csv"))
-        snapshot_frames.append(pd.read_csv(batch_dir / "bucket_oracle_snapshots.csv"))
-    return (
-        pd.concat(result_frames, ignore_index=True),
-        pd.concat(snapshot_frames, ignore_index=True),
-    )
+    return pd.concat(result_frames, ignore_index=True)
 
 
 def completed_causal_batch(batch_dir, expected_problem_ids):
@@ -202,7 +184,7 @@ def run_causal_oracle(args, problem_ids):
         "causal_oracle_candidates.csv",
     )
     for batch_index, batch_ids in enumerate(batches, start=1):
-        phase = f"causal_oracle_selected_batch_{batch_index:03d}"
+        phase = f"causal_oracle_pool_batch_{batch_index:03d}"
         batch_dir = Path(args.output_dir) / "raw" / phase
         if args.resume and completed_causal_batch(batch_dir, batch_ids):
             print(
@@ -232,6 +214,18 @@ def run_causal_oracle(args, problem_ids):
         pd.concat(decision_frames, ignore_index=True),
         pd.concat(candidate_frames, ignore_index=True),
     )
+
+
+def causal_selection_rounds(decisions):
+    rounds = decisions.copy()
+    rounds["oracle_draft_passes"] = pd.to_numeric(
+        rounds["selected_draft_passes"], errors="raise"
+    ).astype(int)
+    rounds["factual_draft_passes"] = pd.to_numeric(
+        rounds["physical_draft_passes"], errors="raise"
+    ).astype(int)
+    rounds["oracle_pass_class"] = rounds["oracle_draft_passes"].map(pass_class)
+    return rounds
 
 
 def problem_profiles(rounds):
@@ -582,11 +576,10 @@ def manifest(args, pool_ids, selected, quotas):
         "balanced_class_quotas": quotas,
         "selection_definition": (
             "Each selected question contributes one randomly selected anchor round. "
-            "Anchor-round quotas are balanced across counterfactual total draft forward "
-            "passes: 1 is step1, 2 is step2, and >=3 is step3plus. Questions are "
-            "unique across strata. The median class and complete round distribution "
-            "for every question remain available as diagnostics. draft_passes_elapsed "
-            "is used because the local step counter resets after proposal extension."
+            "Anchor-round quotas are balanced across stopping depths actually selected "
+            "and executed by the causal oracle over the full 300-question pool: 1 is "
+            "step1, 2 is step2, and >=3 is step3plus. Questions are unique across "
+            "strata, and the complete causal-round distribution is retained."
         ),
         "causal_oracle_interpretation": (
             "The causal oracle chooses an observed refinement snapshot, executes that "
@@ -608,27 +601,23 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for stale_name in (
-        "local_oracle_upper_bound.csv",
-        "selected_oracle_snapshots.csv",
-        "selected_oracle_transitions.csv",
-        "selected_round_oracle_choices.csv",
-    ):
-        stale_path = output_dir / stale_name
-        if stale_path.exists():
-            stale_path.unlink()
     pool_ids = pool_problem_ids(args)
-    results, raw_snapshots = run_oracle_pool(args, pool_ids)
-    snapshots = add_latency_estimates(raw_snapshots)
-    transitions = build_failfast_oracle_transitions(snapshots)
-    rounds = select_round_candidates(snapshots)
-    rounds["oracle_pass_class"] = rounds["oracle_draft_passes"].map(pass_class)
+    failfast_results = run_failfast_pool(args, pool_ids)
+    causal_results, causal_decisions, causal_candidates = run_causal_oracle(
+        args,
+        pool_ids,
+    )
+    rounds = causal_selection_rounds(causal_decisions)
     profiles = problem_profiles(rounds)
 
-    results.to_csv(output_dir / "pool_failfast_results.csv", index=False)
-    snapshots.to_csv(output_dir / "pool_selection_snapshots.csv", index=False)
-    transitions.to_csv(output_dir / "pool_selection_transitions.csv", index=False)
-    rounds.to_csv(output_dir / "pool_selection_round_choices.csv", index=False)
+    failfast_results.to_csv(output_dir / "pool_failfast_results.csv", index=False)
+    causal_results.to_csv(output_dir / "pool_causal_oracle_results.csv", index=False)
+    causal_decisions.to_csv(
+        output_dir / "pool_causal_oracle_decisions.csv", index=False
+    )
+    causal_candidates.to_csv(
+        output_dir / "pool_causal_oracle_candidates.csv", index=False
+    )
     profiles.to_csv(output_dir / "pool_problem_profiles.csv", index=False)
     distribution_summary(profiles, "pool").to_csv(
         output_dir / "pool_class_distribution.csv", index=False
@@ -644,20 +633,39 @@ def main():
         args.selection_seed,
     )
     selected_ids = sorted(set(selected["problem_id"].astype(int)))
-    selected_results = results[results["problem_id"].isin(selected_ids)].copy()
+    selected_failfast = failfast_results[
+        failfast_results["problem_id"].isin(selected_ids)
+    ].copy()
+    selected_causal = causal_results[
+        causal_results["problem_id"].isin(selected_ids)
+    ].copy()
+    selected_decisions = causal_decisions[
+        causal_decisions["problem_id"].isin(selected_ids)
+    ].copy()
+    selected_candidates = causal_candidates[
+        causal_candidates["problem_id"].isin(selected_ids)
+    ].copy()
     selected_rounds = rounds[rounds["problem_id"].isin(selected_ids)].copy()
-    causal_results, causal_decisions, causal_candidates = run_causal_oracle(
-        args,
-        selected_ids,
-    )
 
     selected.to_csv(output_dir / "selected_problem_profiles.csv", index=False)
     anchors.to_csv(output_dir / "selected_anchor_rounds.csv", index=False)
-    selected_results.to_csv(output_dir / "selected_failfast_results.csv", index=False)
-    causal_results.to_csv(output_dir / "causal_oracle_results.csv", index=False)
-    causal_decisions.to_csv(output_dir / "causal_oracle_decisions.csv", index=False)
-    causal_candidates.to_csv(output_dir / "causal_oracle_candidates.csv", index=False)
+    selected_failfast.to_csv(
+        output_dir / "selected_failfast_results.csv", index=False
+    )
+    selected_causal.to_csv(
+        output_dir / "selected_causal_oracle_results.csv", index=False
+    )
+    selected_decisions.to_csv(
+        output_dir / "selected_causal_oracle_decisions.csv", index=False
+    )
+    selected_candidates.to_csv(
+        output_dir / "selected_causal_oracle_candidates.csv", index=False
+    )
     causal_stop_distribution(causal_decisions).to_csv(
+        output_dir / "pool_causal_oracle_stop_distribution.csv",
+        index=False,
+    )
+    causal_stop_distribution(selected_decisions).to_csv(
         output_dir / "causal_oracle_stop_distribution.csv",
         index=False,
     )
@@ -678,13 +686,27 @@ def main():
         ignore_index=True,
     ).to_csv(output_dir / "selected_round_class_distribution.csv", index=False)
 
-    causal_summary = causal_oracle_comparison(
-        selected_results,
+    pool_summary = causal_oracle_comparison(
+        failfast_results,
         causal_results,
         causal_decisions,
     )
+    pool_summary.insert(0, "scope", "pool_300")
+    selected_summary = causal_oracle_comparison(
+        selected_failfast,
+        selected_causal,
+        selected_decisions,
+    )
+    selected_summary.insert(0, "scope", "balanced_50")
+    causal_summary = pd.concat(
+        [pool_summary, selected_summary], ignore_index=True
+    )
     causal_summary.to_csv(output_dir / "causal_oracle_summary.csv", index=False)
-    paired_causal_comparison(selected_results, causal_results).to_csv(
+    paired_causal_comparison(failfast_results, causal_results).to_csv(
+        output_dir / "pool_causal_oracle_paired_results.csv",
+        index=False,
+    )
+    paired_causal_comparison(selected_failfast, selected_causal).to_csv(
         output_dir / "causal_oracle_paired_results.csv",
         index=False,
     )
