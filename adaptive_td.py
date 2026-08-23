@@ -53,6 +53,9 @@ class AdaptiveTDConfig:
     profile_overhead: bool = False
     seed: int = 42
     td_error_clip: float = 32.0
+    policy_mode: str = "legacy"
+    min_action_probability: float = 0.10
+    max_importance_weight: float = 5.0
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -92,6 +95,12 @@ class AdaptiveTDConfig:
             raise ValueError("residual_prior_variance must be non-negative")
         if self.td_error_clip <= 0.0:
             raise ValueError("td_error_clip must be positive")
+        if self.policy_mode not in {"legacy", "symmetric"}:
+            raise ValueError("policy_mode must be legacy or symmetric")
+        if not 0.0 < self.min_action_probability <= 0.5:
+            raise ValueError("min_action_probability must be in (0, 0.5]")
+        if self.max_importance_weight < 1.0:
+            raise ValueError("max_importance_weight must be at least 1")
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,9 @@ class AdaptiveDecision:
     advantage_mean: float
     advantage_risk: float
     stop_probability: float
+    behavior_stop_probability: float
+    selected_action_probability: float
+    importance_weight: float
 
 
 class _LinearActionValue:
@@ -128,6 +140,8 @@ class _LinearActionValue:
             for row in range(dimension)
         ]
         self.sample_count = 0
+        self.sample_weight_sum = 0.0
+        self.sample_weight_square_sum = 0.0
         self.residual_mean = 0.0
         self.residual_m2 = 0.0
         self.config = config
@@ -136,11 +150,21 @@ class _LinearActionValue:
         return _dot(self.theta, features)
 
     def residual_variance(self) -> float:
-        if self.sample_count < 2:
+        if self.sample_count < 2 or self.sample_weight_sum <= 0.0:
+            return self.config.residual_prior_variance
+        denominator = self.residual_degrees_of_freedom()
+        if denominator <= 0.0:
             return self.config.residual_prior_variance
         return max(
             self.config.residual_prior_variance * 1e-3,
-            self.residual_m2 / (self.sample_count - 1),
+            self.residual_m2 / denominator,
+        )
+
+    def residual_degrees_of_freedom(self) -> float:
+        if self.sample_weight_sum <= 0.0:
+            return 0.0
+        return self.sample_weight_sum - (
+            self.sample_weight_square_sum / self.sample_weight_sum
         )
 
     def risk(self, features: Sequence[float]) -> float:
@@ -176,7 +200,9 @@ class _LinearActionValue:
         rate: float,
         *,
         count_observation: bool = True,
+        observation_weight: float = 1.0,
     ) -> float:
+        observation_weight = max(0.0, float(observation_weight))
         prediction = self.mean(features)
         raw_residual = float(target) - prediction
         update_residual = _clip(
@@ -185,24 +211,41 @@ class _LinearActionValue:
             self.config.td_error_clip,
         )
         for index, value in enumerate(features):
-            self.theta[index] += float(rate) * update_residual * value
+            self.theta[index] += (
+                float(rate) * observation_weight * update_residual * value
+            )
             if count_observation:
-                self.precision[index] += value * value
+                self.precision[index] += observation_weight * value * value
         if count_observation:
             projected = [
                 sum(weight * value for weight, value in zip(row, features))
                 for row in self.inverse_covariance
             ]
-            denominator = max(1e-12, 1.0 + _dot(features, projected))
+            denominator = max(
+                1e-12,
+                1.0 + observation_weight * _dot(features, projected),
+            )
             for row in range(len(self.inverse_covariance)):
                 for column in range(len(self.inverse_covariance[row])):
                     self.inverse_covariance[row][column] -= (
-                        projected[row] * projected[column] / denominator
+                        observation_weight
+                        * projected[row]
+                        * projected[column]
+                        / denominator
                     )
             self.sample_count += 1
+            self.sample_weight_sum += observation_weight
+            self.sample_weight_square_sum += observation_weight ** 2
             delta = raw_residual - self.residual_mean
-            self.residual_mean += delta / self.sample_count
-            self.residual_m2 += delta * (raw_residual - self.residual_mean)
+            if self.sample_weight_sum > 0.0:
+                self.residual_mean += (
+                    observation_weight / self.sample_weight_sum
+                ) * delta
+                self.residual_m2 += (
+                    observation_weight
+                    * delta
+                    * (raw_residual - self.residual_mean)
+                )
         return raw_residual
 
 
@@ -306,6 +349,9 @@ class OnlineTDRefinementController:
         probability_margin = (
             self.stop_z_threshold * advantage_risk + self.config.q_margin
         )
+        behavior_stop_probability = stop_probability
+        selected_action_probability = 1.0
+        symmetric_sampling_used = False
         action_started = time.perf_counter() if profiling else None
         exploration_used = False
         finite_estimates = all(
@@ -342,6 +388,30 @@ class OnlineTDRefinementController:
                 action, reason = CONTINUE, "fixed_refinement_depth"
         elif refinement_step >= self.config.max_refinement_steps:
             action, reason = STOP, "max_refinement_steps"
+        elif self.config.policy_mode == "symmetric":
+            if allow_exploration:
+                symmetric_sampling_used = True
+                behavior_stop_probability = _clip(
+                    stop_probability,
+                    self.config.min_action_probability,
+                    1.0 - self.config.min_action_probability,
+                )
+                if self.rng.random() < behavior_stop_probability:
+                    action, reason = STOP, "symmetric_posterior_sample"
+                    selected_action_probability = behavior_stop_probability
+                else:
+                    action, reason = CONTINUE, "symmetric_posterior_sample"
+                    selected_action_probability = 1.0 - behavior_stop_probability
+                greedy_action = (
+                    STOP if advantage_mean > self.config.q_margin else CONTINUE
+                )
+                exploration_used = action != greedy_action
+                if exploration_used:
+                    self.exploration_count += 1
+            elif advantage_mean > self.config.q_margin:
+                action, reason = STOP, "symmetric_greedy_stop"
+            else:
+                action, reason = CONTINUE, "symmetric_greedy_continue"
         elif self.completed_rounds < self.config.warmup_rounds:
             action, reason = CONTINUE, "warmup"
         elif calibration_active:
@@ -373,6 +443,14 @@ class OnlineTDRefinementController:
             else:
                 action, reason = CONTINUE, "uncertain_default_continue"
 
+        if not symmetric_sampling_used:
+            behavior_stop_probability = 1.0 if action == STOP else 0.0
+            selected_action_probability = 1.0
+        importance_weight = min(
+            self.config.max_importance_weight,
+            1.0 / max(selected_action_probability, 1e-12),
+        )
+
         self.decision_count += 1
         if action_started is not None:
             self.record_profile(
@@ -394,6 +472,9 @@ class OnlineTDRefinementController:
             advantage_mean=advantage_mean,
             advantage_risk=advantage_risk,
             stop_probability=stop_probability,
+            behavior_stop_probability=behavior_stop_probability,
+            selected_action_probability=selected_action_probability,
+            importance_weight=importance_weight,
         )
 
     def observe_transition(
@@ -404,6 +485,7 @@ class OnlineTDRefinementController:
         forward_latency_ms: float,
         *,
         next_stop_available: bool = True,
+        action_probability: float = 1.0,
     ) -> float | None:
         latency_ms = max(0.0, float(forward_latency_ms))
         if self.forward_latency_ema_ms is None:
@@ -426,10 +508,15 @@ class OnlineTDRefinementController:
                 future_value,
             )
         target = -self.rho * latency_ms + future_value
+        importance_weight = min(
+            self.config.max_importance_weight,
+            1.0 / max(float(action_probability), 1e-12),
+        )
         residual = self.values[action].update(
             features,
             target,
             self.config.learning_rate,
+            observation_weight=importance_weight,
         )
         if started is not None:
             self.record_profile(
@@ -445,6 +532,7 @@ class OnlineTDRefinementController:
         forward_latency_ms: float,
         *,
         next_stop_available: bool = True,
+        action_probability: float = 1.0,
     ) -> float | None:
         return self.observe_transition(
             CONTINUE,
@@ -452,6 +540,7 @@ class OnlineTDRefinementController:
             next_features,
             forward_latency_ms,
             next_stop_available=next_stop_available,
+            action_probability=action_probability,
         )
 
     def complete_trajectory(
@@ -492,17 +581,24 @@ class OnlineTDRefinementController:
                 early_stop_residuals.append((
                     item["features"],
                     target - self.values[STOP].mean(item["features"]),
+                    float(item.get("importance_weight", 1.0)),
                 ))
 
         td_counted_items = set()
         if self.config.update_mode in {"td", "mixed"}:
             for item in reversed(trajectory):
-                if item.get("action") == STOP:
+                if (
+                    item.get("action") == STOP
+                    and item.get("reason") != "factual_terminal_verification"
+                ):
                     target = float(emitted_tokens) - rho * max(0.0, verifier_latency_ms)
                     self.values[STOP].update(
                         item["features"],
                         target,
                         self.config.learning_rate,
+                        observation_weight=float(
+                            item.get("importance_weight", 1.0)
+                        ),
                     )
                     td_counted_items.add(id(item))
                     break
@@ -517,11 +613,16 @@ class OnlineTDRefinementController:
                     0.0,
                     float(item.get("next_forward_latency_ms", 0.0)),
                 )
+                if item.get("reason") == "factual_terminal_verification":
+                    continue
                 target = float(emitted_tokens) - rho * future_ms
                 self.values[item["action"]].update(
                     item["features"],
                     target,
                     rate,
+                    observation_weight=float(
+                        item.get("importance_weight", 1.0)
+                    ),
                     count_observation=(
                         self.config.update_mode != "mixed"
                         or (
@@ -530,11 +631,12 @@ class OnlineTDRefinementController:
                         )
                     ),
                 )
-        for features, residual in early_stop_residuals:
+        for features, residual, importance_weight in early_stop_residuals:
             self.early_stop_uncertainty.update(
                 features,
                 residual,
                 rate=0.0,
+                observation_weight=importance_weight,
             )
         self.early_stop_observations = self.early_stop_uncertainty.sample_count
         if started is not None:
@@ -597,6 +699,9 @@ class OnlineTDRefinementController:
             "early_stop_min_observations": self.config.early_stop_min_observations,
             "stop_probability_threshold": self.config.stop_probability_threshold,
             "stop_z_threshold": self.stop_z_threshold,
+            "policy_mode": self.config.policy_mode,
+            "min_action_probability": self.config.min_action_probability,
+            "max_importance_weight": self.config.max_importance_weight,
             "rho_tokens_per_ms": self.rho,
             "y_ema": self.y_ema,
             "t_ema_ms": self.t_ema_ms,
@@ -609,6 +714,8 @@ class OnlineTDRefinementController:
                         list(row) for row in value.inverse_covariance
                     ],
                     "sample_count": value.sample_count,
+                    "sample_weight_sum": value.sample_weight_sum,
+                    "sample_weight_square_sum": value.sample_weight_square_sum,
                     "residual_mean": value.residual_mean,
                     "residual_variance": value.residual_variance(),
                 }
@@ -616,6 +723,8 @@ class OnlineTDRefinementController:
             },
             "early_stop_uncertainty": {
                 "sample_count": self.early_stop_uncertainty.sample_count,
+                "sample_weight_sum": self.early_stop_uncertainty.sample_weight_sum,
+                "sample_weight_square_sum": self.early_stop_uncertainty.sample_weight_square_sum,
                 "residual_mean": self.early_stop_uncertainty.residual_mean,
                 "residual_variance": self.early_stop_uncertainty.residual_variance(),
                 "precision": list(self.early_stop_uncertainty.precision),
@@ -651,11 +760,19 @@ class OnlineTDRefinementController:
             value.precision = precision
             value.inverse_covariance = covariance
             value.sample_count = int(state.get("sample_count", 0))
+            value.sample_weight_sum = float(
+                state.get("sample_weight_sum", value.sample_count)
+            )
+            value.sample_weight_square_sum = float(
+                state.get("sample_weight_square_sum", value.sample_count)
+            )
             value.residual_mean = float(state.get("residual_mean", 0.0))
             residual_variance = float(
                 state.get("residual_variance", value.config.residual_prior_variance)
             )
-            value.residual_m2 = residual_variance * max(0, value.sample_count - 1)
+            value.residual_m2 = (
+                residual_variance * value.residual_degrees_of_freedom()
+            )
 
         uncertainty_state = snapshot.get("early_stop_uncertainty") or {}
         uncertainty = self.early_stop_uncertainty
@@ -674,6 +791,18 @@ class OnlineTDRefinementController:
             uncertainty.precision = precision
             uncertainty.inverse_covariance = covariance
             uncertainty.sample_count = int(uncertainty_state.get("sample_count", 0))
+            uncertainty.sample_weight_sum = float(
+                uncertainty_state.get(
+                    "sample_weight_sum",
+                    uncertainty.sample_count,
+                )
+            )
+            uncertainty.sample_weight_square_sum = float(
+                uncertainty_state.get(
+                    "sample_weight_square_sum",
+                    uncertainty.sample_count,
+                )
+            )
             uncertainty.residual_mean = float(
                 uncertainty_state.get("residual_mean", 0.0)
             )
@@ -683,9 +812,9 @@ class OnlineTDRefinementController:
                     uncertainty.config.residual_prior_variance,
                 )
             )
-            uncertainty.residual_m2 = residual_variance * max(
-                0,
-                uncertainty.sample_count - 1,
+            uncertainty.residual_m2 = (
+                residual_variance
+                * uncertainty.residual_degrees_of_freedom()
             )
 
         self.completed_rounds = int(snapshot.get("completed_rounds", 0))

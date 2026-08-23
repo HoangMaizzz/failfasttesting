@@ -306,7 +306,7 @@ class AdaptiveTDTests(unittest.TestCase):
         ]
         self.assertEqual(trajectory_forward_latency(trajectory), 5.0)
 
-    def test_mixed_terminal_update_counts_one_factual_observation(self):
+    def test_terminal_verification_does_not_train_early_stop_value(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(update_mode="mixed", warmup_rounds=0)
         )
@@ -316,12 +316,13 @@ class AdaptiveTDTests(unittest.TestCase):
             [{
                 "features": synthetic_features(1, 1),
                 "action": STOP,
+                "reason": "factual_terminal_verification",
                 "next_forward_latency_ms": 0.0,
             }],
             emitted_tokens=2,
             verifier_latency_ms=1.0,
         )
-        self.assertEqual(controller.values[STOP].sample_count, 1)
+        self.assertEqual(controller.values[STOP].sample_count, 0)
 
     def test_mixed_fallback_counts_continue_when_td_was_unavailable(self):
         controller = OnlineTDRefinementController(
@@ -442,6 +443,124 @@ class AdaptiveTDTests(unittest.TestCase):
                 8,
             )
             self.assertEqual(learned_depth, preferred_depth)
+
+    def test_symmetric_cold_start_samples_both_actions_without_default(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                policy_mode="symmetric",
+                min_action_probability=0.1,
+                warmup_rounds=100,
+                early_stop_min_observations=100,
+                seed=42,
+            )
+        )
+        decisions = [
+            controller.choose(
+                synthetic_features(1, 3),
+                allow_stop=True,
+                refinement_step=1,
+            )
+            for _ in range(1000)
+        ]
+        stop_rate = sum(item.action == STOP for item in decisions) / len(decisions)
+        self.assertGreater(stop_rate, 0.45)
+        self.assertLess(stop_rate, 0.55)
+        self.assertTrue(
+            all(item.reason == "symmetric_posterior_sample" for item in decisions)
+        )
+        self.assertTrue(
+            all(item.behavior_stop_probability == 0.5 for item in decisions)
+        )
+
+    def test_symmetric_frozen_policy_is_greedy_and_deterministic(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(policy_mode="symmetric")
+        )
+        features = synthetic_features(1, 3)
+        controller.values[STOP].theta[0] = 2.0
+        controller.values[CONTINUE].theta[0] = 1.0
+        decisions = [
+            controller.choose(
+                features,
+                allow_stop=True,
+                refinement_step=1,
+                allow_exploration=False,
+            )
+            for _ in range(10)
+        ]
+        self.assertTrue(all(item.action == STOP for item in decisions))
+        self.assertTrue(all(item.selected_action_probability == 1.0 for item in decisions))
+        self.assertTrue(all(not item.exploration_used for item in decisions))
+
+    def test_symmetric_policy_mirrors_stop_and_continue_values(self):
+        features = synthetic_features(1, 3)
+        first = OnlineTDRefinementController(
+            AdaptiveTDConfig(policy_mode="symmetric")
+        )
+        second = OnlineTDRefinementController(
+            AdaptiveTDConfig(policy_mode="symmetric")
+        )
+        first.values[STOP].theta[0] = 1.0
+        first.values[CONTINUE].theta[0] = -1.0
+        second.values[STOP].theta[0] = -1.0
+        second.values[CONTINUE].theta[0] = 1.0
+        stop_preferred = first.choose(
+            features,
+            allow_stop=True,
+            refinement_step=1,
+            allow_exploration=False,
+        )
+        continue_preferred = second.choose(
+            features,
+            allow_stop=True,
+            refinement_step=1,
+            allow_exploration=False,
+        )
+        self.assertEqual(stop_preferred.action, STOP)
+        self.assertEqual(continue_preferred.action, CONTINUE)
+        self.assertAlmostEqual(
+            stop_preferred.stop_probability,
+            1.0 - continue_preferred.stop_probability,
+        )
+
+    def test_symmetric_importance_weight_is_capped(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                policy_mode="symmetric",
+                min_action_probability=0.1,
+                max_importance_weight=5.0,
+                seed=31,
+            )
+        )
+        features = synthetic_features(1, 3)
+        controller.values[STOP].theta[0] = -100.0
+        controller.values[CONTINUE].theta[0] = 100.0
+        decision = controller.choose(
+            features,
+            allow_stop=True,
+            refinement_step=1,
+        )
+        self.assertEqual(decision.action, STOP)
+        self.assertEqual(decision.selected_action_probability, 0.1)
+        self.assertEqual(decision.importance_weight, 5.0)
+
+    def test_weighted_feedback_updates_effective_sample_mass(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(policy_mode="symmetric", update_mode="td")
+        )
+        controller.y_ema = 1.0
+        controller.t_ema_ms = 1.0
+        features = synthetic_features(1, 3)
+        controller.observe_transition(
+            CONTINUE,
+            features,
+            synthetic_features(2, 3),
+            1.0,
+            action_probability=0.2,
+        )
+        value = controller.values[CONTINUE]
+        self.assertEqual(value.sample_count, 1)
+        self.assertEqual(value.sample_weight_sum, 5.0)
 
 
 if __name__ == "__main__":

@@ -1921,6 +1921,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         features,
                                         next_forward_latency_ms,
                                         next_stop_available=stop_available,
+                                        action_probability=float(
+                                            adaptive_pending_continue.get(
+                                                "selected_action_probability",
+                                                1.0,
+                                            )
+                                        ),
                                     )
                                     adaptive_pending_continue[
                                         "td_observation_counted"
@@ -1943,6 +1949,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         features,
                                         next_forward_latency_ms,
                                         next_stop_available=stop_available,
+                                        action_probability=float(
+                                            adaptive_pending_stop_extension.get(
+                                                "selected_action_probability",
+                                                1.0,
+                                            )
+                                        ),
                                     )
                                     adaptive_pending_stop_extension[
                                         "td_observation_counted"
@@ -1957,7 +1969,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         allow_exploration=not bool(
                                             getattr(
                                                 args,
-                                                "adaptive_counterfactual_replay",
+                                                "adaptive_freeze",
                                                 False,
                                             )
                                         ),
@@ -1994,6 +2006,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "stop_probability": float(
                                             decision.stop_probability
+                                        ),
+                                        "behavior_stop_probability": float(
+                                            decision.behavior_stop_probability
+                                        ),
+                                        "selected_action_probability": float(
+                                            decision.selected_action_probability
+                                        ),
+                                        "importance_weight": float(
+                                            decision.importance_weight
                                         ),
                                         "controller_latency_ms": float(decision.latency_ms),
                                         "completed_rounds_before": int(

@@ -421,6 +421,13 @@ parser.add_argument("--adaptive-explore-min", type=float, default=0.01)
 parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
 parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
 parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
+parser.add_argument(
+    "--adaptive-policy-mode",
+    choices=["legacy", "symmetric"],
+    default="legacy",
+)
+parser.add_argument("--adaptive-min-action-probability", type=float, default=0.10)
+parser.add_argument("--adaptive-max-importance-weight", type=float, default=5.0)
 parser.add_argument("--adaptive-use-step-feature", action="store_true")
 parser.add_argument(
     "--adaptive-use-margin-feature",
@@ -494,6 +501,9 @@ args.adaptive_td_controller = (
             force_continue=args.adaptive_force_continue,
             profile_overhead=args.adaptive_profile_overhead,
             seed=args.seed,
+            policy_mode=args.adaptive_policy_mode,
+            min_action_probability=args.adaptive_min_action_probability,
+            max_importance_weight=args.adaptive_max_importance_weight,
         )
     )
     if args.adaptive_td
@@ -562,6 +572,9 @@ BENCHMARK_CSV_COLUMNS = [
     "adaptive_calibration_stop_actions",
     "adaptive_learned_stop_actions",
     "adaptive_early_stop_observations",
+    "adaptive_behavior_stop_probability_mean",
+    "adaptive_selected_action_probability_mean",
+    "adaptive_importance_weight_mean",
     "adaptive_mean_refinement_step",
     "adaptive_controller_ms",
     "adaptive_rho_tokens_per_ms",
@@ -783,6 +796,27 @@ def summarize_frontier_diagnostics(stats_each_round):
                 for item in adaptive_decisions
             ),
             default=0,
+        ),
+        "adaptive_behavior_stop_probability_mean": safe_div(
+            sum(
+                float(item.get("behavior_stop_probability", 0.0))
+                for item in adaptive_decisions
+            ),
+            len(adaptive_decisions),
+        ),
+        "adaptive_selected_action_probability_mean": safe_div(
+            sum(
+                float(item.get("selected_action_probability", 1.0))
+                for item in adaptive_decisions
+            ),
+            len(adaptive_decisions),
+        ),
+        "adaptive_importance_weight_mean": safe_div(
+            sum(
+                float(item.get("importance_weight", 1.0))
+                for item in adaptive_decisions
+            ),
+            len(adaptive_decisions),
         ),
         "adaptive_mean_refinement_step": safe_div(
             sum(float(item.get("step", 0)) for item in adaptive_decisions),
@@ -2020,12 +2054,12 @@ for problem_id, is_warmup in tqdm(
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
-                        and not args.adaptive_freeze
                     ):
-                        args.adaptive_td_controller.observe_round(
-                            len(tokens_to_append),
-                            (draft_time + verify_time + post_verify_time) * 1000.0,
-                        )
+                        if not args.adaptive_freeze:
+                            args.adaptive_td_controller.observe_round(
+                                len(tokens_to_append),
+                                (draft_time + verify_time + post_verify_time) * 1000.0,
+                            )
                         record_adaptive_td_decisions(
                             args,
                             frontier_stats_this_round,

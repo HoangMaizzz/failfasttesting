@@ -72,7 +72,18 @@ def parse_args():
     parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
     parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
     parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
-    parser.add_argument("--adaptive-use-step-feature", action="store_true")
+    parser.add_argument(
+        "--adaptive-policy-mode",
+        choices=("legacy", "symmetric"),
+        default="symmetric",
+    )
+    parser.add_argument("--adaptive-min-action-probability", type=float, default=0.10)
+    parser.add_argument("--adaptive-max-importance-weight", type=float, default=5.0)
+    parser.add_argument(
+        "--adaptive-use-step-feature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--adaptive-use-margin-feature",
         action=argparse.BooleanOptionalAction,
@@ -111,6 +122,10 @@ def validate_args(args):
         raise ValueError("--adaptive-early-stop-min-observations must be non-negative")
     if not 0.5 < args.adaptive_stop_probability_threshold < 1.0:
         raise ValueError("--adaptive-stop-probability-threshold must be in (0.5, 1)")
+    if not 0.0 < args.adaptive_min_action_probability <= 0.5:
+        raise ValueError("--adaptive-min-action-probability must be in (0, 0.5]")
+    if args.adaptive_max_importance_weight < 1.0:
+        raise ValueError("--adaptive-max-importance-weight must be at least 1")
     for dataset in args.datasets:
         available = DATASET_SIZES[dataset] - args.warmup_questions
         if args.num_questions > available:
@@ -147,7 +162,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_early_stop_probability_v8",
+        "version": f"online_td_{args.adaptive_policy_mode}_v9",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -178,6 +193,9 @@ def metadata(args, dataset, method, problem_ids):
             "explore_decay": args.adaptive_explore_decay,
             "warmup_rounds": args.adaptive_warmup_rounds,
             "early_stop_min_observations": args.adaptive_early_stop_min_observations,
+            "policy_mode": args.adaptive_policy_mode,
+            "min_action_probability": args.adaptive_min_action_probability,
+            "max_importance_weight": args.adaptive_max_importance_weight,
             "use_step_feature": args.adaptive_use_step_feature,
             "use_margin_feature": args.adaptive_use_margin_feature,
             "use_stability_feature": args.adaptive_use_stability_feature,
@@ -270,6 +288,11 @@ def run_method(args, dataset, method, problem_ids):
                 "--adaptive-warmup-rounds", str(args.adaptive_warmup_rounds),
                 "--adaptive-early-stop-min-observations",
                 str(args.adaptive_early_stop_min_observations),
+                "--adaptive-policy-mode", args.adaptive_policy_mode,
+                "--adaptive-min-action-probability",
+                str(args.adaptive_min_action_probability),
+                "--adaptive-max-importance-weight",
+                str(args.adaptive_max_importance_weight),
             ])
             if args.adaptive_log_decisions:
                 command.append("--adaptive-log-decisions")
@@ -383,6 +406,27 @@ def aggregate(rows):
             )
             * adaptive_decisions
         ).sum()
+        weighted_behavior_stop_probability = (
+            group.get(
+                "adaptive_behavior_stop_probability_mean",
+                pd.Series(0.0, index=group.index),
+            )
+            * adaptive_decisions
+        ).sum()
+        weighted_selected_action_probability = (
+            group.get(
+                "adaptive_selected_action_probability_mean",
+                pd.Series(1.0, index=group.index),
+            )
+            * adaptive_decisions
+        ).sum()
+        weighted_importance_weight = (
+            group.get(
+                "adaptive_importance_weight_mean",
+                pd.Series(1.0, index=group.index),
+            )
+            * adaptive_decisions
+        ).sum()
         records.append({
             "dataset": dataset,
             "method": method,
@@ -413,6 +457,9 @@ def aggregate(rows):
                 "adaptive_early_stop_observations",
                 pd.Series(0, index=group.index),
             ).max(),
+            "adaptive_behavior_stop_probability_mean": weighted_behavior_stop_probability / max(1, decision_count),
+            "adaptive_selected_action_probability_mean": weighted_selected_action_probability / max(1, decision_count),
+            "adaptive_importance_weight_mean": weighted_importance_weight / max(1, decision_count),
             "adaptive_stop_available_rate_percent": 100.0 * stop_available_decisions.sum() / max(1, decision_count),
             "adaptive_candidate_coverage_rate_percent": 100.0 * candidate_coverage_decisions.sum() / max(1, decision_count),
             "adaptive_outer_verify_eligible_rate_percent": 100.0 * outer_verify_eligible_decisions.sum() / max(1, decision_count),
@@ -529,6 +576,18 @@ def learning_curves(output_dir, datasets):
             "mean_refinement_step": group["step"].mean(),
             "mean_q_stop": group["q_stop_mean"].mean(),
             "mean_q_continue": group["q_continue_mean"].mean(),
+            "mean_behavior_stop_probability": group.get(
+                "behavior_stop_probability",
+                pd.Series(0.0, index=group.index),
+            ).mean(),
+            "mean_selected_action_probability": group.get(
+                "selected_action_probability",
+                pd.Series(1.0, index=group.index),
+            ).mean(),
+            "mean_importance_weight": group.get(
+                "importance_weight",
+                pd.Series(1.0, index=group.index),
+            ).mean(),
             "mean_controller_latency_ms": group["controller_latency_ms"].mean(),
             "mean_rho_tokens_per_ms": group["rho_tokens_per_ms"].mean(),
             "stop_available_rate_percent": 100.0 * group[
@@ -559,6 +618,11 @@ def controller_state_reports(output_dir, datasets, methods):
                     "method": method,
                     "action": action,
                     "sample_count": values.get("sample_count", 0),
+                    "sample_weight_sum": values.get("sample_weight_sum", 0.0),
+                    "sample_weight_square_sum": values.get(
+                        "sample_weight_square_sum",
+                        0.0,
+                    ),
                     "residual_mean": values.get("residual_mean"),
                     "residual_variance": values.get("residual_variance"),
                     "rho_tokens_per_ms": state.get("rho_tokens_per_ms"),
@@ -568,6 +632,13 @@ def controller_state_reports(output_dir, datasets, methods):
                     ),
                     "early_stop_min_observations": state.get(
                         "early_stop_min_observations", 0
+                    ),
+                    "policy_mode": state.get("policy_mode", "legacy"),
+                    "min_action_probability": state.get(
+                        "min_action_probability"
+                    ),
+                    "max_importance_weight": state.get(
+                        "max_importance_weight"
                     ),
                     "stop_probability_threshold": state.get(
                         "stop_probability_threshold"
