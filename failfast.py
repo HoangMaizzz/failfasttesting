@@ -1147,6 +1147,7 @@ def record_adaptive_td_decisions(
             "decision_id": int(decision_id),
             **item,
             "features": json.dumps(item.get("features") or []),
+            "draft_proposal": json.dumps(item.get("draft_proposal") or []),
             "draft_length": target_len,
             "remaining_mask_ratio": float((item.get("features") or [0.0, 0.0])[1]),
             "newly_unmasked_ratio": float((item.get("features") or [0.0, 0.0, 0.0])[2]),

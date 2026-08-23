@@ -1977,6 +1977,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     adaptive_record = {
                                         "step": int(current_step),
                                         "target_len": int(target_len),
+                                        "context_len": int(draft_token_start_idx),
+                                        "draft_proposal": [
+                                            None if token_id is None else int(token_id)
+                                            for token_id in provisional_tokens
+                                        ],
                                         "features": list(features),
                                         "action": decision.action,
                                         "reason": decision.reason,

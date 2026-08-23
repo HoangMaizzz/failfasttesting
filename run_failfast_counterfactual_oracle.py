@@ -182,6 +182,42 @@ def optional_bool(value):
     return bool(value)
 
 
+def normalized_proposal(value):
+    if isinstance(value, str):
+        value = json.loads(value)
+    return [None if token_id is None else int(token_id) for token_id in value]
+
+
+def decision_state_key(problem_id, context_len, target_len, step, draft_proposal):
+    return json.dumps(
+        [
+            int(problem_id),
+            int(context_len),
+            int(target_len),
+            int(step),
+            normalized_proposal(draft_proposal),
+        ],
+        separators=(",", ":"),
+    )
+
+
+def transition_state_fields(current):
+    if "context_len" not in current or "draft_proposal" not in current:
+        return {}
+    proposal = normalized_proposal(current["draft_proposal"])
+    return {
+        "context_len": int(current["context_len"]),
+        "draft_proposal": json.dumps(proposal),
+        "state_key": decision_state_key(
+            current["problem_id"],
+            current["context_len"],
+            current["target_len"],
+            current["step"],
+            proposal,
+        ),
+    }
+
+
 def build_transitions(snapshots, fallback_rho):
     records = []
     group_columns = ["problem_id", "round_id", "target_len"]
@@ -244,6 +280,7 @@ def build_transitions(snapshots, fallback_rho):
                 else continue_ms_per_output
             )
             record = dict(zip(group_columns, keys))
+            record.update(transition_state_fields(current))
             record.update({
                 "from_step": int(current["step"]),
                 "to_step": int(following["step"]),
@@ -310,6 +347,7 @@ def build_failfast_oracle_transitions(snapshots):
             stop_ms_per_output = stop_total_ms / max(1.0, stop_output)
             continue_ms_per_output = continue_total_ms / max(1.0, continue_output)
             record = dict(zip(group_columns, keys))
+            record.update(transition_state_fields(current))
             record.update({
                 "from_step": int(current["step"]),
                 "to_step": int(following["step"]),
