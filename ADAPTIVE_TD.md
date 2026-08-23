@@ -47,9 +47,11 @@ Q_CONTINUE(s) = theta_CONTINUE dot phi(s)
 ```
 
 The throughput reference is the ratio of online EMAs of emitted tokens and
-measured round latency. A factual `CONTINUE` transition receives immediate cost
+measured round latency. A factual action transition receives immediate cost
 `-rho * next_forward_latency_ms` and a one-step TD bootstrap from the observed
-next state. After normal verification, the selected `STOP` state receives
+next state. This includes `STOP` followed by an outer FailFast proposal
+extension, so the first extension forward pass is charged to the action that
+caused it. After normal verification, the selected terminal `STOP` state receives
 `emitted_tokens - rho * verifier_latency_ms`. Reverse factual returns propagate
 the terminal result through only the actions that were actually executed.
 
@@ -59,9 +61,11 @@ TD because it would invalidate the factual trajectory.
 
 ## Risk and exploration
 
-Each action tracks residual variance and diagonal feature precision. Mean-value
-uncertainty is estimated as residual variance multiplied by diagonal leverage,
-so it contracts as matching observations accumulate. A stop is selected only
+Each action tracks residual variance and a full 13-by-13 inverse covariance
+matrix updated online with Sherman-Morrison. Mean-value uncertainty uses the
+quadratic leverage of the current feature vector, so terminal observations do
+not incorrectly remove uncertainty from different early-stop feature
+combinations. A stop is selected only
 when its lower bound exceeds the continue upper bound plus the configured
 margin. Overlapping intervals default to continue, except for optional low-rate
 factual stop exploration. Mixed TD/return updates count each executed
@@ -73,6 +77,10 @@ The default online schedule starts stop exploration at `0.10`, decays it by
 `0.998` per eligible decision, and retains a `0.01` floor. This supplies early
 STOP outcomes during a 50-sample run while keeping exploration explicitly
 separate from learned `stop_interval_dominates` actions in the decision log.
+Before 32 factual early-stop outcomes are available, interval dominance is
+disabled and `STOP` can occur only through explicit exploration. This prevents
+the cold-start model from exploiting confidence learned mostly from mandatory
+terminal states.
 
 ## Baseline preservation
 

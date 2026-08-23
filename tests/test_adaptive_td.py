@@ -6,6 +6,7 @@ from adaptive_td import (
     AdaptiveTDConfig,
     OnlineTDRefinementController,
     build_state_features,
+    trajectory_forward_latency,
 )
 
 
@@ -33,6 +34,66 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertEqual(config.explore_epsilon, 0.10)
         self.assertEqual(config.explore_min, 0.01)
         self.assertEqual(config.explore_decay, 0.998)
+        self.assertEqual(config.early_stop_min_observations, 32)
+
+    def test_calibration_blocks_interval_exploitation_until_early_stop_data_exists(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                warmup_rounds=0,
+                early_stop_min_observations=1,
+                explore_epsilon=0.0,
+                explore_min=0.0,
+            )
+        )
+        features = synthetic_features(1, 3)
+        controller.values[STOP].theta[0] = 100.0
+        decision = controller.choose(
+            features,
+            allow_stop=True,
+            refinement_step=1,
+        )
+        self.assertEqual(decision.action, CONTINUE)
+        self.assertEqual(decision.reason, "early_stop_calibration_continue")
+        self.assertTrue(decision.calibration_active)
+
+        controller.early_stop_observations = 1
+        decision = controller.choose(
+            features,
+            allow_stop=True,
+            refinement_step=1,
+        )
+        self.assertEqual(decision.action, STOP)
+        self.assertEqual(decision.reason, "stop_interval_dominates")
+        self.assertFalse(decision.calibration_active)
+
+    def test_only_factual_early_stop_increments_calibration_count(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(update_mode="factual_return")
+        )
+        features = synthetic_features(1, 3)
+        controller.complete_trajectory(
+            [{
+                "features": features,
+                "action": STOP,
+                "reason": "factual_terminal_verification",
+                "remaining_masks": 0,
+            }],
+            emitted_tokens=1,
+            verifier_latency_ms=1.0,
+        )
+        self.assertEqual(controller.early_stop_observations, 0)
+
+        controller.complete_trajectory(
+            [{
+                "features": features,
+                "action": STOP,
+                "reason": "early_stop_calibration_exploration",
+                "remaining_masks": 2,
+            }],
+            emitted_tokens=1,
+            verifier_latency_ms=1.0,
+        )
+        self.assertEqual(controller.early_stop_observations, 1)
 
     def test_features_are_fixed_width_and_normalized(self):
         features = synthetic_features(2, 3)
@@ -137,6 +198,43 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertGreater(value.residual_variance(), 0.1)
         self.assertLess(value.risk(features), initial_risk)
 
+    def test_full_covariance_preserves_uncertainty_for_unseen_direction(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(epistemic_scale=1.0)
+        )
+        value = controller.values[STOP]
+        seen = [1.0] + [0.0] * 12
+        unseen = [0.0, 1.0] + [0.0] * 11
+        for _ in range(100):
+            value.update(seen, 0.0, rate=0.0)
+        self.assertLess(value.risk(seen), value.risk(unseen))
+
+    def test_stop_to_extension_transition_charges_next_forward(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(update_mode="td", learning_rate=0.1)
+        )
+        controller.y_ema = 1.0
+        controller.t_ema_ms = 1.0
+        current = synthetic_features(1, 3)
+        following = synthetic_features(1, 4)
+        residual = controller.observe_transition(
+            STOP,
+            current,
+            following,
+            2.0,
+        )
+        self.assertIsNotNone(residual)
+        self.assertEqual(controller.values[STOP].sample_count, 1)
+        self.assertLess(controller.values[STOP].mean(current), 0.0)
+
+    def test_trajectory_latency_includes_stop_extension_forward(self):
+        trajectory = [
+            {"action": STOP, "next_forward_latency_ms": 2.0},
+            {"action": CONTINUE, "next_forward_latency_ms": 3.0},
+            {"action": STOP, "next_forward_latency_ms": 0.0},
+        ]
+        self.assertEqual(trajectory_forward_latency(trajectory), 5.0)
+
     def test_mixed_terminal_update_counts_one_factual_observation(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(update_mode="mixed", warmup_rounds=0)
@@ -229,6 +327,7 @@ class AdaptiveTDTests(unittest.TestCase):
                 explore_min=0.05,
                 explore_decay=0.999,
                 warmup_rounds=0,
+                early_stop_min_observations=0,
                 max_refinement_steps=8,
                 seed=preferred_depth,
             )

@@ -43,6 +43,7 @@ class AdaptiveTDConfig:
     explore_min: float = 0.01
     explore_decay: float = 0.998
     warmup_rounds: int = 20
+    early_stop_min_observations: int = 32
     max_refinement_steps: int = 16
     fixed_refinement_steps: int | None = None
     force_continue: bool = False
@@ -70,6 +71,8 @@ class AdaptiveTDConfig:
             raise ValueError("fixed_refinement_steps cannot exceed max_refinement_steps")
         if self.warmup_rounds < 0:
             raise ValueError("warmup_rounds must be non-negative")
+        if self.early_stop_min_observations < 0:
+            raise ValueError("early_stop_min_observations must be non-negative")
         if not 0.0 <= self.explore_min <= self.explore_epsilon <= 1.0:
             raise ValueError("exploration rates must satisfy 0 <= min <= epsilon <= 1")
         if not 0.0 < self.explore_decay <= 1.0:
@@ -103,12 +106,19 @@ class AdaptiveDecision:
     rho_tokens_per_ms: float
     exploration_used: bool
     latency_ms: float
+    early_stop_observations: int
+    calibration_active: bool
 
 
 class _LinearActionValue:
     def __init__(self, dimension: int, config: AdaptiveTDConfig) -> None:
         self.theta = [0.0] * dimension
         self.precision = [0.0] * dimension
+        inverse_prior = 1.0 / config.uncertainty_prior
+        self.inverse_covariance = [
+            [inverse_prior if row == column else 0.0 for column in range(dimension)]
+            for row in range(dimension)
+        ]
         self.sample_count = 0
         self.residual_mean = 0.0
         self.residual_m2 = 0.0
@@ -126,10 +136,11 @@ class _LinearActionValue:
         )
 
     def risk(self, features: Sequence[float]) -> float:
-        leverage = sum(
-            value * value / (precision + self.config.uncertainty_prior)
-            for value, precision in zip(features, self.precision)
-        )
+        projected = [
+            sum(weight * value for weight, value in zip(row, features))
+            for row in self.inverse_covariance
+        ]
+        leverage = max(0.0, _dot(features, projected))
         return math.sqrt(
             max(
                 0.0,
@@ -138,6 +149,7 @@ class _LinearActionValue:
                 * leverage,
             )
         )
+
     def estimate(
         self,
         features: Sequence[float],
@@ -169,6 +181,16 @@ class _LinearActionValue:
             if count_observation:
                 self.precision[index] += value * value
         if count_observation:
+            projected = [
+                sum(weight * value for weight, value in zip(row, features))
+                for row in self.inverse_covariance
+            ]
+            denominator = max(1e-12, 1.0 + _dot(features, projected))
+            for row in range(len(self.inverse_covariance)):
+                for column in range(len(self.inverse_covariance[row])):
+                    self.inverse_covariance[row][column] -= (
+                        projected[row] * projected[column] / denominator
+                    )
             self.sample_count += 1
             delta = raw_residual - self.residual_mean
             self.residual_mean += delta / self.sample_count
@@ -189,6 +211,7 @@ class OnlineTDRefinementController:
         self.completed_rounds = 0
         self.decision_count = 0
         self.exploration_count = 0
+        self.early_stop_observations = 0
         self.forward_latency_ema_ms = None
         self.profile_samples: dict[str, list[float]] = {}
 
@@ -266,6 +289,10 @@ class OnlineTDRefinementController:
             )
         )
 
+        calibration_active = (
+            self.early_stop_observations
+            < self.config.early_stop_min_observations
+        )
         if not allow_stop:
             action, reason = CONTINUE, "provisional_proposal_unavailable"
         elif not finite_estimates:
@@ -281,6 +308,18 @@ class OnlineTDRefinementController:
             action, reason = STOP, "max_refinement_steps"
         elif self.completed_rounds < self.config.warmup_rounds:
             action, reason = CONTINUE, "warmup"
+        elif calibration_active:
+            epsilon = max(
+                self.config.explore_min,
+                self.config.explore_epsilon
+                * (self.config.explore_decay ** self.decision_count),
+            )
+            if epsilon > 0.0 and self.rng.random() < epsilon:
+                action, reason = STOP, "early_stop_calibration_exploration"
+                exploration_used = True
+                self.exploration_count += 1
+            else:
+                action, reason = CONTINUE, "early_stop_calibration_continue"
         elif stop.lower > continue_.upper + self.config.q_margin:
             action, reason = STOP, "stop_interval_dominates"
         elif continue_.lower > stop.upper + self.config.q_margin:
@@ -314,10 +353,13 @@ class OnlineTDRefinementController:
             rho_tokens_per_ms=self.rho,
             exploration_used=exploration_used,
             latency_ms=latency_ms,
+            early_stop_observations=self.early_stop_observations,
+            calibration_active=calibration_active,
         )
 
-    def observe_continue_transition(
+    def observe_transition(
         self,
+        action: str,
         features: Sequence[float],
         next_features: Sequence[float],
         forward_latency_ms: float,
@@ -336,6 +378,8 @@ class OnlineTDRefinementController:
         if self.config.update_mode not in {"td", "mixed"} or self.rho <= 0.0:
             return None
         started = time.perf_counter() if self.config.profile_overhead else None
+        if action not in self.values:
+            raise ValueError(f"Unknown action: {action}")
         future_value = self.values[CONTINUE].mean(next_features)
         if next_stop_available:
             future_value = max(
@@ -343,7 +387,7 @@ class OnlineTDRefinementController:
                 future_value,
             )
         target = -self.rho * latency_ms + future_value
-        residual = self.values[CONTINUE].update(
+        residual = self.values[action].update(
             features,
             target,
             self.config.learning_rate,
@@ -354,6 +398,22 @@ class OnlineTDRefinementController:
                 (time.perf_counter() - started) * 1000.0,
             )
         return residual
+
+    def observe_continue_transition(
+        self,
+        features: Sequence[float],
+        next_features: Sequence[float],
+        forward_latency_ms: float,
+        *,
+        next_stop_available: bool = True,
+    ) -> float | None:
+        return self.observe_transition(
+            CONTINUE,
+            features,
+            next_features,
+            forward_latency_ms,
+            next_stop_available=next_stop_available,
+        )
 
     def complete_trajectory(
         self,
@@ -372,7 +432,6 @@ class OnlineTDRefinementController:
                 + sum(
                     max(0.0, float(item.get("next_forward_latency_ms", 0.0)))
                     for item in trajectory
-                    if item.get("action") == CONTINUE
                 ),
                 1e-9,
             )
@@ -397,11 +456,10 @@ class OnlineTDRefinementController:
             if self.config.update_mode == "mixed":
                 rate *= self.config.mc_mix
             for item in reversed(trajectory):
-                if item.get("action") == CONTINUE:
-                    future_ms += max(
-                        0.0,
-                        float(item.get("next_forward_latency_ms", 0.0)),
-                    )
+                future_ms += max(
+                    0.0,
+                    float(item.get("next_forward_latency_ms", 0.0)),
+                )
                 target = float(emitted_tokens) - rho * future_ms
                 self.values[item["action"]].update(
                     item["features"],
@@ -415,6 +473,12 @@ class OnlineTDRefinementController:
                         )
                     ),
                 )
+        self.early_stop_observations += sum(
+            item.get("action") == STOP
+            and int(item.get("remaining_masks", 0)) > 0
+            and item.get("reason") != "factual_terminal_verification"
+            for item in trajectory
+        )
         if started is not None:
             self.record_profile(
                 "reverse_factual_update",
@@ -471,6 +535,8 @@ class OnlineTDRefinementController:
             "completed_rounds": self.completed_rounds,
             "decision_count": self.decision_count,
             "exploration_count": self.exploration_count,
+            "early_stop_observations": self.early_stop_observations,
+            "early_stop_min_observations": self.config.early_stop_min_observations,
             "rho_tokens_per_ms": self.rho,
             "y_ema": self.y_ema,
             "t_ema_ms": self.t_ema_ms,
@@ -479,6 +545,9 @@ class OnlineTDRefinementController:
                 action: {
                     "theta": list(value.theta),
                     "precision": list(value.precision),
+                    "inverse_covariance": [
+                        list(row) for row in value.inverse_covariance
+                    ],
                     "sample_count": value.sample_count,
                     "residual_mean": value.residual_mean,
                     "residual_variance": value.residual_variance(),
@@ -556,5 +625,4 @@ def trajectory_forward_latency(trajectory: Iterable[dict]) -> float:
     return sum(
         max(0.0, float(item.get("next_forward_latency_ms", 0.0)))
         for item in trajectory
-        if item.get("action") == CONTINUE
     )

@@ -70,6 +70,7 @@ def parse_args():
     parser.add_argument("--adaptive-explore-min", type=float, default=0.01)
     parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
     parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
+    parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
     parser.add_argument("--adaptive-use-step-feature", action="store_true")
     parser.add_argument(
         "--adaptive-use-margin-feature",
@@ -105,6 +106,8 @@ def validate_args(args):
         raise ValueError("--warmup_questions must be non-negative")
     if args.spec_len <= 0 or args.incr_len <= 0:
         raise ValueError("--spec_len and --incr_len must be positive")
+    if args.adaptive_early_stop_min_observations < 0:
+        raise ValueError("--adaptive-early-stop-min-observations must be non-negative")
     for dataset in args.datasets:
         available = DATASET_SIZES[dataset] - args.warmup_questions
         if args.num_questions > available:
@@ -141,7 +144,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_mean_uncertainty_exploration_v6",
+        "version": "online_td_v1_calibrated_full_covariance_v7",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -170,6 +173,7 @@ def metadata(args, dataset, method, problem_ids):
             "explore_min": args.adaptive_explore_min,
             "explore_decay": args.adaptive_explore_decay,
             "warmup_rounds": args.adaptive_warmup_rounds,
+            "early_stop_min_observations": args.adaptive_early_stop_min_observations,
             "use_step_feature": args.adaptive_use_step_feature,
             "use_margin_feature": args.adaptive_use_margin_feature,
             "use_stability_feature": args.adaptive_use_stability_feature,
@@ -258,6 +262,8 @@ def run_method(args, dataset, method, problem_ids):
                 "--adaptive-explore-min", str(args.adaptive_explore_min),
                 "--adaptive-explore-decay", str(args.adaptive_explore_decay),
                 "--adaptive-warmup-rounds", str(args.adaptive_warmup_rounds),
+                "--adaptive-early-stop-min-observations",
+                str(args.adaptive_early_stop_min_observations),
             ])
             if args.adaptive_log_decisions:
                 command.append("--adaptive-log-decisions")
@@ -323,6 +329,18 @@ def aggregate(rows):
             "adaptive_exploration_actions",
             pd.Series(0, index=group.index),
         )
+        adaptive_calibration_decisions = group.get(
+            "adaptive_calibration_decisions",
+            pd.Series(0, index=group.index),
+        )
+        adaptive_calibration_stop_actions = group.get(
+            "adaptive_calibration_stop_actions",
+            pd.Series(0, index=group.index),
+        )
+        adaptive_learned_stop_actions = group.get(
+            "adaptive_learned_stop_actions",
+            pd.Series(0, index=group.index),
+        )
         stop_available_decisions = group.get(
             "adaptive_stop_available_decisions",
             pd.Series(0, index=group.index),
@@ -381,6 +399,14 @@ def aggregate(rows):
             "adaptive_stop_actions": adaptive_stop_actions.sum(),
             "adaptive_stop_rate_percent": 100.0 * adaptive_stop_actions.sum() / max(1, decision_count),
             "adaptive_exploration_rate_percent": 100.0 * adaptive_exploration_actions.sum() / max(1, decision_count),
+            "adaptive_calibration_decisions": adaptive_calibration_decisions.sum(),
+            "adaptive_calibration_rate_percent": 100.0 * adaptive_calibration_decisions.sum() / max(1, decision_count),
+            "adaptive_calibration_stop_actions": adaptive_calibration_stop_actions.sum(),
+            "adaptive_learned_stop_actions": adaptive_learned_stop_actions.sum(),
+            "adaptive_early_stop_observations": group.get(
+                "adaptive_early_stop_observations",
+                pd.Series(0, index=group.index),
+            ).max(),
             "adaptive_stop_available_rate_percent": 100.0 * stop_available_decisions.sum() / max(1, decision_count),
             "adaptive_candidate_coverage_rate_percent": 100.0 * candidate_coverage_decisions.sum() / max(1, decision_count),
             "adaptive_outer_verify_eligible_rate_percent": 100.0 * outer_verify_eligible_decisions.sum() / max(1, decision_count),
@@ -477,6 +503,23 @@ def learning_curves(output_dir, datasets):
             "exploration_rate_percent": 100.0 * group[
                 "exploration_used"
             ].astype(str).str.lower().eq("true").mean(),
+            "calibration_rate_percent": 100.0 * group.get(
+                "early_stop_calibration_active",
+                pd.Series(False, index=group.index),
+            ).astype(str).str.lower().eq("true").mean(),
+            "calibration_stop_rate_percent": 100.0 * (
+                group["reason"] == "early_stop_calibration_exploration"
+            ).mean(),
+            "learned_stop_rate_percent": 100.0 * (
+                group["reason"] == "stop_interval_dominates"
+            ).mean(),
+            "early_stop_observations_max": pd.to_numeric(
+                group.get(
+                    "early_stop_observations_after_round",
+                    pd.Series(0, index=group.index),
+                ),
+                errors="coerce",
+            ).max(),
             "mean_refinement_step": group["step"].mean(),
             "mean_q_stop": group["q_stop_mean"].mean(),
             "mean_q_continue": group["q_continue_mean"].mean(),
@@ -514,6 +557,12 @@ def controller_state_reports(output_dir, datasets, methods):
                     "residual_variance": values.get("residual_variance"),
                     "rho_tokens_per_ms": state.get("rho_tokens_per_ms"),
                     "completed_rounds": state.get("completed_rounds", 0),
+                    "early_stop_observations": state.get(
+                        "early_stop_observations", 0
+                    ),
+                    "early_stop_min_observations": state.get(
+                        "early_stop_min_observations", 0
+                    ),
                 })
             for component, values in state.get("overhead", {}).items():
                 overhead_rows.append({

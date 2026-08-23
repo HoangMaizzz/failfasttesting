@@ -1142,6 +1142,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         frontier_force_stop = False
         accept_probabilities = None
         adaptive_pending_continue = None
+        adaptive_pending_stop_extension = None
         adaptive_previous_proposal = None
 
         def frontier_bin(value):
@@ -1910,6 +1911,25 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ] = transition_residual is not None
                                     adaptive_pending_continue = None
 
+                                if adaptive_pending_stop_extension is not None:
+                                    next_forward_latency_ms = float(
+                                        forward_pass_latencies[-1]
+                                    )
+                                    adaptive_pending_stop_extension[
+                                        "next_forward_latency_ms"
+                                    ] = next_forward_latency_ms
+                                    transition_residual = adaptive_controller.observe_transition(
+                                        "stop",
+                                        adaptive_pending_stop_extension["features"],
+                                        features,
+                                        next_forward_latency_ms,
+                                        next_stop_available=stop_available,
+                                    )
+                                    adaptive_pending_stop_extension[
+                                        "td_observation_counted"
+                                    ] = transition_residual is not None
+                                    adaptive_pending_stop_extension = None
+
                                 if masks_remaining > 0:
                                     decision = adaptive_controller.choose(
                                         features,
@@ -1934,6 +1954,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "q_continue_lcb": float(decision.continue_.lower),
                                         "q_continue_ucb": float(decision.continue_.upper),
                                         "exploration_used": bool(decision.exploration_used),
+                                        "early_stop_observations_before": int(
+                                            decision.early_stop_observations
+                                        ),
+                                        "early_stop_calibration_active": bool(
+                                            decision.calibration_active
+                                        ),
                                         "controller_latency_ms": float(decision.latency_ms),
                                         "completed_rounds_before": int(
                                             adaptive_controller.completed_rounds
@@ -1950,6 +1976,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     })
                                     if decision.action == "stop":
                                         stop_reason = "adaptive_td_stop"
+                                        if post_stop_outer_action == "extend":
+                                            adaptive_pending_stop_extension = adaptive_record
                                     else:
                                         adaptive_pending_continue = adaptive_record
                                 adaptive_previous_proposal = provisional_tokens

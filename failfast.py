@@ -419,6 +419,7 @@ parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.10)
 parser.add_argument("--adaptive-explore-min", type=float, default=0.01)
 parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
 parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
+parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
 parser.add_argument("--adaptive-use-step-feature", action="store_true")
 parser.add_argument(
     "--adaptive-use-margin-feature",
@@ -476,6 +477,7 @@ args.adaptive_td_controller = (
             explore_min=args.adaptive_explore_min,
             explore_decay=args.adaptive_explore_decay,
             warmup_rounds=args.adaptive_warmup_rounds,
+            early_stop_min_observations=args.adaptive_early_stop_min_observations,
             max_refinement_steps=args.adaptive_max_refinement_steps,
             fixed_refinement_steps=args.adaptive_fixed_refinement_steps,
             force_continue=args.adaptive_force_continue,
@@ -542,6 +544,10 @@ BENCHMARK_CSV_COLUMNS = [
     "adaptive_decisions",
     "adaptive_stop_actions",
     "adaptive_exploration_actions",
+    "adaptive_calibration_decisions",
+    "adaptive_calibration_stop_actions",
+    "adaptive_learned_stop_actions",
+    "adaptive_early_stop_observations",
     "adaptive_mean_refinement_step",
     "adaptive_controller_ms",
     "adaptive_rho_tokens_per_ms",
@@ -732,6 +738,27 @@ def summarize_frontier_diagnostics(stats_each_round):
         ),
         "adaptive_exploration_actions": sum(
             bool(item.get("exploration_used")) for item in adaptive_decisions
+        ),
+        "adaptive_calibration_decisions": sum(
+            bool(item.get("early_stop_calibration_active"))
+            for item in adaptive_decisions
+        ),
+        "adaptive_calibration_stop_actions": sum(
+            item.get("action") == "stop"
+            and item.get("reason") == "early_stop_calibration_exploration"
+            for item in adaptive_decisions
+        ),
+        "adaptive_learned_stop_actions": sum(
+            item.get("action") == "stop"
+            and item.get("reason") == "stop_interval_dominates"
+            for item in adaptive_decisions
+        ),
+        "adaptive_early_stop_observations": max(
+            (
+                int(item.get("early_stop_observations_after_round", 0))
+                for item in adaptive_decisions
+            ),
+            default=0,
         ),
         "adaptive_mean_refinement_step": safe_div(
             sum(float(item.get("step", 0)) for item in adaptive_decisions),
@@ -1039,6 +1066,9 @@ def record_adaptive_td_decisions(
             "high_confidence_extension_size": int(high_confidence_extension),
             "realized_post_stop_outer_action": None,
             "outer_action_matches_plan": None,
+            "early_stop_observations_after_round": int(
+                controller.early_stop_observations
+            ),
         }
         if item.get("action") == "stop":
             realized_action = (
