@@ -4,11 +4,13 @@ import math
 import random
 import time
 from dataclasses import dataclass
+from statistics import NormalDist
 from typing import Iterable, Sequence
 
 
 STOP = "stop"
 CONTINUE = "continue"
+_STANDARD_NORMAL = NormalDist()
 
 
 def _clip(value: float, low: float, high: float) -> float:
@@ -35,6 +37,7 @@ class AdaptiveTDConfig:
     update_mode: str = "mixed"
     rho_alpha: float = 0.05
     risk_beta: float = 1.0
+    stop_probability_threshold: float = 0.75
     q_margin: float = 0.0
     uncertainty_prior: float = 1.0
     epistemic_scale: float = 0.1
@@ -81,6 +84,8 @@ class AdaptiveTDConfig:
             raise ValueError("mc_mix must be in [0, 1]")
         if self.risk_beta < 0.0 or self.epistemic_scale < 0.0:
             raise ValueError("risk parameters must be non-negative")
+        if not 0.5 < self.stop_probability_threshold < 1.0:
+            raise ValueError("stop_probability_threshold must be in (0.5, 1)")
         if self.uncertainty_prior <= 0.0:
             raise ValueError("uncertainty_prior must be positive")
         if self.residual_prior_variance < 0.0:
@@ -108,6 +113,9 @@ class AdaptiveDecision:
     latency_ms: float
     early_stop_observations: int
     calibration_active: bool
+    advantage_mean: float
+    advantage_risk: float
+    stop_probability: float
 
 
 class _LinearActionValue:
@@ -205,6 +213,13 @@ class OnlineTDRefinementController:
             STOP: _LinearActionValue(config.feature_dim, config),
             CONTINUE: _LinearActionValue(config.feature_dim, config),
         }
+        self.early_stop_uncertainty = _LinearActionValue(
+            config.feature_dim,
+            config,
+        )
+        self.stop_z_threshold = _STANDARD_NORMAL.inv_cdf(
+            config.stop_probability_threshold
+        )
         self.rng = random.Random(config.seed)
         self.y_ema = None
         self.t_ema_ms = None
@@ -261,7 +276,7 @@ class OnlineTDRefinementController:
         stop = self.values[STOP].estimate(
             features,
             mean=stop_mean,
-            risk=self.values[STOP].risk(features),
+            risk=self.early_stop_uncertainty.risk(features),
         )
         continue_ = self.values[CONTINUE].estimate(
             features,
@@ -273,6 +288,23 @@ class OnlineTDRefinementController:
                 "uncertainty",
                 (time.perf_counter() - uncertainty_started) * 1000.0,
             )
+        advantage_mean = stop.mean - continue_.mean
+        advantage_risk = self.config.risk_beta * math.sqrt(
+            stop.risk * stop.risk + continue_.risk * continue_.risk
+        )
+        if advantage_risk > 0.0:
+            stop_probability = _STANDARD_NORMAL.cdf(
+                advantage_mean / advantage_risk
+            )
+        elif advantage_mean > 0.0:
+            stop_probability = 1.0
+        elif advantage_mean < 0.0:
+            stop_probability = 0.0
+        else:
+            stop_probability = 0.5
+        probability_margin = (
+            self.stop_z_threshold * advantage_risk + self.config.q_margin
+        )
         action_started = time.perf_counter() if profiling else None
         exploration_used = False
         finite_estimates = all(
@@ -286,6 +318,9 @@ class OnlineTDRefinementController:
                 continue_.risk,
                 continue_.lower,
                 continue_.upper,
+                advantage_mean,
+                advantage_risk,
+                stop_probability,
             )
         )
 
@@ -320,10 +355,10 @@ class OnlineTDRefinementController:
                 self.exploration_count += 1
             else:
                 action, reason = CONTINUE, "early_stop_calibration_continue"
-        elif stop.lower > continue_.upper + self.config.q_margin:
-            action, reason = STOP, "stop_interval_dominates"
-        elif continue_.lower > stop.upper + self.config.q_margin:
-            action, reason = CONTINUE, "continue_interval_dominates"
+        elif advantage_mean > probability_margin:
+            action, reason = STOP, "stop_probability_threshold"
+        elif -advantage_mean > probability_margin:
+            action, reason = CONTINUE, "continue_probability_threshold"
         else:
             epsilon = max(
                 self.config.explore_min,
@@ -355,6 +390,9 @@ class OnlineTDRefinementController:
             latency_ms=latency_ms,
             early_stop_observations=self.early_stop_observations,
             calibration_active=calibration_active,
+            advantage_mean=advantage_mean,
+            advantage_risk=advantage_risk,
+            stop_probability=stop_probability,
         )
 
     def observe_transition(
@@ -437,6 +475,24 @@ class OnlineTDRefinementController:
             )
             rho = max(0.0, float(emitted_tokens) / observed_future_ms)
 
+        early_stop_residuals = []
+        factual_future_ms = max(0.0, verifier_latency_ms)
+        for item in reversed(trajectory):
+            factual_future_ms += max(
+                0.0,
+                float(item.get("next_forward_latency_ms", 0.0)),
+            )
+            if (
+                item.get("action") == STOP
+                and int(item.get("remaining_masks", 0)) > 0
+                and item.get("reason") != "factual_terminal_verification"
+            ):
+                target = float(emitted_tokens) - rho * factual_future_ms
+                early_stop_residuals.append((
+                    item["features"],
+                    target - self.values[STOP].mean(item["features"]),
+                ))
+
         td_counted_items = set()
         if self.config.update_mode in {"td", "mixed"}:
             for item in reversed(trajectory):
@@ -473,12 +529,13 @@ class OnlineTDRefinementController:
                         )
                     ),
                 )
-        self.early_stop_observations += sum(
-            item.get("action") == STOP
-            and int(item.get("remaining_masks", 0)) > 0
-            and item.get("reason") != "factual_terminal_verification"
-            for item in trajectory
-        )
+        for features, residual in early_stop_residuals:
+            self.early_stop_uncertainty.update(
+                features,
+                residual,
+                rate=0.0,
+            )
+        self.early_stop_observations = self.early_stop_uncertainty.sample_count
         if started is not None:
             self.record_profile(
                 "reverse_factual_update",
@@ -537,6 +594,8 @@ class OnlineTDRefinementController:
             "exploration_count": self.exploration_count,
             "early_stop_observations": self.early_stop_observations,
             "early_stop_min_observations": self.config.early_stop_min_observations,
+            "stop_probability_threshold": self.config.stop_probability_threshold,
+            "stop_z_threshold": self.stop_z_threshold,
             "rho_tokens_per_ms": self.rho,
             "y_ema": self.y_ema,
             "t_ema_ms": self.t_ema_ms,
@@ -553,6 +612,16 @@ class OnlineTDRefinementController:
                     "residual_variance": value.residual_variance(),
                 }
                 for action, value in self.values.items()
+            },
+            "early_stop_uncertainty": {
+                "sample_count": self.early_stop_uncertainty.sample_count,
+                "residual_mean": self.early_stop_uncertainty.residual_mean,
+                "residual_variance": self.early_stop_uncertainty.residual_variance(),
+                "precision": list(self.early_stop_uncertainty.precision),
+                "inverse_covariance": [
+                    list(row)
+                    for row in self.early_stop_uncertainty.inverse_covariance
+                ],
             },
             "overhead": self.profile_summary(),
         }

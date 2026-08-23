@@ -1960,6 +1960,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "early_stop_calibration_active": bool(
                                             decision.calibration_active
                                         ),
+                                        "advantage_mean": float(
+                                            decision.advantage_mean
+                                        ),
+                                        "advantage_risk": float(
+                                            decision.advantage_risk
+                                        ),
+                                        "stop_probability": float(
+                                            decision.stop_probability
+                                        ),
                                         "controller_latency_ms": float(decision.latency_ms),
                                         "completed_rounds_before": int(
                                             adaptive_controller.completed_rounds

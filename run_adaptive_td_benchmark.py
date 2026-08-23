@@ -63,6 +63,7 @@ def parse_args():
     )
     parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
     parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
+    parser.add_argument("--adaptive-stop-probability-threshold", type=float, default=0.75)
     parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
     parser.add_argument("--adaptive-epistemic-scale", type=float, default=0.1)
     parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
@@ -108,6 +109,8 @@ def validate_args(args):
         raise ValueError("--spec_len and --incr_len must be positive")
     if args.adaptive_early_stop_min_observations < 0:
         raise ValueError("--adaptive-early-stop-min-observations must be non-negative")
+    if not 0.5 < args.adaptive_stop_probability_threshold < 1.0:
+        raise ValueError("--adaptive-stop-probability-threshold must be in (0.5, 1)")
     for dataset in args.datasets:
         available = DATASET_SIZES[dataset] - args.warmup_questions
         if args.num_questions > available:
@@ -144,7 +147,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": "online_td_v1_calibrated_full_covariance_v7",
+        "version": "online_td_v1_early_stop_probability_v8",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -166,6 +169,7 @@ def metadata(args, dataset, method, problem_ids):
             "update_mode": args.adaptive_update_mode,
             "rho_alpha": args.adaptive_rho_alpha,
             "risk_beta": args.adaptive_risk_beta,
+            "stop_probability_threshold": args.adaptive_stop_probability_threshold,
             "uncertainty_prior": args.adaptive_uncertainty_prior,
             "epistemic_scale": args.adaptive_epistemic_scale,
             "q_margin": args.adaptive_q_margin,
@@ -255,6 +259,8 @@ def run_method(args, dataset, method, problem_ids):
                 "--adaptive-update-mode", args.adaptive_update_mode,
                 "--adaptive-rho-alpha", str(args.adaptive_rho_alpha),
                 "--adaptive-risk-beta", str(args.adaptive_risk_beta),
+                "--adaptive-stop-probability-threshold",
+                str(args.adaptive_stop_probability_threshold),
                 "--adaptive-uncertainty-prior", str(args.adaptive_uncertainty_prior),
                 "--adaptive-epistemic-scale", str(args.adaptive_epistemic_scale),
                 "--adaptive-q-margin", str(args.adaptive_q_margin),
@@ -511,7 +517,7 @@ def learning_curves(output_dir, datasets):
                 group["reason"] == "early_stop_calibration_exploration"
             ).mean(),
             "learned_stop_rate_percent": 100.0 * (
-                group["reason"] == "stop_interval_dominates"
+                group["reason"] == "stop_probability_threshold"
             ).mean(),
             "early_stop_observations_max": pd.to_numeric(
                 group.get(
@@ -562,6 +568,32 @@ def controller_state_reports(output_dir, datasets, methods):
                     ),
                     "early_stop_min_observations": state.get(
                         "early_stop_min_observations", 0
+                    ),
+                    "stop_probability_threshold": state.get(
+                        "stop_probability_threshold"
+                    ),
+                })
+            early_uncertainty = state.get("early_stop_uncertainty") or {}
+            if early_uncertainty:
+                state_rows.append({
+                    "dataset": dataset,
+                    "method": method,
+                    "action": "early_stop_uncertainty",
+                    "sample_count": early_uncertainty.get("sample_count", 0),
+                    "residual_mean": early_uncertainty.get("residual_mean"),
+                    "residual_variance": early_uncertainty.get(
+                        "residual_variance"
+                    ),
+                    "rho_tokens_per_ms": state.get("rho_tokens_per_ms"),
+                    "completed_rounds": state.get("completed_rounds", 0),
+                    "early_stop_observations": state.get(
+                        "early_stop_observations", 0
+                    ),
+                    "early_stop_min_observations": state.get(
+                        "early_stop_min_observations", 0
+                    ),
+                    "stop_probability_threshold": state.get(
+                        "stop_probability_threshold"
                     ),
                 })
             for component, values in state.get("overhead", {}).items():

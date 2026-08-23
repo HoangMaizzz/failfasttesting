@@ -35,8 +35,9 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertEqual(config.explore_min, 0.01)
         self.assertEqual(config.explore_decay, 0.998)
         self.assertEqual(config.early_stop_min_observations, 32)
+        self.assertEqual(config.stop_probability_threshold, 0.75)
 
-    def test_calibration_blocks_interval_exploitation_until_early_stop_data_exists(self):
+    def test_calibration_blocks_policy_exploitation_until_early_stop_data_exists(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(
                 warmup_rounds=0,
@@ -63,8 +64,9 @@ class AdaptiveTDTests(unittest.TestCase):
             refinement_step=1,
         )
         self.assertEqual(decision.action, STOP)
-        self.assertEqual(decision.reason, "stop_interval_dominates")
+        self.assertEqual(decision.reason, "stop_probability_threshold")
         self.assertFalse(decision.calibration_active)
+        self.assertGreater(decision.stop_probability, 0.75)
 
     def test_only_factual_early_stop_increments_calibration_count(self):
         controller = OnlineTDRefinementController(
@@ -82,6 +84,7 @@ class AdaptiveTDTests(unittest.TestCase):
             verifier_latency_ms=1.0,
         )
         self.assertEqual(controller.early_stop_observations, 0)
+        self.assertEqual(controller.early_stop_uncertainty.sample_count, 0)
 
         controller.complete_trajectory(
             [{
@@ -94,6 +97,12 @@ class AdaptiveTDTests(unittest.TestCase):
             verifier_latency_ms=1.0,
         )
         self.assertEqual(controller.early_stop_observations, 1)
+        self.assertEqual(controller.early_stop_uncertainty.sample_count, 1)
+
+    def test_invalid_stop_probability_threshold_is_rejected(self):
+        for threshold in (0.5, 1.0):
+            with self.assertRaises(ValueError):
+                AdaptiveTDConfig(stop_probability_threshold=threshold)
 
     def test_features_are_fixed_width_and_normalized(self):
         features = synthetic_features(2, 3)
@@ -208,6 +217,28 @@ class AdaptiveTDTests(unittest.TestCase):
         for _ in range(100):
             value.update(seen, 0.0, rate=0.0)
         self.assertLess(value.risk(seen), value.risk(unseen))
+
+    def test_terminal_stop_residuals_do_not_control_early_stop_risk(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(epistemic_scale=1.0)
+        )
+        features = synthetic_features(1, 3)
+        for index in range(100):
+            controller.values[STOP].update(
+                features,
+                100.0 if index % 2 else -100.0,
+                rate=0.0,
+            )
+        decision = controller.choose(
+            features,
+            allow_stop=False,
+            refinement_step=1,
+        )
+        self.assertAlmostEqual(
+            decision.stop.risk,
+            controller.early_stop_uncertainty.risk(features),
+        )
+        self.assertEqual(controller.early_stop_uncertainty.sample_count, 0)
 
     def test_stop_to_extension_transition_charges_next_forward(self):
         controller = OnlineTDRefinementController(

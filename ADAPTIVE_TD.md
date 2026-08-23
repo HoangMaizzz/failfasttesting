@@ -61,23 +61,26 @@ TD because it would invalidate the factual trajectory.
 
 ## Risk and exploration
 
-Each action tracks residual variance and a full 13-by-13 inverse covariance
-matrix updated online with Sherman-Morrison. Mean-value uncertainty uses the
-quadratic leverage of the current feature vector, so terminal observations do
-not incorrectly remove uncertainty from different early-stop feature
-combinations. A stop is selected only
-when its lower bound exceeds the continue upper bound plus the configured
-margin. Overlapping intervals default to continue, except for optional low-rate
-factual stop exploration. Mixed TD/return updates count each executed
-state-action pair once in precision and residual statistics. Parameters reset
-for every `failfast.py` process and persist across samples within that dataset
-run.
+Each action value tracks a full 13-by-13 inverse covariance matrix updated
+online with Sherman-Morrison. The uncertainty used by the early-stop policy has
+separate residual and covariance statistics updated only by factual STOP actions
+executed while masks remain. Mandatory terminal STOP outcomes still train the
+shared value function, but do not inflate or contract early-stop uncertainty.
+
+After calibration, the controller forms
+`advantage = Q_STOP - Q_CONTINUE` and
+`advantage_risk = risk_beta * sqrt(stop_risk^2 + continue_risk^2)`. It selects
+STOP when `advantage > z * advantage_risk + q_margin`, where the default
+probability threshold `0.75` gives `z = 0.674`. A symmetric confident negative
+advantage selects CONTINUE. Ambiguous decisions default to continue except for
+low-rate factual exploration. Parameters reset for every `failfast.py` process
+and persist across samples within that dataset run.
 
 The default online schedule starts stop exploration at `0.10`, decays it by
 `0.998` per eligible decision, and retains a `0.01` floor. This supplies early
 STOP outcomes during a 50-sample run while keeping exploration explicitly
-separate from learned `stop_interval_dominates` actions in the decision log.
-Before 32 factual early-stop outcomes are available, interval dominance is
+separate from learned `stop_probability_threshold` actions in the decision log.
+Before 32 factual early-stop outcomes are available, probability-based stopping is
 disabled and `STOP` can occur only through explicit exploration. This prevents
 the cold-start model from exploiting confidence learned mostly from mandatory
 terminal states.

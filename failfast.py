@@ -412,6 +412,7 @@ parser.add_argument(
 )
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
 parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
+parser.add_argument("--adaptive-stop-probability-threshold", type=float, default=0.75)
 parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
 parser.add_argument("--adaptive-epistemic-scale", type=float, default=0.1)
 parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
@@ -470,6 +471,7 @@ args.adaptive_td_controller = (
             update_mode=args.adaptive_update_mode,
             rho_alpha=args.adaptive_rho_alpha,
             risk_beta=args.adaptive_risk_beta,
+            stop_probability_threshold=args.adaptive_stop_probability_threshold,
             uncertainty_prior=args.adaptive_uncertainty_prior,
             epistemic_scale=args.adaptive_epistemic_scale,
             q_margin=args.adaptive_q_margin,
@@ -750,7 +752,7 @@ def summarize_frontier_diagnostics(stats_each_round):
         ),
         "adaptive_learned_stop_actions": sum(
             item.get("action") == "stop"
-            and item.get("reason") == "stop_interval_dominates"
+            and item.get("reason") == "stop_probability_threshold"
             for item in adaptive_decisions
         ),
         "adaptive_early_stop_observations": max(
