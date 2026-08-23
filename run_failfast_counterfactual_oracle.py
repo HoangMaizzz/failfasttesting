@@ -430,12 +430,33 @@ def select_round_candidates(snapshots):
         records.append({
             "problem_id": keys[0],
             "round_id": keys[1],
-            "factual_step": factual["step"],
-            "policy_step": policy["step"],
-            "oracle_step": oracle["step"],
+            "factual_step": int(factual["step"]),
+            "policy_step": int(policy["step"]),
+            "oracle_step": int(oracle["step"]),
+            "factual_draft_passes": int(factual["draft_passes_elapsed"]),
+            "policy_draft_passes": int(policy["draft_passes_elapsed"]),
+            "oracle_draft_passes": int(oracle["draft_passes_elapsed"]),
+            "factual_target_len": int(factual["target_len"]),
+            "policy_target_len": int(policy["target_len"]),
+            "oracle_target_len": int(oracle["target_len"]),
             "factual_output_tokens": factual["emitted_len_if_stop"],
             "policy_output_tokens": policy["emitted_len_if_stop"],
             "oracle_output_tokens": oracle["emitted_len_if_stop"],
+            "factual_draft_latency_ms": factual["draft_latency_elapsed_ms"],
+            "policy_draft_latency_ms": policy["draft_latency_elapsed_ms"],
+            "oracle_draft_latency_ms": oracle["draft_latency_elapsed_ms"],
+            "factual_verify_latency_ms": factual["estimated_verify_latency_ms"],
+            "policy_verify_latency_ms": policy["estimated_verify_latency_ms"],
+            "oracle_verify_latency_ms": oracle["estimated_verify_latency_ms"],
+            "factual_post_verify_latency_ms": factual[
+                "estimated_post_verify_latency_ms"
+            ],
+            "policy_post_verify_latency_ms": policy[
+                "estimated_post_verify_latency_ms"
+            ],
+            "oracle_post_verify_latency_ms": oracle[
+                "estimated_post_verify_latency_ms"
+            ],
             "factual_latency_ms": factual["replay_total_latency_ms"],
             "policy_latency_ms": policy["replay_total_latency_ms"],
             "oracle_latency_ms": oracle["replay_total_latency_ms"],
