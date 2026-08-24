@@ -6,6 +6,7 @@ import pandas as pd
 
 from run_gsm8k_balanced_oracle_dataset import (
     balanced_quotas,
+    causal_selection_rounds,
     causal_oracle_comparison,
     completed_failfast_batch,
     pass_class,
@@ -35,9 +36,23 @@ class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
         self.assertEqual(pass_class(2), "step2")
         self.assertEqual(pass_class(3), "step3plus")
 
-    def test_problem_class_uses_median_oracle_passes(self):
+    def test_round_classes_use_refinement_step_not_total_forward_passes(self):
+        rounds = causal_selection_rounds(pd.DataFrame({
+            "selected_step": [1, 2, 3],
+            "selected_draft_passes": [2, 4, 7],
+            "physical_draft_passes": [5, 6, 8],
+        }))
+
+        self.assertEqual(
+            rounds["oracle_pass_class"].tolist(),
+            ["step1", "step2", "step3plus"],
+        )
+        self.assertEqual(rounds["oracle_draft_passes"].tolist(), [2, 4, 7])
+
+    def test_problem_class_uses_median_oracle_refinement_steps(self):
         rounds = pd.DataFrame({
             "problem_id": [1, 1, 1, 2, 2, 2],
+            "oracle_refinement_steps": [1, 2, 2, 2, 3, 4],
             "oracle_draft_passes": [1, 2, 2, 2, 3, 4],
             "factual_draft_passes": [3, 3, 3, 4, 4, 4],
         })

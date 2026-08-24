@@ -17,7 +17,7 @@ from run_failfast_counterfactual_oracle import (
 )
 
 
-VERSION = "gsm8k_balanced_failfast_causal_oracle_v4"
+VERSION = "gsm8k_balanced_failfast_causal_oracle_v5"
 PASS_CLASSES = ("step1", "step2", "step3plus")
 
 
@@ -218,29 +218,37 @@ def run_causal_oracle(args, problem_ids):
 
 def causal_selection_rounds(decisions):
     rounds = decisions.copy()
+    rounds["oracle_refinement_steps"] = pd.to_numeric(
+        rounds["selected_step"], errors="raise"
+    ).astype(int)
     rounds["oracle_draft_passes"] = pd.to_numeric(
         rounds["selected_draft_passes"], errors="raise"
     ).astype(int)
     rounds["factual_draft_passes"] = pd.to_numeric(
         rounds["physical_draft_passes"], errors="raise"
     ).astype(int)
-    rounds["oracle_pass_class"] = rounds["oracle_draft_passes"].map(pass_class)
+    rounds["oracle_pass_class"] = rounds["oracle_refinement_steps"].map(pass_class)
     return rounds
 
 
 def problem_profiles(rounds):
     profiled = rounds.copy()
-    profiled["oracle_pass_class"] = profiled["oracle_draft_passes"].map(pass_class)
+    profiled["oracle_pass_class"] = profiled["oracle_refinement_steps"].map(
+        pass_class
+    )
     records = []
     for problem_id, group in profiled.groupby("problem_id", sort=True):
         counts = group["oracle_pass_class"].value_counts()
-        median_passes = float(group["oracle_draft_passes"].median())
-        problem_class = pass_class(median_passes)
+        median_steps = float(group["oracle_refinement_steps"].median())
+        problem_class = pass_class(median_steps)
         record = {
             "problem_id": int(problem_id),
             "problem_oracle_class": problem_class,
             "num_rounds": int(len(group)),
-            "median_oracle_draft_passes": median_passes,
+            "median_oracle_refinement_steps": median_steps,
+            "mean_oracle_refinement_steps": float(
+                group["oracle_refinement_steps"].mean()
+            ),
             "mean_oracle_draft_passes": float(
                 group["oracle_draft_passes"].mean()
             ),
@@ -367,6 +375,11 @@ def distribution_summary(profiles, scope):
                 if len(group)
                 else np.nan
             ),
+            "mean_oracle_refinement_steps": (
+                float(group["mean_oracle_refinement_steps"].mean())
+                if len(group)
+                else np.nan
+            ),
         })
     return pd.DataFrame(records)
 
@@ -387,6 +400,11 @@ def round_distribution_summary(rounds, scope):
             ),
             "mean_oracle_draft_passes": (
                 float(group["oracle_draft_passes"].mean())
+                if len(group)
+                else np.nan
+            ),
+            "mean_oracle_refinement_steps": (
+                float(group["oracle_refinement_steps"].mean())
                 if len(group)
                 else np.nan
             ),
@@ -552,11 +570,12 @@ def paired_causal_comparison(failfast, causal):
 
 def causal_stop_distribution(decisions):
     profiled = decisions.copy()
-    profiled["selected_pass_class"] = profiled["selected_draft_passes"].map(
+    profiled["selected_refinement_class"] = profiled["selected_step"].map(
         pass_class
     )
-    return profiled.groupby("selected_pass_class", sort=False).agg(
+    return profiled.groupby("selected_refinement_class", sort=False).agg(
         rounds=("round_id", "size"),
+        mean_selected_refinement_steps=("selected_step", "mean"),
         mean_selected_draft_passes=("selected_draft_passes", "mean"),
         mean_candidates=("num_candidates", "mean"),
         mean_expected_emitted_tokens=("selected_expected_emitted_len", "mean"),
@@ -586,10 +605,11 @@ def manifest(args, pool_ids, selected, quotas):
         "balanced_class_quotas": quotas,
         "selection_definition": (
             "Each selected question contributes one randomly selected anchor round. "
-            "Anchor-round quotas are balanced across stopping depths actually selected "
-            "and executed by the causal oracle over the full 300-question pool: 1 is "
-            "step1, 2 is step2, and >=3 is step3plus. Questions are unique across "
-            "strata, and the complete causal-round distribution is retained."
+            "Anchor-round quotas are balanced by selected_step, the local refinement "
+            "depth at the proposal length chosen and executed by the causal oracle over "
+            "the full 300-question pool: 1 is step1, 2 is step2, and >=3 is step3plus. "
+            "Total draft forward passes remain a separate latency metric. Questions are "
+            "unique across strata, and the complete causal-round distribution is retained."
         ),
         "causal_oracle_interpretation": (
             "The causal oracle chooses an observed refinement snapshot, executes that "
