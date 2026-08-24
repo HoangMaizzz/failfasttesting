@@ -17,16 +17,18 @@ from run_gsm8k_balanced_oracle_dataset import (
 
 
 VERSION = "math_failfast_future_adjusted_greedy_oracle_v1"
+DEFAULT_BASELINE_OUTPUT_DIR = (
+    Path(__file__).resolve().parent
+    / "benchmark_references"
+    / "math_failfast8_test50"
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--baseline_output_dir",
-        default=(
-            "/content/failfasttesting/"
-            "outputs_math_feature_preliminary_test50"
-        ),
+        default=str(DEFAULT_BASELINE_OUTPUT_DIR),
     )
     parser.add_argument(
         "--output_dir",

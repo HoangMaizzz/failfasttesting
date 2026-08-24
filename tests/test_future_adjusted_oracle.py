@@ -10,6 +10,7 @@ from future_oracle import (
     select_greedy_future_adjusted_candidate,
 )
 from run_math_future_adjusted_oracle import (
+    DEFAULT_BASELINE_OUTPUT_DIR,
     build_future_cost_profile,
     posthoc_policy_upper_bound,
 )
@@ -37,6 +38,26 @@ def stats():
 
 
 class FutureAdjustedOracleTests(unittest.TestCase):
+    def test_bundled_math_baseline_contains_exact_test50(self):
+        manifest_path = DEFAULT_BASELINE_OUTPUT_DIR / "benchmark_manifest.json"
+        results_path = (
+            DEFAULT_BASELINE_OUTPUT_DIR
+            / "raw"
+            / "failfast"
+            / "benchmark_results.csv"
+        )
+        self.assertTrue(manifest_path.exists())
+        self.assertTrue(results_path.exists())
+        import json
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        results = pd.read_csv(results_path)
+        self.assertEqual(len(manifest["problem_ids"]), 50)
+        self.assertEqual(
+            set(map(int, manifest["problem_ids"])),
+            set(map(int, results["problem_id"])),
+        )
+
     def test_future_round_penalty_can_reverse_local_stop(self):
         rows = [
             candidate(0, 1, 100.0, 4),
