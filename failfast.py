@@ -35,6 +35,15 @@ from future_oracle import (
     select_greedy_future_adjusted_candidate,
     stats_for_problem,
 )
+from global_oracle import (
+    CONTINUE,
+    STOP,
+    OracleBranchRequired,
+    ScriptedOracleRefinementController,
+    analyze_stop_depth_curves,
+    solve_canonical_oracle_graph,
+    summarize_policy_path,
+)
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -414,6 +423,10 @@ parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--collect_bucket_oracle", action="store_true")
 parser.add_argument("--causal_oracle", action="store_true")
 parser.add_argument("--causal_oracle_future_cost_profile", type=str)
+parser.add_argument("--global_oracle_graph", action="store_true")
+parser.add_argument("--global_oracle_max_states", type=int, default=0)
+parser.add_argument("--global_oracle_log_interval", type=int, default=25)
+parser.add_argument("--global_oracle_epsilon_cost_ms", type=float, default=1.0)
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
 parser.add_argument(
@@ -520,7 +533,37 @@ if args.causal_oracle and (args.adaptive_td or args.frontier_stop_mode != "disab
     raise ValueError("--causal_oracle requires the unmodified FailFast drafting policy")
 if args.causal_oracle_future_cost_profile and not args.causal_oracle:
     raise ValueError("--causal_oracle_future_cost_profile requires --causal_oracle")
+if args.global_oracle_graph:
+    if args.causal_oracle or args.adaptive_td or args.frontier_stop_mode != "disabled":
+        raise ValueError(
+            "--global_oracle_graph requires unmodified FailFast without another controller"
+        )
+    if args.decoding_strategy != "greedy":
+        raise ValueError("--global_oracle_graph requires greedy decoding")
+    if args.benchmark_modes != ["dllm_ar"]:
+        raise ValueError("--global_oracle_graph requires --benchmark_modes dllm_ar")
+    if not args.collect_bucket_oracle:
+        raise ValueError("--global_oracle_graph requires --collect_bucket_oracle")
+    if args.reuse_drafts:
+        raise ValueError("--global_oracle_graph does not support --reuse_drafts")
+    if not args.disable_reusing_drafter_kvs:
+        raise ValueError(
+            "--global_oracle_graph requires --disable_reusing_drafter_kvs "
+            "so counterfactual states are replayable and path-independent"
+        )
+    if args.global_oracle_max_states < 0:
+        raise ValueError("--global_oracle_max_states must be non-negative")
+    if args.global_oracle_log_interval <= 0:
+        raise ValueError("--global_oracle_log_interval must be positive")
+    if args.global_oracle_epsilon_cost_ms < 0.0:
+        raise ValueError("--global_oracle_epsilon_cost_ms must be non-negative")
+    if args.warmup_questions:
+        raise ValueError("--global_oracle_graph does not support warmup questions")
 def build_adaptive_controller(args):
+    if args.global_oracle_graph:
+        return ScriptedOracleRefinementController(
+            max_refinement_steps=max(64, args.adaptive_max_refinement_steps),
+        )
     if not args.adaptive_td:
         return None
     if args.adaptive_controller == "dist_time_token":
@@ -1539,6 +1582,31 @@ def evaluate_oracle_proposal(
     current_token_ids,
     draft_proposal,
 ):
+    result = evaluate_oracle_proposal_tokens(
+        target_model,
+        orig_model_inputs,
+        current_token_ids,
+        draft_proposal,
+        max_append_tokens=len(draft_proposal) + 1,
+        eos_token_id=None,
+    )
+    return (
+        result["accepted_len"],
+        result["emitted_len"],
+        result["verify_latency_ms"],
+        result["post_verify_latency_ms"],
+    )
+
+
+def evaluate_oracle_proposal_tokens(
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    draft_proposal,
+    *,
+    max_append_tokens,
+    eos_token_id,
+):
     combined_ids = current_token_ids + draft_proposal
     proposal_tensor = torch.tensor(
         [combined_ids],
@@ -1570,14 +1638,659 @@ def evaluate_oracle_proposal(
     post_verify_start = time.perf_counter()
     verify_logits = oracle_outputs.logits[0, :len(draft_proposal)]
     accepted_len = 0
+    final_token = None
     for index, draft_token_id in enumerate(draft_proposal):
         target_token_id = int(torch.argmax(verify_logits[index], dim=-1).item())
         if int(draft_token_id) != target_token_id:
+            final_token = target_token_id
             break
         accepted_len += 1
+    if final_token is None:
+        final_token = int(torch.argmax(oracle_outputs.logits[0, -1, :], dim=-1).item())
+    tokens_to_append = [
+        int(token_id)
+        for token_id in draft_proposal[:accepted_len]
+    ] + [final_token]
+    if eos_token_id is not None and int(eos_token_id) in tokens_to_append:
+        eos_index = tokens_to_append.index(int(eos_token_id))
+        tokens_to_append = tokens_to_append[:eos_index + 1]
+    tokens_to_append = tokens_to_append[:max(0, int(max_append_tokens))]
     post_verify_latency_ms = (time.perf_counter() - post_verify_start) * 1000.0
     del verify_logits, oracle_outputs
-    return accepted_len, accepted_len + 1, verify_latency_ms, post_verify_latency_ms
+    return {
+        "accepted_len": min(accepted_len, len(tokens_to_append)),
+        "emitted_len": len(tokens_to_append),
+        "tokens_to_append": tokens_to_append,
+        "final_token": final_token,
+        "verify_latency_ms": verify_latency_ms,
+        "post_verify_latency_ms": post_verify_latency_ms,
+    }
+
+
+def enumerate_global_oracle_round_edges(
+    args,
+    problem_id,
+    target_model,
+    dllm,
+    orig_model_inputs,
+    current_token_ids,
+    num_target_tokens,
+    drafter_threshold,
+    lowconf_threshold,
+    max_spec_len,
+    incr_len,
+):
+    controller = args.adaptive_td_controller
+    pending_scripts = [tuple()]
+    visited_scripts = set()
+    decision_states = {}
+    edges = []
+    replay_count = 0
+    search_started = time.perf_counter()
+
+    while pending_scripts:
+        script = pending_scripts.pop()
+        if script in visited_scripts:
+            continue
+        visited_scripts.add(script)
+        replay_count += 1
+        if (
+            args.global_oracle_max_states
+            and replay_count > args.global_oracle_max_states
+        ):
+            raise RuntimeError(
+                "Exact global oracle replay limit reached; no approximate result "
+                "was written. Increase --global_oracle_max_states or set it to 0."
+            )
+        controller.set_script(script)
+        args.last_frontier_stats = None
+        transformers.set_seed(args.seed)
+        if orig_model_inputs["input_ids"].is_cuda:
+            torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+        draft_started = time.perf_counter()
+        try:
+            (
+                draft_proposal,
+                actual_spec_len,
+                num_forward_passes,
+                forward_pass_latencies,
+            ) = get_next_tokens_dllm(
+                dllm,
+                args,
+                orig_model_inputs,
+                current_token_ids,
+                spec_len=args.spec_len,
+                output_seqlen=3 * args.block_size,
+                small_block_size=args.small_block_size,
+                threshold=drafter_threshold,
+                is_drafter=True,
+                lowconf_threshold=lowconf_threshold,
+                max_spec_len=max_spec_len,
+                incr_len=incr_len,
+                last_round_rejected=None,
+            )
+        except OracleBranchRequired as required:
+            if required.decision_index != len(script):
+                raise RuntimeError("oracle replay consumed an inconsistent script")
+            decision_states[script] = {
+                "problem_id": int(problem_id),
+                "prefix_len": len(current_token_ids),
+                "script": list(script),
+                **required.state,
+            }
+            pending_scripts.append(script + (STOP,))
+            pending_scripts.append(script + (CONTINUE,))
+            continue
+        if orig_model_inputs["input_ids"].is_cuda:
+            torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+        draft_replay_wall_time_ms = (time.perf_counter() - draft_started) * 1000.0
+        if controller.script_position != len(script):
+            raise RuntimeError("oracle replay completed without consuming its script")
+        if not draft_proposal:
+            raise RuntimeError("global oracle drafter returned an empty proposal")
+
+        frontier_stats = getattr(args, "last_frontier_stats", None) or {}
+        verification = evaluate_oracle_proposal_tokens(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            [int(token_id) for token_id in draft_proposal],
+            max_append_tokens=num_target_tokens - len(current_token_ids),
+            eos_token_id=args.target_tokenizer.eos_token_id,
+        )
+        child_tokens = tuple(
+            list(current_token_ids) + verification["tokens_to_append"]
+        )
+        decision_trace = []
+        for decision in frontier_stats.get("adaptive_decisions") or []:
+            decision_trace.append({
+                "step": int(decision.get("step", 0)),
+                "target_len": int(decision.get("target_len", 0)),
+                "remaining_masks": int(decision.get("remaining_masks", 0)),
+                "newly_unmasked": int(decision.get("newly_unmasked", 0)),
+                "action": decision.get("action"),
+                "stop_available": bool(decision.get("stop_available")),
+                "outer_action_after_stop": decision.get("post_stop_outer_action"),
+                "elapsed_draft_ms": float(
+                    decision.get("oracle_elapsed_draft_ms", 0.0)
+                ),
+            })
+        extension_events = frontier_stats.get("extension_events") or []
+        verify_latency_ms = float(verification["verify_latency_ms"])
+        post_verify_latency_ms = float(verification["post_verify_latency_ms"])
+        draft_latency_ms = float(sum(forward_pass_latencies))
+        edge = {
+            "candidate_index": len(edges),
+            "state": len(current_token_ids),
+            "child_state": len(child_tokens),
+            "step": len(script),
+            "draft_passes": int(num_forward_passes),
+            "draft_latency_ms": draft_latency_ms,
+            "verify_latency_ms": verify_latency_ms,
+            "post_verify_latency_ms": post_verify_latency_ms,
+            "edge_latency_ms": (
+                draft_latency_ms + verify_latency_ms + post_verify_latency_ms
+            ),
+            "emitted_len": int(verification["emitted_len"]),
+            "accepted_len": int(verification["accepted_len"]),
+            "proposal_len": int(actual_spec_len),
+            "blocks": 1 + len(extension_events),
+            "action_script": list(script),
+            "action_script_text": "".join(
+                "S" if action == STOP else "C" for action in script
+            ),
+            "decision_trace": decision_trace,
+            "draft_proposal": [int(token_id) for token_id in draft_proposal],
+            "tokens_to_append": list(verification["tokens_to_append"]),
+            "child_tokens": child_tokens,
+            "final_token": int(verification["final_token"]),
+            "is_failfast": int(all(action == CONTINUE for action in script)),
+            "replay_forward_latency_ms": float(sum(forward_pass_latencies)),
+            "draft_replay_wall_time_ms": draft_replay_wall_time_ms,
+            "draft_non_forward_replay_ms": max(
+                0.0, draft_replay_wall_time_ms - draft_latency_ms
+            ),
+            "stop_reason": frontier_stats.get("stop_reason"),
+            "extension_events": extension_events,
+        }
+        edges.append(edge)
+
+    failfast_edges = [edge for edge in edges if edge["is_failfast"]]
+    if len(failfast_edges) != 1:
+        raise RuntimeError(
+            f"expected one all-CONTINUE FailFast replay, found {len(failfast_edges)}"
+        )
+    return {
+        "edges": edges,
+        "decision_states": decision_states,
+        "replays": replay_count,
+        "search_wall_time_ms": (time.perf_counter() - search_started) * 1000.0,
+    }
+
+
+def run_global_oracle_problem(
+    args,
+    problem_id,
+    target_model,
+    dllm,
+    orig_model_inputs,
+    num_target_tokens,
+    drafter_threshold,
+    lowconf_threshold,
+    max_spec_len,
+    incr_len,
+):
+    problem_started = time.perf_counter()
+    queue = [tuple()]
+    prefix_by_length = {0: tuple()}
+    expansions = {}
+    edges_by_state = {}
+    decision_states = {}
+    terminal_length = None
+    total_replays = 0
+    dp_calls = 0
+    memo_hits = 0
+
+    while queue:
+        prefix = queue.pop(0)
+        state = len(prefix)
+        dp_calls += 1
+        if state in expansions:
+            memo_hits += 1
+            continue
+        if terminal_length is not None and state >= terminal_length:
+            continue
+        expansion = enumerate_global_oracle_round_edges(
+            args,
+            problem_id,
+            target_model,
+            dllm,
+            orig_model_inputs,
+            list(prefix),
+            num_target_tokens,
+            drafter_threshold,
+            lowconf_threshold,
+            max_spec_len,
+            incr_len,
+        )
+        expansions[state] = expansion
+        total_replays += int(expansion["replays"])
+        state_edges = []
+        for edge in expansion["edges"]:
+            child = edge["child_tokens"]
+            child_state = len(child)
+            existing = prefix_by_length.get(child_state)
+            if existing is not None and existing != child:
+                raise RuntimeError(
+                    "Greedy lossless invariant failed: two oracle branches produced "
+                    f"different target prefixes of length {child_state}"
+                )
+            prefix_by_length[child_state] = child
+            state_edges.append(edge)
+            reached_terminal = (
+                args.target_tokenizer.eos_token_id in edge["tokens_to_append"]
+                or child_state >= num_target_tokens
+            )
+            if reached_terminal:
+                if terminal_length is None:
+                    terminal_length = child_state
+                elif terminal_length != child_state:
+                    raise RuntimeError(
+                        "oracle branches reached different greedy terminal lengths"
+                    )
+            else:
+                queue.append(child)
+        edges_by_state[state] = state_edges
+        for script, decision in expansion["decision_states"].items():
+            decision_states[(state, script)] = decision
+        if len(expansions) % args.global_oracle_log_interval == 0:
+            logging.info(
+                "[Global oracle problem %s] expanded=%s queued=%s replays=%s",
+                problem_id,
+                len(expansions),
+                len(queue),
+                total_replays,
+            )
+
+    if terminal_length is None:
+        raise RuntimeError("global oracle did not reach EOS or max_new_tokens")
+    pruned_edges = {}
+    solvable = {terminal_length}
+    for state in sorted(edges_by_state, reverse=True):
+        valid = [
+            edge for edge in edges_by_state[state]
+            if int(edge["child_state"]) in solvable
+        ]
+        if valid:
+            pruned_edges[state] = valid
+            solvable.add(state)
+    if 0 not in solvable:
+        raise RuntimeError("global oracle root cannot reach the terminal state")
+
+    solved = solve_canonical_oracle_graph(pruned_edges, terminal_length)
+    path_summaries = {
+        policy: summarize_policy_path(path)
+        for policy, path in solved["paths"].items()
+    }
+    global_path = solved["paths"]["global"]
+    failfast_path = solved["paths"]["failfast"]
+    current_token_ids = list(prefix_by_length[terminal_length])
+    if [edge["tokens_to_append"] for edge in global_path] != [
+        edge["tokens_to_append"] for edge in failfast_path
+    ]:
+        global_output = [token for edge in global_path for token in edge["tokens_to_append"]]
+        failfast_output = [token for edge in failfast_path for token in edge["tokens_to_append"]]
+        if global_output != failfast_output:
+            raise RuntimeError("global and FailFast paths did not reproduce identical output")
+
+    optimal_states = {int(edge["state"]) for edge in global_path}
+    failfast_states = {int(edge["state"]) for edge in failfast_path}
+    node_rows = []
+
+    def suffix_path(state):
+        path = []
+        current = int(state)
+        while current != terminal_length:
+            edge = solved["policies"]["global"][current]
+            path.append(edge)
+            current = int(edge["child_state"])
+        return path
+
+    def controllable_decision(edge, index):
+        decisions = [
+            item for item in edge["decision_trace"]
+            if item.get("stop_available")
+        ]
+        return decisions[index] if index < len(decisions) else {}
+
+    for (state, script), decision in sorted(
+        decision_states.items(), key=lambda item: (item[0][0], item[0][1])
+    ):
+        edges = pruned_edges.get(state, [])
+        action_values = {}
+        action_edges = {}
+        for action in (STOP, CONTINUE):
+            prefix_script = script + (action,)
+            candidates = [
+                edge for edge in edges
+                if tuple(edge["action_script"][:len(prefix_script)]) == prefix_script
+            ]
+            if not candidates:
+                continue
+            best_edge = min(
+                candidates,
+                key=lambda edge: (
+                    float(edge["edge_latency_ms"])
+                    + solved["values"]["global"][int(edge["child_state"])],
+                    int(edge["draft_passes"]),
+                ),
+            )
+            action_edges[action] = best_edge
+            action_values[action] = (
+                float(best_edge["edge_latency_ms"])
+                + solved["values"]["global"][int(best_edge["child_state"])]
+            )
+        if STOP not in action_values or CONTINUE not in action_values:
+            continue
+        global_action = min(action_values, key=action_values.get)
+        stop_edge = action_edges[STOP]
+        continue_edge = action_edges[CONTINUE]
+        stop_immediate = float(stop_edge["edge_latency_ms"]) / max(
+            1, int(stop_edge["emitted_len"])
+        )
+        continue_immediate = float(continue_edge["edge_latency_ms"]) / max(
+            1, int(continue_edge["emitted_len"])
+        )
+        myopic_action = STOP if stop_immediate <= continue_immediate else CONTINUE
+        delayed = global_action == CONTINUE and myopic_action == STOP
+        target_len = int(decision.get("proposal_length", 0))
+        stop_suffix = suffix_path(stop_edge["child_state"])
+        continue_suffix = suffix_path(continue_edge["child_state"])
+        stop_decision = controllable_decision(stop_edge, len(script))
+        continue_outer_action = (
+            "extend"
+            if any(
+                int(event.get("from_len", -1)) == target_len
+                for event in continue_edge.get("extension_events", [])
+            )
+            else "verify"
+        )
+        block_start = len(script)
+        while block_start > 0:
+            parent_script = script[:block_start - 1]
+            parent_state = decision_states.get((state, parent_script))
+            if (
+                parent_state is None
+                or int(parent_state.get("proposal_length", 0)) != target_len
+            ):
+                break
+            block_start -= 1
+        block_key = "".join(
+            "S" if action == STOP else "C" for action in script[:block_start]
+        )
+        row = {
+            "problem_id": int(problem_id),
+            "prefix_len": int(state),
+            "script": "".join("S" if x == STOP else "C" for x in script),
+            "decision_index": len(script),
+            "refinement_step": int(decision.get("refinement_step", 0)),
+            "target_len": target_len,
+            "block_id": max(0, (target_len - 1) // max(1, int(incr_len))),
+            "block_key": block_key,
+            "stop_global_cost_ms": action_values[STOP],
+            "continue_global_cost_ms": action_values[CONTINUE],
+            "stop_immediate_ms_per_token": stop_immediate,
+            "continue_immediate_ms_per_token": continue_immediate,
+            "global_action": global_action,
+            "myopic_action": myopic_action,
+            "global_myopic_disagree": int(global_action != myopic_action),
+            "delayed_benefit": int(delayed),
+            "global_regret_if_myopic_ms": (
+                action_values[myopic_action] - action_values[global_action]
+            ),
+            "on_global_prefix": int(state in optimal_states),
+            "on_failfast_prefix": int(state in failfast_states),
+            "outer_action_if_stop": stop_decision.get(
+                "outer_action_after_stop"
+            ),
+            "outer_action_after_natural_continue": continue_outer_action,
+            "stop_accepted_tokens": int(stop_edge["accepted_len"]),
+            "continue_accepted_tokens": int(continue_edge["accepted_len"]),
+            "stop_emitted_tokens": int(stop_edge["emitted_len"]),
+            "continue_emitted_tokens": int(continue_edge["emitted_len"]),
+            "stop_draft_passes": int(stop_edge["draft_passes"]),
+            "continue_draft_passes": int(continue_edge["draft_passes"]),
+            "stop_future_verifier_calls": 1 + len(stop_suffix),
+            "continue_future_verifier_calls": 1 + len(continue_suffix),
+            "natural_termination": 0,
+        }
+        node_rows.append(row)
+
+    curve_groups = {}
+    for row in node_rows:
+        curve_groups.setdefault(
+            (row["prefix_len"], row["block_key"], row["target_len"]), []
+        ).append(row)
+    natural_rows = []
+    for (_, _, _), rows in curve_groups.items():
+        last = max(rows, key=lambda item: item["refinement_step"])
+        next_script = last["script"] + "C"
+        same_block_continuation = any(
+            row["script"] == next_script
+            and row["target_len"] == last["target_len"]
+            for row in rows
+        )
+        if same_block_continuation:
+            continue
+        natural_rows.append({
+            **last,
+            "script": next_script,
+            "decision_index": int(last["decision_index"]) + 1,
+            "refinement_step": int(last["refinement_step"]) + 1,
+            "stop_global_cost_ms": float(last["continue_global_cost_ms"]),
+            "continue_global_cost_ms": math.inf,
+            "stop_immediate_ms_per_token": float(
+                last["continue_immediate_ms_per_token"]
+            ),
+            "continue_immediate_ms_per_token": math.inf,
+            "global_action": STOP,
+            "myopic_action": STOP,
+            "global_myopic_disagree": 0,
+            "delayed_benefit": 0,
+            "global_regret_if_myopic_ms": 0.0,
+            "stop_accepted_tokens": int(last["continue_accepted_tokens"]),
+            "stop_emitted_tokens": int(last["continue_emitted_tokens"]),
+            "stop_draft_passes": int(last["continue_draft_passes"]),
+            "stop_future_verifier_calls": int(
+                last["continue_future_verifier_calls"]
+            ),
+            "outer_action_if_stop": last[
+                "outer_action_after_natural_continue"
+            ],
+            "natural_termination": 1,
+        })
+    node_rows.extend(natural_rows)
+    node_rows, delayed_rows, patience_rows = analyze_stop_depth_curves(
+        node_rows,
+        args.global_oracle_epsilon_cost_ms,
+    )
+    for row in delayed_rows:
+        row["problem_id"] = int(problem_id)
+    for row in patience_rows:
+        row["problem_id"] = int(problem_id)
+
+    def public_edge(edge, policy=None, round_id=None):
+        return {
+            key: (
+                json.dumps(value)
+                if isinstance(value, (list, tuple, dict))
+                else value
+            )
+            for key, value in {
+                **edge,
+                "policy": policy,
+                "round_id": round_id,
+            }.items()
+            if key not in {"child_tokens"}
+        }
+
+    edge_rows = [
+        public_edge(edge)
+        for state in sorted(pruned_edges)
+        for edge in pruned_edges[state]
+    ]
+    optimal_rounds = [
+        public_edge(edge, "global", round_id)
+        for round_id, edge in enumerate(global_path)
+    ]
+    failfast_trace = [
+        public_edge(edge, "failfast", round_id)
+        for round_id, edge in enumerate(failfast_path)
+    ]
+    optimal_trace = []
+    for round_id, edge in enumerate(global_path):
+        previous_elapsed_ms = 0.0
+        child_future_ms = solved["values"]["global"][int(edge["child_state"])]
+        for decision_id, decision in enumerate(edge["decision_trace"]):
+            elapsed_ms = float(decision.get("elapsed_draft_ms", previous_elapsed_ms))
+            optimal_trace.append({
+                "problem_id": int(problem_id),
+                "round_id": round_id,
+                "prefix_len": int(edge["state"]),
+                "block_id": max(
+                    0,
+                    (int(decision.get("target_len", 0)) - 1)
+                    // max(1, int(incr_len)),
+                ),
+                "decision_id": decision_id,
+                "refinement_step": int(decision.get("step", 0)),
+                "remaining_masks": int(decision.get("remaining_masks", 0)),
+                "newly_committed_tokens": int(decision.get("newly_unmasked", 0)),
+                "action": decision.get("action"),
+                "outer_decision_after_stop": decision.get(
+                    "outer_action_after_stop"
+                ),
+                "cumulative_proposal_length": int(
+                    decision.get("target_len", 0)
+                ),
+                "next_state_type": (
+                    "outer" if decision.get("action") == STOP else "inner"
+                ),
+                "branch_immediate_latency_ms": max(
+                    0.0, elapsed_ms - previous_elapsed_ms
+                ),
+                "global_cost_to_go_ms": max(
+                    0.0,
+                    float(edge["edge_latency_ms"]) - elapsed_ms + child_future_ms,
+                ),
+                "optimal_future_verifier_calls": 1 + len(
+                    suffix_path(edge["child_state"])
+                ),
+                "optimal_future_dllm_forwards": int(edge["draft_passes"]) + sum(
+                    int(item["draft_passes"])
+                    for item in suffix_path(edge["child_state"])
+                ),
+            })
+            previous_elapsed_ms = elapsed_ms
+    search_wall_time_ms = (time.perf_counter() - problem_started) * 1000.0
+    global_summary = path_summaries["global"]
+    failfast_summary = path_summaries["failfast"]
+    summary_row = {
+        "problem_id": int(problem_id),
+        "generated_tokens": terminal_length,
+        "output_token_hash": token_sequence_hash(current_token_ids),
+        "baseline_total_latency_ms": failfast_summary["total_latency_ms"],
+        "oracle_optimal_latency_ms": global_summary["total_latency_ms"],
+        "oracle_speedup": safe_div(
+            failfast_summary["total_latency_ms"],
+            global_summary["total_latency_ms"],
+        ),
+        "baseline_dllm_forwards": failfast_summary["draft_passes"],
+        "oracle_dllm_forwards": global_summary["draft_passes"],
+        "baseline_verifier_calls": failfast_summary["rounds"],
+        "oracle_verifier_calls": global_summary["rounds"],
+        "baseline_blocks": sum(int(edge["blocks"]) for edge in failfast_path),
+        "oracle_blocks": sum(int(edge["blocks"]) for edge in global_path),
+        "baseline_rounds": failfast_summary["rounds"],
+        "oracle_rounds": global_summary["rounds"],
+        "baseline_tokens_per_second": safe_div(
+            terminal_length * 1000.0, failfast_summary["total_latency_ms"]
+        ),
+        "oracle_tokens_per_second": safe_div(
+            terminal_length * 1000.0, global_summary["total_latency_ms"]
+        ),
+        "oracle_search_wall_time_ms": search_wall_time_ms,
+        "unique_dp_states": len(pruned_edges) + 1,
+        "dp_calls": dp_calls,
+        "memo_hits": memo_hits,
+        "memo_hit_rate": safe_div(memo_hits, dp_calls),
+        "oracle_replays": total_replays,
+        "num_delayed_benefit_blocks": len({
+            (row["prefix_len"], row["block_key"]) for row in delayed_rows
+        }),
+        "num_local_minimum_traps": len(delayed_rows),
+        "num_local_minima": sum(
+            int(row["is_local_minimum"]) for row in node_rows
+        ),
+        "patience1_failures": sum(
+            row["patience"] == 1 and row["would_fail"] for row in patience_rows
+        ),
+        "patience2_failures": sum(
+            row["patience"] == 2 and row["would_fail"] for row in patience_rows
+        ),
+        "patience3_failures": sum(
+            row["patience"] == 3 and row["would_fail"] for row in patience_rows
+        ),
+        "global_never_slower_validation": int(
+            global_summary["total_latency_ms"]
+            <= failfast_summary["total_latency_ms"] + 1e-6
+        ),
+        "cache_mode": "disabled_path_independent_replay",
+    }
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    for filename, rows in (
+        ("global_oracle_edges.csv", edge_rows),
+        ("global_oracle_nodes.csv", node_rows),
+        ("global_oracle_block_curves.csv", node_rows),
+        ("global_oracle_delayed_benefit_events.csv", delayed_rows),
+        ("global_oracle_patience_analysis.csv", patience_rows),
+        ("global_oracle_optimal_trace.csv", optimal_trace),
+        ("global_oracle_optimal_rounds.csv", optimal_rounds),
+        ("global_oracle_failfast_trace.csv", failfast_trace),
+        ("global_oracle_problem_summary.csv", [summary_row]),
+    ):
+        if rows:
+            columns = sorted({key for row in rows for key in row})
+            append_csv_rows(os.path.join(args.output_dir, filename), columns, rows)
+
+    stats_each_round = []
+    for edge in global_path:
+        stats_each_round.append({
+            "target_tokens": edge["tokens_to_append"],
+            "prefix_len": int(edge["state"]),
+            "spec_len": int(edge["proposal_len"]),
+            "~draft_proposal": edge["draft_proposal"],
+            "accepted_len": int(edge["accepted_len"]),
+            "acceptance_rate": safe_div(
+                edge["accepted_len"], edge["proposal_len"]
+            ),
+            "num_forward_passes": int(edge["draft_passes"]),
+            "draft_time_ms": float(edge["draft_latency_ms"]),
+            "verify_time_ms": float(edge["verify_latency_ms"]),
+            "post_verify_time_ms": float(edge["post_verify_latency_ms"]),
+            "final_token": int(edge["final_token"]),
+            "bonus_token": None,
+            "emitted_tokens": edge["tokens_to_append"],
+            "frontier_stats": None,
+        })
+    return {
+        "current_token_ids": current_token_ids,
+        "stats_each_round": stats_each_round,
+        "summary": summary_row,
+        "global": global_summary,
+        "failfast": failfast_summary,
+    }
 
 
 def choose_causal_oracle_proposal(
@@ -2078,7 +2791,34 @@ for problem_id, is_warmup in tqdm(
                     inner_bar = tqdm(total=num_target_tokens, miniters=1, desc=f"Verification (Problem {problem_id})",
                                     position=1, leave=True, dynamic_ncols=False, file=sys.stdout)
 
-                while len(current_token_ids) < num_target_tokens:
+                global_oracle_result = None
+                if args.global_oracle_graph:
+                    global_oracle_result = run_global_oracle_problem(
+                        args,
+                        problem_id,
+                        target_model,
+                        dllm,
+                        orig_model_inputs,
+                        num_target_tokens,
+                        drafter_threshold,
+                        lowconf_threshold,
+                        max_spec_len,
+                        incr_len,
+                    )
+                    current_token_ids = global_oracle_result["current_token_ids"]
+                    pickled_data["stats_each_round"] = global_oracle_result[
+                        "stats_each_round"
+                    ]
+                    global_stats = global_oracle_result["global"]
+                    draft_time_total = global_stats["draft_latency_ms"] / 1000.0
+                    verify_time_total = global_stats["verify_latency_ms"] / 1000.0
+                    post_verify_time_total = (
+                        global_stats["post_verify_latency_ms"] / 1000.0
+                    )
+                    total_num_forward_passes = int(global_stats["draft_passes"])
+                    num_speculation_rounds = int(global_stats["rounds"])
+
+                while not args.global_oracle_graph and len(current_token_ids) < num_target_tokens:
                     logging.debug(f"--- [{drafter_name}_{freq_scheme}] Speculation round {num_speculation_rounds} ---")
 
                     if orig_model_inputs["input_ids"].is_cuda:
@@ -2579,11 +3319,16 @@ for problem_id, is_warmup in tqdm(
 
             if orig_model_inputs["input_ids"].is_cuda:
                 torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
-            actual_e2e_time = (
-                time.perf_counter()
-                - generation_start
-                - oracle_diagnostic_time_total
-            )
+            if args.global_oracle_graph:
+                actual_e2e_time = (
+                    global_oracle_result["global"]["total_latency_ms"] / 1000.0
+                )
+            else:
+                actual_e2e_time = (
+                    time.perf_counter()
+                    - generation_start
+                    - oracle_diagnostic_time_total
+                )
 
             if inner_bar is not None:
                 inner_bar.close()
@@ -2669,7 +3414,7 @@ for problem_id, is_warmup in tqdm(
             frontier_stop_enabled(args)
             or args.collect_draft_diagnostics
             or args.collect_bucket_oracle
-        ):
+        ) and not args.global_oracle_graph:
             append_frontier_diagnostic_rows(
                 args,
                 problem_id,

@@ -1100,7 +1100,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         prefill_output = None
         conf_of_unmasked_tokens = []
         frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
-        adaptive_enabled = bool(getattr(args, "adaptive_td", False)) if args is not None else False
+        adaptive_enabled = bool(
+            getattr(args, "adaptive_td", False)
+            or getattr(args, "global_oracle_graph", False)
+        ) if args is not None else False
         adaptive_controller = getattr(args, "adaptive_td_controller", None) if adaptive_enabled else None
         frontier_stats = {
             "enabled": bool(return_frontier_stats),
