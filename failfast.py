@@ -30,6 +30,11 @@ from distributional_controller import (
 )
 from bucket_renewal import position_bucket
 from causal_oracle_utils import prepare_causal_oracle_snapshots
+from future_oracle import (
+    load_future_cost_profile,
+    select_greedy_future_adjusted_candidate,
+    stats_for_problem,
+)
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -408,6 +413,7 @@ parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--collect_bucket_oracle", action="store_true")
 parser.add_argument("--causal_oracle", action="store_true")
+parser.add_argument("--causal_oracle_future_cost_profile", type=str)
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
 parser.add_argument(
@@ -512,6 +518,8 @@ if args.causal_oracle and not args.collect_bucket_oracle:
     raise ValueError("--causal_oracle requires --collect_bucket_oracle")
 if args.causal_oracle and (args.adaptive_td or args.frontier_stop_mode != "disabled"):
     raise ValueError("--causal_oracle requires the unmodified FailFast drafting policy")
+if args.causal_oracle_future_cost_profile and not args.causal_oracle:
+    raise ValueError("--causal_oracle_future_cost_profile requires --causal_oracle")
 def build_adaptive_controller(args):
     if not args.adaptive_td:
         return None
@@ -772,6 +780,14 @@ CAUSAL_ORACLE_CANDIDATE_COLUMNS = [
     "counterfactual_accept_check_latency_ms",
     "counterfactual_total_latency_ms",
     "counterfactual_ms_per_output_token",
+    "future_reference_emitted_len",
+    "future_token_deficit",
+    "expected_extra_verifier_rounds",
+    "future_draft_penalty_ms",
+    "future_verify_penalty_ms",
+    "future_post_verify_penalty_ms",
+    "future_round_penalty_ms",
+    "adjusted_counterfactual_total_latency_ms",
     "oracle_action",
     "selected",
 ]
@@ -795,6 +811,17 @@ CAUSAL_ORACLE_DECISION_COLUMNS = [
     "selected_counterfactual_verify_latency_ms",
     "selected_counterfactual_accept_check_latency_ms",
     "selected_counterfactual_ms_per_output_token",
+    "oracle_cost_model",
+    "profile_tokens_per_round",
+    "profile_draft_ms_per_round",
+    "profile_verify_ms_per_round",
+    "profile_post_verify_ms_per_round",
+    "selected_expected_extra_verifier_rounds",
+    "selected_future_draft_penalty_ms",
+    "selected_future_verify_penalty_ms",
+    "selected_future_post_verify_penalty_ms",
+    "selected_future_round_penalty_ms",
+    "selected_adjusted_counterfactual_total_latency_ms",
     "oracle_action_trace",
     "physical_draft_passes",
     "physical_draft_latency_ms",
@@ -1622,41 +1649,64 @@ def choose_causal_oracle_proposal(
             "_proposal": proposal,
         })
     probe_wall_time_ms = (time.perf_counter() - probe_start) * 1000.0
-    selected = min(
-        rows,
-        key=lambda row: (
-            row["counterfactual_ms_per_output_token"],
-            row["draft_passes_elapsed"],
-            row["target_len"],
-        ),
-    )
-    selected["selected"] = True
-    selected_passes = int(selected["draft_passes_elapsed"])
-    action_trace = []
-    stop_recorded = False
-    for row in sorted(
-        rows,
-        key=lambda item: (
-            item["draft_passes_elapsed"],
-            item["target_len"],
-            item["candidate_index"],
-        ),
-    ):
-        if row is selected:
-            action = "stop"
-            stop_recorded = True
-        elif not stop_recorded and row["draft_passes_elapsed"] < selected_passes:
-            action = "continue"
-        else:
-            action = "not_reached"
-        row["oracle_action"] = action
-        if action != "not_reached":
-            action_trace.append({
-                "candidate_index": int(row["candidate_index"]),
-                "draft_passes": int(row["draft_passes_elapsed"]),
-                "target_len": int(row["target_len"]),
-                "action": action,
-            })
+    if args.causal_oracle_future_cost_profile:
+        if not hasattr(args, "causal_oracle_loaded_future_cost_profile"):
+            args.causal_oracle_loaded_future_cost_profile = load_future_cost_profile(
+                args.causal_oracle_future_cost_profile
+            )
+        future_stats = stats_for_problem(
+            args.causal_oracle_loaded_future_cost_profile,
+            problem_id,
+        )
+        selected, action_trace = select_greedy_future_adjusted_candidate(
+            rows,
+            future_stats,
+        )
+        selected["_oracle_cost_model"] = "failfast_future_round_adjusted_greedy"
+        selected["_future_stats"] = future_stats
+    else:
+        selected = min(
+            rows,
+            key=lambda row: (
+                row["counterfactual_ms_per_output_token"],
+                row["draft_passes_elapsed"],
+                row["target_len"],
+            ),
+        )
+        selected["selected"] = True
+        selected_passes = int(selected["draft_passes_elapsed"])
+        action_trace = []
+        stop_recorded = False
+        for row in sorted(
+            rows,
+            key=lambda item: (
+                item["draft_passes_elapsed"],
+                item["target_len"],
+                item["candidate_index"],
+            ),
+        ):
+            if row is selected:
+                action = "stop"
+                stop_recorded = True
+            elif not stop_recorded and row["draft_passes_elapsed"] < selected_passes:
+                action = "continue"
+            else:
+                action = "not_reached"
+            row["oracle_action"] = action
+            if action != "not_reached":
+                action_trace.append({
+                    "candidate_index": int(row["candidate_index"]),
+                    "draft_passes": int(row["draft_passes_elapsed"]),
+                    "target_len": int(row["target_len"]),
+                    "action": action,
+                })
+        selected["_oracle_cost_model"] = "local_ms_per_output_token"
+        selected["_future_stats"] = {
+            "tokens_per_round": 0.0,
+            "draft_ms_per_round": 0.0,
+            "verify_ms_per_round": 0.0,
+            "post_verify_ms_per_round": 0.0,
+        }
     selected["_action_trace"] = action_trace
     selected["_num_candidates"] = len(rows)
     selected["_snapshot_fallback_used"] = int(fallback_used)
@@ -2198,6 +2248,40 @@ for problem_id, is_warmup in tqdm(
                             "selected_counterfactual_ms_per_output_token": selected[
                                 "counterfactual_ms_per_output_token"
                             ],
+                            "oracle_cost_model": selected["_oracle_cost_model"],
+                            "profile_tokens_per_round": selected["_future_stats"][
+                                "tokens_per_round"
+                            ],
+                            "profile_draft_ms_per_round": selected["_future_stats"][
+                                "draft_ms_per_round"
+                            ],
+                            "profile_verify_ms_per_round": selected["_future_stats"][
+                                "verify_ms_per_round"
+                            ],
+                            "profile_post_verify_ms_per_round": selected[
+                                "_future_stats"
+                            ]["post_verify_ms_per_round"],
+                            "selected_expected_extra_verifier_rounds": selected.get(
+                                "expected_extra_verifier_rounds", 0.0
+                            ),
+                            "selected_future_draft_penalty_ms": selected.get(
+                                "future_draft_penalty_ms", 0.0
+                            ),
+                            "selected_future_verify_penalty_ms": selected.get(
+                                "future_verify_penalty_ms", 0.0
+                            ),
+                            "selected_future_post_verify_penalty_ms": selected.get(
+                                "future_post_verify_penalty_ms", 0.0
+                            ),
+                            "selected_future_round_penalty_ms": selected.get(
+                                "future_round_penalty_ms", 0.0
+                            ),
+                            "selected_adjusted_counterfactual_total_latency_ms": (
+                                selected.get(
+                                    "adjusted_counterfactual_total_latency_ms",
+                                    selected["counterfactual_total_latency_ms"],
+                                )
+                            ),
                             "oracle_action_trace": json.dumps(
                                 selected["_action_trace"]
                             ),
