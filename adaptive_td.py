@@ -11,6 +11,21 @@ from typing import Iterable, Sequence
 STOP = "stop"
 CONTINUE = "continue"
 _STANDARD_NORMAL = NormalDist()
+FEATURE_NAMES = (
+    "bias",
+    "remaining_mask_ratio",
+    "newly_unmasked_ratio",
+    "mean_confidence",
+    "min_confidence",
+    "max_confidence",
+    "confidence_std",
+    "mean_margin",
+    "first_mask_ratio",
+    "frontier_ratio",
+    "proposal_change_ratio",
+    "recoverable_change_ratio",
+    "refinement_step",
+)
 
 
 def _clip(value: float, low: float, high: float) -> float:
@@ -58,6 +73,7 @@ class AdaptiveTDConfig:
     max_importance_weight: float = 5.0
     full_stream_bootstrap: bool = False
     reverse_backup: bool = False
+    disabled_features: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -103,6 +119,13 @@ class AdaptiveTDConfig:
             raise ValueError("min_action_probability must be in (0, 0.5]")
         if self.max_importance_weight < 1.0:
             raise ValueError("max_importance_weight must be at least 1")
+        unknown_features = set(self.disabled_features).difference(FEATURE_NAMES)
+        if unknown_features:
+            raise ValueError(
+                f"unknown disabled features: {sorted(unknown_features)}"
+            )
+        if "bias" in self.disabled_features:
+            raise ValueError("bias cannot be disabled")
 
 
 @dataclass(frozen=True)
@@ -296,6 +319,7 @@ class OnlineTDRefinementController:
     def build_features(self, **state) -> tuple[float, ...]:
         return build_state_features(
             max_refinement_steps=self.config.max_refinement_steps,
+            disabled_features=self.config.disabled_features,
             **state,
         )
 
@@ -832,6 +856,7 @@ class OnlineTDRefinementController:
             "policy_mode": self.config.policy_mode,
             "min_action_probability": self.config.min_action_probability,
             "max_importance_weight": self.config.max_importance_weight,
+            "disabled_features": list(self.config.disabled_features),
             "rho_tokens_per_ms": self.rho,
             "y_ema": self.y_ema,
             "t_ema_ms": self.t_ema_ms,
@@ -983,6 +1008,7 @@ def build_state_features(
     use_margin: bool = True,
     use_stability: bool = True,
     use_step: bool = True,
+    disabled_features: Sequence[str] = (),
 ) -> tuple[float, ...]:
     length = max(1, int(proposal_length))
     confidences = [_clip(value, 0.0, 1.0) for value in recoverable_confidences]
@@ -1013,7 +1039,7 @@ def build_state_features(
         if use_step
         else 0.0
     )
-    return (
+    features = [
         1.0,
         _clip(remaining_masks / length, 0.0, 1.0),
         _clip(newly_unmasked / length, 0.0, 1.0),
@@ -1027,7 +1053,12 @@ def build_state_features(
         _clip(proposal_change_ratio, 0.0, 1.0) if use_stability else 0.0,
         _clip(recoverable_change_ratio, 0.0, 1.0) if use_stability else 0.0,
         step_feature,
-    )
+    ]
+    disabled = set(disabled_features)
+    for index, name in enumerate(FEATURE_NAMES):
+        if name in disabled:
+            features[index] = 0.0
+    return tuple(features)
 
 
 def trajectory_forward_latency(trajectory: Iterable[dict]) -> float:

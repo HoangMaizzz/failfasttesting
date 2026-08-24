@@ -1,6 +1,7 @@
 import unittest
 
 from adaptive_td import (
+    FEATURE_NAMES,
     CONTINUE,
     STOP,
     AdaptiveTDConfig,
@@ -148,6 +149,31 @@ class AdaptiveTDTests(unittest.TestCase):
         features = synthetic_features(2, 3)
         self.assertEqual(len(features), 13)
         self.assertTrue(all(0.0 <= value <= 1.0 for value in features))
+
+    def test_disabled_features_are_zeroed_without_changing_width(self):
+        disabled = ("mean_confidence", "frontier_ratio", "refinement_step")
+        features = build_state_features(
+            proposal_length=8,
+            remaining_masks=4,
+            newly_unmasked=4,
+            recoverable_confidences=[0.2, 0.4, 0.6, 0.8],
+            recoverable_margins=[0.1, 0.2, 0.3, 0.4],
+            first_remaining_position=4,
+            frontier_length=5,
+            proposal_change_ratio=0.25,
+            recoverable_change_ratio=0.5,
+            refinement_step=2,
+            max_refinement_steps=16,
+            disabled_features=disabled,
+        )
+        self.assertEqual(len(features), len(FEATURE_NAMES))
+        for name in disabled:
+            self.assertEqual(features[FEATURE_NAMES.index(name)], 0.0)
+        self.assertGreater(features[FEATURE_NAMES.index("mean_margin")], 0.0)
+
+    def test_bias_cannot_be_disabled(self):
+        with self.assertRaises(ValueError):
+            AdaptiveTDConfig(disabled_features=("bias",))
 
     def test_cold_start_and_force_continue_preserve_baseline_action(self):
         features = synthetic_features(1, 3)

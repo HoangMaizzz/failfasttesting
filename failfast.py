@@ -19,7 +19,11 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
+from adaptive_td import (
+    FEATURE_NAMES,
+    AdaptiveTDConfig,
+    OnlineTDRefinementController,
+)
 from distributional_controller import (
     DistributionalControllerConfig,
     DistributionalTimeTokenController,
@@ -441,6 +445,12 @@ parser.add_argument("--adaptive-min-action-probability", type=float, default=0.1
 parser.add_argument("--adaptive-max-importance-weight", type=float, default=5.0)
 parser.add_argument("--adaptive-use-step-feature", action="store_true")
 parser.add_argument(
+    "--adaptive-disable-features",
+    nargs="*",
+    choices=FEATURE_NAMES[1:],
+    default=[],
+)
+parser.add_argument(
     "--adaptive-use-margin-feature",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -552,6 +562,7 @@ def build_adaptive_controller(args):
             min_action_probability=args.adaptive_min_action_probability,
             max_importance_weight=args.adaptive_max_importance_weight,
             full_stream_bootstrap=True,
+            disabled_features=tuple(args.adaptive_disable_features),
         )
     )
 
