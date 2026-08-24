@@ -1123,6 +1123,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "adaptive_enabled": adaptive_enabled,
             "adaptive_decisions": [],
             "adaptive_trajectory": [],
+            "adaptive_full_stream_resolutions": [],
             "adaptive_last_features": None,
             "forward_pass_breakdown": {
                 "prefill": 0,
@@ -1908,6 +1909,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     for key, value in availability_fields.items()
                                 })
 
+                                if not bool(getattr(args, "adaptive_freeze", False)):
+                                    full_stream_resolution = adaptive_controller.resolve_pending_stop(
+                                        features,
+                                        next_stop_available=stop_available,
+                                        observed_at=time.perf_counter(),
+                                    )
+                                    if full_stream_resolution is not None:
+                                        frontier_stats[
+                                            "adaptive_full_stream_resolutions"
+                                        ].append(full_stream_resolution)
+
                                 if (
                                     adaptive_pending_continue is not None
                                     and not bool(getattr(args, "adaptive_freeze", False))
@@ -1966,6 +1978,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         features,
                                         allow_stop=stop_available,
                                         refinement_step=current_step,
+                                        elapsed_draft_ms=sum(
+                                            float(value)
+                                            for value in forward_pass_latencies
+                                        ),
+                                        proposal_length=target_len,
+                                        frontier_length=frontier_k,
                                         allow_exploration=not bool(
                                             getattr(
                                                 args,
@@ -2022,6 +2040,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             decision.importance_weight
                                         ),
                                         "controller_latency_ms": float(decision.latency_ms),
+                                        "decision_monotonic_s": time.perf_counter(),
+                                        **dict(decision.diagnostics),
                                         "completed_rounds_before": int(
                                             adaptive_controller.completed_rounds
                                         ),
@@ -2036,7 +2056,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "adaptive_controller_latency_ms": decision.latency_ms,
                                     })
                                     if decision.action == "stop":
-                                        stop_reason = "adaptive_td_stop"
+                                        stop_reason = (
+                                            f"adaptive_{getattr(adaptive_controller, 'controller_name', 'avg_td')}_stop"
+                                        )
                                         if post_stop_outer_action == "extend":
                                             adaptive_pending_stop_extension = adaptive_record
                                     else:

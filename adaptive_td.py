@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import NormalDist
 from typing import Iterable, Sequence
 
@@ -56,6 +56,8 @@ class AdaptiveTDConfig:
     policy_mode: str = "legacy"
     min_action_probability: float = 0.10
     max_importance_weight: float = 5.0
+    full_stream_bootstrap: bool = False
+    reverse_backup: bool = False
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -128,6 +130,7 @@ class AdaptiveDecision:
     behavior_stop_probability: float
     selected_action_probability: float
     importance_weight: float
+    diagnostics: dict[str, float | str] = field(default_factory=dict)
 
 
 class _LinearActionValue:
@@ -250,6 +253,8 @@ class _LinearActionValue:
 
 
 class OnlineTDRefinementController:
+    controller_name = "avg_td"
+
     def __init__(self, config: AdaptiveTDConfig) -> None:
         self.config = config
         self.values = {
@@ -272,6 +277,8 @@ class OnlineTDRefinementController:
         self.early_stop_observations = 0
         self.forward_latency_ema_ms = None
         self.profile_samples: dict[str, list[float]] = {}
+        self.pending_stop = None
+        self.full_stream_transitions: list[dict] = []
 
     @property
     def rho(self) -> float:
@@ -299,6 +306,7 @@ class OnlineTDRefinementController:
         allow_stop: bool,
         refinement_step: int,
         allow_exploration: bool = True,
+        **_unused,
     ) -> AdaptiveDecision:
         started = time.perf_counter()
         profiling = self.config.profile_overhead
@@ -475,7 +483,114 @@ class OnlineTDRefinementController:
             behavior_stop_probability=behavior_stop_probability,
             selected_action_probability=selected_action_probability,
             importance_weight=importance_weight,
+            diagnostics={"controller_name": self.controller_name},
         )
+
+    def resolve_pending_stop(
+        self,
+        next_features: Sequence[float],
+        *,
+        next_stop_available: bool = True,
+        observed_at: float | None = None,
+    ) -> dict | None:
+        if not self.config.full_stream_bootstrap or self.pending_stop is None:
+            return None
+        update_started = time.perf_counter()
+        pending = self.pending_stop
+        self.pending_stop = None
+        observed_at = time.perf_counter() if observed_at is None else float(observed_at)
+        elapsed_ms = max(0.0, (observed_at - pending["started_at"]) * 1000.0)
+        future_value = self.values[CONTINUE].mean(next_features)
+        if next_stop_available:
+            future_value = max(
+                self.values[STOP].mean(next_features),
+                future_value,
+            )
+        rho = self.rho
+        target = float(pending["emitted_tokens"]) - rho * elapsed_ms + future_value
+        residual = self.values[STOP].update(
+            pending["features"],
+            target,
+            self.config.learning_rate,
+            observation_weight=pending["importance_weight"],
+        )
+        self.early_stop_observations = self.values[STOP].sample_count
+        transition = {
+            "terminal": False,
+            "emitted_tokens": pending["emitted_tokens"],
+            "delta_time_ms": elapsed_ms,
+            "rho_tokens_per_ms": rho,
+            "bootstrap_value": future_value,
+            "td_target": target,
+            "td_error": residual,
+        }
+        self.full_stream_transitions.append(transition)
+        self.record_profile(
+            "pending_stop_resolution",
+            (time.perf_counter() - update_started) * 1000.0,
+        )
+        return transition
+
+    def _complete_full_stream_trajectory(
+        self,
+        trajectory: Sequence[dict],
+        *,
+        emitted_tokens: int,
+        verifier_latency_ms: float,
+        terminal: bool,
+    ) -> None:
+        final_stop = next(
+            (
+                item
+                for item in reversed(trajectory)
+                if item.get("action") == STOP
+                and item.get("post_stop_outer_action") == "verify"
+                and not item.get("counterfactual_replay_overrode_action", False)
+            ),
+            None,
+        )
+        if final_stop is None:
+            return
+        rho = self.rho
+        started_at = float(
+            final_stop.get(
+                "decision_monotonic_s",
+                time.perf_counter() - max(0.0, verifier_latency_ms) / 1000.0,
+            )
+        )
+        importance_weight = float(final_stop.get("importance_weight", 1.0))
+        if not terminal:
+            self.pending_stop = {
+                "features": tuple(final_stop["features"]),
+                "emitted_tokens": int(emitted_tokens),
+                "started_at": started_at,
+                "importance_weight": importance_weight,
+            }
+            final_stop["full_stream_stop_pending"] = True
+            return
+        elapsed_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+        target = float(emitted_tokens) - rho * elapsed_ms
+        residual = self.values[STOP].update(
+            final_stop["features"],
+            target,
+            self.config.learning_rate,
+            observation_weight=importance_weight,
+        )
+        self.early_stop_observations = self.values[STOP].sample_count
+        final_stop.update({
+            "full_stream_stop_pending": False,
+            "full_stream_terminal_target": target,
+            "full_stream_terminal_td_error": residual,
+        })
+        self.full_stream_transitions.append({
+            "terminal": True,
+            "emitted_tokens": int(emitted_tokens),
+            "delta_time_ms": elapsed_ms,
+            "rho_tokens_per_ms": rho,
+            "bootstrap_value": 0.0,
+            "td_target": target,
+            "td_error": residual,
+        })
 
     def observe_transition(
         self,
@@ -549,9 +664,23 @@ class OnlineTDRefinementController:
         *,
         emitted_tokens: int,
         verifier_latency_ms: float,
+        post_verify_latency_ms: float = 0.0,
+        round_latency_ms: float | None = None,
+        terminal: bool = False,
     ) -> None:
         if not trajectory:
             return
+        if self.config.full_stream_bootstrap:
+            self._complete_full_stream_trajectory(
+                trajectory,
+                emitted_tokens=emitted_tokens,
+                verifier_latency_ms=(
+                    float(verifier_latency_ms) + float(post_verify_latency_ms)
+                ),
+                terminal=terminal,
+            )
+            if not self.config.reverse_backup:
+                return
         started = time.perf_counter() if self.config.profile_overhead else None
         rho = self.rho
         if rho <= 0.0:
@@ -692,6 +821,7 @@ class OnlineTDRefinementController:
 
     def snapshot(self) -> dict:
         return {
+            "controller_name": self.controller_name,
             "completed_rounds": self.completed_rounds,
             "decision_count": self.decision_count,
             "exploration_count": self.exploration_count,
@@ -734,6 +864,15 @@ class OnlineTDRefinementController:
                 ],
             },
             "overhead": self.profile_summary(),
+            "full_stream": {
+                "enabled": self.config.full_stream_bootstrap,
+                "pending": self.pending_stop is not None,
+                "transition_count": len(self.full_stream_transitions),
+                "terminal_transition_count": sum(
+                    bool(item.get("terminal"))
+                    for item in self.full_stream_transitions
+                ),
+            },
         }
 
     def load_snapshot(self, snapshot: dict) -> None:

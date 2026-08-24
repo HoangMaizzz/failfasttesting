@@ -20,6 +20,10 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
+from distributional_controller import (
+    DistributionalControllerConfig,
+    DistributionalTimeTokenController,
+)
 from bucket_renewal import position_bucket
 from causal_oracle_utils import prepare_causal_oracle_snapshots
 
@@ -402,6 +406,11 @@ parser.add_argument("--collect_bucket_oracle", action="store_true")
 parser.add_argument("--causal_oracle", action="store_true")
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
+parser.add_argument(
+    "--adaptive-controller",
+    choices=["avg_td", "dist_time_token"],
+    default="avg_td",
+)
 parser.add_argument("--adaptive-max-refinement-steps", type=int, default=16)
 parser.add_argument("--adaptive-fixed-refinement-steps", type=int)
 parser.add_argument("--adaptive-learning-rate", type=float, default=0.02)
@@ -447,6 +456,15 @@ parser.add_argument("--adaptive-freeze", action="store_true")
 parser.add_argument("--adaptive-counterfactual-replay", action="store_true")
 parser.add_argument("--adaptive-log-decisions", action="store_true")
 parser.add_argument("--adaptive-profile-overhead", action="store_true")
+parser.add_argument(
+    "--dist-decision-rule",
+    choices=["expected_regret", "probability"],
+    default="expected_regret",
+)
+parser.add_argument("--dist-stop-probability-threshold", type=float, default=0.55)
+parser.add_argument("--dist-stop-regret-weight", type=float, default=1.0)
+parser.add_argument("--dist-continue-regret-weight", type=float, default=1.0)
+parser.add_argument("--dist-latency-ema-alpha", type=float, default=0.2)
 parser.add_argument("--quiet_generation", action="store_true")
 parser.add_argument("--disable_progress", action="store_true")
 parser.add_argument("--skip_artifacts", action="store_true")
@@ -484,8 +502,31 @@ if args.causal_oracle and not args.collect_bucket_oracle:
     raise ValueError("--causal_oracle requires --collect_bucket_oracle")
 if args.causal_oracle and (args.adaptive_td or args.frontier_stop_mode != "disabled"):
     raise ValueError("--causal_oracle requires the unmodified FailFast drafting policy")
-args.adaptive_td_controller = (
-    OnlineTDRefinementController(
+def build_adaptive_controller(args):
+    if not args.adaptive_td:
+        return None
+    if args.adaptive_controller == "dist_time_token":
+        return DistributionalTimeTokenController(
+            DistributionalControllerConfig(
+                learning_rate=args.adaptive_learning_rate,
+                latency_alpha=args.dist_latency_ema_alpha,
+                throughput_alpha=args.adaptive_rho_alpha,
+                decision_rule=args.dist_decision_rule,
+                stop_probability_threshold=args.dist_stop_probability_threshold,
+                stop_regret_weight=args.dist_stop_regret_weight,
+                continue_regret_weight=args.dist_continue_regret_weight,
+                explore_epsilon=args.adaptive_explore_epsilon,
+                explore_min=args.adaptive_explore_min,
+                explore_decay=args.adaptive_explore_decay,
+                warmup_rounds=args.adaptive_warmup_rounds,
+                max_refinement_steps=args.adaptive_max_refinement_steps,
+                fixed_refinement_steps=args.adaptive_fixed_refinement_steps,
+                force_continue=args.adaptive_force_continue,
+                profile_overhead=args.adaptive_profile_overhead,
+                seed=args.seed,
+            )
+        )
+    return OnlineTDRefinementController(
         AdaptiveTDConfig(
             learning_rate=args.adaptive_learning_rate,
             mc_learning_rate=args.adaptive_mc_learning_rate,
@@ -510,11 +551,12 @@ args.adaptive_td_controller = (
             policy_mode=args.adaptive_policy_mode,
             min_action_probability=args.adaptive_min_action_probability,
             max_importance_weight=args.adaptive_max_importance_weight,
+            full_stream_bootstrap=True,
         )
     )
-    if args.adaptive_td
-    else None
-)
+
+
+args.adaptive_td_controller = build_adaptive_controller(args)
 if args.adaptive_state_path:
     with open(args.adaptive_state_path, "r", encoding="utf-8") as handle:
         args.adaptive_td_controller.load_snapshot(json.load(handle))
@@ -1127,6 +1169,8 @@ def complete_adaptive_td_trajectory(
     *,
     emitted_tokens,
     verifier_latency_ms,
+    round_latency_ms=None,
+    terminal=False,
 ):
     if (
         not getattr(args, "adaptive_td", False)
@@ -1140,6 +1184,10 @@ def complete_adaptive_td_trajectory(
         trajectory,
         emitted_tokens=int(emitted_tokens),
         verifier_latency_ms=float(verifier_latency_ms),
+        round_latency_ms=(
+            None if round_latency_ms is None else float(round_latency_ms)
+        ),
+        terminal=bool(terminal),
     )
 
 
@@ -1203,6 +1251,7 @@ def record_adaptive_td_decisions(
             )
         item.update(finalized_fields)
         args.adaptive_decision_rows.append({
+            "adaptive_controller": getattr(controller, "controller_name", "avg_td"),
             "problem_id": int(problem_id),
             "round_id": int(round_id),
             "decision_id": int(decision_id),
@@ -2318,6 +2367,11 @@ for problem_id, is_warmup in tqdm(
                             frontier_stats_this_round,
                             emitted_tokens=len(tokens_to_append),
                             verifier_latency_ms=verify_time * 1000.0,
+                            round_latency_ms=(draft_time + verify_time) * 1000.0,
+                            terminal=(
+                                target_tokenizer.eos_token_id in tokens_to_append
+                                or len(current_token_ids) >= num_target_tokens
+                            ),
                         )
 
                     if (
@@ -2602,3 +2656,21 @@ if args.adaptive_td:
             writer = csv.DictWriter(handle, fieldnames=decision_columns)
             writer.writeheader()
             writer.writerows(decision_rows)
+    transition_rows = getattr(
+        args.adaptive_td_controller,
+        "full_stream_transitions",
+        [],
+    )
+    if transition_rows:
+        transition_columns = sorted(
+            {column for row in transition_rows for column in row}
+        )
+        with open(
+            os.path.join(args.output_dir, "adaptive_full_stream_transitions.csv"),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=transition_columns)
+            writer.writeheader()
+            writer.writerows(transition_rows)

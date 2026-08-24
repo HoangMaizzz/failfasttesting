@@ -19,6 +19,8 @@ DATASET_SIZES = {
 METHODS = (
     "failfast",
     "adaptive_td",
+    "avg_td",
+    "dist_time_token",
     "adaptive_force_continue",
     "fixed_r1",
     "fixed_r2",
@@ -38,7 +40,7 @@ def parse_args():
         "--methods",
         nargs="+",
         choices=METHODS,
-        default=["failfast", "adaptive_td"],
+        default=["failfast", "avg_td", "dist_time_token"],
     )
     parser.add_argument("--num_questions", type=int, default=15)
     parser.add_argument("--warmup_questions", type=int, default=1)
@@ -96,6 +98,15 @@ def parse_args():
     )
     parser.add_argument("--adaptive-log-decisions", action="store_true")
     parser.add_argument("--adaptive-profile-overhead", action="store_true")
+    parser.add_argument(
+        "--dist-decision-rule",
+        choices=("expected_regret", "probability"),
+        default="expected_regret",
+    )
+    parser.add_argument("--dist-stop-probability-threshold", type=float, default=0.55)
+    parser.add_argument("--dist-stop-regret-weight", type=float, default=1.0)
+    parser.add_argument("--dist-continue-regret-weight", type=float, default=1.0)
+    parser.add_argument("--dist-latency-ema-alpha", type=float, default=0.2)
     parser.add_argument("--sample_seed", type=int, default=2026)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -162,7 +173,7 @@ def run_streaming(command, cwd):
 
 def metadata(args, dataset, method, problem_ids):
     return {
-        "version": f"online_td_{args.adaptive_policy_mode}_v9",
+        "version": "adaptive_controller_ab_v1",
         "dataset": dataset,
         "method": method,
         "problem_ids": problem_ids,
@@ -201,6 +212,12 @@ def metadata(args, dataset, method, problem_ids):
             "use_stability_feature": args.adaptive_use_stability_feature,
             "log_decisions": args.adaptive_log_decisions,
             "profile_overhead": args.adaptive_profile_overhead,
+            "controller": method,
+            "dist_decision_rule": args.dist_decision_rule,
+            "dist_stop_probability_threshold": args.dist_stop_probability_threshold,
+            "dist_stop_regret_weight": args.dist_stop_regret_weight,
+            "dist_continue_regret_weight": args.dist_continue_regret_weight,
+            "dist_latency_ema_alpha": args.dist_latency_ema_alpha,
         },
     }
 
@@ -232,6 +249,7 @@ def run_method(args, dataset, method, problem_ids):
             "benchmark_results.csv",
             "adaptive_td_decisions.csv",
             "adaptive_td_runtime_state.json",
+            "adaptive_full_stream_transitions.csv",
             "run_metadata.json",
         ):
             path = output_dir / filename
@@ -268,8 +286,10 @@ def run_method(args, dataset, method, problem_ids):
             "--log_level", args.log_level,
         ]
         if method != "failfast":
+            controller_name = "avg_td" if method == "adaptive_td" else method
             command.extend([
                 "--adaptive-td",
+                "--adaptive-controller", controller_name,
                 "--adaptive-max-refinement-steps", str(args.adaptive_max_refinement_steps),
                 "--adaptive-learning-rate", str(args.adaptive_learning_rate),
                 "--adaptive-mc-learning-rate", str(args.adaptive_mc_learning_rate),
@@ -293,6 +313,13 @@ def run_method(args, dataset, method, problem_ids):
                 str(args.adaptive_min_action_probability),
                 "--adaptive-max-importance-weight",
                 str(args.adaptive_max_importance_weight),
+                "--dist-decision-rule", args.dist_decision_rule,
+                "--dist-stop-probability-threshold",
+                str(args.dist_stop_probability_threshold),
+                "--dist-stop-regret-weight", str(args.dist_stop_regret_weight),
+                "--dist-continue-regret-weight",
+                str(args.dist_continue_regret_weight),
+                "--dist-latency-ema-alpha", str(args.dist_latency_ema_alpha),
             ])
             if args.adaptive_log_decisions:
                 command.append("--adaptive-log-decisions")
@@ -474,7 +501,7 @@ def aggregate(rows):
 
 
 def paired_comparison(rows):
-    if not {"failfast", "adaptive_td"}.issubset(set(rows["method"])):
+    if "failfast" not in set(rows["method"]):
         return pd.DataFrame()
     columns = [
         "dataset",
@@ -488,53 +515,59 @@ def paired_comparison(rows):
         "output_tokens",
     ]
     pivot = rows[columns].pivot(index=["dataset", "problem_id"], columns="method")
-    result = pd.DataFrame({
-        "dataset": pivot.index.get_level_values("dataset"),
-        "problem_id": pivot.index.get_level_values("problem_id"),
-        "measured_speedup_vs_failfast": (
-            pivot[("measured_ms_per_output_token", "failfast")]
-            / pivot[("measured_ms_per_output_token", "adaptive_td")]
-        ).to_numpy(),
-        "e2e_speedup_vs_failfast": (
-            pivot[("e2e_ms_per_output_token", "failfast")]
-            / pivot[("e2e_ms_per_output_token", "adaptive_td")]
-        ).to_numpy(),
-        "adaptive_wins": (
-            pivot[("measured_ms_per_output_token", "adaptive_td")]
-            < pivot[("measured_ms_per_output_token", "failfast")]
-        ).astype(int).to_numpy(),
-        "output_match": (
-            pivot[("output_token_hash", "adaptive_td")]
-            == pivot[("output_token_hash", "failfast")]
-        ).astype(int).to_numpy(),
-        "adaptive_minus_failfast_verifier_rounds_per_100_tokens": (
-            100.0
-            * pivot[("num_speculation_rounds", "adaptive_td")]
-            / pivot[("output_tokens", "adaptive_td")]
-            - 100.0
-            * pivot[("num_speculation_rounds", "failfast")]
-            / pivot[("output_tokens", "failfast")]
-        ).to_numpy(),
-        "adaptive_minus_failfast_draft_passes_per_100_tokens": (
-            100.0
-            * pivot[("total_num_forward_passes", "adaptive_td")]
-            / pivot[("output_tokens", "adaptive_td")]
-            - 100.0
-            * pivot[("total_num_forward_passes", "failfast")]
-            / pivot[("output_tokens", "failfast")]
-        ).to_numpy(),
-    })
-    return result
+    records = []
+    for method in sorted(set(rows["method"]) - {"failfast"}):
+        if ("measured_ms_per_output_token", method) not in pivot:
+            continue
+        for index in pivot.index:
+            records.append({
+                "dataset": index[0],
+                "problem_id": index[1],
+                "method": method,
+                "measured_speedup_vs_failfast": (
+                    pivot.loc[index, ("measured_ms_per_output_token", "failfast")]
+                    / pivot.loc[index, ("measured_ms_per_output_token", method)]
+                ),
+                "e2e_speedup_vs_failfast": (
+                    pivot.loc[index, ("e2e_ms_per_output_token", "failfast")]
+                    / pivot.loc[index, ("e2e_ms_per_output_token", method)]
+                ),
+                "adaptive_wins": int(
+                    pivot.loc[index, ("measured_ms_per_output_token", method)]
+                    < pivot.loc[index, ("measured_ms_per_output_token", "failfast")]
+                ),
+                "output_match": int(
+                    pivot.loc[index, ("output_token_hash", method)]
+                    == pivot.loc[index, ("output_token_hash", "failfast")]
+                ),
+                "adaptive_minus_failfast_verifier_rounds_per_100_tokens": (
+                    100.0 * pivot.loc[index, ("num_speculation_rounds", method)]
+                    / pivot.loc[index, ("output_tokens", method)]
+                    - 100.0 * pivot.loc[index, ("num_speculation_rounds", "failfast")]
+                    / pivot.loc[index, ("output_tokens", "failfast")]
+                ),
+                "adaptive_minus_failfast_draft_passes_per_100_tokens": (
+                    100.0 * pivot.loc[index, ("total_num_forward_passes", method)]
+                    / pivot.loc[index, ("output_tokens", method)]
+                    - 100.0 * pivot.loc[index, ("total_num_forward_passes", "failfast")]
+                    / pivot.loc[index, ("output_tokens", "failfast")]
+                ),
+            })
+    return pd.DataFrame(records)
 
 
-def learning_curves(output_dir, datasets):
+def learning_curves(output_dir, datasets, methods):
     frames = []
     for dataset in datasets:
-        path = output_dir / "raw" / dataset / "adaptive_td" / "adaptive_td_decisions.csv"
-        if path.exists():
-            frame = pd.read_csv(path)
-            frame["dataset"] = dataset
-            frames.append(frame)
+        for method in methods:
+            if method == "failfast":
+                continue
+            path = output_dir / "raw" / dataset / method / "adaptive_td_decisions.csv"
+            if path.exists():
+                frame = pd.read_csv(path)
+                frame["dataset"] = dataset
+                frame["method"] = method
+                frames.append(frame)
     if not frames:
         return pd.DataFrame(), pd.DataFrame()
     decisions = pd.concat(frames, ignore_index=True, sort=False)
@@ -545,11 +578,12 @@ def learning_curves(output_dir, datasets):
         labels=["0-99", "100-499", "500-999", "1000+"],
     )
     records = []
-    for (dataset, window), group in decisions.groupby(
-        ["dataset", "learning_window"], observed=True, sort=False
+    for (dataset, method, window), group in decisions.groupby(
+        ["dataset", "method", "learning_window"], observed=True, sort=False
     ):
         records.append({
             "dataset": dataset,
+            "method": method,
             "learning_window": str(window),
             "decisions": len(group),
             "stop_rate_percent": 100.0 * group["action"].eq("stop").mean(),
@@ -644,6 +678,21 @@ def controller_state_reports(output_dir, datasets, methods):
                         "stop_probability_threshold"
                     ),
                 })
+            for model_name, values in state.get("models", {}).items():
+                state_rows.append({
+                    "dataset": dataset,
+                    "method": method,
+                    "action": model_name,
+                    "sample_count": values.get("sample_count", 0),
+                    "residual_mean": values.get("residual_mean"),
+                    "residual_variance": values.get("residual_variance"),
+                    "rho_tokens_per_ms": state.get("rho_tokens_per_ms"),
+                    "completed_rounds": state.get("completed_rounds", 0),
+                    "early_stop_observations": state.get(
+                        "early_stop_observations", 0
+                    ),
+                    "controller_name": state.get("controller_name"),
+                })
             early_uncertainty = state.get("early_stop_uncertainty") or {}
             if early_uncertainty:
                 state_rows.append({
@@ -695,7 +744,7 @@ def main():
     rows = pd.concat(frames, ignore_index=True, sort=False)
     summary = aggregate(rows)
     paired = paired_comparison(rows)
-    decisions, curves = learning_curves(output_dir, args.datasets)
+    decisions, curves = learning_curves(output_dir, args.datasets, args.methods)
     controller_states, overhead = controller_state_reports(
         output_dir,
         args.datasets,
@@ -717,7 +766,7 @@ def main():
     if not paired.empty:
         print("\nPAIRED SUMMARY")
         print(
-            paired.groupby("dataset", sort=False).agg(
+            paired.groupby(["dataset", "method"], sort=False).agg(
                 num_samples=("problem_id", "size"),
                 geometric_speedup=(
                     "measured_speedup_vs_failfast",
