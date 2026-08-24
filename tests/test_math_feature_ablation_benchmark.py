@@ -6,6 +6,7 @@ from adaptive_td import FEATURE_NAMES
 from run_math_feature_ablation_benchmark import (
     FEATURE_GROUPS,
     aggregate_method,
+    feature_group_screening_summary,
     paired_ablation_summary,
 )
 
@@ -55,6 +56,34 @@ class MathFeatureAblationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["full_speedup_vs_ablated"], 1.25)
         self.assertEqual(summary["full_win_rate_percent"], 100.0)
         self.assertEqual(summary["output_hash_match_percent"], 100.0)
+
+    def test_group_screening_combines_performance_oracle_and_usage(self):
+        ablations = pd.DataFrame([{
+            "ablation": "drop_frontier",
+            "full_speedup_vs_ablated": 1.10,
+            "geometric_speedup_ci95_low": 1.02,
+            "geometric_speedup_ci95_high": 1.18,
+        }])
+        feature_states = pd.DataFrame([{
+            "method": "avg_td_full",
+            "feature": "frontier_ratio",
+            "std": 0.25,
+            "standardized_final_effect": 0.20,
+        }])
+        oracle_features = pd.DataFrame([{
+            "feature": "frontier_ratio",
+            "oracle_stop_auc": 0.80,
+            "match_rate_percent": 75.0,
+        }])
+        summary = feature_group_screening_summary(
+            ablations,
+            feature_states,
+            oracle_features,
+        ).iloc[0]
+        self.assertEqual(summary["performance_evidence"], "helpful")
+        self.assertEqual(summary["oracle_signal"], "strong")
+        self.assertEqual(summary["screening_recommendation"], "keep")
+        self.assertAlmostEqual(summary["mean_oracle_separation"], 0.6)
 
 
 if __name__ == "__main__":

@@ -344,6 +344,110 @@ def feature_state_summary(output_dir, variants):
     return pd.DataFrame(records)
 
 
+def feature_group_screening_summary(ablations, feature_states, oracle_features):
+    full_states = feature_states[feature_states["method"].eq("avg_td_full")]
+    records = []
+    for _, ablation in ablations.iterrows():
+        variant = ablation["ablation"]
+        features = FEATURE_GROUPS[variant]
+        states = full_states[full_states["feature"].isin(features)]
+        oracle = oracle_features[oracle_features["feature"].isin(features)]
+        auc = pd.to_numeric(oracle.get("oracle_stop_auc"), errors="coerce").dropna()
+        oracle_separation = 2.0 * (auc - 0.5).abs()
+        match_rate = pd.to_numeric(
+            oracle.get("match_rate_percent"), errors="coerce"
+        ).dropna()
+        standardized_effect = pd.to_numeric(
+            states.get("standardized_final_effect"), errors="coerce"
+        ).abs().dropna()
+        feature_std = pd.to_numeric(states.get("std"), errors="coerce").dropna()
+        ci_low = float(ablation["geometric_speedup_ci95_low"])
+        ci_high = float(ablation["geometric_speedup_ci95_high"])
+        if ci_low > 1.0:
+            performance_evidence = "helpful"
+        elif ci_high < 1.0:
+            performance_evidence = "harmful"
+        else:
+            performance_evidence = "uncertain"
+        mean_separation = (
+            float(oracle_separation.mean()) if len(oracle_separation) else np.nan
+        )
+        if not math.isfinite(mean_separation):
+            oracle_signal = "unavailable"
+        elif mean_separation >= 0.30:
+            oracle_signal = "strong"
+        elif mean_separation >= 0.15:
+            oracle_signal = "moderate"
+        else:
+            oracle_signal = "weak"
+        records.append({
+            "feature_group": variant.removeprefix("drop_"),
+            "ablation": variant,
+            "features": json.dumps(features),
+            "full_speedup_vs_ablated": float(
+                ablation["full_speedup_vs_ablated"]
+            ),
+            "geometric_speedup_ci95_low": ci_low,
+            "geometric_speedup_ci95_high": ci_high,
+            "performance_evidence": performance_evidence,
+            "oracle_signal": oracle_signal,
+            "mean_oracle_separation": mean_separation,
+            "max_oracle_separation": (
+                float(oracle_separation.max()) if len(oracle_separation) else np.nan
+            ),
+            "oracle_match_rate_percent": (
+                float(match_rate.max()) if len(match_rate) else 0.0
+            ),
+            "nonconstant_feature_fraction": (
+                float(feature_std.gt(1e-6).mean()) if len(feature_std) else 0.0
+            ),
+            "mean_abs_standardized_effect": (
+                float(standardized_effect.mean())
+                if len(standardized_effect)
+                else 0.0
+            ),
+            "max_abs_standardized_effect": (
+                float(standardized_effect.max())
+                if len(standardized_effect)
+                else 0.0
+            ),
+        })
+    summary = pd.DataFrame(records)
+    if summary.empty:
+        return summary
+    usage_median = float(summary["mean_abs_standardized_effect"].median())
+    summary["learning_usage"] = np.where(
+        summary["mean_abs_standardized_effect"] >= usage_median,
+        "high",
+        "low",
+    )
+
+    def recommendation(row):
+        if row.performance_evidence == "helpful":
+            return "keep"
+        if row.performance_evidence == "harmful":
+            return "drop_candidate"
+        if row.oracle_signal == "unavailable" or row.oracle_match_rate_percent < 20.0:
+            return "insufficient_oracle_coverage"
+        if row.oracle_signal in {"strong", "moderate"}:
+            return (
+                "keep_for_individual_ablation"
+                if row.learning_usage == "high"
+                else "improve_learning"
+            )
+        return (
+            "regularize_or_drop"
+            if row.learning_usage == "high"
+            else "drop_candidate"
+        )
+
+    summary["screening_recommendation"] = summary.apply(recommendation, axis=1)
+    return summary.sort_values(
+        ["performance_evidence", "full_speedup_vs_ablated"],
+        ascending=[True, False],
+    ).reset_index(drop=True)
+
+
 def add_state_occurrence(frame):
     result = frame.copy()
     result["state_key"] = result.apply(
@@ -533,7 +637,9 @@ def write_manifest(args, output_dir, problem_ids):
             ),
             "limitations": (
                 "One online order and stochastic symmetric action sampling do not prove "
-                "feature causality. Correlated features are ablated as groups."
+                "feature causality. Correlated features are ablated as groups. The "
+                "screening recommendation is a heuristic for follow-up experiments, "
+                "not a final feature-selection result."
             ),
         },
     }
@@ -602,6 +708,11 @@ def main():
     ablations = paired_ablation_summary(result_frames)
     feature_states = feature_state_summary(output_dir, args.ablations)
     evaluated, oracle_features, oracle_decisions = feature_oracle_alignment(output_dir)
+    group_screening = feature_group_screening_summary(
+        ablations,
+        feature_states,
+        oracle_features,
+    )
     windows = learning_windows(evaluated)
     causal_decisions = pd.read_csv(causal_dir / "causal_oracle_decisions.csv")
     causal_summary = causal_oracle_comparison(
@@ -626,6 +737,10 @@ def main():
     summary.to_csv(output_dir / "method_summary.csv", index=False)
     ablations.to_csv(output_dir / "feature_ablation_summary.csv", index=False)
     feature_states.to_csv(output_dir / "feature_state_summary.csv", index=False)
+    group_screening.to_csv(
+        output_dir / "feature_group_screening.csv",
+        index=False,
+    )
     evaluated.to_csv(output_dir / "full_oracle_matched_decisions.csv", index=False)
     oracle_features.to_csv(output_dir / "feature_oracle_alignment.csv", index=False)
     oracle_decisions.to_csv(output_dir / "full_oracle_decision_summary.csv", index=False)
@@ -644,6 +759,8 @@ def main():
     print(summary.to_string(index=False))
     print("\nFEATURE GROUP ABLATION")
     print(ablations.to_string(index=False))
+    print("\nFEATURE GROUP SCREENING")
+    print(group_screening.to_string(index=False))
     print("\nCAUSAL ORACLE UPPER BOUND")
     print(causal_summary.to_string(index=False))
     print("\nFULL CONTROLLER ORACLE ALIGNMENT")
