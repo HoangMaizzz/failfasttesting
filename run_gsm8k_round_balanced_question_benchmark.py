@@ -35,6 +35,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=50)
     parser.add_argument("--selection_restarts", type=int, default=32)
     parser.add_argument("--selection_max_iterations", type=int, default=200)
+    parser.add_argument("--balance_strength", type=float, default=0.25)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--spec_len", type=int, default=8)
@@ -81,6 +82,8 @@ def validate_args(args):
         raise ValueError("--batch_size must be positive")
     if args.selection_restarts <= 0 or args.selection_max_iterations <= 0:
         raise ValueError("selection search limits must be positive")
+    if not 0.0 <= args.balance_strength <= 1.0:
+        raise ValueError("--balance_strength must be in [0, 1]")
     if args.spec_len <= 0 or args.incr_len <= 0:
         raise ValueError("proposal lengths must be positive")
 
@@ -93,22 +96,25 @@ def nested_pool_problem_ids(args):
     return population[:args.pool_size]
 
 
-def round_balance_score(counts):
+def round_balance_score(counts, target_shares=None):
     counts = np.asarray(counts, dtype=np.float64)
     total = float(counts.sum())
     if total <= 0:
         return float("inf")
     shares = counts / total
-    deviations = np.abs(shares - (1.0 / len(PASS_CLASSES)))
+    if target_shares is None:
+        target_shares = np.full(len(PASS_CLASSES), 1.0 / len(PASS_CLASSES))
+    target_shares = np.asarray(target_shares, dtype=np.float64)
+    deviations = np.abs(shares - target_shares)
     return float(deviations.max() + 0.1 * np.sqrt(np.mean(deviations ** 2)))
 
 
-def round_balance_metrics(counts):
+def round_balance_metrics(counts, target_shares=None):
     counts = np.asarray(counts, dtype=np.float64)
     total = float(counts.sum())
     shares = counts / max(1.0, total)
     mean = float(counts.mean())
-    return {
+    metrics = {
         "total_rounds": int(total),
         "step1_rounds": int(counts[0]),
         "step2_rounds": int(counts[1]),
@@ -124,8 +130,15 @@ def round_balance_metrics(counts):
             if counts.min() > 0
             else float("inf")
         ),
-        "selection_objective": round_balance_score(counts),
+        "selection_objective": round_balance_score(counts, target_shares),
     }
+    if target_shares is not None:
+        target_shares = np.asarray(target_shares, dtype=np.float64)
+        for index, label in enumerate(PASS_CLASSES):
+            metrics[f"target_{label}_percent"] = (
+                100.0 * float(target_shares[index])
+            )
+    return metrics
 
 
 def select_round_balanced_questions(
@@ -134,11 +147,19 @@ def select_round_balanced_questions(
     selection_seed,
     restarts=32,
     max_iterations=200,
+    balance_strength=0.25,
 ):
     ordered = profiles.sort_values("problem_id").reset_index(drop=True).copy()
     if len(ordered) < selected_size:
         raise ValueError("The oracle pool contains fewer questions than requested")
     vectors = ordered[COUNT_COLUMNS].to_numpy(dtype=np.float64)
+    pool_counts = vectors.sum(axis=0)
+    natural_shares = pool_counts / max(1.0, float(pool_counts.sum()))
+    uniform_shares = np.full(len(PASS_CLASSES), 1.0 / len(PASS_CLASSES))
+    target_shares = (
+        (1.0 - balance_strength) * natural_shares
+        + balance_strength * uniform_shares
+    )
     rng = np.random.default_rng(selection_seed)
     all_indices = np.arange(len(ordered), dtype=np.int64)
 
@@ -160,7 +181,7 @@ def select_round_balanced_questions(
         selected = np.zeros(len(ordered), dtype=bool)
         selected[np.asarray(initial, dtype=np.int64)] = True
         counts = vectors[selected].sum(axis=0)
-        score = round_balance_score(counts)
+        score = round_balance_score(counts, target_shares)
 
         for _ in range(max_iterations):
             selected_indices = all_indices[selected]
@@ -172,7 +193,7 @@ def select_round_balanced_questions(
             )
             totals = candidate_counts.sum(axis=2)
             shares = candidate_counts / np.maximum(1.0, totals[:, :, None])
-            deviations = np.abs(shares - (1.0 / len(PASS_CLASSES)))
+            deviations = np.abs(shares - target_shares[None, None, :])
             scores = deviations.max(axis=2) + 0.1 * np.sqrt(
                 np.mean(deviations ** 2, axis=2)
             )
@@ -202,8 +223,18 @@ def select_round_balanced_questions(
     selected_profiles["selection_objective"] = best_score
     random_counts = vectors[random_reference].sum(axis=0)
     diagnostics = {
-        "optimized": round_balance_metrics(best_counts),
-        "random_reference": round_balance_metrics(random_counts),
+        "pool_distribution": round_balance_metrics(
+            pool_counts, natural_shares
+        ),
+        "target_distribution_percent": {
+            label: 100.0 * float(target_shares[index])
+            for index, label in enumerate(PASS_CLASSES)
+        },
+        "balance_strength": float(balance_strength),
+        "optimized": round_balance_metrics(best_counts, target_shares),
+        "random_reference": round_balance_metrics(
+            random_counts, target_shares
+        ),
         "num_pool_questions": int(len(ordered)),
         "num_selected_questions": int(selected_size),
         "selection_seed": int(selection_seed),
@@ -246,10 +277,11 @@ def benchmark_manifest(args, candidate_ids, evaluated_ids, selected_ids, diagnos
         "selection_diagnostics": diagnostics,
         "selection_definition": (
             "Each question contributes all of its causal-oracle speculation rounds. "
-            "A fixed-size subset of unique problem_ids is selected to minimize the "
-            "aggregate distribution imbalance among oracle-optimal refinement depths "
-            "step1, step2, and step3plus. No question is assigned a single class and "
-            "no round is discarded after question selection."
+            "A fixed-size subset of unique problem_ids is selected toward a soft "
+            "target interpolated between the candidate pool's natural round "
+            "distribution and a uniform step1/step2/step3plus distribution. No "
+            "question is assigned a single class and no round is discarded after "
+            "question selection."
         ),
         "timing_definition": (
             "FailFast and the causal oracle are compared on the same selected questions "
@@ -285,6 +317,7 @@ def main():
         args.selection_seed,
         args.selection_restarts,
         args.selection_max_iterations,
+        args.balance_strength,
     )
     selected_ids = sorted(selected_profiles["problem_id"].astype(int).tolist())
     selected_id_set = set(selected_ids)
