@@ -15,7 +15,7 @@ from run_gsm8k_balanced_oracle_dataset import (
     partition_problem_ids,
     problem_profiles,
     run_causal_oracle,
-    select_balanced_problems,
+    select_balanced_rounds,
 )
 
 
@@ -65,56 +65,43 @@ class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
         self.assertEqual(profiles.loc[1, "oracle_step2_rounds"], 2)
 
     def test_balanced_selection_is_deterministic_and_exact(self):
-        profiles = pd.DataFrame({
-            "problem_id": range(12),
-            "problem_oracle_class": ["step1"] * 4 + ["step2"] * 4 + ["step3plus"] * 4,
-            "class_purity_percent": [75.0] * 12,
-            "oracle_step1_rounds": [1] * 12,
-            "oracle_step2_rounds": [1] * 12,
-            "oracle_step3plus_rounds": [1] * 12,
-            "oracle_step1_round_percent": [34.0] * 12,
-            "oracle_step2_round_percent": [33.0] * 12,
-            "oracle_step3plus_round_percent": [33.0] * 12,
-        })
         rounds = pd.DataFrame({
             "problem_id": [problem_id for problem_id in range(12) for _ in range(3)],
             "round_id": [0, 1, 2] * 12,
             "oracle_pass_class": ["step1", "step2", "step3plus"] * 12,
         })
-        first, anchors, quotas = select_balanced_problems(
-            profiles, rounds, 9, 17
-        )
-        second, second_anchors, _ = select_balanced_problems(
-            profiles, rounds, 9, 17
-        )
+        first, quotas = select_balanced_rounds(rounds, 9, 17)
+        second, _ = select_balanced_rounds(rounds, 9, 17)
         self.assertEqual(quotas, {"step1": 3, "step2": 3, "step3plus": 3})
         self.assertEqual(
             first["selection_stratum"].value_counts().to_dict(),
             quotas,
         )
-        self.assertEqual(first["problem_id"].tolist(), second["problem_id"].tolist())
-        self.assertEqual(anchors["problem_id"].tolist(), second_anchors["problem_id"].tolist())
-        self.assertEqual(anchors["problem_id"].nunique(), 9)
+        self.assertEqual(
+            first[["problem_id", "round_id"]].values.tolist(),
+            second[["problem_id", "round_id"]].values.tolist(),
+        )
+        self.assertFalse(first.duplicated(["problem_id", "round_id"]).any())
+
+    def test_round_balance_allows_multiple_rounds_from_same_question(self):
+        rounds = pd.DataFrame({
+            "problem_id": [7, 7, 7],
+            "round_id": [0, 1, 2],
+            "oracle_pass_class": ["step1", "step2", "step3plus"],
+        })
+        selected, quotas = select_balanced_rounds(rounds, 3, 5)
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected["problem_id"].nunique(), 1)
+        self.assertEqual(quotas, {"step1": 1, "step2": 1, "step3plus": 1})
 
     def test_selection_rejects_fake_balance_when_a_class_is_short(self):
-        profiles = pd.DataFrame({
-            "problem_id": range(5),
-            "problem_oracle_class": ["step1", "step1", "step2", "step2", "step3plus"],
-            "class_purity_percent": [100.0] * 5,
-            "oracle_step1_rounds": [1, 1, 0, 0, 0],
-            "oracle_step2_rounds": [0, 0, 1, 1, 0],
-            "oracle_step3plus_rounds": [0, 0, 0, 0, 1],
-            "oracle_step1_round_percent": [100.0, 100.0, 0.0, 0.0, 0.0],
-            "oracle_step2_round_percent": [0.0, 0.0, 100.0, 100.0, 0.0],
-            "oracle_step3plus_round_percent": [0.0, 0.0, 0.0, 0.0, 100.0],
-        })
         rounds = pd.DataFrame({
             "problem_id": range(5),
             "round_id": [0] * 5,
             "oracle_pass_class": ["step1", "step1", "step2", "step2", "step3plus"],
         })
         with self.assertRaisesRegex(ValueError, "cannot provide"):
-            select_balanced_problems(profiles, rounds, 6, 1)
+            select_balanced_rounds(rounds, 6, 1)
 
     def test_causal_collection_stops_after_first_balanced_batch(self):
         with TemporaryDirectory() as directory:
