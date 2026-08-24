@@ -1,6 +1,8 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -12,6 +14,7 @@ from run_gsm8k_balanced_oracle_dataset import (
     pass_class,
     partition_problem_ids,
     problem_profiles,
+    run_causal_oracle,
     select_balanced_problems,
 )
 
@@ -112,6 +115,48 @@ class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(ValueError, "cannot provide"):
             select_balanced_problems(profiles, rounds, 6, 1)
+
+    def test_causal_collection_stops_after_first_balanced_batch(self):
+        with TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                output_dir=directory,
+                batch_size=3,
+                resume=False,
+                collect_until_balanced=True,
+                selected_size=3,
+                selection_seed=17,
+            )
+
+            def write_batch(_, problem_ids, phase, extra_args, required_files):
+                batch_dir = Path(directory) / "raw" / phase
+                batch_dir.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame({"problem_id": problem_ids}).to_csv(
+                    batch_dir / "benchmark_results.csv", index=False
+                )
+                pd.DataFrame({
+                    "problem_id": problem_ids,
+                    "round_id": [0] * len(problem_ids),
+                    "selected_step": [1, 2, 3],
+                    "selected_draft_passes": [2, 3, 4],
+                    "physical_draft_passes": [4, 4, 4],
+                }).to_csv(batch_dir / "causal_oracle_decisions.csv", index=False)
+                pd.DataFrame({"problem_id": problem_ids}).to_csv(
+                    batch_dir / "causal_oracle_candidates.csv", index=False
+                )
+                return batch_dir
+
+            with patch(
+                "run_gsm8k_balanced_oracle_dataset.run_phase",
+                side_effect=write_batch,
+            ) as mocked_run:
+                results, decisions, candidates = run_causal_oracle(
+                    args, [10, 11, 12, 13, 14, 15]
+                )
+
+            self.assertEqual(mocked_run.call_count, 1)
+            self.assertEqual(results["problem_id"].tolist(), [10, 11, 12])
+            self.assertEqual(decisions["problem_id"].nunique(), 3)
+            self.assertEqual(candidates["problem_id"].nunique(), 3)
 
     def test_causal_comparison_uses_executed_algorithm_times(self):
         failfast = pd.DataFrame({

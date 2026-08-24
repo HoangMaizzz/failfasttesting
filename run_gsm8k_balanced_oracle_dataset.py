@@ -17,7 +17,7 @@ from run_failfast_counterfactual_oracle import (
 )
 
 
-VERSION = "gsm8k_balanced_failfast_causal_oracle_v5"
+VERSION = "gsm8k_balanced_failfast_causal_oracle_v6"
 PASS_CLASSES = ("step1", "step2", "step3plus")
 
 
@@ -54,6 +54,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--collect_until_balanced", action="store_true")
     parser.add_argument(
         "--log_level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -93,7 +94,8 @@ def pass_class(value):
 
 def pool_problem_ids(args):
     population = list(range(args.warmup_questions, DATASET_SIZES["gsm8k"]))
-    return sorted(random.Random(args.sample_seed).sample(population, args.pool_size))
+    sampled = random.Random(args.sample_seed).sample(population, args.pool_size)
+    return sampled if args.collect_until_balanced else sorted(sampled)
 
 
 def partition_problem_ids(problem_ids, batch_size):
@@ -209,6 +211,34 @@ def run_causal_oracle(args, problem_ids):
         result_frames.append(pd.read_csv(batch_dir / "benchmark_results.csv"))
         decision_frames.append(pd.read_csv(batch_dir / "causal_oracle_decisions.csv"))
         candidate_frames.append(pd.read_csv(batch_dir / "causal_oracle_candidates.csv"))
+        if args.collect_until_balanced:
+            partial_decisions = pd.concat(decision_frames, ignore_index=True)
+            partial_rounds = causal_selection_rounds(partial_decisions)
+            partial_profiles = problem_profiles(partial_rounds)
+            eligible = {
+                label: int(partial_profiles[f"oracle_{label}_rounds"].gt(0).sum())
+                for label in PASS_CLASSES
+            }
+            try:
+                select_balanced_problems(
+                    partial_profiles,
+                    partial_rounds,
+                    args.selected_size,
+                    args.selection_seed,
+                )
+            except ValueError:
+                print(
+                    f"COLLECTION PROGRESS | evaluated={len(partial_profiles)} | "
+                    f"eligible={eligible}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"BALANCED TARGET REACHED | evaluated={len(partial_profiles)} | "
+                    f"eligible={eligible}",
+                    flush=True,
+                )
+                break
     return (
         pd.concat(result_frames, ignore_index=True),
         pd.concat(decision_frames, ignore_index=True),
@@ -586,7 +616,7 @@ def causal_stop_distribution(decisions):
     ).reset_index()
 
 
-def manifest(args, pool_ids, selected, quotas):
+def manifest(args, candidate_ids, evaluated_ids, selected, quotas):
     root = Path(__file__).resolve().parent
     try:
         commit = subprocess.check_output(
@@ -600,14 +630,16 @@ def manifest(args, pool_ids, selected, quotas):
         "python": sys.version,
         "platform": platform.platform(),
         "arguments": vars(args),
-        "pool_problem_ids": pool_ids,
+        "candidate_problem_ids": candidate_ids,
+        "evaluated_problem_ids": evaluated_ids,
+        "num_evaluated_questions": len(evaluated_ids),
         "selected_problem_ids": selected["problem_id"].astype(int).tolist(),
         "balanced_class_quotas": quotas,
         "selection_definition": (
             "Each selected question contributes one randomly selected anchor round. "
             "Anchor-round quotas are balanced by selected_step, the local refinement "
             "depth at the proposal length chosen and executed by the causal oracle over "
-            "the full 300-question pool: 1 is step1, 2 is step2, and >=3 is step3plus. "
+            "the evaluated question pool: 1 is step1, 2 is step2, and >=3 is step3plus. "
             "Total draft forward passes remain a separate latency metric. Questions are "
             "unique across strata, and the complete causal-round distribution is retained."
         ),
@@ -631,12 +663,13 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    pool_ids = pool_problem_ids(args)
-    failfast_results = run_failfast_pool(args, pool_ids)
+    candidate_ids = pool_problem_ids(args)
     causal_results, causal_decisions, causal_candidates = run_causal_oracle(
         args,
-        pool_ids,
+        candidate_ids,
     )
+    evaluated_ids = causal_results["problem_id"].astype(int).tolist()
+    failfast_results = run_failfast_pool(args, evaluated_ids)
     rounds = causal_selection_rounds(causal_decisions)
     profiles = problem_profiles(rounds)
 
@@ -647,6 +680,24 @@ def main():
     )
     causal_candidates.to_csv(
         output_dir / "pool_causal_oracle_candidates.csv", index=False
+    )
+    failfast_results.to_csv(
+        output_dir / "all_evaluated_failfast_results.csv", index=False
+    )
+    causal_results.to_csv(
+        output_dir / "all_evaluated_causal_oracle_results.csv", index=False
+    )
+    causal_decisions.to_csv(
+        output_dir / "all_evaluated_causal_oracle_decisions.csv", index=False
+    )
+    causal_candidates.to_csv(
+        output_dir / "all_evaluated_causal_oracle_candidates.csv", index=False
+    )
+    rounds.to_csv(
+        output_dir / "all_evaluated_causal_oracle_rounds.csv", index=False
+    )
+    profiles.to_csv(
+        output_dir / "all_evaluated_problem_profiles.csv", index=False
     )
     profiles.to_csv(output_dir / "pool_problem_profiles.csv", index=False)
     distribution_summary(profiles, "pool").to_csv(
@@ -691,6 +742,9 @@ def main():
     selected_candidates.to_csv(
         output_dir / "selected_causal_oracle_candidates.csv", index=False
     )
+    selected_rounds.to_csv(
+        output_dir / "selected_causal_oracle_rounds.csv", index=False
+    )
     causal_stop_distribution(causal_decisions).to_csv(
         output_dir / "pool_causal_oracle_stop_distribution.csv",
         index=False,
@@ -721,7 +775,7 @@ def main():
         causal_results,
         causal_decisions,
     )
-    pool_summary.insert(0, "scope", "pool_300")
+    pool_summary.insert(0, "scope", f"all_evaluated_{len(evaluated_ids)}")
     selected_summary = causal_oracle_comparison(
         selected_failfast,
         selected_causal,
@@ -743,8 +797,14 @@ def main():
     (output_dir / "selected_problem_ids.json").write_text(
         json.dumps(selected_ids, indent=2), encoding="utf-8"
     )
+    (output_dir / "all_evaluated_problem_ids.json").write_text(
+        json.dumps(evaluated_ids, indent=2), encoding="utf-8"
+    )
     (output_dir / "benchmark_manifest.json").write_text(
-        json.dumps(manifest(args, pool_ids, selected, quotas), indent=2),
+        json.dumps(
+            manifest(args, candidate_ids, evaluated_ids, selected, quotas),
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
