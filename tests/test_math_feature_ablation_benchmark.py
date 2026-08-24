@@ -6,8 +6,10 @@ from adaptive_td import FEATURE_NAMES
 from run_math_feature_ablation_benchmark import (
     FEATURE_GROUPS,
     aggregate_method,
+    feature_action_bins,
     feature_group_screening_summary,
     paired_ablation_summary,
+    preliminary_feature_action_summary,
 )
 
 
@@ -57,6 +59,11 @@ class MathFeatureAblationTests(unittest.TestCase):
         self.assertEqual(summary["full_win_rate_percent"], 100.0)
         self.assertEqual(summary["output_hash_match_percent"], 100.0)
 
+    def test_paired_ablation_supports_preliminary_only_run(self):
+        summary = paired_ablation_summary({"avg_td_full": result_frame()})
+        self.assertTrue(summary.empty)
+        self.assertIn("full_speedup_vs_ablated", summary.columns)
+
     def test_group_screening_combines_performance_oracle_and_usage(self):
         ablations = pd.DataFrame([{
             "ablation": "drop_frontier",
@@ -84,6 +91,44 @@ class MathFeatureAblationTests(unittest.TestCase):
         self.assertEqual(summary["oracle_signal"], "strong")
         self.assertEqual(summary["screening_recommendation"], "keep")
         self.assertAlmostEqual(summary["mean_oracle_separation"], 0.6)
+
+    def test_preliminary_feature_reports_preserve_policy_and_oracle_actions(self):
+        feature_rows = [
+            [1.0, *([0.1] * (len(FEATURE_NAMES) - 1))],
+            [1.0, *([0.9] * (len(FEATURE_NAMES) - 1))],
+        ]
+        decisions = pd.DataFrame({
+            "features": [str(row).replace("'", '"') for row in feature_rows],
+            "action": ["continue", "stop"],
+            "q_stop_mean": [0.0, 1.0],
+            "q_continue_mean": [1.0, 0.0],
+            "stop_probability": [0.1, 0.9],
+        })
+        evaluated = decisions.copy()
+        evaluated["oracle_action"] = ["continue", "stop"]
+        states = pd.DataFrame({
+            "method": ["avg_td_full"] * len(FEATURE_NAMES),
+            "feature": FEATURE_NAMES,
+            "stop_theta": [0.1] * len(FEATURE_NAMES),
+            "continue_theta": [0.0] * len(FEATURE_NAMES),
+            "theta_stop_minus_continue": [0.1] * len(FEATURE_NAMES),
+            "standardized_final_effect": [0.05] * len(FEATURE_NAMES),
+        })
+        summary = preliminary_feature_action_summary(
+            decisions,
+            evaluated,
+            states,
+        )
+        confidence = summary[summary.feature.eq("mean_confidence")].iloc[0]
+        self.assertEqual(confidence.policy_stop_auc, 1.0)
+        self.assertEqual(confidence.oracle_stop_auc, 1.0)
+        bins = feature_action_bins(decisions, evaluated, num_bins=2)
+        matched = bins[
+            (bins.source == "oracle_matched_decisions")
+            & (bins.feature == "mean_confidence")
+        ]
+        self.assertEqual(len(matched), 2)
+        self.assertEqual(set(matched.decision_accuracy_percent), {100.0})
 
 
 if __name__ == "__main__":

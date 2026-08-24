@@ -103,6 +103,7 @@ def parse_args():
         choices=tuple(FEATURE_GROUPS),
         default=list(FEATURE_GROUPS),
     )
+    parser.add_argument("--preliminary-only", action="store_true")
     parser.add_argument("--sample_seed", type=int, default=2026)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -294,6 +295,20 @@ def paired_ablation_summary(result_frames):
                 ).mean()
             ),
         })
+    if not records:
+        return pd.DataFrame(columns=[
+            "ablation",
+            "disabled_features",
+            "num_questions",
+            "pooled_full_ms_per_output_token",
+            "pooled_ablated_ms_per_output_token",
+            "full_speedup_vs_ablated",
+            "full_win_rate_percent",
+            "geometric_mean_full_speedup_vs_ablated",
+            "geometric_speedup_ci95_low",
+            "geometric_speedup_ci95_high",
+            "output_hash_match_percent",
+        ])
     return pd.DataFrame(records).sort_values(
         "full_speedup_vs_ablated",
         ascending=False,
@@ -478,6 +493,17 @@ def auc_score(values, labels):
     )
 
 
+def spearman_score(left, right):
+    left = pd.Series(left).reset_index(drop=True)
+    right = pd.Series(right).reset_index(drop=True)
+    valid = left.notna() & right.notna()
+    left = left[valid]
+    right = right[valid]
+    if len(left) < 2 or left.nunique() < 2 or right.nunique() < 2:
+        return np.nan
+    return float(left.corr(right, method="spearman"))
+
+
 def feature_oracle_alignment(output_dir):
     decisions = add_state_occurrence(
         pd.read_csv(output_dir / "raw" / "avg_td_full" / "adaptive_td_decisions.csv")
@@ -540,9 +566,9 @@ def feature_oracle_alignment(output_dir):
             "mean": float(values.mean()),
             "std": float(values.std(ddof=0)),
             "unique_values": int(values.nunique()),
-            "spearman_with_predicted_stop_advantage": values.corr(
-                evaluated["predicted_advantage"].reset_index(drop=True),
-                method="spearman",
+            "spearman_with_predicted_stop_advantage": spearman_score(
+                values,
+                evaluated["predicted_advantage"],
             ),
             "oracle_stop_auc": auc_score(values, evaluated.oracle_stop),
             "oracle_stop_mean": float(values[evaluated.oracle_stop.to_numpy() == 1].mean()),
@@ -573,9 +599,10 @@ def feature_oracle_alignment(output_dir):
         "continue_recall_percent": 100.0
         * true_continue
         / max(1, true_continue + false_stop),
-        "spearman_predicted_advantage_vs_oracle_stop": pd.Series(
-            evaluated.predicted_advantage
-        ).corr(pd.Series(evaluated.oracle_stop), method="spearman"),
+        "spearman_predicted_advantage_vs_oracle_stop": spearman_score(
+            evaluated.predicted_advantage,
+            evaluated.oracle_stop,
+        ),
     }])
     return evaluated, pd.DataFrame(records), decision_summary
 
@@ -600,6 +627,120 @@ def learning_windows(evaluated):
             "oracle_stop_rate_percent": 100.0 * group.oracle_action.eq("stop").mean(),
             "mean_predicted_stop_probability": group.stop_probability.mean(),
         })
+    return pd.DataFrame(records)
+
+
+def preliminary_feature_action_summary(decisions, evaluated, feature_states):
+    matrix = load_feature_matrix(decisions)
+    policy_stop = decisions["action"].eq("stop").astype(int).reset_index(drop=True)
+    predicted_advantage = (
+        pd.to_numeric(decisions["q_stop_mean"], errors="coerce")
+        - pd.to_numeric(decisions["q_continue_mean"], errors="coerce")
+    ).reset_index(drop=True)
+    evaluated_matrix = (
+        load_feature_matrix(evaluated) if not evaluated.empty else None
+    )
+    oracle_stop = (
+        evaluated["oracle_action"].eq("stop").astype(int).reset_index(drop=True)
+        if not evaluated.empty
+        else pd.Series(dtype=int)
+    )
+    full_states = feature_states[
+        feature_states["method"].eq("avg_td_full")
+    ].set_index("feature")
+    records = []
+    for index, name in enumerate(FEATURE_NAMES):
+        values = pd.Series(matrix[:, index])
+        stop_values = values[policy_stop.eq(1)]
+        continue_values = values[policy_stop.eq(0)]
+        if evaluated_matrix is not None:
+            matched_values = pd.Series(evaluated_matrix[:, index])
+            oracle_stop_values = matched_values[oracle_stop.eq(1)]
+            oracle_continue_values = matched_values[oracle_stop.eq(0)]
+        else:
+            matched_values = pd.Series(dtype=float)
+            oracle_stop_values = pd.Series(dtype=float)
+            oracle_continue_values = pd.Series(dtype=float)
+        state = full_states.loc[name]
+        records.append({
+            "feature": name,
+            "decisions": len(values),
+            "oracle_matched_decisions": len(matched_values),
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=0)),
+            "unique_values": int(values.nunique()),
+            "policy_stop_mean": float(stop_values.mean()),
+            "policy_continue_mean": float(continue_values.mean()),
+            "policy_stop_auc": auc_score(values, policy_stop),
+            "spearman_with_predicted_stop_advantage": spearman_score(
+                values,
+                predicted_advantage,
+            ),
+            "oracle_stop_mean": float(oracle_stop_values.mean()),
+            "oracle_continue_mean": float(oracle_continue_values.mean()),
+            "oracle_stop_auc": auc_score(matched_values, oracle_stop),
+            "stop_theta": float(state["stop_theta"]),
+            "continue_theta": float(state["continue_theta"]),
+            "theta_stop_minus_continue": float(
+                state["theta_stop_minus_continue"]
+            ),
+            "standardized_final_effect": float(
+                state["standardized_final_effect"]
+            ),
+        })
+    return pd.DataFrame(records)
+
+
+def feature_action_bins(decisions, evaluated, num_bins=5):
+    records = []
+    sources = [("all_policy_decisions", decisions)]
+    if not evaluated.empty:
+        sources.append(("oracle_matched_decisions", evaluated))
+    for source, frame in sources:
+        matrix = load_feature_matrix(frame)
+        for index, name in enumerate(FEATURE_NAMES):
+            values = pd.Series(matrix[:, index], index=frame.index)
+            unique_values = int(values.nunique())
+            if unique_values <= 1:
+                bins = pd.Series(0, index=frame.index)
+            else:
+                bins = pd.qcut(
+                    values,
+                    q=min(num_bins, unique_values),
+                    labels=False,
+                    duplicates="drop",
+                )
+            grouped = frame.assign(_feature_value=values, _feature_bin=bins).groupby(
+                "_feature_bin",
+                dropna=False,
+            )
+            for bin_id, group in grouped:
+                oracle_available = "oracle_action" in group
+                records.append({
+                    "source": source,
+                    "feature": name,
+                    "quantile_bin": int(bin_id) if pd.notna(bin_id) else -1,
+                    "observations": len(group),
+                    "minimum": float(group["_feature_value"].min()),
+                    "maximum": float(group["_feature_value"].max()),
+                    "mean": float(group["_feature_value"].mean()),
+                    "policy_stop_rate_percent": 100.0
+                    * group["action"].eq("stop").mean(),
+                    "mean_stop_probability": float(group["stop_probability"].mean()),
+                    "mean_predicted_stop_advantage": float(
+                        (group["q_stop_mean"] - group["q_continue_mean"]).mean()
+                    ),
+                    "oracle_stop_rate_percent": (
+                        100.0 * group["oracle_action"].eq("stop").mean()
+                        if oracle_available
+                        else np.nan
+                    ),
+                    "decision_accuracy_percent": (
+                        100.0 * group["action"].eq(group["oracle_action"]).mean()
+                        if oracle_available
+                        else np.nan
+                    ),
+                })
     return pd.DataFrame(records)
 
 
@@ -629,6 +770,11 @@ def write_manifest(args, output_dir, problem_ids):
                 "Each avg_td variant learns online from zero on the same ordered "
                 "questions. A positive full_speedup_vs_ablated means the removed "
                 "feature group helped the full controller."
+            ),
+            "preliminary_only": (
+                "When enabled, only FailFast-8, the executed causal oracle, and the "
+                "full Method A controller run. Feature-action reports are diagnostic; "
+                "they rank signals for later ablation but do not establish causality."
             ),
             "causal_oracle": (
                 "The causal oracle executes the best observed refinement snapshot "
@@ -686,7 +832,7 @@ def main():
         "failfast": pd.read_csv(baseline_dir / "benchmark_results.csv"),
         "causal_oracle": pd.read_csv(causal_dir / "benchmark_results.csv"),
     }
-    execution_variants = list(args.ablations)
+    execution_variants = ["full"] if args.preliminary_only else list(args.ablations)
     random.Random(args.sample_seed + 7919).shuffle(execution_variants)
     args.execution_order = execution_variants
     for variant in execution_variants:
@@ -706,7 +852,7 @@ def main():
 
     summary = method_summary(result_frames)
     ablations = paired_ablation_summary(result_frames)
-    feature_states = feature_state_summary(output_dir, args.ablations)
+    feature_states = feature_state_summary(output_dir, execution_variants)
     evaluated, oracle_features, oracle_decisions = feature_oracle_alignment(output_dir)
     group_screening = feature_group_screening_summary(
         ablations,
@@ -714,6 +860,15 @@ def main():
         oracle_features,
     )
     windows = learning_windows(evaluated)
+    full_decisions = pd.read_csv(
+        output_dir / "raw" / "avg_td_full" / "adaptive_td_decisions.csv"
+    )
+    preliminary_features = preliminary_feature_action_summary(
+        full_decisions,
+        evaluated,
+        feature_states,
+    )
+    preliminary_bins = feature_action_bins(full_decisions, evaluated)
     causal_decisions = pd.read_csv(causal_dir / "causal_oracle_decisions.csv")
     causal_summary = causal_oracle_comparison(
         result_frames["failfast"],
@@ -737,6 +892,14 @@ def main():
     summary.to_csv(output_dir / "method_summary.csv", index=False)
     ablations.to_csv(output_dir / "feature_ablation_summary.csv", index=False)
     feature_states.to_csv(output_dir / "feature_state_summary.csv", index=False)
+    preliminary_features.to_csv(
+        output_dir / "preliminary_feature_action_summary.csv",
+        index=False,
+    )
+    preliminary_bins.to_csv(
+        output_dir / "preliminary_feature_action_bins.csv",
+        index=False,
+    )
     group_screening.to_csv(
         output_dir / "feature_group_screening.csv",
         index=False,
@@ -761,6 +924,8 @@ def main():
     print(ablations.to_string(index=False))
     print("\nFEATURE GROUP SCREENING")
     print(group_screening.to_string(index=False))
+    print("\nPRELIMINARY FEATURE-ACTION SUMMARY")
+    print(preliminary_features.to_string(index=False))
     print("\nCAUSAL ORACLE UPPER BOUND")
     print(causal_summary.to_string(index=False))
     print("\nFULL CONTROLLER ORACLE ALIGNMENT")
