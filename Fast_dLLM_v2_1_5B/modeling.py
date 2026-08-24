@@ -2166,7 +2166,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 ):
                                     stop_reason = "bucket_renewal_lower_cost"
 
-                            if bool(getattr(args, "collect_bucket_oracle", False)):
+                            if (
+                                bool(getattr(args, "collect_bucket_oracle", False))
+                                and (
+                                    not bool(getattr(args, "global_oracle_graph", False))
+                                    or (
+                                        adaptive_record is not None
+                                        and bool(adaptive_record.get("stop_available"))
+                                    )
+                                )
+                            ):
                                 frontier_stats["oracle_snapshot_attempts"] += 1
                                 remaining_absolute_positions = [
                                     draft_token_start_idx + int(rel_pos)
@@ -2183,18 +2192,52 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     oracle_x = x_t.clone()
                                     for absolute_pos in remaining_absolute_positions:
                                         oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
+                                    oracle_outer_action = (
+                                        post_stop_outer_action
+                                        if adaptive_enabled
+                                        else (
+                                            "verify"
+                                            if (
+                                                any(
+                                                    float(value) < tau_f
+                                                    for value in confidences
+                                                )
+                                                or int(target_len) >= int(max_spec_len)
+                                            )
+                                            else "extend"
+                                        )
+                                    )
+                                    oracle_controllable_decisions = [
+                                        item
+                                        for item in frontier_stats["adaptive_decisions"]
+                                        if item.get("stop_available")
+                                    ]
                                     frontier_stats["oracle_refinement_snapshots"].append({
                                         "step": current_step,
                                         "target_len": int(target_len),
                                         "draft_passes_elapsed": int(num_forward_passes),
                                         "draft_latency_elapsed_ms": float(sum(forward_pass_latencies)),
                                         "masks_remaining": int(masks_remaining),
+                                        "newly_committed": int(unmasked_this_step),
                                         "committed_tokens": int(target_len - masks_remaining),
                                         "filled_tokens": int(masks_remaining),
                                         "draft_proposal": oracle_x[
                                             0,
                                             draft_token_start_idx:draft_end_idx,
                                         ].tolist(),
+                                        "confidences": [float(value) for value in confidences],
+                                        "margins": [float(value) for value in margins],
+                                        "outer_action_if_stop": oracle_outer_action,
+                                        "oracle_decision_index": len(
+                                            oracle_controllable_decisions
+                                        ) - 1,
+                                        "oracle_action_prefix": list(
+                                            getattr(
+                                                adaptive_controller,
+                                                "executed_actions",
+                                                [],
+                                            )
+                                        ),
                                         "predicted_expected_output": step_record.get(
                                             "bucket_expected_output"
                                         ),

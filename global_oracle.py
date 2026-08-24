@@ -30,13 +30,19 @@ class ScriptedOracleRefinementController(OnlineTDRefinementController):
         )
         self.action_script = ()
         self.script_position = 0
+        self.default_action = None
+        self.executed_actions = []
 
-    def set_script(self, actions):
+    def set_script(self, actions, default_action=None):
         unknown = set(actions).difference({STOP, CONTINUE})
         if unknown:
             raise ValueError(f"unknown oracle actions: {sorted(unknown)}")
+        if default_action not in (None, STOP, CONTINUE):
+            raise ValueError(f"unknown default oracle action: {default_action}")
         self.action_script = tuple(actions)
         self.script_position = 0
+        self.default_action = default_action
+        self.executed_actions = []
 
     def choose(
         self,
@@ -50,18 +56,23 @@ class ScriptedOracleRefinementController(OnlineTDRefinementController):
             action = CONTINUE
             reason = "oracle_mandatory_continue"
         elif self.script_position >= len(self.action_script):
-            raise OracleBranchRequired(
-                self.script_position,
-                {
-                    "refinement_step": int(refinement_step),
-                    "features": list(features),
-                    **state,
-                },
-            )
+            if self.default_action is None:
+                raise OracleBranchRequired(
+                    self.script_position,
+                    {
+                        "refinement_step": int(refinement_step),
+                        "features": list(features),
+                        **state,
+                    },
+                )
+            action = self.default_action
+            reason = "oracle_default_action"
         else:
             action = self.action_script[self.script_position]
             self.script_position += 1
             reason = "oracle_scripted_action"
+        if allow_stop:
+            self.executed_actions.append(action)
         zero = ActionEstimate(0.0, 0.0, 0.0, 0.0)
         return AdaptiveDecision(
             action=action,
@@ -81,7 +92,7 @@ class ScriptedOracleRefinementController(OnlineTDRefinementController):
             importance_weight=1.0,
             diagnostics={
                 "controller_name": self.controller_name,
-                "oracle_script_index": self.script_position - 1,
+                "oracle_script_index": len(self.executed_actions) - 1,
                 "oracle_elapsed_draft_ms": float(
                     state.get("elapsed_draft_ms", 0.0)
                 ),
