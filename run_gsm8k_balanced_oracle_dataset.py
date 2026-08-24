@@ -16,7 +16,7 @@ from run_failfast_counterfactual_oracle import (
 )
 
 
-VERSION = "gsm8k_balanced_failfast_causal_oracle_v8_question_anchor"
+VERSION = "gsm8k_balanced_failfast_causal_oracle_v7_round_stratified"
 PASS_CLASSES = ("step1", "step2", "step3plus")
 
 
@@ -54,11 +54,6 @@ def parse_args():
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--collect_until_balanced", action="store_true")
-    parser.add_argument(
-        "--selection_unit",
-        choices=("round", "question_anchor"),
-        default="round",
-    )
     parser.add_argument(
         "--log_level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -218,28 +213,12 @@ def run_causal_oracle(args, problem_ids):
         if args.collect_until_balanced:
             partial_decisions = pd.concat(decision_frames, ignore_index=True)
             partial_rounds = causal_selection_rounds(partial_decisions)
-            selection_unit = getattr(args, "selection_unit", "round")
-            if selection_unit == "question_anchor":
-                eligible = {
-                    label: int(
-                        partial_rounds.loc[
-                            partial_rounds["oracle_pass_class"].eq(label),
-                            "problem_id",
-                        ].nunique()
-                    )
-                    for label in PASS_CLASSES
-                }
-                selector = select_balanced_question_anchors
-                eligible_label = "eligible_questions"
-            else:
-                eligible = {
-                    label: int(partial_rounds["oracle_pass_class"].eq(label).sum())
-                    for label in PASS_CLASSES
-                }
-                selector = select_balanced_rounds
-                eligible_label = "eligible_rounds"
+            eligible = {
+                label: int(partial_rounds["oracle_pass_class"].eq(label).sum())
+                for label in PASS_CLASSES
+            }
             try:
-                selector(
+                select_balanced_rounds(
                     partial_rounds,
                     args.selected_size,
                     args.selection_seed,
@@ -248,16 +227,14 @@ def run_causal_oracle(args, problem_ids):
                 print(
                     f"COLLECTION PROGRESS | evaluated_questions="
                     f"{partial_rounds['problem_id'].nunique()} | "
-                    f"rounds={len(partial_rounds)} | "
-                    f"{eligible_label}={eligible}",
+                    f"rounds={len(partial_rounds)} | eligible_rounds={eligible}",
                     flush=True,
                 )
             else:
                 print(
                     f"BALANCED TARGET REACHED | evaluated_questions="
                     f"{partial_rounds['problem_id'].nunique()} | "
-                    f"rounds={len(partial_rounds)} | "
-                    f"{eligible_label}={eligible}",
+                    f"rounds={len(partial_rounds)} | eligible_rounds={eligible}",
                     flush=True,
                 )
                 break
@@ -358,82 +335,6 @@ def select_balanced_rounds(rounds, selected_size, selection_seed):
     )
 
 
-def select_balanced_question_anchors(rounds, selected_size, selection_seed):
-    quotas = balanced_quotas(selected_size)
-    key_columns = ["problem_id", "round_id"]
-    if rounds.duplicated(key_columns).any():
-        raise ValueError("Oracle rounds must be unique by problem_id and round_id")
-
-    candidate_orders = {}
-    available = {}
-    for label in PASS_CLASSES:
-        problem_ids = sorted(
-            rounds.loc[
-                rounds["oracle_pass_class"].eq(label), "problem_id"
-            ].astype(int).unique()
-        )
-        available[label] = len(problem_ids)
-        random.Random(f"{selection_seed}:{label}:questions").shuffle(problem_ids)
-        candidate_orders[label] = problem_ids
-
-    slots = [
-        (label, slot_index)
-        for label in sorted(PASS_CLASSES, key=lambda item: available[item])
-        for slot_index in range(quotas[label])
-    ]
-    problem_to_slot = {}
-    slot_to_problem = {}
-
-    def assign(slot, visited):
-        label, _ = slot
-        for problem_id in candidate_orders[label]:
-            if problem_id in visited:
-                continue
-            visited.add(problem_id)
-            previous_slot = problem_to_slot.get(problem_id)
-            if previous_slot is None or assign(previous_slot, visited):
-                problem_to_slot[problem_id] = slot
-                slot_to_problem[slot] = problem_id
-                return True
-        return False
-
-    for slot in slots:
-        if not assign(slot, set()):
-            raise ValueError(
-                "The oracle pool cannot provide enough unique questions for all "
-                "refinement-depth quotas. "
-                f"quotas={quotas}, eligible_questions={available}. Increase "
-                "--pool_size or use --collect_until_balanced with a larger pool."
-            )
-
-    selected_rows = []
-    for slot, problem_id in slot_to_problem.items():
-        label, _ = slot
-        candidates = rounds[
-            rounds["problem_id"].astype(int).eq(problem_id)
-            & rounds["oracle_pass_class"].eq(label)
-        ].copy()
-        indices = list(candidates.index)
-        random.Random(
-            f"{selection_seed}:{label}:{problem_id}:anchor"
-        ).shuffle(indices)
-        anchor = candidates.loc[[indices[0]]].copy()
-        anchor["selection_stratum"] = label
-        anchor["class_quota"] = quotas[label]
-        anchor["selection_seed"] = int(selection_seed)
-        selected_rows.append(anchor)
-
-    selected = pd.concat(selected_rows, ignore_index=True, sort=False)
-    if selected["problem_id"].nunique() != selected_size:
-        raise RuntimeError("Question-anchor selection produced duplicate questions")
-    return (
-        selected.sort_values(
-            ["selection_stratum", "problem_id", "round_id"]
-        ).reset_index(drop=True),
-        quotas,
-    )
-
-
 def distribution_summary(profiles, scope):
     class_column = (
         "selection_stratum"
@@ -493,39 +394,6 @@ def round_distribution_summary(rounds, scope):
             ),
             "mean_oracle_refinement_steps": (
                 float(group["oracle_refinement_steps"].mean())
-                if len(group)
-                else np.nan
-            ),
-        })
-    return pd.DataFrame(records)
-
-
-def question_anchor_distribution_summary(profiles, scope):
-    records = []
-    for label in PASS_CLASSES:
-        group = profiles[profiles["selection_stratum"].eq(label)]
-        matching_round_percent = (
-            group[f"oracle_{label}_round_percent"]
-            if len(group)
-            else pd.Series(dtype=float)
-        )
-        records.append({
-            "scope": scope,
-            "selection_stratum": label,
-            "num_questions": int(len(group)),
-            "question_percent": 100.0 * len(group) / max(1, len(profiles)),
-            "mean_matching_round_percent": (
-                float(matching_round_percent.mean())
-                if len(group)
-                else np.nan
-            ),
-            "mean_oracle_refinement_steps_all_rounds": (
-                float(group["mean_oracle_refinement_steps"].mean())
-                if len(group)
-                else np.nan
-            ),
-            "mean_oracle_draft_passes_all_rounds": (
-                float(group["mean_oracle_draft_passes"].mean())
                 if len(group)
                 else np.nan
             ),
@@ -738,16 +606,11 @@ def manifest(args, candidate_ids, evaluated_ids, selected_rounds, quotas):
         ],
         "balanced_class_quotas": quotas,
         "selection_definition": (
-            "Each selected problem_id is unique and is assigned one causal-oracle "
-            "anchor round. Anchor quotas are balanced by selected_step: 1 is step1, "
-            "2 is step2, and >=3 is step3plus. The complete natural distribution of "
-            "all rounds from every selected question is retained separately."
-            if getattr(args, "selection_unit", "round") == "question_anchor"
-            else
             "The selected dataset contains speculation rounds sampled directly from "
             "causal-oracle decisions. Quotas are balanced by selected_step: 1 is step1, "
             "2 is step2, and >=3 is step3plus. Each (problem_id, round_id) is unique; "
-            "a question may contribute multiple rounds."
+            "a question may contribute multiple rounds. Total draft forward passes remain "
+            "a separate latency metric, and the natural full-pool distribution is retained."
         ),
         "causal_oracle_interpretation": (
             "The causal oracle chooses an observed refinement snapshot, executes that "
@@ -775,32 +638,11 @@ def main():
         candidate_ids,
     )
     evaluated_ids = causal_results["problem_id"].astype(int).tolist()
+    failfast_results = run_failfast_pool(args, evaluated_ids)
     rounds = causal_selection_rounds(causal_decisions)
     profiles = problem_profiles(rounds)
 
-    selector = (
-        select_balanced_question_anchors
-        if args.selection_unit == "question_anchor"
-        else select_balanced_rounds
-    )
-    anchors, quotas = selector(
-        rounds,
-        args.selected_size,
-        args.selection_seed,
-    )
-    selected_ids = sorted(set(anchors["problem_id"].astype(int)))
-    baseline_ids = (
-        selected_ids
-        if args.selection_unit == "question_anchor"
-        else evaluated_ids
-    )
-    failfast_results = run_failfast_pool(args, baseline_ids)
-
-    failfast_results.to_csv(output_dir / "failfast_results.csv", index=False)
-    if args.selection_unit == "round":
-        failfast_results.to_csv(
-            output_dir / "pool_failfast_results.csv", index=False
-        )
+    failfast_results.to_csv(output_dir / "pool_failfast_results.csv", index=False)
     causal_results.to_csv(output_dir / "pool_causal_oracle_results.csv", index=False)
     causal_decisions.to_csv(
         output_dir / "pool_causal_oracle_decisions.csv", index=False
@@ -808,10 +650,9 @@ def main():
     causal_candidates.to_csv(
         output_dir / "pool_causal_oracle_candidates.csv", index=False
     )
-    if args.selection_unit == "round":
-        failfast_results.to_csv(
-            output_dir / "all_evaluated_failfast_results.csv", index=False
-        )
+    failfast_results.to_csv(
+        output_dir / "all_evaluated_failfast_results.csv", index=False
+    )
     causal_results.to_csv(
         output_dir / "all_evaluated_causal_oracle_results.csv", index=False
     )
@@ -835,27 +676,13 @@ def main():
         output_dir / "pool_round_class_distribution.csv", index=False
     )
 
+    anchors, quotas = select_balanced_rounds(
+        rounds,
+        args.selected_size,
+        args.selection_seed,
+    )
+    selected_ids = sorted(set(anchors["problem_id"].astype(int)))
     selected = profiles[profiles["problem_id"].isin(selected_ids)].copy()
-    if args.selection_unit == "question_anchor":
-        anchor_metadata = anchors[
-            [
-                "problem_id",
-                "round_id",
-                "selection_stratum",
-                "oracle_refinement_steps",
-                "oracle_draft_passes",
-            ]
-        ].rename(columns={
-            "round_id": "anchor_round_id",
-            "oracle_refinement_steps": "anchor_oracle_refinement_steps",
-            "oracle_draft_passes": "anchor_oracle_draft_passes",
-        })
-        selected = selected.merge(
-            anchor_metadata,
-            on="problem_id",
-            how="inner",
-            validate="one_to_one",
-        )
     selected_keys = anchors[["problem_id", "round_id"]].drop_duplicates()
     selected_failfast = failfast_results[
         failfast_results["problem_id"].isin(selected_ids)
@@ -914,14 +741,6 @@ def main():
     round_distribution_summary(anchors, "balanced_anchor_rounds").to_csv(
         output_dir / "selected_class_distribution.csv", index=False
     )
-    if args.selection_unit == "question_anchor":
-        question_anchor_distribution_summary(
-            selected,
-            "balanced_unique_questions",
-        ).to_csv(
-            output_dir / "selected_question_class_distribution.csv",
-            index=False,
-        )
     pd.concat(
         [
             round_distribution_summary(
@@ -936,6 +755,12 @@ def main():
         ignore_index=True,
     ).to_csv(output_dir / "selected_round_class_distribution.csv", index=False)
 
+    pool_summary = causal_oracle_comparison(
+        failfast_results,
+        causal_results,
+        causal_decisions,
+    )
+    pool_summary.insert(0, "scope", f"all_evaluated_{len(evaluated_ids)}")
     selected_summary = causal_oracle_comparison(
         selected_failfast,
         selected_causal,
@@ -944,56 +769,16 @@ def main():
     selected_summary.insert(
         0,
         "scope",
-        f"balanced_question_subset_{len(selected_ids)}",
+        f"anchor_question_subset_{len(selected_ids)}",
     )
-    if args.selection_unit == "round":
-        pool_summary = causal_oracle_comparison(
-            failfast_results,
-            causal_results,
-            causal_decisions,
-        )
-        pool_summary.insert(0, "scope", f"all_evaluated_{len(evaluated_ids)}")
-        causal_summary = pd.concat(
-            [pool_summary, selected_summary], ignore_index=True
-        )
-    else:
-        causal_summary = selected_summary
+    causal_summary = pd.concat(
+        [pool_summary, selected_summary], ignore_index=True
+    )
     causal_summary.to_csv(output_dir / "causal_oracle_summary.csv", index=False)
-    if args.selection_unit == "question_anchor":
-        class_summaries = []
-        for label in PASS_CLASSES:
-            class_ids = set(
-                selected.loc[
-                    selected["selection_stratum"].eq(label), "problem_id"
-                ].astype(int)
-            )
-            class_failfast = selected_failfast[
-                selected_failfast["problem_id"].astype(int).isin(class_ids)
-            ]
-            class_causal = selected_causal[
-                selected_causal["problem_id"].astype(int).isin(class_ids)
-            ]
-            class_decisions = selected_question_decisions[
-                selected_question_decisions["problem_id"].astype(int).isin(
-                    class_ids
-                )
-            ]
-            class_summary = causal_oracle_comparison(
-                class_failfast,
-                class_causal,
-                class_decisions,
-            )
-            class_summary.insert(0, "selection_stratum", label)
-            class_summaries.append(class_summary)
-        pd.concat(class_summaries, ignore_index=True).to_csv(
-            output_dir / "causal_oracle_class_summary.csv",
-            index=False,
-        )
-    if args.selection_unit == "round":
-        paired_causal_comparison(failfast_results, causal_results).to_csv(
-            output_dir / "pool_causal_oracle_paired_results.csv",
-            index=False,
-        )
+    paired_causal_comparison(failfast_results, causal_results).to_csv(
+        output_dir / "pool_causal_oracle_paired_results.csv",
+        index=False,
+    )
     paired_causal_comparison(selected_failfast, selected_causal).to_csv(
         output_dir / "causal_oracle_paired_results.csv",
         index=False,

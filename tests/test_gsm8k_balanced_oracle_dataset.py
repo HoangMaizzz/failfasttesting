@@ -14,9 +14,7 @@ from run_gsm8k_balanced_oracle_dataset import (
     pass_class,
     partition_problem_ids,
     problem_profiles,
-    question_anchor_distribution_summary,
     run_causal_oracle,
-    select_balanced_question_anchors,
     select_balanced_rounds,
 )
 
@@ -95,62 +93,6 @@ class Gsm8kBalancedOracleDatasetTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual(selected["problem_id"].nunique(), 1)
         self.assertEqual(quotas, {"step1": 1, "step2": 1, "step3plus": 1})
-
-    def test_question_anchor_balance_uses_unique_problem_ids(self):
-        rows = []
-        for problem_id in range(12):
-            for round_id, label in enumerate(
-                ("step1", "step2", "step3plus")
-            ):
-                rows.append({
-                    "problem_id": problem_id,
-                    "round_id": round_id,
-                    "oracle_pass_class": label,
-                    "oracle_refinement_steps": round_id + 1,
-                    "oracle_draft_passes": round_id + 2,
-                })
-        rounds = pd.DataFrame(rows)
-
-        selected, quotas = select_balanced_question_anchors(rounds, 9, 17)
-
-        self.assertEqual(quotas, {"step1": 3, "step2": 3, "step3plus": 3})
-        self.assertEqual(selected["problem_id"].nunique(), 9)
-        self.assertEqual(
-            selected["selection_stratum"].value_counts().to_dict(),
-            quotas,
-        )
-        self.assertFalse(selected.duplicated(["problem_id"]).any())
-
-    def test_question_anchor_balance_rejects_overlapping_short_pool(self):
-        rounds = pd.DataFrame({
-            "problem_id": [1, 1, 1],
-            "round_id": [0, 1, 2],
-            "oracle_pass_class": ["step1", "step2", "step3plus"],
-        })
-        with self.assertRaisesRegex(ValueError, "unique questions"):
-            select_balanced_question_anchors(rounds, 3, 17)
-
-    def test_question_anchor_summary_reports_question_counts(self):
-        profiles = pd.DataFrame({
-            "selection_stratum": ["step1", "step2", "step3plus"],
-            "oracle_step1_round_percent": [80.0, 10.0, 10.0],
-            "oracle_step2_round_percent": [10.0, 70.0, 20.0],
-            "oracle_step3plus_round_percent": [10.0, 20.0, 70.0],
-            "mean_oracle_refinement_steps": [1.2, 2.0, 3.4],
-            "mean_oracle_draft_passes": [2.2, 3.0, 4.4],
-        })
-        summary = question_anchor_distribution_summary(
-            profiles, "selected"
-        ).set_index("selection_stratum")
-        self.assertEqual(summary["num_questions"].to_dict(), {
-            "step1": 1,
-            "step2": 1,
-            "step3plus": 1,
-        })
-        self.assertEqual(
-            summary.loc["step3plus", "mean_matching_round_percent"],
-            70.0,
-        )
 
     def test_selection_rejects_fake_balance_when_a_class_is_short(self):
         rounds = pd.DataFrame({
