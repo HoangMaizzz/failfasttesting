@@ -10,6 +10,7 @@ from run_gsm8k_strict_oracle_method_a_test50 import (
     confusion_summary,
     feature_alignment,
     match_decisions,
+    method_a_phase_complete,
 )
 
 
@@ -21,6 +22,24 @@ def feature_row(first_value):
 
 
 class Gsm8kStrictOracleMethodATests(unittest.TestCase):
+    def test_method_a_resume_requires_all_expected_problem_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            pd.DataFrame({"problem_id": [1, 2]}).to_csv(
+                directory / "benchmark_results.csv",
+                index=False,
+            )
+            pd.DataFrame({"action": ["stop"]}).to_csv(
+                directory / "adaptive_td_decisions.csv",
+                index=False,
+            )
+            (directory / "adaptive_td_runtime_state.json").write_text(
+                json.dumps({"controller_name": "avg_td"}),
+                encoding="utf-8",
+            )
+            self.assertTrue(method_a_phase_complete(directory, [1, 2]))
+            self.assertFalse(method_a_phase_complete(directory, [1, 2, 3]))
+
     def test_exact_state_matching_rejects_different_proposal(self):
         method = pd.DataFrame({
             "problem_id": [7, 7],

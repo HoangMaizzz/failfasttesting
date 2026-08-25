@@ -113,6 +113,55 @@ def sampled_problem_ids(args):
     ))
 
 
+def method_a_phase_complete(phase_dir, problem_ids):
+    result_path = phase_dir / "benchmark_results.csv"
+    decision_path = phase_dir / "adaptive_td_decisions.csv"
+    state_path = phase_dir / "adaptive_td_runtime_state.json"
+    if not all(path.exists() and path.stat().st_size > 0 for path in (
+        result_path,
+        decision_path,
+        state_path,
+    )):
+        return False
+    try:
+        results = pd.read_csv(result_path)
+        decisions = pd.read_csv(decision_path)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, pd.errors.EmptyDataError, json.JSONDecodeError):
+        return False
+    return (
+        len(results) == len(problem_ids)
+        and set(results["problem_id"].astype(int)) == set(map(int, problem_ids))
+        and not decisions.empty
+        and state.get("controller_name") == "avg_td"
+    )
+
+
+def run_method_a_fresh(args, problem_ids):
+    phase_dir = Path(args.output_dir) / "raw" / "method_a_fresh"
+    if args.resume and method_a_phase_complete(phase_dir, problem_ids):
+        print("RESUME method_a_fresh", flush=True)
+        return phase_dir
+    if phase_dir.exists():
+        shutil.rmtree(phase_dir)
+    original_resume = args.resume
+    args.resume = False
+    try:
+        return run_standard_phase(
+            args,
+            problem_ids,
+            "method_a_fresh",
+            adaptive_args(args, ()),
+            [
+                "benchmark_results.csv",
+                "adaptive_td_decisions.csv",
+                "adaptive_td_runtime_state.json",
+            ],
+        )
+    finally:
+        args.resume = original_resume
+
+
 def source_config(args):
     return {
         "dataset": "gsm8k",
@@ -483,17 +532,7 @@ def main():
     source = source_config(args)
     started = time.time()
 
-    method_a_dir = run_standard_phase(
-        args,
-        problem_ids,
-        "method_a_fresh",
-        adaptive_args(args, ()),
-        [
-            "benchmark_results.csv",
-            "adaptive_td_decisions.csv",
-            "adaptive_td_runtime_state.json",
-        ],
-    )
+    method_a_dir = run_method_a_fresh(args, problem_ids)
 
     prepass_dir = run_strict_phase(
         args,
