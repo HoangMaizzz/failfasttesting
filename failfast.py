@@ -1991,7 +1991,7 @@ def run_strict_greedy_local_oracle_problem(
             )
     selected_round_actions = []
 
-    def run_draft(script, default_action):
+    def run_draft(script, default_action, reuse_selected_cache=False):
         return run_oracle_draft_trajectory(
             args,
             dllm,
@@ -2003,7 +2003,9 @@ def run_strict_greedy_local_oracle_problem(
             incr_len,
             action_script=script,
             default_action=default_action,
-            prev_prefill_output=prev_prefill_output,
+            prev_prefill_output=(
+                prev_prefill_output if reuse_selected_cache else None
+            ),
         )
 
     def evaluate_branch(script, decision_index, current_state):
@@ -2085,7 +2087,9 @@ def run_strict_greedy_local_oracle_problem(
                     f"strict greedy replay exhausted policy at round {round_id}"
                 )
             action_script = list(replay_rounds[round_id]["actions"])
-            final_draft = run_draft(tuple(action_script), None)
+            final_draft = run_draft(
+                tuple(action_script), None, reuse_selected_cache=True
+            )
             if tuple(final_draft["action_script"]) != tuple(action_script):
                 raise RuntimeError(
                     f"strict greedy replay diverged at problem={problem_id}, "
@@ -2200,6 +2204,14 @@ def run_strict_greedy_local_oracle_problem(
                         raise RuntimeError(
                             "strict greedy oracle exceeded the refinement safety bound"
                         )
+            final_draft = run_draft(
+                tuple(action_script), None, reuse_selected_cache=True
+            )
+            if tuple(final_draft["action_script"]) != tuple(action_script):
+                raise RuntimeError(
+                    f"selected strict greedy path diverged with real KV reuse at "
+                    f"problem={problem_id}, round={round_id}"
+                )
         selected_round_actions.append({
             "round_id": int(round_id),
             "actions": list(action_script),
