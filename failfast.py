@@ -2010,6 +2010,32 @@ def run_strict_greedy_local_oracle_problem(
         draft = run_draft(script, CONTINUE)
         branch_prefill_output = draft.pop("prefill_output", None)
         del branch_prefill_output
+        required_prefix = tuple(script[:decision_index + 1])
+        executed_prefix = tuple(
+            draft["action_script"][:decision_index + 1]
+        )
+        if executed_prefix != required_prefix:
+            raise RuntimeError(
+                "strict greedy branch diverged before the requested decision"
+            )
+        decisions = draft["frontier_stats"].get("adaptive_decisions") or []
+        decision_record = next(
+            (
+                record
+                for record in decisions
+                if bool(record.get("stop_available"))
+                and int(record.get("oracle_script_index", -1)) == decision_index
+            ),
+            None,
+        )
+        elapsed_before_ms = float(
+            current_state.get("elapsed_draft_ms", 0.0)
+            if decision_record is None
+            else decision_record.get(
+                "oracle_elapsed_draft_ms",
+                current_state.get("elapsed_draft_ms", 0.0),
+            )
+        )
         verification = evaluate_oracle_proposal_tokens(
             target_model,
             orig_model_inputs,
@@ -2017,21 +2043,6 @@ def run_strict_greedy_local_oracle_problem(
             draft["proposal"],
             max_append_tokens=num_target_tokens - len(current_token_ids),
             eos_token_id=eos_token_id,
-        )
-        decisions = draft["frontier_stats"].get("adaptive_decisions") or []
-        controllable_decisions = [
-            record for record in decisions if bool(record.get("stop_available"))
-        ]
-        if decision_index >= len(controllable_decisions):
-            raise RuntimeError(
-                "strict greedy branch did not replay the requested decision"
-            )
-        decision_record = controllable_decisions[decision_index]
-        elapsed_before_ms = float(
-            decision_record.get(
-                "oracle_elapsed_draft_ms",
-                current_state.get("elapsed_draft_ms", 0.0),
-            )
         )
         remaining_forward_ms = max(
             0.0, draft["draft_latency_ms"] - elapsed_before_ms
