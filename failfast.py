@@ -15,6 +15,7 @@ import pprint
 import logging
 import argparse
 import transformers
+from pathlib import Path
 from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -49,6 +50,12 @@ from truncated_global_oracle import (
     estimate_cache_bytes,
     greedy_lcp_verification,
     solve_truncated_horizon,
+)
+from strict_greedy_oracle import (
+    GreedyBranch,
+    choose_strict_greedy_action,
+    format_outer_path,
+    load_verifier_profile,
 )
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -435,6 +442,11 @@ parser.add_argument("--global_oracle_log_interval", type=int, default=25)
 parser.add_argument("--global_oracle_epsilon_cost_ms", type=float, default=1.0)
 parser.add_argument("--truncated_global_horizon", type=int, default=0)
 parser.add_argument("--truncated_lcp_validation_candidates", type=int, default=16)
+parser.add_argument("--strict_greedy_local_oracle", action="store_true")
+parser.add_argument("--strict_greedy_verifier_profile", type=str)
+parser.add_argument("--strict_greedy_epsilon_ms", type=float, default=1.0)
+parser.add_argument("--strict_greedy_replay_policy", type=str)
+parser.add_argument("--log_verifier_calls", action="store_true")
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
 parser.add_argument(
@@ -575,8 +587,25 @@ if args.global_oracle_graph:
         )
 elif args.truncated_global_horizon:
     raise ValueError("--truncated_global_horizon requires --global_oracle_graph")
+if args.strict_greedy_local_oracle:
+    if args.causal_oracle or args.global_oracle_graph or args.adaptive_td:
+        raise ValueError("strict greedy oracle cannot be combined with another oracle/controller")
+    if args.frontier_stop_mode != "disabled":
+        raise ValueError("strict greedy oracle requires unmodified FailFast")
+    if args.decoding_strategy != "greedy":
+        raise ValueError("strict greedy oracle requires greedy decoding")
+    if args.benchmark_modes != ["dllm_ar"]:
+        raise ValueError("strict greedy oracle requires --benchmark_modes dllm_ar")
+    if not args.strict_greedy_verifier_profile:
+        raise ValueError("strict greedy oracle requires --strict_greedy_verifier_profile")
+    if args.strict_greedy_epsilon_ms < 0.0:
+        raise ValueError("--strict_greedy_epsilon_ms must be non-negative")
+elif args.strict_greedy_verifier_profile:
+    raise ValueError("--strict_greedy_verifier_profile requires strict greedy oracle")
+if args.strict_greedy_replay_policy and not args.strict_greedy_local_oracle:
+    raise ValueError("--strict_greedy_replay_policy requires strict greedy oracle")
 def build_adaptive_controller(args):
-    if args.global_oracle_graph:
+    if args.global_oracle_graph or args.strict_greedy_local_oracle:
         return ScriptedOracleRefinementController(
             max_refinement_steps=max(64, args.adaptive_max_refinement_steps),
         )
@@ -635,6 +664,19 @@ def build_adaptive_controller(args):
 
 
 args.adaptive_td_controller = build_adaptive_controller(args)
+args.strict_greedy_profile = (
+    load_verifier_profile(args.strict_greedy_verifier_profile)
+    if args.strict_greedy_local_oracle
+    else None
+)
+args.strict_greedy_decision_rows = []
+args.verifier_call_rows = []
+args.strict_greedy_replay_data = (
+    json.loads(Path(args.strict_greedy_replay_policy).read_text(encoding="utf-8"))
+    if args.strict_greedy_replay_policy
+    else None
+)
+args.strict_greedy_selected_policy = {}
 if args.adaptive_state_path:
     with open(args.adaptive_state_path, "r", encoding="utf-8") as handle:
         args.adaptive_td_controller.load_snapshot(json.load(handle))
@@ -1063,7 +1105,10 @@ def summarize_frontier_diagnostics(stats_each_round):
     }
 
 def frontier_stop_enabled(args):
-    return bool(getattr(args, "adaptive_td", False)) or (
+    return bool(
+        getattr(args, "adaptive_td", False)
+        or getattr(args, "strict_greedy_local_oracle", False)
+    ) or (
         getattr(args, "frontier_stop_mode", "disabled")
         not in (None, "disabled", "none", "off")
     )
@@ -1855,6 +1900,8 @@ def run_oracle_draft_trajectory(
     incr_len,
     action_script=(),
     default_action=CONTINUE,
+    prev_prefill_output=None,
+    last_round_rejected=None,
 ):
     controller = args.adaptive_td_controller
     controller.set_script(action_script, default_action=default_action)
@@ -1863,12 +1910,7 @@ def run_oracle_draft_trajectory(
     if orig_model_inputs["input_ids"].is_cuda:
         torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
     started = time.perf_counter()
-    (
-        proposal,
-        actual_spec_len,
-        num_forward_passes,
-        forward_pass_latencies,
-    ) = get_next_tokens_dllm(
+    draft_result = get_next_tokens_dllm(
         dllm,
         args,
         orig_model_inputs,
@@ -1881,8 +1923,25 @@ def run_oracle_draft_trajectory(
         lowconf_threshold=lowconf_threshold,
         max_spec_len=max_spec_len,
         incr_len=incr_len,
-        last_round_rejected=None,
+        last_round_rejected=last_round_rejected,
+        prev_prefill_output=prev_prefill_output,
     )
+    if args.disable_reusing_drafter_kvs:
+        (
+            proposal,
+            actual_spec_len,
+            num_forward_passes,
+            forward_pass_latencies,
+        ) = draft_result
+        prefill_output = None
+    else:
+        (
+            proposal,
+            actual_spec_len,
+            prefill_output,
+            num_forward_passes,
+            forward_pass_latencies,
+        ) = draft_result
     if orig_model_inputs["input_ids"].is_cuda:
         torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
     return {
@@ -1893,6 +1952,317 @@ def run_oracle_draft_trajectory(
         "draft_wall_time_ms": (time.perf_counter() - started) * 1000.0,
         "frontier_stats": getattr(args, "last_frontier_stats", None) or {},
         "action_script": tuple(controller.executed_actions),
+        "prefill_output": prefill_output,
+    }
+
+
+def run_strict_greedy_local_oracle_problem(
+    args,
+    problem_id,
+    target_model,
+    dllm,
+    orig_model_inputs,
+    num_target_tokens,
+    drafter_threshold,
+    lowconf_threshold,
+    max_spec_len,
+    incr_len,
+):
+    profile = args.strict_greedy_profile
+    mean_verify_ms = float(profile["mean_verify_latency_ms"])
+    mean_tokens_per_verify = float(profile["mean_tokens_per_verify"])
+    eos_token_id = args.target_tokenizer.eos_token_id
+    current_token_ids = []
+    stats_each_round = []
+    draft_latency_ms = 0.0
+    verify_latency_ms = 0.0
+    post_verify_latency_ms = 0.0
+    draft_passes = 0
+    round_id = 0
+    prev_prefill_output = None
+    replay_rounds = None
+    if args.strict_greedy_replay_data is not None:
+        replay_rounds = args.strict_greedy_replay_data.get("policies", {}).get(
+            str(problem_id)
+        )
+        if replay_rounds is None:
+            raise ValueError(
+                f"strict greedy replay policy has no problem_id={problem_id}"
+            )
+    selected_round_actions = []
+
+    def run_draft(script, default_action):
+        return run_oracle_draft_trajectory(
+            args,
+            dllm,
+            orig_model_inputs,
+            current_token_ids,
+            drafter_threshold,
+            lowconf_threshold,
+            max_spec_len,
+            incr_len,
+            action_script=script,
+            default_action=default_action,
+            prev_prefill_output=prev_prefill_output,
+        )
+
+    def evaluate_branch(script, decision_index, current_state):
+        draft = run_draft(script, CONTINUE)
+        verification = evaluate_oracle_proposal_tokens(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            draft["proposal"],
+            max_append_tokens=num_target_tokens - len(current_token_ids),
+            eos_token_id=eos_token_id,
+        )
+        decisions = draft["frontier_stats"].get("adaptive_decisions") or []
+        controllable_decisions = [
+            record for record in decisions if bool(record.get("stop_available"))
+        ]
+        if decision_index >= len(controllable_decisions):
+            raise RuntimeError(
+                "strict greedy branch did not replay the requested decision"
+            )
+        decision_record = controllable_decisions[decision_index]
+        elapsed_before_ms = float(
+            decision_record.get(
+                "oracle_elapsed_draft_ms",
+                current_state.get("elapsed_draft_ms", 0.0),
+            )
+        )
+        remaining_forward_ms = max(
+            0.0, draft["draft_latency_ms"] - elapsed_before_ms
+        )
+        draft_overhead_ms = max(
+            0.0, draft["draft_wall_time_ms"] - draft["draft_latency_ms"]
+        )
+        remaining_fraction = safe_div(
+            remaining_forward_ms, draft["draft_latency_ms"]
+        )
+        local_draft_ms = (
+            remaining_forward_ms + draft_overhead_ms * remaining_fraction
+        )
+        local_post_verify_ms = float(verification["post_verify_latency_ms"])
+        target_len = int(current_state.get("proposal_length", 0))
+        extension_events = [
+            event
+            for event in draft["frontier_stats"].get("extension_events") or []
+            if int(event.get("from_len", -1)) >= target_len
+        ]
+        outer_path = format_outer_path(len(extension_events))
+        return {
+            "draft": draft,
+            "verification": verification,
+            "local_draft_ms": local_draft_ms,
+            "local_post_verify_ms": local_post_verify_ms,
+            "local_cost_ms": (
+                local_draft_ms + mean_verify_ms + local_post_verify_ms
+            ),
+            "emitted_tokens": int(verification["emitted_len"]),
+            "accepted_tokens": int(verification["accepted_len"]),
+            "outer_path": outer_path,
+            "proposal_len": int(draft["proposal_len"]),
+            "extension_count": len(extension_events),
+        }
+
+    while len(current_token_ids) < num_target_tokens and eos_token_id not in current_token_ids:
+        round_decisions = []
+        if replay_rounds is not None:
+            if round_id >= len(replay_rounds):
+                raise RuntimeError(
+                    f"strict greedy replay exhausted policy at round {round_id}"
+                )
+            action_script = list(replay_rounds[round_id]["actions"])
+            final_draft = run_draft(tuple(action_script), None)
+            if tuple(final_draft["action_script"]) != tuple(action_script):
+                raise RuntimeError(
+                    f"strict greedy replay diverged at problem={problem_id}, "
+                    f"round={round_id}"
+                )
+        else:
+            action_script = []
+            while True:
+                try:
+                    final_draft = run_draft(tuple(action_script), None)
+                    break
+                except OracleBranchRequired as required:
+                    if required.decision_index != len(action_script):
+                        raise RuntimeError(
+                            "strict greedy replay consumed an inconsistent script"
+                        )
+                    decision_index = len(action_script)
+                    stop_branch = evaluate_branch(
+                        tuple(action_script) + (STOP,),
+                        decision_index,
+                        required.state,
+                    )
+                    continue_branch = evaluate_branch(
+                        tuple(action_script) + (CONTINUE, STOP),
+                        decision_index,
+                        required.state,
+                    )
+                    decision = choose_strict_greedy_action(
+                        GreedyBranch(
+                            stop_branch["local_cost_ms"],
+                            stop_branch["emitted_tokens"],
+                        ),
+                        GreedyBranch(
+                            continue_branch["local_cost_ms"],
+                            continue_branch["emitted_tokens"],
+                        ),
+                        mean_verify_latency_ms=mean_verify_ms,
+                        mean_tokens_per_verify=mean_tokens_per_verify,
+                        epsilon_ms=args.strict_greedy_epsilon_ms,
+                        baseline_action=CONTINUE,
+                    )
+                    chosen_branch = (
+                        stop_branch if decision.action == STOP else continue_branch
+                    )
+                    target_len = int(required.state.get("proposal_length", 0))
+                    row = {
+                    "sample_id": int(problem_id),
+                    "round_id": int(round_id),
+                    "decision_id": int(decision_index),
+                    "block_id": max(0, (target_len - 1) // max(1, int(incr_len))),
+                    "refinement_step": int(required.state.get("refinement_step", 0)),
+                    "remaining_masks": int(required.state.get("remaining_masks", 0)),
+                    "newly_committed": int(required.state.get("newly_committed", 0)),
+                    "accumulated_proposal_length": target_len,
+                    "baseline_action": CONTINUE,
+                    "stop_local_cost_ms": stop_branch["local_cost_ms"],
+                    "stop_local_draft_ms": stop_branch["local_draft_ms"],
+                    "stop_local_post_verify_ms": stop_branch[
+                        "local_post_verify_ms"
+                    ],
+                    "stop_Y": stop_branch["emitted_tokens"],
+                    "stop_outer_path": stop_branch["outer_path"],
+                    "stop_next_verify_proposal_length": stop_branch["proposal_len"],
+                    "continue_local_cost_ms": continue_branch["local_cost_ms"],
+                    "continue_local_draft_ms": continue_branch[
+                        "local_draft_ms"
+                    ],
+                    "continue_local_post_verify_ms": continue_branch[
+                        "local_post_verify_ms"
+                    ],
+                    "continue_Y": continue_branch["emitted_tokens"],
+                    "continue_outer_path": continue_branch["outer_path"],
+                    "continue_next_verify_proposal_length": continue_branch["proposal_len"],
+                    "mean_verify_latency_ms": mean_verify_ms,
+                    "mean_tokens_per_verify": mean_tokens_per_verify,
+                    "predicted_extra_calls_stop": decision.stop_extra_calls,
+                    "predicted_extra_calls_continue": decision.continue_extra_calls,
+                    "penalty_stop_ms": decision.stop_penalty_ms,
+                    "penalty_continue_ms": decision.continue_penalty_ms,
+                    "J_stop_ms": decision.stop_score_ms,
+                    "J_continue_ms": decision.continue_score_ms,
+                    "DeltaJ_ms": decision.delta_j_ms,
+                    "immediate_compute_difference_ms": (
+                        continue_branch["local_cost_ms"]
+                        - stop_branch["local_cost_ms"]
+                    ),
+                    "verifier_penalty_difference_ms": (
+                        decision.continue_penalty_ms - decision.stop_penalty_ms
+                    ),
+                    "chosen_action": decision.action,
+                    "differs_from_baseline": int(decision.action != CONTINUE),
+                    "changed_by_verifier_penalty": int(
+                        decision.action != decision.immediate_action
+                    ),
+                    "tie_fallback_used": int(decision.tie_fallback_used),
+                    "verify_to_extend_flip": int(
+                        stop_branch["outer_path"] == "VERIFY"
+                        and continue_branch["outer_path"].startswith("EXTEND")
+                    ),
+                    "selected_predicted_extra_calls": (
+                        decision.stop_extra_calls
+                        if decision.action == STOP
+                        else decision.continue_extra_calls
+                    ),
+                    "selected_outer_path": chosen_branch["outer_path"],
+                    }
+                    if getattr(args, "strict_greedy_record_diagnostics", True):
+                        args.strict_greedy_decision_rows.append(row)
+                    round_decisions.append(row)
+                    action_script.append(decision.action)
+                    if len(action_script) > 128:
+                        raise RuntimeError(
+                            "strict greedy oracle exceeded the refinement safety bound"
+                        )
+        selected_round_actions.append({
+            "round_id": int(round_id),
+            "actions": list(action_script),
+        })
+
+        verification = evaluate_oracle_proposal_tokens(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            final_draft["proposal"],
+            max_append_tokens=num_target_tokens - len(current_token_ids),
+            eos_token_id=eos_token_id,
+        )
+        tokens_to_append = verification["tokens_to_append"]
+        prefix_len = len(current_token_ids)
+        current_token_ids.extend(tokens_to_append)
+        final_draft_ms = float(final_draft["draft_wall_time_ms"])
+        draft_latency_ms += final_draft_ms
+        verify_latency_ms += float(verification["verify_latency_ms"])
+        post_verify_latency_ms += float(verification["post_verify_latency_ms"])
+        draft_passes += int(final_draft["draft_passes"])
+        prev_prefill_output = final_draft["prefill_output"]
+        stats_each_round.append({
+            "target_tokens": tokens_to_append,
+            "prefix_len": prefix_len,
+            "spec_len": int(final_draft["proposal_len"]),
+            "~draft_proposal": final_draft["proposal"],
+            "accepted_len": int(verification["accepted_len"]),
+            "acceptance_rate": safe_div(
+                verification["accepted_len"], final_draft["proposal_len"]
+            ),
+            "num_forward_passes": int(final_draft["draft_passes"]),
+            "draft_time_ms": final_draft_ms,
+            "verify_time_ms": float(verification["verify_latency_ms"]),
+            "post_verify_time_ms": float(verification["post_verify_latency_ms"]),
+            "final_token": int(tokens_to_append[-1]),
+            "bonus_token": None,
+            "emitted_tokens": tokens_to_append,
+            "strict_greedy_decisions": len(round_decisions),
+        })
+        if getattr(args, "strict_greedy_record_diagnostics", True):
+            args.verifier_call_rows.append({
+                "problem_id": int(problem_id),
+                "mode": "strict_greedy_local_oracle",
+                "round_id": int(round_id),
+                "proposal_length": int(final_draft["proposal_len"]),
+                "accepted_tokens": int(verification["accepted_len"]),
+                "emitted_tokens": len(tokens_to_append),
+                "verify_latency_ms": float(verification["verify_latency_ms"]),
+            })
+        round_id += 1
+
+    if replay_rounds is not None and round_id != len(replay_rounds):
+        raise RuntimeError(
+            f"strict greedy replay used {round_id}/{len(replay_rounds)} rounds"
+        )
+    if replay_rounds is None and getattr(
+        args, "strict_greedy_record_diagnostics", True
+    ):
+        args.strict_greedy_selected_policy[str(problem_id)] = selected_round_actions
+
+    return {
+        "current_token_ids": current_token_ids,
+        "stats_each_round": stats_each_round,
+        "global": {
+            "draft_latency_ms": draft_latency_ms,
+            "verify_latency_ms": verify_latency_ms,
+            "post_verify_latency_ms": post_verify_latency_ms,
+            "total_latency_ms": (
+                draft_latency_ms + verify_latency_ms + post_verify_latency_ms
+            ),
+            "draft_passes": draft_passes,
+            "rounds": round_id,
+        },
     }
 
 
@@ -3443,12 +3813,16 @@ for problem_id, is_warmup in tqdm(
                                     position=1, leave=True, dynamic_ncols=False, file=sys.stdout)
 
                 global_oracle_result = None
-                if args.global_oracle_graph:
-                    oracle_runner = (
-                        run_truncated_global_oracle_problem
-                        if args.truncated_global_horizon
-                        else run_global_oracle_problem
-                    )
+                if args.global_oracle_graph or args.strict_greedy_local_oracle:
+                    if args.strict_greedy_local_oracle:
+                        args.strict_greedy_record_diagnostics = not is_warmup
+                        oracle_runner = run_strict_greedy_local_oracle_problem
+                    else:
+                        oracle_runner = (
+                            run_truncated_global_oracle_problem
+                            if args.truncated_global_horizon
+                            else run_global_oracle_problem
+                        )
                     global_oracle_result = oracle_runner(
                         args,
                         problem_id,
@@ -3474,7 +3848,9 @@ for problem_id, is_warmup in tqdm(
                     total_num_forward_passes = int(global_stats["draft_passes"])
                     num_speculation_rounds = int(global_stats["rounds"])
 
-                while not args.global_oracle_graph and len(current_token_ids) < num_target_tokens:
+                while not (
+                    args.global_oracle_graph or args.strict_greedy_local_oracle
+                ) and len(current_token_ids) < num_target_tokens:
                     logging.debug(f"--- [{drafter_name}_{freq_scheme}] Speculation round {num_speculation_rounds} ---")
 
                     if orig_model_inputs["input_ids"].is_cuda:
@@ -3964,6 +4340,16 @@ for problem_id, is_warmup in tqdm(
                         "frontier_stats": frontier_stats_this_round,
                     }
                     pickled_data["stats_each_round"].append(info_this_round)
+                    if args.log_verifier_calls and not is_warmup:
+                        args.verifier_call_rows.append({
+                            "problem_id": int(problem_id),
+                            "mode": benchmark_mode,
+                            "round_id": int(num_speculation_rounds),
+                            "proposal_length": int(spec_len),
+                            "accepted_tokens": int(accepted_len),
+                            "emitted_tokens": len(tokens_to_append),
+                            "verify_latency_ms": verify_time * 1000.0,
+                        })
                     
                     num_speculation_rounds += 1
                     
@@ -3975,7 +4361,7 @@ for problem_id, is_warmup in tqdm(
 
             if orig_model_inputs["input_ids"].is_cuda:
                 torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
-            if args.global_oracle_graph:
+            if args.global_oracle_graph or args.strict_greedy_local_oracle:
                 actual_e2e_time = (
                     global_oracle_result["global"]["total_latency_ms"] / 1000.0
                 )
@@ -4070,7 +4456,7 @@ for problem_id, is_warmup in tqdm(
             frontier_stop_enabled(args)
             or args.collect_draft_diagnostics
             or args.collect_bucket_oracle
-        ) and not args.global_oracle_graph:
+        ) and not (args.global_oracle_graph or args.strict_greedy_local_oracle):
             append_frontier_diagnostic_rows(
                 args,
                 problem_id,
@@ -4170,3 +4556,54 @@ if args.adaptive_td:
             writer = csv.DictWriter(handle, fieldnames=transition_columns)
             writer.writeheader()
             writer.writerows(transition_rows)
+
+if args.strict_greedy_local_oracle and args.strict_greedy_decision_rows:
+    os.makedirs(args.output_dir, exist_ok=True)
+    decision_columns = sorted({
+        column for row in args.strict_greedy_decision_rows for column in row
+    })
+    with open(
+        os.path.join(args.output_dir, "greedy_local_oracle_decisions.csv"),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=decision_columns)
+        writer.writeheader()
+        writer.writerows(args.strict_greedy_decision_rows)
+
+if (
+    args.strict_greedy_local_oracle
+    and args.strict_greedy_replay_data is None
+    and args.strict_greedy_selected_policy
+):
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(
+        os.path.join(args.output_dir, "strict_greedy_policy.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            {
+                "version": "strict_greedy_local_policy_v1",
+                "policies": args.strict_greedy_selected_policy,
+            },
+            handle,
+            indent=2,
+        )
+
+if args.log_verifier_calls or args.strict_greedy_local_oracle:
+    if args.verifier_call_rows:
+        os.makedirs(args.output_dir, exist_ok=True)
+        call_columns = sorted({
+            column for row in args.verifier_call_rows for column in row
+        })
+        with open(
+            os.path.join(args.output_dir, "verifier_calls.csv"),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=call_columns)
+            writer.writeheader()
+            writer.writerows(args.verifier_call_rows)

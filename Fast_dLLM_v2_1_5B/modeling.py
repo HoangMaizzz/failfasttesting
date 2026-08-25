@@ -1103,6 +1103,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         adaptive_enabled = bool(
             getattr(args, "adaptive_td", False)
             or getattr(args, "global_oracle_graph", False)
+            or getattr(args, "strict_greedy_local_oracle", False)
         ) if args is not None else False
         adaptive_controller = getattr(args, "adaptive_td_controller", None) if adaptive_enabled else None
         frontier_stats = {
@@ -1987,6 +1988,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         proposal_length=target_len,
                                         frontier_length=frontier_k,
+                                        remaining_masks=masks_remaining,
+                                        newly_committed=unmasked_this_step,
                                         allow_exploration=not bool(
                                             getattr(
                                                 args,
