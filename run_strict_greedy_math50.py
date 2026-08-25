@@ -98,7 +98,7 @@ def common_command(source, problem_ids, dllm_dir, output_dir, log_level):
         sys.executable,
         "-u",
         "failfast.py",
-        "--dataset_name", "math",
+        "--dataset_name", str(source.get("dataset", "math")),
         "--num_questions", str(len(problem_ids)),
         "--problem_ids", *[str(value) for value in problem_ids],
         "--warmup_questions", "1",

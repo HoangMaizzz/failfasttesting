@@ -7,11 +7,28 @@ import pandas as pd
 
 from run_strict_greedy_math50 import (
     build_verifier_profile,
+    common_command,
     decision_summary,
 )
 
 
 class StrictGreedyMath50Tests(unittest.TestCase):
+    def test_common_command_accepts_an_explicit_dataset(self):
+        source = {
+            "dataset": "gsm8k",
+            "max_new_tokens": 1024,
+            "block_size": 32,
+            "small_block_size": 8,
+            "target_model_name": "target",
+            "drafter_threshold": 0.05,
+            "lowconf_threshold": 0.45,
+            "max_spec_len": 60,
+            "seed": 42,
+        }
+        command = common_command(source, [1, 2], "dllm", "output", "INFO")
+        dataset_index = command.index("--dataset_name") + 1
+        self.assertEqual(command[dataset_index], "gsm8k")
+
     def test_prepass_profile_uses_real_arithmetic_means(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
