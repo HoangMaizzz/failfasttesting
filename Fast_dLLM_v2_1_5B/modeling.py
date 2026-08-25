@@ -1010,6 +1010,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         end_time.record()
                         torch.cuda.synchronize()
                         forward_pass_latencies.append(start_time.elapsed_time(end_time))
+                        if (
+                            adaptive_enabled
+                            and adaptive_controller is not None
+                            and getattr(
+                                adaptive_controller.config,
+                                "feature_schema",
+                                "otrc_v1_td",
+                            ) == "otrc_v2_td"
+                            and not bool(getattr(args, "adaptive_freeze", False))
+                        ):
+                            adaptive_controller.observe_factual_draft_forward(
+                                forward_pass_latencies[-1]
+                            )
                         ##################End of timer##################
                         num_forward_passes += 1
                         logger.debug(f"{Colors.CYAN}block {block_idx}, small_block_idx {small_block_idx}, fwd pass. start {start}, end {end}.{Colors.RESET}")
@@ -1467,6 +1480,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         ##################End of timer##################
                         num_forward_passes += 1
                         frontier_stats["forward_pass_breakdown"]["denoising"] += 1
+                        if (
+                            adaptive_enabled
+                            and adaptive_controller is not None
+                            and getattr(
+                                adaptive_controller.config,
+                                "feature_schema",
+                                "otrc_v1_td",
+                            ) == "otrc_v2_td"
+                            and not bool(getattr(args, "adaptive_freeze", False))
+                        ):
+                            adaptive_controller.observe_factual_draft_forward(
+                                forward_pass_latencies[-1]
+                            )
                         logger.debug(f"{Colors.CYAN}block {block_idx}, small_block_idx {small_block_idx}, fwd pass. start {start}, end {end}.{Colors.RESET}")
                         
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
@@ -1535,6 +1561,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             current_step_confidences = {}
                             current_step_margins = {}
                             unmasked_this_step = 0
+                            newly_unmasked_absolute_positions = []
                             local_snapshot = torch.stack(
                                 (
                                     x_1[0].float(),
@@ -1566,6 +1593,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 if draft_token_start_idx <= absolute_pos < draft_end_idx:
                                     absolute_pos = int(absolute_pos)
                                     unmasked_this_step += 1
+                                    newly_unmasked_absolute_positions.append(absolute_pos)
                                     token_confidence = float(local_confidences[local_idx])
                                     token_margin = float(local_margins[local_idx])
                                     committed_confidences[absolute_pos] = token_confidence
@@ -1827,8 +1855,81 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 recoverable_margins = [
                                     margins[index] for index in sorted(recoverable_positions)
                                 ]
+                                active_absolute_start = max(
+                                    draft_token_start_idx,
+                                    block_abs_start + small_block_start_idx,
+                                )
+                                active_absolute_end = min(
+                                    draft_end_idx,
+                                    block_abs_start + small_block_end_idx,
+                                )
+                                active_span_length = max(
+                                    1,
+                                    active_absolute_end - active_absolute_start,
+                                )
+                                active_remaining_positions = [
+                                    absolute_pos
+                                    for absolute_pos in range(
+                                        active_absolute_start,
+                                        active_absolute_end,
+                                    )
+                                    if current_draft_tokens[
+                                        absolute_pos - draft_token_start_idx
+                                    ] == mask_id
+                                ]
+                                active_remaining_confidences = [
+                                    float(current_step_confidences.get(absolute_pos, 0.0))
+                                    for absolute_pos in active_remaining_positions
+                                ]
+                                prefix_length = 0
+                                prefix_length_before = 0
+                                newly_unmasked_absolute_set = set(
+                                    newly_unmasked_absolute_positions
+                                )
+                                for relative_pos, token_id in enumerate(
+                                    current_draft_tokens
+                                ):
+                                    if token_id == mask_id:
+                                        break
+                                    prefix_length = relative_pos + 1
+                                for relative_pos, token_id in enumerate(
+                                    current_draft_tokens
+                                ):
+                                    absolute_pos = draft_token_start_idx + relative_pos
+                                    if (
+                                        token_id == mask_id
+                                        or absolute_pos in newly_unmasked_absolute_set
+                                    ):
+                                        break
+                                    prefix_length_before = relative_pos + 1
+                                newly_unmasked_prefix = sum(
+                                    1
+                                    for relative_pos in range(prefix_length)
+                                    if draft_token_start_idx + relative_pos
+                                    in newly_unmasked_absolute_set
+                                )
                                 features = adaptive_controller.build_features(
                                     proposal_length=target_len,
+                                    max_spec_len=max_spec_len,
+                                    active_span_length=active_span_length,
+                                    active_remaining_masks=len(
+                                        active_remaining_positions
+                                    ),
+                                    active_newly_unmasked=unmasked_this_step,
+                                    prefix_length=prefix_length,
+                                    prefix_advance=max(
+                                        0,
+                                        prefix_length - prefix_length_before,
+                                    ),
+                                    newly_unmasked_prefix=newly_unmasked_prefix,
+                                    active_remaining_confidences=(
+                                        active_remaining_confidences
+                                    ),
+                                    failfast_candidate_min_confidence=(
+                                        min(confidences) if confidences else 0.0
+                                    ),
+                                    drafter_threshold=threshold,
+                                    failfast_threshold=tau_f,
                                     remaining_masks=masks_remaining,
                                     newly_unmasked=unmasked_this_step,
                                     recoverable_confidences=recoverable_confidences,
@@ -2013,6 +2114,32 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "reason": decision.reason,
                                         "remaining_masks": int(masks_remaining),
                                         "newly_unmasked": int(unmasked_this_step),
+                                        "active_span_length": int(active_span_length),
+                                        "active_remaining_masks": int(
+                                            len(active_remaining_positions)
+                                        ),
+                                        "prefix_length": int(prefix_length),
+                                        "prefix_length_before": int(
+                                            prefix_length_before
+                                        ),
+                                        "prefix_advance": int(
+                                            max(0, prefix_length - prefix_length_before)
+                                        ),
+                                        "newly_unmasked_prefix": int(
+                                            newly_unmasked_prefix
+                                        ),
+                                        "failfast_candidate_min_confidence": float(
+                                            min(confidences) if confidences else 0.0
+                                        ),
+                                        "factual_draft_latency_ema_ms": (
+                                            adaptive_controller.factual_draft_latency_ema_ms
+                                        ),
+                                        "factual_verifier_latency_ema_ms": (
+                                            adaptive_controller.factual_verifier_latency_ema_ms
+                                        ),
+                                        "factual_tokens_per_verifier_ema": (
+                                            adaptive_controller.factual_tokens_per_verifier_ema
+                                        ),
                                         "rho_tokens_per_ms": float(decision.rho_tokens_per_ms),
                                         "q_stop_mean": float(decision.stop.mean),
                                         "q_stop_risk": float(decision.stop.risk),

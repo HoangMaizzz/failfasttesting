@@ -11,7 +11,7 @@ from typing import Iterable, Sequence
 STOP = "stop"
 CONTINUE = "continue"
 _STANDARD_NORMAL = NormalDist()
-FEATURE_NAMES = (
+V1_FEATURE_NAMES = (
     "bias",
     "remaining_mask_ratio",
     "newly_unmasked_ratio",
@@ -26,6 +26,24 @@ FEATURE_NAMES = (
     "recoverable_change_ratio",
     "refinement_step",
 )
+V2_FEATURE_NAMES = (
+    "bias",
+    "active_remaining_mask_ratio",
+    "prefix_resolved_ratio",
+    "prefix_advance_ratio",
+    "active_newly_unmasked_ratio",
+    "newly_unmasked_prefix_share",
+    "min_confidence_gap",
+    "failfast_margin",
+    "accumulated_spec_ratio",
+    "draft_verify_latency_ratio",
+    "ema_tokens_per_verifier_ratio",
+)
+FEATURE_NAMES = V1_FEATURE_NAMES
+FEATURE_SCHEMAS = {
+    "otrc_v1_td": V1_FEATURE_NAMES,
+    "otrc_v2_td": V2_FEATURE_NAMES,
+}
 
 
 def _clip(value: float, low: float, high: float) -> float:
@@ -46,6 +64,8 @@ def _dot(left: Sequence[float], right: Sequence[float]) -> float:
 @dataclass(frozen=True)
 class AdaptiveTDConfig:
     feature_dim: int = 13
+    feature_schema: str = "otrc_v1_td"
+    feature_version: int = 1
     learning_rate: float = 0.02
     mc_learning_rate: float = 0.01
     mc_mix: float = 0.5
@@ -74,10 +94,20 @@ class AdaptiveTDConfig:
     full_stream_bootstrap: bool = False
     reverse_backup: bool = False
     disabled_features: tuple[str, ...] = ()
+    factual_ema_alpha: float = 0.2
+    weight_snapshot_interval: int = 100
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
             raise ValueError("feature_dim must be positive")
+        if self.feature_schema not in FEATURE_SCHEMAS:
+            raise ValueError(f"unknown feature schema: {self.feature_schema}")
+        expected_dim = len(FEATURE_SCHEMAS[self.feature_schema])
+        if self.feature_dim != expected_dim:
+            raise ValueError(
+                f"feature_dim={self.feature_dim} does not match "
+                f"{self.feature_schema} dimension {expected_dim}"
+            )
         if self.learning_rate < 0.0 or self.mc_learning_rate < 0.0:
             raise ValueError("learning rates must be non-negative")
         if self.update_mode not in {"td", "factual_return", "mixed"}:
@@ -119,7 +149,12 @@ class AdaptiveTDConfig:
             raise ValueError("min_action_probability must be in (0, 0.5]")
         if self.max_importance_weight < 1.0:
             raise ValueError("max_importance_weight must be at least 1")
-        unknown_features = set(self.disabled_features).difference(FEATURE_NAMES)
+        if not 0.0 < self.factual_ema_alpha <= 1.0:
+            raise ValueError("factual_ema_alpha must be in (0, 1]")
+        if self.weight_snapshot_interval < 0:
+            raise ValueError("weight_snapshot_interval must be non-negative")
+        feature_names = FEATURE_SCHEMAS[self.feature_schema]
+        unknown_features = set(self.disabled_features).difference(feature_names)
         if unknown_features:
             raise ValueError(
                 f"unknown disabled features: {sorted(unknown_features)}"
@@ -280,6 +315,10 @@ class OnlineTDRefinementController:
 
     def __init__(self, config: AdaptiveTDConfig) -> None:
         self.config = config
+        self.controller_name = (
+            "avg_td" if config.feature_schema == "otrc_v1_td" else config.feature_schema
+        )
+        self.feature_names = FEATURE_SCHEMAS[config.feature_schema]
         self.values = {
             STOP: _LinearActionValue(config.feature_dim, config),
             CONTINUE: _LinearActionValue(config.feature_dim, config),
@@ -299,9 +338,13 @@ class OnlineTDRefinementController:
         self.exploration_count = 0
         self.early_stop_observations = 0
         self.forward_latency_ema_ms = None
+        self.factual_draft_latency_ema_ms = None
+        self.factual_verifier_latency_ema_ms = None
+        self.factual_tokens_per_verifier_ema = None
         self.profile_samples: dict[str, list[float]] = {}
         self.pending_stop = None
         self.full_stream_transitions: list[dict] = []
+        self.weight_snapshots: list[dict] = []
 
     @property
     def rho(self) -> float:
@@ -317,11 +360,65 @@ class OnlineTDRefinementController:
         return self.values[action].estimate(features)
 
     def build_features(self, **state) -> tuple[float, ...]:
+        if self.config.feature_schema == "otrc_v2_td":
+            return build_v2_state_features(
+                factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
+                factual_verifier_latency_ema_ms=self.factual_verifier_latency_ema_ms,
+                factual_tokens_per_verifier_ema=(
+                    self.factual_tokens_per_verifier_ema
+                ),
+                disabled_features=self.config.disabled_features,
+                **state,
+            )
         return build_state_features(
             max_refinement_steps=self.config.max_refinement_steps,
             disabled_features=self.config.disabled_features,
             **state,
         )
+
+    def _update_factual_ema(self, current: float | None, observation: float) -> float:
+        observation = max(0.0, float(observation))
+        if current is None:
+            return observation
+        alpha = self.config.factual_ema_alpha
+        return (1.0 - alpha) * current + alpha * observation
+
+    def observe_factual_draft_forward(self, latency_ms: float) -> None:
+        self.factual_draft_latency_ema_ms = self._update_factual_ema(
+            self.factual_draft_latency_ema_ms,
+            latency_ms,
+        )
+
+    def observe_factual_verifier_call(
+        self,
+        emitted_tokens: int,
+        latency_ms: float,
+    ) -> None:
+        self.factual_verifier_latency_ema_ms = self._update_factual_ema(
+            self.factual_verifier_latency_ema_ms,
+            latency_ms,
+        )
+        self.factual_tokens_per_verifier_ema = self._update_factual_ema(
+            self.factual_tokens_per_verifier_ema,
+            emitted_tokens,
+        )
+
+    def _maybe_snapshot_weights(self) -> None:
+        interval = self.config.weight_snapshot_interval
+        if interval <= 0 or self.decision_count % interval:
+            return
+        self.weight_snapshots.append({
+            "decision_count": int(self.decision_count),
+            "theta_stop": list(self.values[STOP].theta),
+            "theta_continue": list(self.values[CONTINUE].theta),
+            "theta_diff": [
+                stop - continue_
+                for stop, continue_ in zip(
+                    self.values[STOP].theta,
+                    self.values[CONTINUE].theta,
+                )
+            ],
+        })
 
     def choose(
         self,
@@ -484,6 +581,7 @@ class OnlineTDRefinementController:
         )
 
         self.decision_count += 1
+        self._maybe_snapshot_weights()
         if action_started is not None:
             self.record_profile(
                 "action_selection",
@@ -507,7 +605,14 @@ class OnlineTDRefinementController:
             behavior_stop_probability=behavior_stop_probability,
             selected_action_probability=selected_action_probability,
             importance_weight=importance_weight,
-            diagnostics={"controller_name": self.controller_name},
+            diagnostics={
+                "controller_name": self.controller_name,
+                "feature_schema": self.config.feature_schema,
+                "greedy_action": (
+                    STOP if advantage_mean > self.config.q_margin else CONTINUE
+                ),
+                "executed_action": action,
+            },
         )
 
     def resolve_pending_stop(
@@ -846,6 +951,10 @@ class OnlineTDRefinementController:
     def snapshot(self) -> dict:
         return {
             "controller_name": self.controller_name,
+            "feature_schema": self.config.feature_schema,
+            "feature_version": self.config.feature_version,
+            "feature_dim": self.config.feature_dim,
+            "feature_names": list(self.feature_names),
             "completed_rounds": self.completed_rounds,
             "decision_count": self.decision_count,
             "exploration_count": self.exploration_count,
@@ -861,6 +970,11 @@ class OnlineTDRefinementController:
             "y_ema": self.y_ema,
             "t_ema_ms": self.t_ema_ms,
             "forward_latency_ema_ms": self.forward_latency_ema_ms,
+            "factual_draft_latency_ema_ms": self.factual_draft_latency_ema_ms,
+            "factual_verifier_latency_ema_ms": self.factual_verifier_latency_ema_ms,
+            "factual_tokens_per_verifier_ema": (
+                self.factual_tokens_per_verifier_ema
+            ),
             "actions": {
                 action: {
                     "theta": list(value.theta),
@@ -889,6 +1003,7 @@ class OnlineTDRefinementController:
                 ],
             },
             "overhead": self.profile_summary(),
+            "weight_snapshots": list(self.weight_snapshots),
             "full_stream": {
                 "enabled": self.config.full_stream_bootstrap,
                 "pending": self.pending_stop is not None,
@@ -901,6 +1016,19 @@ class OnlineTDRefinementController:
         }
 
     def load_snapshot(self, snapshot: dict) -> None:
+        snapshot_schema = snapshot.get("feature_schema", "otrc_v1_td")
+        snapshot_version = int(snapshot.get("feature_version", 1))
+        snapshot_names = tuple(snapshot.get("feature_names") or V1_FEATURE_NAMES)
+        if (
+            snapshot_schema != self.config.feature_schema
+            or snapshot_version != self.config.feature_version
+            or snapshot_names != self.feature_names
+        ):
+            raise ValueError(
+                "snapshot feature schema does not match controller: "
+                f"snapshot={snapshot_schema}/v{snapshot_version}, "
+                f"controller={self.config.feature_schema}/v{self.config.feature_version}"
+            )
         actions = snapshot.get("actions") or {}
         for action in (STOP, CONTINUE):
             state = actions.get(action)
@@ -990,6 +1118,16 @@ class OnlineTDRefinementController:
         self.y_ema = snapshot.get("y_ema")
         self.t_ema_ms = snapshot.get("t_ema_ms")
         self.forward_latency_ema_ms = snapshot.get("forward_latency_ema_ms")
+        self.factual_draft_latency_ema_ms = snapshot.get(
+            "factual_draft_latency_ema_ms"
+        )
+        self.factual_verifier_latency_ema_ms = snapshot.get(
+            "factual_verifier_latency_ema_ms"
+        )
+        self.factual_tokens_per_verifier_ema = snapshot.get(
+            "factual_tokens_per_verifier_ema"
+        )
+        self.weight_snapshots = list(snapshot.get("weight_snapshots") or [])
 
 
 def build_state_features(
@@ -1009,6 +1147,7 @@ def build_state_features(
     use_stability: bool = True,
     use_step: bool = True,
     disabled_features: Sequence[str] = (),
+    **_unused,
 ) -> tuple[float, ...]:
     length = max(1, int(proposal_length))
     confidences = [_clip(value, 0.0, 1.0) for value in recoverable_confidences]
@@ -1056,6 +1195,92 @@ def build_state_features(
     ]
     disabled = set(disabled_features)
     for index, name in enumerate(FEATURE_NAMES):
+        if name in disabled:
+            features[index] = 0.0
+    return tuple(features)
+
+
+def build_v2_state_features(
+    *,
+    proposal_length: int,
+    max_spec_len: int,
+    active_span_length: int,
+    active_remaining_masks: int,
+    active_newly_unmasked: int,
+    prefix_length: int,
+    prefix_advance: int,
+    newly_unmasked_prefix: int,
+    active_remaining_confidences: Sequence[float],
+    failfast_candidate_min_confidence: float,
+    drafter_threshold: float,
+    failfast_threshold: float,
+    factual_draft_latency_ema_ms: float | None,
+    factual_verifier_latency_ema_ms: float | None,
+    factual_tokens_per_verifier_ema: float | None,
+    disabled_features: Sequence[str] = (),
+    **_unused,
+) -> tuple[float, ...]:
+    proposal_length = max(1, int(proposal_length))
+    max_spec_len = max(proposal_length, int(max_spec_len))
+    active_span_length = max(1, int(active_span_length))
+    active_newly_unmasked = max(0, int(active_newly_unmasked))
+    eps = 1e-9
+
+    confidences = [
+        _clip(value, 0.0, 1.0)
+        for value in active_remaining_confidences
+    ]
+    tau_d = max(float(drafter_threshold), eps)
+    tau_f = max(float(failfast_threshold), eps)
+    min_confidence_gap = _clip(
+        (tau_d - (min(confidences) if confidences else tau_d)) / tau_d,
+        0.0,
+        1.0,
+    )
+    failfast_margin = _clip(
+        (float(failfast_candidate_min_confidence) - tau_f) / tau_f,
+        -1.0,
+        1.0,
+    )
+
+    if (
+        factual_draft_latency_ema_ms is None
+        or factual_verifier_latency_ema_ms is None
+        or factual_verifier_latency_ema_ms <= 0.0
+    ):
+        draft_verify_ratio = 1.0
+    else:
+        draft_verify_ratio = _clip(
+            float(factual_draft_latency_ema_ms)
+            / max(float(factual_verifier_latency_ema_ms), eps),
+            0.0,
+            2.0,
+        )
+    tokens_per_verifier = (
+        1.0
+        if factual_tokens_per_verifier_ema is None
+        else max(0.0, float(factual_tokens_per_verifier_ema))
+    )
+
+    features = [
+        1.0,
+        _clip(active_remaining_masks / active_span_length, 0.0, 1.0),
+        _clip(prefix_length / proposal_length, 0.0, 1.0),
+        _clip(prefix_advance / proposal_length, 0.0, 1.0),
+        _clip(active_newly_unmasked / active_span_length, 0.0, 1.0),
+        _clip(
+            newly_unmasked_prefix / max(active_newly_unmasked, 1),
+            0.0,
+            1.0,
+        ),
+        min_confidence_gap,
+        failfast_margin,
+        _clip(proposal_length / max_spec_len, 0.0, 1.0),
+        draft_verify_ratio,
+        _clip(tokens_per_verifier / (max_spec_len + 1.0), 0.0, 1.0),
+    ]
+    disabled = set(disabled_features)
+    for index, name in enumerate(V2_FEATURE_NAMES):
         if name in disabled:
             features[index] = 0.0
     return tuple(features)

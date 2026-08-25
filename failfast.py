@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from adaptive_td import (
     FEATURE_NAMES,
+    FEATURE_SCHEMAS,
     AdaptiveTDConfig,
     OnlineTDRefinementController,
 )
@@ -466,6 +467,11 @@ parser.add_argument(
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
 parser.add_argument(
+    "--adaptive-feature-schema",
+    choices=sorted(FEATURE_SCHEMAS),
+    default="otrc_v1_td",
+)
+parser.add_argument(
     "--adaptive-controller",
     choices=["avg_td", "dist_time_token"],
     default="avg_td",
@@ -502,7 +508,12 @@ parser.add_argument("--adaptive-use-step-feature", action="store_true")
 parser.add_argument(
     "--adaptive-disable-features",
     nargs="*",
-    choices=FEATURE_NAMES[1:],
+    choices=sorted({
+        name
+        for names in FEATURE_SCHEMAS.values()
+        for name in names
+        if name != "bias"
+    }),
     default=[],
 )
 parser.add_argument(
@@ -521,6 +532,8 @@ parser.add_argument("--adaptive-freeze", action="store_true")
 parser.add_argument("--adaptive-counterfactual-replay", action="store_true")
 parser.add_argument("--adaptive-log-decisions", action="store_true")
 parser.add_argument("--adaptive-profile-overhead", action="store_true")
+parser.add_argument("--adaptive-factual-ema-alpha", type=float, default=0.2)
+parser.add_argument("--adaptive-weight-snapshot-interval", type=int, default=100)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -551,6 +564,11 @@ if args.audit_greedy_consistency and args.decoding_strategy != "greedy":
     raise ValueError("--audit_greedy_consistency requires greedy decoding")
 if args.adaptive_td and args.frontier_stop_mode != "disabled":
     raise ValueError("--adaptive-td cannot be combined with --frontier_stop_mode")
+if (
+    args.adaptive_controller != "avg_td"
+    and args.adaptive_feature_schema != "otrc_v1_td"
+):
+    raise ValueError("OTRC feature schemas require --adaptive-controller avg_td")
 if args.adaptive_td and args.bucket_oracle_force_continue:
     raise ValueError(
         "--bucket_oracle_force_continue would invalidate adaptive TD trajectories"
@@ -652,6 +670,11 @@ def build_adaptive_controller(args):
         )
     return OnlineTDRefinementController(
         AdaptiveTDConfig(
+            feature_dim=len(FEATURE_SCHEMAS[args.adaptive_feature_schema]),
+            feature_schema=args.adaptive_feature_schema,
+            feature_version=(
+                2 if args.adaptive_feature_schema == "otrc_v2_td" else 1
+            ),
             learning_rate=args.adaptive_learning_rate,
             mc_learning_rate=args.adaptive_mc_learning_rate,
             mc_mix=args.adaptive_mc_mix,
@@ -677,6 +700,8 @@ def build_adaptive_controller(args):
             max_importance_weight=args.adaptive_max_importance_weight,
             full_stream_bootstrap=True,
             disabled_features=tuple(args.adaptive_disable_features),
+            factual_ema_alpha=args.adaptive_factual_ema_alpha,
+            weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
         )
     )
 
@@ -1412,6 +1437,13 @@ def record_adaptive_td_decisions(
                 realized_action == item.get("post_stop_outer_action")
             )
         item.update(finalized_fields)
+        feature_values = {
+            name: float(value)
+            for name, value in zip(
+                getattr(controller, "feature_names", FEATURE_NAMES),
+                item.get("features") or [],
+            )
+        }
         args.adaptive_decision_rows.append({
             "adaptive_controller": getattr(controller, "controller_name", "avg_td"),
             "problem_id": int(problem_id),
@@ -1419,10 +1451,12 @@ def record_adaptive_td_decisions(
             "decision_id": int(decision_id),
             **item,
             "features": json.dumps(item.get("features") or []),
+            "feature_names": json.dumps(list(
+                getattr(controller, "feature_names", FEATURE_NAMES)
+            )),
             "draft_proposal": json.dumps(item.get("draft_proposal") or []),
             "draft_length": target_len,
-            "remaining_mask_ratio": float((item.get("features") or [0.0, 0.0])[1]),
-            "newly_unmasked_ratio": float((item.get("features") or [0.0, 0.0, 0.0])[2]),
+            **feature_values,
             "accepted_draft_tokens": int(accepted_draft_tokens),
             "emitted_tokens": int(emitted_tokens),
             "verifier_latency_ms": float(verifier_latency_ms),
@@ -4497,6 +4531,18 @@ for problem_id, is_warmup in tqdm(
                         and args.adaptive_td
                     ):
                         if not args.adaptive_freeze:
+                            if (
+                                getattr(
+                                    args.adaptive_td_controller.config,
+                                    "feature_schema",
+                                    "otrc_v1_td",
+                                )
+                                == "otrc_v2_td"
+                            ):
+                                args.adaptive_td_controller.observe_factual_verifier_call(
+                                    len(tokens_to_append),
+                                    verify_time * 1000.0,
+                                )
                             args.adaptive_td_controller.observe_round(
                                 len(tokens_to_append),
                                 (draft_time + verify_time + post_verify_time) * 1000.0,
