@@ -2008,6 +2008,8 @@ def run_strict_greedy_local_oracle_problem(
 
     def evaluate_branch(script, decision_index, current_state):
         draft = run_draft(script, CONTINUE)
+        branch_prefill_output = draft.pop("prefill_output", None)
+        del branch_prefill_output
         verification = evaluate_oracle_proposal_tokens(
             target_model,
             orig_model_inputs,
@@ -2052,8 +2054,6 @@ def run_strict_greedy_local_oracle_problem(
         ]
         outer_path = format_outer_path(len(extension_events))
         return {
-            "draft": draft,
-            "verification": verification,
             "local_draft_ms": local_draft_ms,
             "local_post_verify_ms": local_post_verify_ms,
             "local_cost_ms": (
