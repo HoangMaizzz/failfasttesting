@@ -1982,6 +1982,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         features,
                                         allow_stop=stop_available,
                                         refinement_step=current_step,
+                                        context_len=int(draft_token_start_idx),
+                                        draft_proposal=provisional_tokens,
                                         elapsed_draft_ms=sum(
                                             float(value)
                                             for value in forward_pass_latencies

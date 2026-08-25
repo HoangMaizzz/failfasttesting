@@ -1,9 +1,34 @@
+import hashlib
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 
 from adaptive_td import CONTINUE, STOP
+
+
+def build_oracle_state_key(
+    problem_id,
+    context_len,
+    proposal_length,
+    refinement_step,
+    draft_proposal,
+):
+    payload = json.dumps(
+        {
+            "problem_id": int(problem_id),
+            "context_len": int(context_len),
+            "proposal_length": int(proposal_length),
+            "refinement_step": int(refinement_step),
+            "draft_proposal": [
+                None if token_id is None else int(token_id)
+                for token_id in (draft_proposal or [])
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)

@@ -3,12 +3,28 @@ import unittest
 from adaptive_td import CONTINUE, STOP
 from strict_greedy_oracle import (
     GreedyBranch,
+    build_oracle_state_key,
     choose_strict_greedy_action,
     format_outer_path,
 )
 
 
 class StrictGreedyOracleTests(unittest.TestCase):
+    def test_state_key_covers_prefix_and_provisional_proposal(self):
+        base = build_oracle_state_key(2, 300, 8, 1, [1, None, 3])
+        self.assertEqual(
+            base,
+            build_oracle_state_key(2, 300, 8, 1, [1, None, 3]),
+        )
+        self.assertNotEqual(
+            base,
+            build_oracle_state_key(2, 301, 8, 1, [1, None, 3]),
+        )
+        self.assertNotEqual(
+            base,
+            build_oracle_state_key(2, 300, 8, 1, [1, 4, 3]),
+        )
+
     def test_sequential_greedy_continue_then_stop(self):
         first = choose_strict_greedy_action(
             GreedyBranch(100.0, 5),

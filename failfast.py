@@ -53,6 +53,7 @@ from truncated_global_oracle import (
 )
 from strict_greedy_oracle import (
     GreedyBranch,
+    build_oracle_state_key,
     choose_strict_greedy_action,
     format_outer_path,
     load_verifier_profile,
@@ -2097,6 +2098,52 @@ def run_strict_greedy_local_oracle_problem(
                     f"strict greedy replay diverged at problem={problem_id}, "
                     f"round={round_id}"
                 )
+            if getattr(args, "strict_greedy_record_diagnostics", True):
+                replay_records = (
+                    final_draft["frontier_stats"].get("adaptive_decisions") or []
+                )
+                for record in replay_records:
+                    if not bool(record.get("stop_available")):
+                        continue
+                    decision_index = int(record.get("oracle_script_index", -1))
+                    if decision_index < 0:
+                        continue
+                    target_len = int(record.get("target_len", 0))
+                    refinement_step = int(record.get("step", 0))
+                    context_len = int(record.get(
+                        "context_len",
+                        orig_model_inputs["input_ids"].shape[1]
+                        + len(current_token_ids),
+                    ))
+                    draft_proposal = record.get("draft_proposal") or []
+                    row = {
+                        "sample_id": int(problem_id),
+                        "round_id": int(round_id),
+                        "decision_id": decision_index,
+                        "block_id": max(
+                            0,
+                            (target_len - 1) // max(1, int(incr_len)),
+                        ),
+                        "refinement_step": refinement_step,
+                        "context_len": context_len,
+                        "prefix_output_tokens": int(len(current_token_ids)),
+                        "draft_proposal": json.dumps(draft_proposal),
+                        "state_key": build_oracle_state_key(
+                            problem_id,
+                            context_len,
+                            target_len,
+                            refinement_step,
+                            draft_proposal,
+                        ),
+                        "accumulated_proposal_length": target_len,
+                        "remaining_masks": int(record.get("remaining_masks", 0)),
+                        "newly_committed": int(record.get("newly_unmasked", 0)),
+                        "chosen_action": str(record.get("action")),
+                        "features": json.dumps(record.get("features") or []),
+                        "replay_only": 1,
+                    }
+                    args.strict_greedy_decision_rows.append(row)
+                    round_decisions.append(row)
         else:
             action_script = []
             while True:
@@ -2137,12 +2184,32 @@ def run_strict_greedy_local_oracle_problem(
                         stop_branch if decision.action == STOP else continue_branch
                     )
                     target_len = int(required.state.get("proposal_length", 0))
+                    context_len = int(required.state.get(
+                        "context_len",
+                        orig_model_inputs["input_ids"].shape[1]
+                        + len(current_token_ids),
+                    ))
+                    refinement_step = int(
+                        required.state.get("refinement_step", 0)
+                    )
+                    draft_proposal = required.state.get("draft_proposal") or []
                     row = {
                     "sample_id": int(problem_id),
                     "round_id": int(round_id),
                     "decision_id": int(decision_index),
                     "block_id": max(0, (target_len - 1) // max(1, int(incr_len))),
-                    "refinement_step": int(required.state.get("refinement_step", 0)),
+                    "refinement_step": refinement_step,
+                    "context_len": context_len,
+                    "prefix_output_tokens": int(len(current_token_ids)),
+                    "draft_proposal": json.dumps(draft_proposal),
+                    "state_key": build_oracle_state_key(
+                        problem_id,
+                        context_len,
+                        target_len,
+                        refinement_step,
+                        draft_proposal,
+                    ),
+                    "replay_only": 0,
                     "remaining_masks": int(required.state.get("remaining_masks", 0)),
                     "newly_committed": int(required.state.get("newly_committed", 0)),
                     "accumulated_proposal_length": target_len,
