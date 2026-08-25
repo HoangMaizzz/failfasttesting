@@ -67,6 +67,12 @@ def format_outer_path(extension_count):
     return " -> ".join(["EXTEND"] * extension_count + ["VERIFY"])
 
 
+def one_action_rollout_scripts(action_script):
+    """Control only the current action; later decisions use baseline CONTINUE."""
+    prefix = tuple(action_script)
+    return prefix + (STOP,), prefix + (CONTINUE,)
+
+
 def choose_strict_greedy_action(
     stop,
     continue_,

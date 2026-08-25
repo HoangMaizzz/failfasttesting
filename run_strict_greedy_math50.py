@@ -14,7 +14,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 REFERENCE_DIR = ROOT / "benchmark_references" / "math_failfast8_test50"
-VERSION = "strict_greedy_local_refinement_oracle_math50_v1"
+VERSION = "strict_greedy_local_refinement_oracle_math50_v2"
 
 
 def parse_args():
@@ -628,9 +628,9 @@ def main():
         "execution_order": [label for label, _ in phase_specs],
         "epsilon_ms": args.epsilon_ms,
         "oracle_definition": (
-            "Rolling strict one-step greedy comparison of STOP@t against "
-            "CONTINUE@t then forced STOP@(t+1). Both branches execute original "
-            "FailFast outer EXTEND behavior to the next real verifier boundary."
+            "Rolling one-action greedy comparison of STOP@t against CONTINUE@t. "
+            "After the current candidate action, both counterfactual branches "
+            "execute baseline FailFast-8 to the next real verifier boundary."
         ),
         "primary_timing": (
             "Real selected-path draft wall latency plus verifier and post-verifier "

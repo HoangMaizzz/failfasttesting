@@ -6,10 +6,16 @@ from strict_greedy_oracle import (
     build_oracle_state_key,
     choose_strict_greedy_action,
     format_outer_path,
+    one_action_rollout_scripts,
 )
 
 
 class StrictGreedyOracleTests(unittest.TestCase):
+    def test_one_action_rollout_does_not_force_stop_at_next_state(self):
+        stop_script, continue_script = one_action_rollout_scripts([CONTINUE])
+        self.assertEqual(stop_script, (CONTINUE, STOP))
+        self.assertEqual(continue_script, (CONTINUE, CONTINUE))
+
     def test_state_key_covers_prefix_and_provisional_proposal(self):
         base = build_oracle_state_key(2, 300, 8, 1, [1, None, 3])
         self.assertEqual(

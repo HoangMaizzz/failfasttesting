@@ -55,6 +55,7 @@ from strict_greedy_oracle import (
     GreedyBranch,
     build_oracle_state_key,
     choose_strict_greedy_action,
+    one_action_rollout_scripts,
     format_outer_path,
     load_verifier_profile,
 )
@@ -2251,13 +2252,16 @@ def run_strict_greedy_local_oracle_problem(
                             "strict greedy replay consumed an inconsistent script"
                         )
                     decision_index = len(action_script)
+                    stop_script, continue_script = one_action_rollout_scripts(
+                        action_script
+                    )
                     stop_branch = evaluate_branch(
-                        tuple(action_script) + (STOP,),
+                        stop_script,
                         decision_index,
                         required.state,
                     )
                     continue_branch = evaluate_branch(
-                        tuple(action_script) + (CONTINUE, STOP),
+                        continue_script,
                         decision_index,
                         required.state,
                     )
@@ -2297,6 +2301,7 @@ def run_strict_greedy_local_oracle_problem(
                     "context_len": context_len,
                     "prefix_output_tokens": int(len(current_token_ids)),
                     "draft_proposal": json.dumps(draft_proposal),
+                    "features": json.dumps(required.state.get("features") or []),
                     "state_key": build_oracle_state_key(
                         problem_id,
                         context_len,
@@ -4811,7 +4816,7 @@ if (
     ) as handle:
         json.dump(
             {
-                "version": "strict_greedy_local_policy_v1",
+                "version": "strict_greedy_local_policy_v2_one_action_rollout",
                 "policies": args.strict_greedy_selected_policy,
             },
             handle,
