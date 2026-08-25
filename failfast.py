@@ -1799,8 +1799,9 @@ def audit_committed_greedy_tokens(
 
         batched_values, batched_ids = torch.topk(batched_logits, k=2)
         prefix_values, prefix_ids = torch.topk(prefix_logits, k=2)
-        batched_token = int(batched_ids[0].item())
-        prefix_token = int(prefix_ids[0].item())
+        # topk does not preserve argmax tie-breaking when logits are equal.
+        batched_token = int(torch.argmax(batched_logits, dim=-1).item())
+        prefix_token = int(torch.argmax(prefix_logits, dim=-1).item())
         rows.append({
             "emitted_offset": int(emitted_offset),
             "absolute_output_position": int(len(current_token_ids) + emitted_offset),
