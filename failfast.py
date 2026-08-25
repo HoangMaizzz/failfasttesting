@@ -448,6 +448,20 @@ parser.add_argument("--strict_greedy_verifier_profile", type=str)
 parser.add_argument("--strict_greedy_epsilon_ms", type=float, default=1.0)
 parser.add_argument("--strict_greedy_replay_policy", type=str)
 parser.add_argument("--log_verifier_calls", action="store_true")
+parser.add_argument(
+    "--audit_greedy_consistency",
+    action="store_true",
+    help=(
+        "Diagnostic only: recompute every committed verifier token from its "
+        "exact prefix and log batched-versus-prefix greedy consistency."
+    ),
+)
+parser.add_argument(
+    "--audit_greedy_problem_ids",
+    type=int,
+    nargs="+",
+    help="Limit greedy consistency auditing to these dataset problem IDs.",
+)
 parser.add_argument("--bucket_oracle_force_continue", action="store_true")
 parser.add_argument("--adaptive-td", action="store_true")
 parser.add_argument(
@@ -532,6 +546,8 @@ args, _ = parser.parse_known_args()
 
 if args.target_model_name is None:
     args.target_model_name = args.verifier_model_name
+if args.audit_greedy_consistency and args.decoding_strategy != "greedy":
+    raise ValueError("--audit_greedy_consistency requires greedy decoding")
 if args.adaptive_td and args.frontier_stop_mode != "disabled":
     raise ValueError("--adaptive-td cannot be combined with --frontier_stop_mode")
 if args.adaptive_td and args.bucket_oracle_force_continue:
@@ -672,6 +688,8 @@ args.strict_greedy_profile = (
 )
 args.strict_greedy_decision_rows = []
 args.verifier_call_rows = []
+args.greedy_consistency_rows = []
+args.output_token_rows = []
 args.strict_greedy_replay_data = (
     json.loads(Path(args.strict_greedy_replay_policy).read_text(encoding="utf-8"))
     if args.strict_greedy_replay_policy
@@ -1727,6 +1745,83 @@ def evaluate_oracle_proposal_tokens(
         "verify_latency_ms": verify_latency_ms,
         "post_verify_latency_ms": post_verify_latency_ms,
     }
+
+
+@torch.inference_mode()
+def audit_committed_greedy_tokens(
+    target_model,
+    orig_model_inputs,
+    current_token_ids,
+    draft_proposal,
+    accepted_len,
+    tokens_to_append,
+    batched_output_logits,
+    *,
+    eos_token_id,
+):
+    """Compare batched verifier choices with one-prefix-at-a-time argmax."""
+    rows = []
+    replay_prefix = list(current_token_ids)
+    proposal_len = len(draft_proposal)
+    for emitted_offset, emitted_token in enumerate(tokens_to_append):
+        replay_tensor = torch.tensor(
+            [replay_prefix],
+            device=target_model.device,
+            dtype=torch.long,
+        )
+        replay_input_ids = torch.cat(
+            [orig_model_inputs["input_ids"], replay_tensor],
+            dim=1,
+        )
+        replay_attention_mask = torch.cat(
+            [orig_model_inputs["attention_mask"], torch.ones_like(replay_tensor)],
+            dim=1,
+        )
+        replay_outputs = target_model(
+            input_ids=replay_input_ids,
+            attention_mask=replay_attention_mask,
+            use_cache=False,
+            logits_to_keep=1,
+        )
+        prefix_logits = replay_outputs.logits[0, -1].float()
+
+        if emitted_offset < accepted_len:
+            batched_logit_index = emitted_offset
+            token_role = "accepted_draft"
+        elif accepted_len < proposal_len:
+            batched_logit_index = accepted_len
+            token_role = "correction"
+        else:
+            batched_logit_index = proposal_len
+            token_role = "bonus"
+        batched_logits = batched_output_logits[batched_logit_index].float()
+
+        batched_values, batched_ids = torch.topk(batched_logits, k=2)
+        prefix_values, prefix_ids = torch.topk(prefix_logits, k=2)
+        batched_token = int(batched_ids[0].item())
+        prefix_token = int(prefix_ids[0].item())
+        rows.append({
+            "emitted_offset": int(emitted_offset),
+            "absolute_output_position": int(len(current_token_ids) + emitted_offset),
+            "token_role": token_role,
+            "proposal_length": int(proposal_len),
+            "accepted_length": int(accepted_len),
+            "emitted_token": int(emitted_token),
+            "batched_argmax_token": batched_token,
+            "prefix_argmax_token": prefix_token,
+            "emitted_matches_batched": int(int(emitted_token) == batched_token),
+            "batched_matches_prefix": int(batched_token == prefix_token),
+            "batched_margin": float((batched_values[0] - batched_values[1]).item()),
+            "prefix_margin": float((prefix_values[0] - prefix_values[1]).item()),
+            "batched_top2_token": int(batched_ids[1].item()),
+            "prefix_top2_token": int(prefix_ids[1].item()),
+            "emitted_is_eos": int(
+                eos_token_id is not None and int(emitted_token) == int(eos_token_id)
+            ),
+        })
+        replay_prefix.append(int(emitted_token))
+        del replay_outputs, prefix_logits, batched_logits
+    return rows
 
 
 def enumerate_global_oracle_round_edges(
@@ -4341,6 +4436,32 @@ for problem_id, is_warmup in tqdm(
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
+                    audit_this_problem = (
+                        args.audit_greedy_consistency
+                        and (
+                            not args.audit_greedy_problem_ids
+                            or int(problem_id) in args.audit_greedy_problem_ids
+                        )
+                    )
+                    if audit_this_problem:
+                        audit_rows = audit_committed_greedy_tokens(
+                            target_model,
+                            orig_model_inputs,
+                            oracle_prefix_token_ids,
+                            draft_proposal,
+                            accepted_len,
+                            tokens_to_append,
+                            outputs.logits[0],
+                            eos_token_id=target_tokenizer.eos_token_id,
+                        )
+                        for audit_row in audit_rows:
+                            audit_row.update({
+                                "problem_id": int(problem_id),
+                                "mode": benchmark_mode,
+                                "round_id": int(num_speculation_rounds),
+                                "prefix_length": int(prefix_len),
+                            })
+                        args.greedy_consistency_rows.extend(audit_rows)
                     if causal_oracle_decision is not None:
                         causal_oracle_decision.update({
                             "executed_accepted_len": accepted_len,
@@ -4509,6 +4630,21 @@ for problem_id, is_warmup in tqdm(
             print_sd_trajectory(pickled_data, target_tokenizer)
 
         generated_text = target_tokenizer.decode(current_token_ids, skip_special_tokens=True)
+        if (
+            args.audit_greedy_consistency
+            and not is_warmup
+            and (
+                not args.audit_greedy_problem_ids
+                or int(problem_id) in args.audit_greedy_problem_ids
+            )
+        ):
+            args.output_token_rows.extend({
+                "problem_id": int(problem_id),
+                "mode": benchmark_mode,
+                "output_position": int(position),
+                "token_id": int(token_id),
+                "is_eos": int(int(token_id) == int(target_tokenizer.eos_token_id)),
+            } for position, token_id in enumerate(current_token_ids))
         predicted_answer = extract_predicted_answer(generated_text)
         reference_answer = extract_reference_answer(raw_data)
         
@@ -4697,3 +4833,22 @@ if args.log_verifier_calls or args.strict_greedy_local_oracle:
             writer = csv.DictWriter(handle, fieldnames=call_columns)
             writer.writeheader()
             writer.writerows(args.verifier_call_rows)
+
+if args.audit_greedy_consistency:
+    os.makedirs(args.output_dir, exist_ok=True)
+    for filename, rows in (
+        ("greedy_consistency_audit.csv", args.greedy_consistency_rows),
+        ("output_token_trace.csv", args.output_token_rows),
+    ):
+        if not rows:
+            continue
+        columns = sorted({column for row in rows for column in row})
+        with open(
+            os.path.join(args.output_dir, filename),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            writer.writerows(rows)
