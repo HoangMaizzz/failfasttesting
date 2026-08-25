@@ -1985,7 +1985,9 @@ def run_strict_greedy_local_oracle_problem(
         replay_rounds = args.strict_greedy_replay_data.get("policies", {}).get(
             str(problem_id)
         )
-        if replay_rounds is None:
+        if replay_rounds is None and getattr(
+            args, "strict_greedy_record_diagnostics", True
+        ):
             raise ValueError(
                 f"strict greedy replay policy has no problem_id={problem_id}"
             )
@@ -2268,9 +2270,7 @@ def run_strict_greedy_local_oracle_problem(
         raise RuntimeError(
             f"strict greedy replay used {round_id}/{len(replay_rounds)} rounds"
         )
-    if replay_rounds is None and getattr(
-        args, "strict_greedy_record_diagnostics", True
-    ):
+    if replay_rounds is None and args.strict_greedy_replay_data is None:
         args.strict_greedy_selected_policy[str(problem_id)] = selected_round_actions
 
     return {
