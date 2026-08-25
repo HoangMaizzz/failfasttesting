@@ -27,6 +27,15 @@ GSM8K_SIZE = 1319
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_questions", type=int, default=50)
+    parser.add_argument(
+        "--reference_pool_size",
+        type=int,
+        default=50,
+        help=(
+            "Build each sampled subset from this fixed-size reference pool. "
+            "For GSM8K, 10/50 therefore reuses IDs from the prior 50-question run."
+        ),
+    )
     parser.add_argument("--sample_seed", type=int, default=2026)
     parser.add_argument("--paired_repetitions", type=int, choices=(1, 2), default=2)
     parser.add_argument("--epsilon_ms", type=float, default=1.0)
@@ -61,13 +70,22 @@ def math_configuration(num_questions):
     return source, problem_ids[:num_questions]
 
 
-def gsm8k_configuration(num_questions, sample_seed):
-    if num_questions <= 0 or num_questions > GSM8K_SIZE - 1:
+def gsm8k_configuration(num_questions, sample_seed, reference_pool_size=50):
+    if reference_pool_size <= 0 or reference_pool_size > GSM8K_SIZE - 1:
+        raise ValueError(
+            f"GSM8K reference_pool_size must be in [1, {GSM8K_SIZE - 1}]"
+        )
+    if num_questions <= 0 or num_questions > reference_pool_size:
+        raise ValueError(
+            f"GSM8K num_questions must be in [1, {reference_pool_size}]"
+        )
+    if num_questions > GSM8K_SIZE - 1:
         raise ValueError(f"GSM8K num_questions must be in [1, {GSM8K_SIZE - 1}]")
-    problem_ids = sorted(random.Random(sample_seed).sample(
+    reference_pool = sorted(random.Random(sample_seed).sample(
         list(range(1, GSM8K_SIZE)),
-        num_questions,
+        reference_pool_size,
     ))
+    problem_ids = reference_pool[:num_questions]
     source = {
         "dataset": "gsm8k",
         "max_new_tokens": 1024,
@@ -205,7 +223,11 @@ def main():
 
     configurations = {
         "math": math_configuration(args.num_questions),
-        "gsm8k": gsm8k_configuration(args.num_questions, args.sample_seed),
+        "gsm8k": gsm8k_configuration(
+            args.num_questions,
+            args.sample_seed,
+            args.reference_pool_size,
+        ),
     }
     reports = []
     decisions = []
@@ -245,6 +267,7 @@ def main():
         ).strip(),
         "datasets": list(configurations),
         "num_questions_per_dataset": args.num_questions,
+        "reference_pool_size": args.reference_pool_size,
         "sample_seed": args.sample_seed,
         "paired_repetitions": args.paired_repetitions,
         "elapsed_hours": (time.time() - started) / 3600.0,

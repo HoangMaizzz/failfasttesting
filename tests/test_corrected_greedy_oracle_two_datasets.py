@@ -20,6 +20,12 @@ class CorrectedGreedyOracleTwoDatasetTests(unittest.TestCase):
         self.assertIn(1202, first_ids)
         self.assertEqual(len(first_ids), len(set(first_ids)))
 
+    def test_gsm8k_small_run_is_subset_of_prior_fifty_question_pool(self):
+        _, full_ids = gsm8k_configuration(50, 2026)
+        _, small_ids = gsm8k_configuration(10, 2026)
+        self.assertEqual(small_ids, full_ids[:10])
+        self.assertTrue(set(small_ids).issubset(full_ids))
+
 
 if __name__ == "__main__":
     unittest.main()
