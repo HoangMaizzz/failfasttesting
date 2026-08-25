@@ -39,10 +39,22 @@ V2_FEATURE_NAMES = (
     "draft_verify_latency_ratio",
     "ema_tokens_per_verifier_ratio",
 )
+V21_FEATURE_NAMES = (
+    "bias",
+    "proposal_remaining_mask_ratio",
+    "prefix_resolved_ratio",
+    "prefix_advance_ratio",
+    "min_confidence_gap",
+    "failfast_margin",
+    "accumulated_spec_ratio",
+    "draft_verify_latency_ratio",
+    "ema_tokens_per_verifier_ratio",
+)
 FEATURE_NAMES = V1_FEATURE_NAMES
 FEATURE_SCHEMAS = {
     "otrc_v1_td": V1_FEATURE_NAMES,
     "otrc_v2_td": V2_FEATURE_NAMES,
+    "otrc_v2_1_td": V21_FEATURE_NAMES,
 }
 
 
@@ -360,6 +372,16 @@ class OnlineTDRefinementController:
         return self.values[action].estimate(features)
 
     def build_features(self, **state) -> tuple[float, ...]:
+        if self.config.feature_schema == "otrc_v2_1_td":
+            return build_v21_state_features(
+                factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
+                factual_verifier_latency_ema_ms=self.factual_verifier_latency_ema_ms,
+                factual_tokens_per_verifier_ema=(
+                    self.factual_tokens_per_verifier_ema
+                ),
+                disabled_features=self.config.disabled_features,
+                **state,
+            )
         if self.config.feature_schema == "otrc_v2_td":
             return build_v2_state_features(
                 factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
@@ -1281,6 +1303,82 @@ def build_v2_state_features(
     ]
     disabled = set(disabled_features)
     for index, name in enumerate(V2_FEATURE_NAMES):
+        if name in disabled:
+            features[index] = 0.0
+    return tuple(features)
+
+
+def build_v21_state_features(
+    *,
+    proposal_length: int,
+    max_spec_len: int,
+    proposal_remaining_masks: int,
+    proposal_remaining_confidences: Sequence[float],
+    prefix_length: int,
+    prefix_advance: int,
+    failfast_candidate_min_confidence: float,
+    drafter_threshold: float,
+    failfast_threshold: float,
+    factual_draft_latency_ema_ms: float | None,
+    factual_verifier_latency_ema_ms: float | None,
+    factual_tokens_per_verifier_ema: float | None,
+    disabled_features: Sequence[str] = (),
+    **_unused,
+) -> tuple[float, ...]:
+    proposal_length = max(1, int(proposal_length))
+    max_spec_len = max(proposal_length, int(max_spec_len))
+    eps = 1e-9
+    confidences = [
+        _clip(value, 0.0, 1.0)
+        for value in proposal_remaining_confidences
+    ]
+    tau_d = max(float(drafter_threshold), eps)
+    tau_f = max(float(failfast_threshold), eps)
+    min_confidence_gap = 0.0
+    if confidences:
+        min_confidence_gap = _clip(
+            (tau_d - min(confidences)) / tau_d,
+            -1.0,
+            1.0,
+        )
+    failfast_margin = _clip(
+        (float(failfast_candidate_min_confidence) - tau_f) / tau_f,
+        -1.0,
+        1.0,
+    )
+
+    if (
+        factual_draft_latency_ema_ms is None
+        or factual_verifier_latency_ema_ms is None
+        or factual_verifier_latency_ema_ms <= 0.0
+    ):
+        draft_verify_ratio = 1.0
+    else:
+        draft_verify_ratio = _clip(
+            float(factual_draft_latency_ema_ms)
+            / max(float(factual_verifier_latency_ema_ms), eps),
+            0.0,
+            2.0,
+        )
+    tokens_per_verifier = (
+        1.0
+        if factual_tokens_per_verifier_ema is None
+        else max(0.0, float(factual_tokens_per_verifier_ema))
+    )
+
+    features = [
+        1.0,
+        _clip(proposal_remaining_masks / proposal_length, 0.0, 1.0),
+        _clip(prefix_length / proposal_length, 0.0, 1.0),
+        _clip(prefix_advance / proposal_length, 0.0, 1.0),
+        min_confidence_gap,
+        failfast_margin,
+        _clip(proposal_length / max_spec_len, 0.0, 1.0),
+        draft_verify_ratio,
+        _clip(tokens_per_verifier / (max_spec_len + 1.0), 0.0, 1.0),
+    ]
+    disabled = set(disabled_features)
+    for index, name in enumerate(V21_FEATURE_NAMES):
         if name in disabled:
             features[index] = 0.0
     return tuple(features)

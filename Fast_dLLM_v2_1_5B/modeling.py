@@ -1017,7 +1017,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 adaptive_controller.config,
                                 "feature_schema",
                                 "otrc_v1_td",
-                            ) == "otrc_v2_td"
+                            ) in ("otrc_v2_td", "otrc_v2_1_td")
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
                             adaptive_controller.observe_factual_draft_forward(
@@ -1487,7 +1487,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 adaptive_controller.config,
                                 "feature_schema",
                                 "otrc_v1_td",
-                            ) == "otrc_v2_td"
+                            ) in ("otrc_v2_td", "otrc_v2_1_td")
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
                             adaptive_controller.observe_factual_draft_forward(
@@ -1819,6 +1819,25 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     draft_token_start_idx + int(position)
                                     for position in remaining_relative_positions
                                 ]
+                                proposal_remaining_confidences = [
+                                    float(current_step_confidences[absolute_pos])
+                                    for absolute_pos in remaining_absolute_positions
+                                    if absolute_pos in current_step_confidences
+                                ]
+                                proposal_remaining_confidence_count = len(
+                                    proposal_remaining_confidences
+                                )
+                                proposal_remaining_confidence_coverage = (
+                                    proposal_remaining_confidence_count
+                                    / max(len(remaining_absolute_positions), 1)
+                                )
+                                proposal_snapshot_valid = (
+                                    masks_remaining
+                                    == len(remaining_relative_positions)
+                                    == len(remaining_absolute_positions)
+                                    and proposal_remaining_confidence_count
+                                    <= masks_remaining
+                                )
                                 provisional_tokens = []
                                 for relative_pos, current_token in enumerate(current_draft_tokens):
                                     absolute_pos = draft_token_start_idx + relative_pos
@@ -1924,6 +1943,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     newly_unmasked_prefix=newly_unmasked_prefix,
                                     active_remaining_confidences=(
                                         active_remaining_confidences
+                                    ),
+                                    proposal_remaining_masks=masks_remaining,
+                                    proposal_remaining_confidences=(
+                                        proposal_remaining_confidences
                                     ),
                                     failfast_candidate_min_confidence=(
                                         min(confidences) if confidences else 0.0
@@ -2118,6 +2141,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "active_remaining_masks": int(
                                             len(active_remaining_positions)
                                         ),
+                                        "proposal_remaining_masks": int(
+                                            masks_remaining
+                                        ),
+                                        "proposal_remaining_confidence_count": int(
+                                            proposal_remaining_confidence_count
+                                        ),
+                                        "proposal_remaining_confidence_coverage": float(
+                                            proposal_remaining_confidence_coverage
+                                        ),
+                                        "proposal_snapshot_valid": bool(
+                                            proposal_snapshot_valid
+                                        ),
+                                        "proposal_snapshot_phase": "post_commit_pre_decision",
                                         "prefix_length": int(prefix_length),
                                         "prefix_length_before": int(
                                             prefix_length_before

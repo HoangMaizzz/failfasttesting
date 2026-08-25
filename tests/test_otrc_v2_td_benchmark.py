@@ -5,12 +5,18 @@ from pathlib import Path
 
 import pandas as pd
 
-from run_otrc_v2_td_benchmark import command_for, feature_diagnostics
+from adaptive_td import V21_FEATURE_NAMES
+from run_otrc_v2_td_benchmark import (
+    command_for,
+    feature_diagnostics,
+    snapshot_diagnostics,
+)
 
 
 class OTRCV2TDBenchmarkTests(unittest.TestCase):
     def args(self):
         return Namespace(
+            feature_schema="otrc_v2_1_td",
             warmup_questions=1,
             max_new_tokens=1024,
             spec_len=8,
@@ -45,7 +51,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             log_level="INFO",
         )
 
-    def test_command_runs_only_v2(self):
+    def test_command_runs_only_v21(self):
         command = command_for(
             self.args(),
             "gsm8k",
@@ -53,7 +59,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             Path("/tmp/out"),
         )
         joined = " ".join(command)
-        self.assertIn("--adaptive-feature-schema otrc_v2_td", joined)
+        self.assertIn("--adaptive-feature-schema otrc_v2_1_td", joined)
         self.assertNotIn("strict_greedy", joined)
         self.assertNotIn("causal_oracle", joined)
         self.assertNotIn("verifier_ar", joined)
@@ -61,19 +67,37 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
     def test_feature_diagnostics_flags_constant_feature(self):
         decisions = pd.DataFrame({
             "features": [
-                "[1,0.5,0.2,0.1,0.5,0.5,0.8,-0.2,0.2,1.0,0.1]",
-                "[1,0.2,0.4,0.3,0.8,0.2,0.3,0.1,0.4,0.5,0.2]",
+                "[1,0.5,0.2,0.1,0.8,-0.2,0.2,1.0,0.1]",
+                "[1,0.2,0.4,0.3,-0.5,0.1,0.4,0.5,0.2]",
             ]
         })
         stats, pearson, spearman, conditioning = feature_diagnostics(
             "gsm8k",
             decisions,
+            V21_FEATURE_NAMES,
         )
         bias = stats.loc[stats.feature.eq("bias")].iloc[0]
         self.assertEqual(bias.approximately_constant, 1)
-        self.assertEqual(conditioning.iloc[0].feature_dim, 11)
+        self.assertEqual(conditioning.iloc[0].feature_dim, 9)
         self.assertFalse(pearson.empty)
         self.assertFalse(spearman.empty)
+
+    def test_snapshot_diagnostics_checks_post_commit_invariants(self):
+        decisions = pd.DataFrame({
+            "proposal_remaining_masks": [4, 2],
+            "remaining_masks": [4, 2],
+            "proposal_remaining_confidence_count": [4, 1],
+            "proposal_remaining_confidence_coverage": [1.0, 0.5],
+            "proposal_snapshot_valid": [True, True],
+            "proposal_snapshot_phase": [
+                "post_commit_pre_decision",
+                "post_commit_pre_decision",
+            ],
+        })
+        result = snapshot_diagnostics("math", decisions)
+        self.assertEqual(result["valid_snapshot_percent"], 100.0)
+        self.assertEqual(result["mask_count_match_percent"], 100.0)
+        self.assertEqual(result["confidence_coverage_mean"], 0.75)
 
 
 if __name__ == "__main__":
