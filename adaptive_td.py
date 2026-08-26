@@ -129,6 +129,7 @@ class AdaptiveTDConfig:
     disabled_features: tuple[str, ...] = ()
     factual_ema_alpha: float = 0.2
     rho_warmup_boundaries: int = 0
+    policy_weight_ema_beta: float = 0.0
     weight_snapshot_interval: int = 100
 
     def __post_init__(self) -> None:
@@ -204,6 +205,17 @@ class AdaptiveTDConfig:
         ):
             raise ValueError(
                 "rho warmup requires verifier-boundary factual no-bootstrap"
+            )
+        if not 0.0 <= self.policy_weight_ema_beta < 1.0:
+            raise ValueError("policy_weight_ema_beta must be in [0, 1)")
+        if (
+            self.policy_weight_ema_beta
+            and self.credit_assignment
+            != "verifier_boundary_factual_no_bootstrap"
+        ):
+            raise ValueError(
+                "policy weight EMA requires verifier-boundary factual "
+                "no-bootstrap"
             )
         if self.weight_snapshot_interval < 0:
             raise ValueError("weight_snapshot_interval must be non-negative")
@@ -377,6 +389,12 @@ class OnlineTDRefinementController:
             STOP: _LinearActionValue(config.feature_dim, config),
             CONTINUE: _LinearActionValue(config.feature_dim, config),
         }
+        self.policy_ema_theta = {
+            STOP: [0.0] * config.feature_dim,
+            CONTINUE: [0.0] * config.feature_dim,
+        }
+        self.policy_ema_initialized = {STOP: False, CONTINUE: False}
+        self.policy_ema_update_count = {STOP: 0, CONTINUE: 0}
         self.early_stop_uncertainty = _LinearActionValue(
             config.feature_dim,
             config,
@@ -432,6 +450,52 @@ class OnlineTDRefinementController:
             self.config.credit_assignment
             == "verifier_boundary_factual_no_bootstrap"
         )
+
+    @property
+    def uses_policy_weight_ema(self) -> bool:
+        return self.config.policy_weight_ema_beta > 0.0
+
+    def _policy_theta(self, action: str) -> Sequence[float]:
+        if (
+            self.uses_policy_weight_ema
+            and self.policy_ema_initialized[action]
+        ):
+            return self.policy_ema_theta[action]
+        return self.values[action].theta
+
+    def _policy_mean(self, action: str, features: Sequence[float]) -> float:
+        return _dot(self._policy_theta(action), features)
+
+    def _update_policy_weight_ema(self, action: str) -> None:
+        if not self.uses_policy_weight_ema:
+            return
+        online = self.values[action].theta
+        if not self.policy_ema_initialized[action]:
+            self.policy_ema_theta[action] = list(online)
+            self.policy_ema_initialized[action] = True
+        else:
+            beta = self.config.policy_weight_ema_beta
+            self.policy_ema_theta[action] = [
+                beta * averaged + (1.0 - beta) * current
+                for averaged, current in zip(
+                    self.policy_ema_theta[action],
+                    online,
+                )
+            ]
+        self.policy_ema_update_count[action] += 1
+
+    @staticmethod
+    def _probability_from_advantage(
+        advantage_mean: float,
+        advantage_risk: float,
+    ) -> float:
+        if advantage_risk > 0.0:
+            return _STANDARD_NORMAL.cdf(advantage_mean / advantage_risk)
+        if advantage_mean > 0.0:
+            return 1.0
+        if advantage_mean < 0.0:
+            return 0.0
+        return 0.5
 
     def advance_algorithm_latency(
         self,
@@ -609,6 +673,15 @@ class OnlineTDRefinementController:
                     self.values[CONTINUE].theta,
                 )
             ],
+            "policy_theta_stop": list(self._policy_theta(STOP)),
+            "policy_theta_continue": list(self._policy_theta(CONTINUE)),
+            "policy_theta_diff": [
+                stop - continue_
+                for stop, continue_ in zip(
+                    self._policy_theta(STOP),
+                    self._policy_theta(CONTINUE),
+                )
+            ],
         })
 
     def choose(
@@ -623,14 +696,16 @@ class OnlineTDRefinementController:
         started = time.perf_counter()
         profiling = self.config.profile_overhead
         stop_started = time.perf_counter() if profiling else None
-        stop_mean = self.values[STOP].mean(features)
+        raw_stop_mean = self.values[STOP].mean(features)
+        stop_mean = self._policy_mean(STOP, features)
         if stop_started is not None:
             self.record_profile(
                 "q_stop",
                 (time.perf_counter() - stop_started) * 1000.0,
             )
         continue_started = time.perf_counter() if profiling else None
-        continue_mean = self.values[CONTINUE].mean(features)
+        raw_continue_mean = self.values[CONTINUE].mean(features)
+        continue_mean = self._policy_mean(CONTINUE, features)
         if continue_started is not None:
             self.record_profile(
                 "q_continue",
@@ -653,19 +728,18 @@ class OnlineTDRefinementController:
                 (time.perf_counter() - uncertainty_started) * 1000.0,
             )
         advantage_mean = stop.mean - continue_.mean
+        raw_advantage_mean = raw_stop_mean - raw_continue_mean
         advantage_risk = self.config.risk_beta * math.sqrt(
             stop.risk * stop.risk + continue_.risk * continue_.risk
         )
-        if advantage_risk > 0.0:
-            stop_probability = _STANDARD_NORMAL.cdf(
-                advantage_mean / advantage_risk
-            )
-        elif advantage_mean > 0.0:
-            stop_probability = 1.0
-        elif advantage_mean < 0.0:
-            stop_probability = 0.0
-        else:
-            stop_probability = 0.5
+        stop_probability = self._probability_from_advantage(
+            advantage_mean,
+            advantage_risk,
+        )
+        raw_stop_probability = self._probability_from_advantage(
+            raw_advantage_mean,
+            advantage_risk,
+        )
         probability_margin = (
             self.stop_z_threshold * advantage_risk + self.config.q_margin
         )
@@ -807,6 +881,50 @@ class OnlineTDRefinementController:
                     STOP if advantage_mean > self.config.q_margin else CONTINUE
                 ),
                 "executed_action": action,
+                "policy_weight_ema_enabled": self.uses_policy_weight_ema,
+                "policy_weight_ema_beta": self.config.policy_weight_ema_beta,
+                "raw_q_stop": raw_stop_mean,
+                "raw_q_continue": raw_continue_mean,
+                "ema_q_stop": stop.mean,
+                "ema_q_continue": continue_.mean,
+                "raw_advantage": raw_advantage_mean,
+                "ema_advantage": advantage_mean,
+                "raw_stop_probability": raw_stop_probability,
+                "ema_stop_probability": stop_probability,
+                "raw_greedy_action": (
+                    STOP
+                    if raw_advantage_mean > self.config.q_margin
+                    else CONTINUE
+                ),
+                "ema_greedy_action": (
+                    STOP if advantage_mean > self.config.q_margin else CONTINUE
+                ),
+                "raw_ema_greedy_disagreement": (
+                    (raw_advantage_mean > self.config.q_margin)
+                    != (advantage_mean > self.config.q_margin)
+                ),
+                "raw_bias_difference": (
+                    self.values[STOP].theta[0]
+                    - self.values[CONTINUE].theta[0]
+                ),
+                "ema_bias_difference": (
+                    self._policy_theta(STOP)[0]
+                    - self._policy_theta(CONTINUE)[0]
+                ),
+                "stop_weight_ema_distance_l2": math.sqrt(sum(
+                    (raw - averaged) ** 2
+                    for raw, averaged in zip(
+                        self.values[STOP].theta,
+                        self._policy_theta(STOP),
+                    )
+                )),
+                "continue_weight_ema_distance_l2": math.sqrt(sum(
+                    (raw - averaged) ** 2
+                    for raw, averaged in zip(
+                        self.values[CONTINUE].theta,
+                        self._policy_theta(CONTINUE),
+                    )
+                )),
             },
         )
 
@@ -940,6 +1058,7 @@ class OnlineTDRefinementController:
                     self.config.learning_rate,
                     observation_weight=float(record["importance_weight"]),
                 )
+                self._update_policy_weight_ema(action)
                 self.factual_learning_update_count += 1
                 if action == STOP:
                     self.early_stop_observations = self.values[STOP].sample_count
@@ -1455,6 +1574,19 @@ class OnlineTDRefinementController:
                 self.factual_warmup_transition_count
             ),
             "rho_warmup_boundaries": self.config.rho_warmup_boundaries,
+            "policy_weight_ema_beta": self.config.policy_weight_ema_beta,
+            "policy_weight_ema": {
+                action: {
+                    "theta": list(self.policy_ema_theta[action]),
+                    "initialized": bool(
+                        self.policy_ema_initialized[action]
+                    ),
+                    "update_count": int(
+                        self.policy_ema_update_count[action]
+                    ),
+                }
+                for action in (STOP, CONTINUE)
+            },
             "actions": {
                 action: {
                     "theta": list(value.theta),
@@ -1512,12 +1644,21 @@ class OnlineTDRefinementController:
             "per_step_td",
         )
         snapshot_rho_warmup = int(snapshot.get("rho_warmup_boundaries", 0))
+        snapshot_policy_ema_beta = float(
+            snapshot.get("policy_weight_ema_beta", 0.0)
+        )
         if (
             snapshot_schema != self.config.feature_schema
             or snapshot_version != self.config.feature_version
             or snapshot_names != self.feature_names
             or snapshot_credit_assignment != self.config.credit_assignment
             or snapshot_rho_warmup != self.config.rho_warmup_boundaries
+            or not math.isclose(
+                snapshot_policy_ema_beta,
+                self.config.policy_weight_ema_beta,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
         ):
             raise ValueError(
                 "snapshot feature schema does not match controller: "
@@ -1526,7 +1667,9 @@ class OnlineTDRefinementController:
                 f"snapshot_credit={snapshot_credit_assignment}, "
                 f"controller_credit={self.config.credit_assignment}, "
                 f"snapshot_rho_warmup={snapshot_rho_warmup}, "
-                f"controller_rho_warmup={self.config.rho_warmup_boundaries}"
+                f"controller_rho_warmup={self.config.rho_warmup_boundaries}, "
+                f"snapshot_policy_ema_beta={snapshot_policy_ema_beta}, "
+                f"controller_policy_ema_beta={self.config.policy_weight_ema_beta}"
             )
         actions = snapshot.get("actions") or {}
         for action in (STOP, CONTINUE):
@@ -1563,6 +1706,28 @@ class OnlineTDRefinementController:
             )
             value.residual_m2 = (
                 residual_variance * value.residual_degrees_of_freedom()
+            )
+
+        policy_ema = snapshot.get("policy_weight_ema") or {}
+        for action in (STOP, CONTINUE):
+            state = policy_ema.get(action) or {}
+            theta = [
+                float(item)
+                for item in state.get(
+                    "theta",
+                    self.values[action].theta,
+                )
+            ]
+            if len(theta) != self.config.feature_dim:
+                raise ValueError(
+                    "snapshot policy EMA dimension does not match controller"
+                )
+            self.policy_ema_theta[action] = theta
+            self.policy_ema_initialized[action] = bool(
+                state.get("initialized", False)
+            )
+            self.policy_ema_update_count[action] = int(
+                state.get("update_count", 0)
             )
 
         uncertainty_state = snapshot.get("early_stop_uncertainty") or {}

@@ -88,6 +88,7 @@ def parse_args():
     )
     parser.add_argument("--adaptive_rho_alpha", type=float, default=0.05)
     parser.add_argument("--rho_warmup_boundaries", type=int, default=0)
+    parser.add_argument("--policy_weight_ema_beta", type=float, default=0.0)
     parser.add_argument("--adaptive_factual_ema_alpha", type=float, default=0.2)
     parser.add_argument("--adaptive_risk_beta", type=float, default=1.0)
     parser.add_argument("--adaptive_stop_probability_threshold", type=float, default=0.75)
@@ -142,6 +143,16 @@ def validate_args(args):
         raise ValueError(
             "rho warmup is only supported by factual no-bootstrap credit"
         )
+    if not 0.0 <= args.policy_weight_ema_beta < 1.0:
+        raise ValueError("--policy_weight_ema_beta must be in [0, 1)")
+    if (
+        args.policy_weight_ema_beta
+        and args.credit_assignment
+        != "verifier_boundary_factual_no_bootstrap"
+    ):
+        raise ValueError(
+            "policy weight EMA is only supported by factual no-bootstrap credit"
+        )
 
 
 def method_name(args):
@@ -152,7 +163,13 @@ def method_name(args):
             else "otrc_v2_2_factual_no_bootstrap"
         )
         warmup = int(getattr(args, "rho_warmup_boundaries", 0))
-        return f"{base}_rho_warmup{warmup}" if warmup else base
+        if warmup:
+            base = f"{base}_rho_warmup{warmup}"
+        policy_beta = float(getattr(args, "policy_weight_ema_beta", 0.0))
+        if policy_beta:
+            beta_label = f"{policy_beta:.6f}".rstrip("0").rstrip(".")
+            base = f"{base}_policy_ema{beta_label.replace('.', 'p')}"
+        return base
     if args.credit_assignment == "verifier_boundary_factual":
         return (
             "otrc_v2_2_compact_factual"
@@ -212,6 +229,8 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-rho-alpha", str(args.adaptive_rho_alpha),
         "--adaptive-rho-warmup-boundaries",
         str(args.rho_warmup_boundaries),
+        "--adaptive-policy-weight-ema-beta",
+        str(args.policy_weight_ema_beta),
         "--adaptive-factual-ema-alpha", str(args.adaptive_factual_ema_alpha),
         "--adaptive-risk-beta", str(args.adaptive_risk_beta),
         "--adaptive-stop-probability-threshold",
@@ -251,6 +270,7 @@ def phase_complete(
     feature_schema,
     credit_assignment,
     rho_warmup_boundaries,
+    policy_weight_ema_beta,
 ):
     required = [
         directory / "benchmark_results.csv",
@@ -270,6 +290,11 @@ def phase_complete(
         and state.get("credit_assignment", "per_step_td") == credit_assignment
         and int(state.get("rho_warmup_boundaries", 0))
         == int(rho_warmup_boundaries)
+        and abs(
+            float(state.get("policy_weight_ema_beta", 0.0))
+            - float(policy_weight_ema_beta)
+        )
+        <= 1e-12
     )
 
 
@@ -282,6 +307,7 @@ def run_dataset(args, dataset, problem_ids):
         args.feature_schema,
         args.credit_assignment,
         args.rho_warmup_boundaries,
+        args.policy_weight_ema_beta,
     ):
         print(f"RESUME {dataset} {method}", flush=True)
         return output_dir
@@ -603,6 +629,19 @@ def weight_rows(dataset, state, feature_names):
     records = []
     stop = state["actions"]["stop"]["theta"]
     continue_ = state["actions"]["continue"]["theta"]
+    policy_state = state.get("policy_weight_ema") or {}
+    stop_policy_state = policy_state.get("stop") or {}
+    continue_policy_state = policy_state.get("continue") or {}
+    policy_stop = (
+        stop_policy_state.get("theta", stop)
+        if stop_policy_state.get("initialized", False)
+        else stop
+    )
+    policy_continue = (
+        continue_policy_state.get("theta", continue_)
+        if continue_policy_state.get("initialized", False)
+        else continue_
+    )
     for index, name in enumerate(feature_names):
         records.append({
             "dataset": dataset,
@@ -612,6 +651,11 @@ def weight_rows(dataset, state, feature_names):
             "theta_stop": stop[index],
             "theta_continue": continue_[index],
             "theta_diff": stop[index] - continue_[index],
+            "policy_theta_stop": policy_stop[index],
+            "policy_theta_continue": policy_continue[index],
+            "policy_theta_diff": (
+                policy_stop[index] - policy_continue[index]
+            ),
         })
     for snapshot in state.get("weight_snapshots") or []:
         for index, name in enumerate(feature_names):
@@ -623,8 +667,117 @@ def weight_rows(dataset, state, feature_names):
                 "theta_stop": snapshot["theta_stop"][index],
                 "theta_continue": snapshot["theta_continue"][index],
                 "theta_diff": snapshot["theta_diff"][index],
+                "policy_theta_stop": snapshot.get(
+                    "policy_theta_stop",
+                    snapshot["theta_stop"],
+                )[index],
+                "policy_theta_continue": snapshot.get(
+                    "policy_theta_continue",
+                    snapshot["theta_continue"],
+                )[index],
+                "policy_theta_diff": snapshot.get(
+                    "policy_theta_diff",
+                    snapshot["theta_diff"],
+                )[index],
             })
     return records
+
+
+def policy_ema_diagnostics(dataset, decisions):
+    required = {
+        "raw_stop_probability",
+        "ema_stop_probability",
+        "raw_greedy_action",
+        "ema_greedy_action",
+        "raw_ema_greedy_disagreement",
+        "raw_advantage",
+        "ema_advantage",
+        "raw_bias_difference",
+        "ema_bias_difference",
+        "stop_weight_ema_distance_l2",
+        "continue_weight_ema_distance_l2",
+    }
+    missing = required.difference(decisions.columns)
+    if missing:
+        raise ValueError(
+            f"decision log is missing policy EMA fields: {sorted(missing)}"
+        )
+    frame = decisions.copy().reset_index(drop=True)
+    numeric = required.difference({"raw_greedy_action", "ema_greedy_action"})
+    for column in numeric:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    disagreement = frame["raw_greedy_action"].ne(frame["ema_greedy_action"])
+    summary = {
+        "dataset": dataset,
+        "decisions": int(len(frame)),
+        "policy_weight_ema_enabled": bool(
+            frame.get("policy_weight_ema_enabled", pd.Series([False]))
+            .astype(str).str.lower().eq("true").any()
+        ),
+        "raw_greedy_stop_rate_percent": 100.0 * float(
+            frame["raw_greedy_action"].eq("stop").mean()
+        ),
+        "ema_greedy_stop_rate_percent": 100.0 * float(
+            frame["ema_greedy_action"].eq("stop").mean()
+        ),
+        "raw_ema_disagreement_percent": 100.0 * float(disagreement.mean()),
+        "raw_stop_probability_mean": float(
+            frame["raw_stop_probability"].mean()
+        ),
+        "ema_stop_probability_mean": float(
+            frame["ema_stop_probability"].mean()
+        ),
+        "raw_advantage_std": float(frame["raw_advantage"].std(ddof=0)),
+        "ema_advantage_std": float(frame["ema_advantage"].std(ddof=0)),
+        "raw_bias_difference_final": float(
+            frame["raw_bias_difference"].iloc[-1]
+        ),
+        "ema_bias_difference_final": float(
+            frame["ema_bias_difference"].iloc[-1]
+        ),
+        "stop_weight_ema_distance_l2_mean": float(
+            frame["stop_weight_ema_distance_l2"].mean()
+        ),
+        "continue_weight_ema_distance_l2_mean": float(
+            frame["continue_weight_ema_distance_l2"].mean()
+        ),
+    }
+    frame["time_bin"] = pd.qcut(
+        frame.index,
+        q=min(4, len(frame)),
+        labels=[f"Q{index + 1}" for index in range(min(4, len(frame)))],
+    )
+    dynamics = frame.groupby("time_bin", observed=True).agg(
+        decisions=("ema_advantage", "size"),
+        raw_advantage_mean=("raw_advantage", "mean"),
+        ema_advantage_mean=("ema_advantage", "mean"),
+        raw_stop_probability_mean=("raw_stop_probability", "mean"),
+        ema_stop_probability_mean=("ema_stop_probability", "mean"),
+        raw_greedy_stop_rate_percent=(
+            "raw_greedy_action",
+            lambda values: 100.0 * values.eq("stop").mean(),
+        ),
+        ema_greedy_stop_rate_percent=(
+            "ema_greedy_action",
+            lambda values: 100.0 * values.eq("stop").mean(),
+        ),
+        raw_ema_disagreement_percent=(
+            "raw_ema_greedy_disagreement",
+            lambda values: 100.0 * values.astype(str).str.lower().eq("true").mean(),
+        ),
+        raw_bias_difference_mean=("raw_bias_difference", "mean"),
+        ema_bias_difference_mean=("ema_bias_difference", "mean"),
+        stop_weight_ema_distance_l2_mean=(
+            "stop_weight_ema_distance_l2",
+            "mean",
+        ),
+        continue_weight_ema_distance_l2_mean=(
+            "continue_weight_ema_distance_l2",
+            "mean",
+        ),
+    ).reset_index()
+    dynamics.insert(0, "dataset", dataset)
+    return summary, dynamics
 
 
 def main():
@@ -642,6 +795,8 @@ def main():
     confidence_rows = []
     factual_summary_frames = []
     factual_dynamics_frames = []
+    policy_ema_rows = []
+    policy_ema_dynamics_frames = []
     selected_ids = {}
     feature_names = FEATURE_SCHEMAS[args.feature_schema]
 
@@ -669,6 +824,7 @@ def main():
             decisions["exploration_used"].astype(bool).mean()
         )
         summary["output_hash_unique"] = int(results.output_token_hash.nunique())
+        summary["policy_weight_ema_beta"] = args.policy_weight_ema_beta
         summaries.append(summary)
 
         stats, pearson, spearman, conditioning = feature_diagnostics(
@@ -680,6 +836,9 @@ def main():
         conditioning_frames.append(conditioning)
         dynamics_frames.append(learning_dynamics(dataset, decisions))
         weights.extend(weight_rows(dataset, state, feature_names))
+        ema_summary, ema_dynamics = policy_ema_diagnostics(dataset, decisions)
+        policy_ema_rows.append(ema_summary)
+        policy_ema_dynamics_frames.append(ema_dynamics)
         snapshot_rows.append(snapshot_diagnostics(dataset, decisions))
         confidence_rows.append(confidence_diagnostics(
             dataset,
@@ -719,6 +878,14 @@ def main():
     )
     pd.DataFrame(weights).to_csv(
         output_dir / "weight_trajectory.csv",
+        index=False,
+    )
+    pd.DataFrame(policy_ema_rows).to_csv(
+        output_dir / "policy_ema_summary.csv",
+        index=False,
+    )
+    pd.concat(policy_ema_dynamics_frames, ignore_index=True).to_csv(
+        output_dir / "policy_ema_learning_dynamics.csv",
         index=False,
     )
     pd.DataFrame(snapshot_rows).to_csv(

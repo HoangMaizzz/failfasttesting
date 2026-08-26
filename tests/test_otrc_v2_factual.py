@@ -14,6 +14,7 @@ FEATURES = (1.0,) + (0.0,) * 12
 def factual_controller(
     credit_assignment="verifier_boundary_factual",
     rho_warmup_boundaries=0,
+    policy_weight_ema_beta=0.0,
 ):
     controller = OnlineTDRefinementController(
         AdaptiveTDConfig(
@@ -22,6 +23,7 @@ def factual_controller(
             learning_rate=0.01,
             profile_overhead=False,
             rho_warmup_boundaries=rho_warmup_boundaries,
+            policy_weight_ema_beta=policy_weight_ema_beta,
         )
     )
     controller.observe_round(1, 10.0)
@@ -42,6 +44,118 @@ def record(action, anchor_ms, rho=0.1):
 
 
 class VerifierBoundaryFactualTests(unittest.TestCase):
+    def test_policy_weight_ema_rejects_bootstrapped_credit(self):
+        with self.assertRaisesRegex(ValueError, "no-bootstrap"):
+            AdaptiveTDConfig(
+                credit_assignment="verifier_boundary_factual",
+                policy_weight_ema_beta=0.99,
+            )
+
+    def test_policy_weight_ema_updates_only_the_factual_action(self):
+        controller = factual_controller(
+            "verifier_boundary_factual_no_bootstrap",
+            policy_weight_ema_beta=0.5,
+        )
+
+        controller.complete_trajectory(
+            [record(STOP, 0.0, rho=0.0)],
+            emitted_tokens=2,
+            verifier_latency_ms=1.0,
+            post_verify_latency_ms=0.0,
+            terminal=False,
+        )
+        first_online = list(controller.values[STOP].theta)
+        self.assertEqual(controller.policy_ema_theta[STOP], first_online)
+        self.assertTrue(controller.policy_ema_initialized[STOP])
+        self.assertFalse(controller.policy_ema_initialized[CONTINUE])
+
+        anchor = controller.algorithm_latency_ms
+        controller.complete_trajectory(
+            [record(STOP, anchor, rho=0.0)],
+            emitted_tokens=4,
+            verifier_latency_ms=1.0,
+            post_verify_latency_ms=0.0,
+            terminal=False,
+        )
+        second_online = controller.values[STOP].theta
+        expected = [
+            0.5 * old + 0.5 * new
+            for old, new in zip(first_online, second_online)
+        ]
+        for actual, wanted in zip(controller.policy_ema_theta[STOP], expected):
+            self.assertAlmostEqual(actual, wanted)
+
+        stop_ema = list(controller.policy_ema_theta[STOP])
+        anchor = controller.algorithm_latency_ms
+        controller.complete_trajectory(
+            [record(CONTINUE, anchor, rho=0.0)],
+            emitted_tokens=3,
+            verifier_latency_ms=1.0,
+            post_verify_latency_ms=0.0,
+            terminal=False,
+        )
+        self.assertEqual(controller.policy_ema_theta[STOP], stop_ema)
+        self.assertEqual(
+            controller.policy_ema_theta[CONTINUE],
+            controller.values[CONTINUE].theta,
+        )
+        self.assertEqual(controller.policy_ema_update_count[STOP], 2)
+        self.assertEqual(controller.policy_ema_update_count[CONTINUE], 1)
+
+    def test_policy_uses_ema_mean_while_logging_raw_shadow_policy(self):
+        controller = OnlineTDRefinementController(AdaptiveTDConfig(
+            credit_assignment="verifier_boundary_factual_no_bootstrap",
+            policy_weight_ema_beta=0.99,
+            policy_mode="symmetric",
+        ))
+        controller.values[STOP].theta[0] = 5.0
+        controller.policy_ema_theta[STOP][0] = -1.0
+        controller.policy_ema_initialized[STOP] = True
+        controller.policy_ema_theta[CONTINUE][0] = 0.0
+        controller.policy_ema_initialized[CONTINUE] = True
+
+        decision = controller.choose(
+            FEATURES,
+            allow_stop=True,
+            refinement_step=1,
+            allow_exploration=False,
+        )
+
+        self.assertEqual(decision.action, CONTINUE)
+        self.assertEqual(decision.diagnostics["raw_greedy_action"], STOP)
+        self.assertEqual(decision.diagnostics["ema_greedy_action"], CONTINUE)
+        self.assertTrue(
+            decision.diagnostics["raw_ema_greedy_disagreement"]
+        )
+
+    def test_policy_weight_ema_round_trips_through_snapshot(self):
+        original = factual_controller(
+            "verifier_boundary_factual_no_bootstrap",
+            policy_weight_ema_beta=0.99,
+        )
+        original.complete_trajectory(
+            [record(STOP, 0.0, rho=0.0)],
+            emitted_tokens=2,
+            verifier_latency_ms=1.0,
+            post_verify_latency_ms=0.0,
+            terminal=False,
+        )
+        restored = factual_controller(
+            "verifier_boundary_factual_no_bootstrap",
+            policy_weight_ema_beta=0.99,
+        )
+        restored.load_snapshot(original.snapshot())
+
+        self.assertEqual(restored.policy_ema_theta, original.policy_ema_theta)
+        self.assertEqual(
+            restored.policy_ema_initialized,
+            original.policy_ema_initialized,
+        )
+        self.assertEqual(
+            restored.policy_ema_update_count,
+            original.policy_ema_update_count,
+        )
+
     def test_rho_warmup_rejects_bootstrapped_credit(self):
         with self.assertRaisesRegex(ValueError, "no-bootstrap"):
             AdaptiveTDConfig(

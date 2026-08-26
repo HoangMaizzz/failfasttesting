@@ -12,6 +12,7 @@ from run_otrc_v2_td_benchmark import (
     factual_target_diagnostics,
     feature_diagnostics,
     method_name,
+    policy_ema_diagnostics,
     snapshot_diagnostics,
 )
 
@@ -38,6 +39,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             adaptive_update_mode="mixed",
             adaptive_rho_alpha=0.05,
             rho_warmup_boundaries=0,
+            policy_weight_ema_beta=0.0,
             adaptive_factual_ema_alpha=0.2,
             adaptive_risk_beta=1.0,
             adaptive_stop_probability_threshold=0.75,
@@ -112,6 +114,45 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             "--adaptive-rho-warmup-boundaries 32",
             " ".join(command),
         )
+
+    def test_compact_policy_ema_has_distinct_method_and_cli(self):
+        args = self.args()
+        args.feature_schema = "otrc_v2_2_compact_td"
+        args.credit_assignment = "verifier_boundary_factual_no_bootstrap"
+        args.policy_weight_ema_beta = 0.99
+        command = command_for(args, "gsm8k", [6], Path("/tmp/out"))
+
+        self.assertEqual(
+            method_name(args),
+            "otrc_v2_2_compact_factual_no_bootstrap_policy_ema0p99",
+        )
+        self.assertIn(
+            "--adaptive-policy-weight-ema-beta 0.99",
+            " ".join(command),
+        )
+
+    def test_policy_ema_diagnostics_compare_raw_and_deployed_policy(self):
+        decisions = pd.DataFrame({
+            "policy_weight_ema_enabled": [True, True],
+            "raw_stop_probability": [0.8, 0.2],
+            "ema_stop_probability": [0.7, 0.6],
+            "raw_greedy_action": ["stop", "continue"],
+            "ema_greedy_action": ["stop", "stop"],
+            "raw_ema_greedy_disagreement": [False, True],
+            "raw_advantage": [1.0, -1.0],
+            "ema_advantage": [0.5, 0.2],
+            "raw_bias_difference": [1.0, -1.0],
+            "ema_bias_difference": [0.5, 0.2],
+            "stop_weight_ema_distance_l2": [0.1, 0.2],
+            "continue_weight_ema_distance_l2": [0.3, 0.4],
+        })
+
+        summary, dynamics = policy_ema_diagnostics("math", decisions)
+
+        self.assertEqual(summary["raw_greedy_stop_rate_percent"], 50.0)
+        self.assertEqual(summary["ema_greedy_stop_rate_percent"], 100.0)
+        self.assertEqual(summary["raw_ema_disagreement_percent"], 50.0)
+        self.assertEqual(len(dynamics), 2)
 
     def test_feature_diagnostics_flags_constant_feature(self):
         decisions = pd.DataFrame({

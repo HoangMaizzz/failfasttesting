@@ -497,6 +497,7 @@ parser.add_argument(
 )
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
 parser.add_argument("--adaptive-rho-warmup-boundaries", type=int, default=0)
+parser.add_argument("--adaptive-policy-weight-ema-beta", type=float, default=0.0)
 parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
 parser.add_argument("--adaptive-stop-probability-threshold", type=float, default=0.75)
 parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
@@ -717,6 +718,7 @@ def build_adaptive_controller(args):
             disabled_features=tuple(args.adaptive_disable_features),
             factual_ema_alpha=args.adaptive_factual_ema_alpha,
             rho_warmup_boundaries=args.adaptive_rho_warmup_boundaries,
+            policy_weight_ema_beta=args.adaptive_policy_weight_ema_beta,
             weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
         )
     )
