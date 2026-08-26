@@ -132,6 +132,9 @@ class AdaptiveTDConfig:
     policy_weight_ema_beta: float = 0.0
     policy_weight_ema_mode: str = "global_step"
     weight_snapshot_interval: int = 100
+    value_parameterization: str = "independent_q"
+    shared_value_learning_rate: float = 0.015
+    shared_advantage_learning_rate: float = 0.02
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -224,6 +227,34 @@ class AdaptiveTDConfig:
             )
         if self.weight_snapshot_interval < 0:
             raise ValueError("weight_snapshot_interval must be non-negative")
+        if self.value_parameterization not in {
+            "independent_q",
+            "shared_value_advantage",
+        }:
+            raise ValueError(
+                "value_parameterization must be independent_q or "
+                "shared_value_advantage"
+            )
+        if (
+            self.shared_value_learning_rate < 0.0
+            or self.shared_advantage_learning_rate < 0.0
+        ):
+            raise ValueError("shared value/advantage rates must be non-negative")
+        if (
+            self.value_parameterization == "shared_value_advantage"
+            and self.credit_assignment
+            != "verifier_boundary_factual_no_bootstrap"
+        ):
+            raise ValueError(
+                "shared value/advantage requires factual no-bootstrap credit"
+            )
+        if (
+            self.value_parameterization == "shared_value_advantage"
+            and self.policy_weight_ema_beta
+        ):
+            raise ValueError(
+                "shared value/advantage does not support policy weight EMA"
+            )
         feature_names = FEATURE_SCHEMAS[self.feature_schema]
         unknown_features = set(self.disabled_features).difference(feature_names)
         if unknown_features:
@@ -389,11 +420,15 @@ class OnlineTDRefinementController:
         self.controller_name = (
             "avg_td" if config.feature_schema == "otrc_v1_td" else config.feature_schema
         )
+        if config.value_parameterization == "shared_value_advantage":
+            self.controller_name += "_shared_value_advantage"
         self.feature_names = FEATURE_SCHEMAS[config.feature_schema]
         self.values = {
             STOP: _LinearActionValue(config.feature_dim, config),
             CONTINUE: _LinearActionValue(config.feature_dim, config),
         }
+        self.shared_value_theta = [0.0] * config.feature_dim
+        self.shared_advantage_theta = [0.0] * config.feature_dim
         self.policy_ema_theta = {
             STOP: [0.0] * config.feature_dim,
             CONTINUE: [0.0] * config.feature_dim,
@@ -460,6 +495,77 @@ class OnlineTDRefinementController:
     @property
     def uses_policy_weight_ema(self) -> bool:
         return self.config.policy_weight_ema_beta > 0.0
+
+    @property
+    def uses_shared_value_advantage(self) -> bool:
+        return self.config.value_parameterization == "shared_value_advantage"
+
+    def _sync_shared_action_means(self) -> None:
+        if not self.uses_shared_value_advantage:
+            return
+        self.values[STOP].theta = [
+            value + 0.5 * advantage
+            for value, advantage in zip(
+                self.shared_value_theta,
+                self.shared_advantage_theta,
+            )
+        ]
+        self.values[CONTINUE].theta = [
+            value - 0.5 * advantage
+            for value, advantage in zip(
+                self.shared_value_theta,
+                self.shared_advantage_theta,
+            )
+        ]
+
+    def _update_factual_action_value(
+        self,
+        action: str,
+        features: Sequence[float],
+        target: float,
+        *,
+        observation_weight: float,
+    ) -> float:
+        if not self.uses_shared_value_advantage:
+            return self.values[action].update(
+                features,
+                target,
+                self.config.learning_rate,
+                observation_weight=observation_weight,
+            )
+
+        # Preserve the historical per-action covariance/residual accounting
+        # used by the behavior policy, while learning the mean through a
+        # coupled shared-value/explicit-advantage parameterization.
+        raw_residual = self.values[action].update(
+            features,
+            target,
+            rate=0.0,
+            observation_weight=observation_weight,
+        )
+        update_residual = _clip(
+            raw_residual,
+            -self.config.td_error_clip,
+            self.config.td_error_clip,
+        )
+        sign = 1.0 if action == STOP else -1.0
+        value_scale = (
+            self.config.shared_value_learning_rate
+            * observation_weight
+            * update_residual
+        )
+        advantage_scale = (
+            0.5
+            * sign
+            * self.config.shared_advantage_learning_rate
+            * observation_weight
+            * update_residual
+        )
+        for index, feature in enumerate(features):
+            self.shared_value_theta[index] += value_scale * feature
+            self.shared_advantage_theta[index] += advantage_scale * feature
+        self._sync_shared_action_means()
+        return raw_residual
 
     def _policy_theta(self, action: str) -> Sequence[float]:
         if (
@@ -721,6 +827,9 @@ class OnlineTDRefinementController:
             "policy_ema_continue_update_count": int(
                 self.policy_ema_update_count[CONTINUE]
             ),
+            "value_parameterization": self.config.value_parameterization,
+            "shared_value_theta": list(self.shared_value_theta),
+            "shared_advantage_theta": list(self.shared_advantage_theta),
         })
 
     def choose(
@@ -916,6 +1025,18 @@ class OnlineTDRefinementController:
             diagnostics={
                 "controller_name": self.controller_name,
                 "feature_schema": self.config.feature_schema,
+                "value_parameterization": self.config.value_parameterization,
+                "shared_value_mean": _dot(
+                    self.shared_value_theta,
+                    features,
+                ) if self.uses_shared_value_advantage else 0.5 * (
+                    raw_stop_mean + raw_continue_mean
+                ),
+                "explicit_advantage_mean": _dot(
+                    self.shared_advantage_theta,
+                    features,
+                ) if self.uses_shared_value_advantage else raw_advantage_mean,
+                "legacy_advantage_risk": advantage_risk,
                 "greedy_action": (
                     STOP if advantage_mean > self.config.q_margin else CONTINUE
                 ),
@@ -1095,10 +1216,10 @@ class OnlineTDRefinementController:
                 + float(bootstrap_value)
             )
             if update_applied:
-                residual = self.values[action].update(
+                residual = self._update_factual_action_value(
+                    action,
                     record["features"],
                     target,
-                    self.config.learning_rate,
                     observation_weight=float(record["importance_weight"]),
                 )
                 self._update_policy_weight_ema(action)
@@ -1141,6 +1262,13 @@ class OnlineTDRefinementController:
                     self.config.rho_warmup_boundaries
                 ),
                 "importance_weight": float(record["importance_weight"]),
+                "value_parameterization": self.config.value_parameterization,
+                "decision_shared_value": float(
+                    record.get("decision_shared_value", 0.0)
+                ),
+                "decision_explicit_advantage": float(
+                    record.get("decision_explicit_advantage", 0.0)
+                ),
                 "selected_action_probability": float(
                     record["selected_action_probability"]
                 ),
@@ -1202,6 +1330,12 @@ class OnlineTDRefinementController:
                 ),
                 "importance_weight": float(
                     item.get("importance_weight", 1.0)
+                ),
+                "decision_shared_value": float(
+                    item.get("shared_value_mean", 0.0)
+                ),
+                "decision_explicit_advantage": float(
+                    item.get("explicit_advantage_mean", 0.0)
                 ),
                 "source_record": item,
             })
@@ -1592,6 +1726,15 @@ class OnlineTDRefinementController:
             "stop_z_threshold": self.stop_z_threshold,
             "policy_mode": self.config.policy_mode,
             "credit_assignment": self.config.credit_assignment,
+            "value_parameterization": self.config.value_parameterization,
+            "shared_value_learning_rate": (
+                self.config.shared_value_learning_rate
+            ),
+            "shared_advantage_learning_rate": (
+                self.config.shared_advantage_learning_rate
+            ),
+            "shared_value_theta": list(self.shared_value_theta),
+            "shared_advantage_theta": list(self.shared_advantage_theta),
             "min_action_probability": self.config.min_action_probability,
             "max_importance_weight": self.config.max_importance_weight,
             "disabled_features": list(self.config.disabled_features),
@@ -1690,6 +1833,22 @@ class OnlineTDRefinementController:
             "credit_assignment",
             "per_step_td",
         )
+        snapshot_value_parameterization = snapshot.get(
+            "value_parameterization",
+            "independent_q",
+        )
+        snapshot_shared_value_rate = float(
+            snapshot.get(
+                "shared_value_learning_rate",
+                self.config.shared_value_learning_rate,
+            )
+        )
+        snapshot_shared_advantage_rate = float(
+            snapshot.get(
+                "shared_advantage_learning_rate",
+                self.config.shared_advantage_learning_rate,
+            )
+        )
         snapshot_rho_warmup = int(snapshot.get("rho_warmup_boundaries", 0))
         snapshot_policy_ema_beta = float(
             snapshot.get("policy_weight_ema_beta", 0.0)
@@ -1704,6 +1863,20 @@ class OnlineTDRefinementController:
             or snapshot_version != self.config.feature_version
             or snapshot_names != self.feature_names
             or snapshot_credit_assignment != self.config.credit_assignment
+            or snapshot_value_parameterization
+            != self.config.value_parameterization
+            or not math.isclose(
+                snapshot_shared_value_rate,
+                self.config.shared_value_learning_rate,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                snapshot_shared_advantage_rate,
+                self.config.shared_advantage_learning_rate,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
             or snapshot_rho_warmup != self.config.rho_warmup_boundaries
             or not math.isclose(
                 snapshot_policy_ema_beta,
@@ -1722,6 +1895,10 @@ class OnlineTDRefinementController:
                 f"controller={self.config.feature_schema}/v{self.config.feature_version}, "
                 f"snapshot_credit={snapshot_credit_assignment}, "
                 f"controller_credit={self.config.credit_assignment}, "
+                f"snapshot_value_parameterization="
+                f"{snapshot_value_parameterization}, "
+                f"controller_value_parameterization="
+                f"{self.config.value_parameterization}, "
                 f"snapshot_rho_warmup={snapshot_rho_warmup}, "
                 f"controller_rho_warmup={self.config.rho_warmup_boundaries}, "
                 f"snapshot_policy_ema_beta={snapshot_policy_ema_beta}, "
@@ -1765,6 +1942,26 @@ class OnlineTDRefinementController:
             value.residual_m2 = (
                 residual_variance * value.residual_degrees_of_freedom()
             )
+
+        if self.uses_shared_value_advantage:
+            shared_value = [
+                float(item)
+                for item in snapshot.get("shared_value_theta", [])
+            ]
+            shared_advantage = [
+                float(item)
+                for item in snapshot.get("shared_advantage_theta", [])
+            ]
+            if (
+                len(shared_value) != self.config.feature_dim
+                or len(shared_advantage) != self.config.feature_dim
+            ):
+                raise ValueError(
+                    "snapshot is missing shared value/advantage parameters"
+                )
+            self.shared_value_theta = shared_value
+            self.shared_advantage_theta = shared_advantage
+            self._sync_shared_action_means()
 
         policy_ema = snapshot.get("policy_weight_ema") or {}
         for action in (STOP, CONTINUE):

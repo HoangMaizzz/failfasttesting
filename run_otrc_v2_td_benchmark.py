@@ -91,6 +91,17 @@ def parse_args():
     parser.add_argument("--drafter_threshold", type=float, default=0.05)
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument("--adaptive_learning_rate", type=float, default=0.02)
+    parser.add_argument(
+        "--value_parameterization",
+        choices=("independent_q", "shared_value_advantage"),
+        default="independent_q",
+    )
+    parser.add_argument("--shared_value_learning_rate", type=float, default=0.015)
+    parser.add_argument(
+        "--shared_advantage_learning_rate",
+        type=float,
+        default=0.02,
+    )
     parser.add_argument("--adaptive_mc_learning_rate", type=float, default=0.01)
     parser.add_argument("--adaptive_mc_mix", type=float, default=0.5)
     parser.add_argument(
@@ -174,6 +185,24 @@ def validate_args(args):
         raise ValueError(
             "policy weight EMA is only supported by factual no-bootstrap credit"
         )
+    value_parameterization = getattr(
+        args,
+        "value_parameterization",
+        "independent_q",
+    )
+    if (
+        value_parameterization == "shared_value_advantage"
+        and args.credit_assignment
+        != "verifier_boundary_factual_no_bootstrap"
+    ):
+        raise ValueError(
+            "shared value/advantage requires factual no-bootstrap credit"
+        )
+    if (
+        value_parameterization == "shared_value_advantage"
+        and args.policy_weight_ema_beta
+    ):
+        raise ValueError("shared value/advantage requires Weight-EMA disabled")
 
 
 def method_name(args):
@@ -191,6 +220,10 @@ def method_name(args):
             beta_label = f"{policy_beta:.6f}".rstrip("0").rstrip(".")
             base = f"{base}_policy_ema{beta_label.replace('.', 'p')}"
             base = f"{base}_{args.policy_weight_ema_mode}"
+        if getattr(args, "value_parameterization", "independent_q") == (
+            "shared_value_advantage"
+        ):
+            base = f"{base}_shared_value_advantage"
         return base
     if args.credit_assignment == "verifier_boundary_factual":
         return (
@@ -245,6 +278,12 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-feature-schema", args.feature_schema,
         "--adaptive-credit-assignment", args.credit_assignment,
         "--adaptive-learning-rate", str(args.adaptive_learning_rate),
+        "--adaptive-value-parameterization",
+        getattr(args, "value_parameterization", "independent_q"),
+        "--adaptive-shared-value-learning-rate",
+        str(getattr(args, "shared_value_learning_rate", 0.015)),
+        "--adaptive-shared-advantage-learning-rate",
+        str(getattr(args, "shared_advantage_learning_rate", 0.02)),
         "--adaptive-mc-learning-rate", str(args.adaptive_mc_learning_rate),
         "--adaptive-mc-mix", str(args.adaptive_mc_mix),
         "--adaptive-update-mode", args.adaptive_update_mode,
@@ -296,6 +335,7 @@ def phase_complete(
     rho_warmup_boundaries,
     policy_weight_ema_beta,
     policy_weight_ema_mode,
+    value_parameterization,
 ):
     required = [
         directory / "benchmark_results.csv",
@@ -325,6 +365,8 @@ def phase_complete(
             or state.get("policy_weight_ema_mode", "action_step")
             == policy_weight_ema_mode
         )
+        and state.get("value_parameterization", "independent_q")
+        == value_parameterization
     )
 
 
@@ -339,6 +381,7 @@ def run_dataset(args, dataset, problem_ids):
         args.rho_warmup_boundaries,
         args.policy_weight_ema_beta,
         args.policy_weight_ema_mode,
+        getattr(args, "value_parameterization", "independent_q"),
     ):
         print(f"RESUME {dataset} {method}", flush=True)
         return output_dir

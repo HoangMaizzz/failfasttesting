@@ -479,6 +479,21 @@ parser.add_argument(
 parser.add_argument("--adaptive-max-refinement-steps", type=int, default=16)
 parser.add_argument("--adaptive-fixed-refinement-steps", type=int)
 parser.add_argument("--adaptive-learning-rate", type=float, default=0.02)
+parser.add_argument(
+    "--adaptive-value-parameterization",
+    choices=["independent_q", "shared_value_advantage"],
+    default="independent_q",
+)
+parser.add_argument(
+    "--adaptive-shared-value-learning-rate",
+    type=float,
+    default=0.015,
+)
+parser.add_argument(
+    "--adaptive-shared-advantage-learning-rate",
+    type=float,
+    default=0.02,
+)
 parser.add_argument("--adaptive-mc-learning-rate", type=float, default=0.01)
 parser.add_argument("--adaptive-mc-mix", type=float, default=0.5)
 parser.add_argument(
@@ -709,6 +724,13 @@ def build_adaptive_controller(args):
                 "otrc_v2_2_compact_td": 226,
             }[args.adaptive_feature_schema],
             learning_rate=args.adaptive_learning_rate,
+            value_parameterization=args.adaptive_value_parameterization,
+            shared_value_learning_rate=(
+                args.adaptive_shared_value_learning_rate
+            ),
+            shared_advantage_learning_rate=(
+                args.adaptive_shared_advantage_learning_rate
+            ),
             mc_learning_rate=args.adaptive_mc_learning_rate,
             mc_mix=args.adaptive_mc_mix,
             update_mode=args.adaptive_update_mode,
