@@ -4,6 +4,7 @@ from argparse import Namespace
 from run_no_weight_ema_aime_humaneval import (
     DATASET_COUNTS,
     benchmark_command,
+    failfast_command,
     validate_args,
 )
 from run_otrc_v2_td_benchmark import PROBLEM_IDS
@@ -42,6 +43,25 @@ class NoWeightEMAAimeHumanEvalTests(unittest.TestCase):
         self.assertNotIn("oracle", command)
         self.assertNotIn("--methods failfast", command)
         self.assertIn("--resume", command)
+
+    def test_failfast_command_uses_identical_ids_and_greedy_decoding(self):
+        command = failfast_command(
+            self.args(),
+            "aime",
+            29,
+            "/tmp/failfast",
+        )
+        joined = " ".join(command)
+        problem_index = command.index("--problem_ids") + 1
+        warmup_index = command.index("--warmup_questions")
+        measured_ids = [int(value) for value in command[problem_index:warmup_index]]
+
+        self.assertEqual(measured_ids, PROBLEM_IDS["aime"][:29])
+        self.assertIn("--decoding_strategy greedy", joined)
+        self.assertIn("--dllm_variant failfast", joined)
+        self.assertIn("--spec_len 8", joined)
+        self.assertIn("--sweep_incr_len 8", joined)
+        self.assertNotIn("--adaptive-td", command)
 
     def test_benchmark_requires_one_warmup_question(self):
         args = self.args()
