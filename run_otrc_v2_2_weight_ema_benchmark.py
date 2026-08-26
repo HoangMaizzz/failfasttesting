@@ -10,7 +10,7 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "otrc_v2_2_compact_no_bootstrap_weight_ema_v1"
+VERSION = "otrc_v2_2_compact_no_bootstrap_weight_ema_global_step_v2"
 
 
 def parse_args():
@@ -18,6 +18,11 @@ def parse_args():
     parser.add_argument("--datasets", nargs="+", default=["math", "gsm8k"])
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument("--policy_weight_ema_beta", type=float, default=0.99)
+    parser.add_argument(
+        "--policy_weight_ema_mode",
+        choices=("global_step", "action_step"),
+        default="global_step",
+    )
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument(
@@ -52,6 +57,8 @@ def validate_args(args):
         abs_tol=1e-12,
     ):
         raise ValueError("this predeclared ablation requires beta=0.99")
+    if args.policy_weight_ema_mode != "global_step":
+        raise ValueError("this predeclared ablation requires global_step EMA")
 
 
 def benchmark_command(args):
@@ -71,6 +78,8 @@ def benchmark_command(args):
         "0",
         "--policy_weight_ema_beta",
         str(args.policy_weight_ema_beta),
+        "--policy_weight_ema_mode",
+        args.policy_weight_ema_mode,
         "--warmup_questions",
         str(args.warmup_questions),
         "--max_new_tokens",
@@ -174,7 +183,10 @@ def validate_outputs(output_dir):
     )
     if len(policy) != 2 or not enabled.all():
         raise RuntimeError("policy EMA diagnostics are incomplete")
-    method = "otrc_v2_2_compact_factual_no_bootstrap_policy_ema0p99"
+    method = (
+        "otrc_v2_2_compact_factual_no_bootstrap_"
+        "policy_ema0p99_global_step"
+    )
     states = {}
     for dataset in ("math", "gsm8k"):
         state_path = (
@@ -186,11 +198,21 @@ def validate_outputs(output_dir):
         )
         state = json.loads(state_path.read_text(encoding="utf-8"))
         updates = state["policy_weight_ema"]
-        if not all(updates[action]["update_count"] > 0 for action in updates):
-            raise RuntimeError(f"policy EMA missed an action on {dataset}")
-        states[dataset] = {
-            action: updates[action]["update_count"]
+        global_updates = int(state.get("policy_ema_global_update_count", 0))
+        action_updates = {
+            action: int(updates[action]["update_count"])
             for action in updates
+        }
+        if global_updates <= 0:
+            raise RuntimeError(f"policy EMA did not advance on {dataset}")
+        if any(count != global_updates for count in action_updates.values()):
+            raise RuntimeError(
+                f"global EMA clocks diverged on {dataset}: "
+                f"global={global_updates}, actions={action_updates}"
+            )
+        states[dataset] = {
+            "global": global_updates,
+            **action_updates,
         }
     return ratio, policy, states
 

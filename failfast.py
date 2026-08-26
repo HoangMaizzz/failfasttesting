@@ -497,7 +497,25 @@ parser.add_argument(
 )
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
 parser.add_argument("--adaptive-rho-warmup-boundaries", type=int, default=0)
-parser.add_argument("--adaptive-policy-weight-ema-beta", type=float, default=0.0)
+parser.add_argument(
+    "--adaptive-policy-weight-ema-beta",
+    type=float,
+    default=0.0,
+    help=(
+        "EMA beta for policy decision weights. A value of 0 disables policy "
+        "weight EMA."
+    ),
+)
+parser.add_argument(
+    "--adaptive-policy-weight-ema-mode",
+    choices=["global_step", "action_step"],
+    default="global_step",
+    help=(
+        "Policy-weight EMA clock. global_step advances BOTH STOP and CONTINUE "
+        "EMA heads after every factual learner update; action_step reproduces "
+        "the historical selected-action-only EMA."
+    ),
+)
 parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
 parser.add_argument("--adaptive-stop-probability-threshold", type=float, default=0.75)
 parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
@@ -719,6 +737,7 @@ def build_adaptive_controller(args):
             factual_ema_alpha=args.adaptive_factual_ema_alpha,
             rho_warmup_boundaries=args.adaptive_rho_warmup_boundaries,
             policy_weight_ema_beta=args.adaptive_policy_weight_ema_beta,
+            policy_weight_ema_mode=args.adaptive_policy_weight_ema_mode,
             weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
         )
     )

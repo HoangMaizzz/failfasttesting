@@ -130,6 +130,7 @@ class AdaptiveTDConfig:
     factual_ema_alpha: float = 0.2
     rho_warmup_boundaries: int = 0
     policy_weight_ema_beta: float = 0.0
+    policy_weight_ema_mode: str = "global_step"
     weight_snapshot_interval: int = 100
 
     def __post_init__(self) -> None:
@@ -208,6 +209,10 @@ class AdaptiveTDConfig:
             )
         if not 0.0 <= self.policy_weight_ema_beta < 1.0:
             raise ValueError("policy_weight_ema_beta must be in [0, 1)")
+        if self.policy_weight_ema_mode not in {"action_step", "global_step"}:
+            raise ValueError(
+                "policy_weight_ema_mode must be action_step or global_step"
+            )
         if (
             self.policy_weight_ema_beta
             and self.credit_assignment
@@ -395,6 +400,7 @@ class OnlineTDRefinementController:
         }
         self.policy_ema_initialized = {STOP: False, CONTINUE: False}
         self.policy_ema_update_count = {STOP: 0, CONTINUE: 0}
+        self.policy_ema_global_update_count = 0
         self.early_stop_uncertainty = _LinearActionValue(
             config.feature_dim,
             config,
@@ -466,23 +472,46 @@ class OnlineTDRefinementController:
     def _policy_mean(self, action: str, features: Sequence[float]) -> float:
         return _dot(self._policy_theta(action), features)
 
-    def _update_policy_weight_ema(self, action: str) -> None:
+    def _update_policy_weight_ema(self, updated_action: str) -> None:
+        """Update policy-weight EMA after one factual learner update.
+
+        ``action_step`` reproduces the historical behavior: only the EMA of
+        the action whose raw head changed is advanced.
+
+        ``global_step`` treats [theta_STOP, theta_CONTINUE] as one parameter
+        vector and advances the EMA of *both* heads after every factual
+        learner update.  This gives STOP and CONTINUE the same EMA clock even
+        under highly imbalanced action frequencies.
+        """
         if not self.uses_policy_weight_ema:
             return
-        online = self.values[action].theta
-        if not self.policy_ema_initialized[action]:
-            self.policy_ema_theta[action] = list(online)
-            self.policy_ema_initialized[action] = True
+        if updated_action not in {STOP, CONTINUE}:
+            raise ValueError(f"unknown EMA-updated action: {updated_action}")
+
+        beta = self.config.policy_weight_ema_beta
+        if self.config.policy_weight_ema_mode == "action_step":
+            actions_to_advance = (updated_action,)
         else:
-            beta = self.config.policy_weight_ema_beta
-            self.policy_ema_theta[action] = [
-                beta * averaged + (1.0 - beta) * current
-                for averaged, current in zip(
-                    self.policy_ema_theta[action],
-                    online,
-                )
-            ]
-        self.policy_ema_update_count[action] += 1
+            actions_to_advance = (STOP, CONTINUE)
+            self.policy_ema_global_update_count += 1
+
+        for action in actions_to_advance:
+            online = self.values[action].theta
+            if not self.policy_ema_initialized[action]:
+                # Initialize from the current raw head, rather than averaging
+                # from zero. In global mode both heads initialize on the same
+                # global learner step.
+                self.policy_ema_theta[action] = list(online)
+                self.policy_ema_initialized[action] = True
+            else:
+                self.policy_ema_theta[action] = [
+                    beta * averaged + (1.0 - beta) * current
+                    for averaged, current in zip(
+                        self.policy_ema_theta[action],
+                        online,
+                    )
+                ]
+            self.policy_ema_update_count[action] += 1
 
     @staticmethod
     def _probability_from_advantage(
@@ -682,6 +711,16 @@ class OnlineTDRefinementController:
                     self._policy_theta(CONTINUE),
                 )
             ],
+            "policy_weight_ema_mode": self.config.policy_weight_ema_mode,
+            "policy_ema_global_update_count": int(
+                self.policy_ema_global_update_count
+            ),
+            "policy_ema_stop_update_count": int(
+                self.policy_ema_update_count[STOP]
+            ),
+            "policy_ema_continue_update_count": int(
+                self.policy_ema_update_count[CONTINUE]
+            ),
         })
 
     def choose(
@@ -883,6 +922,10 @@ class OnlineTDRefinementController:
                 "executed_action": action,
                 "policy_weight_ema_enabled": self.uses_policy_weight_ema,
                 "policy_weight_ema_beta": self.config.policy_weight_ema_beta,
+                "policy_weight_ema_mode": self.config.policy_weight_ema_mode,
+                "policy_ema_global_update_count": self.policy_ema_global_update_count,
+                "policy_ema_stop_update_count": self.policy_ema_update_count[STOP],
+                "policy_ema_continue_update_count": self.policy_ema_update_count[CONTINUE],
                 "raw_q_stop": raw_stop_mean,
                 "raw_q_continue": raw_continue_mean,
                 "ema_q_stop": stop.mean,
@@ -1575,6 +1618,10 @@ class OnlineTDRefinementController:
             ),
             "rho_warmup_boundaries": self.config.rho_warmup_boundaries,
             "policy_weight_ema_beta": self.config.policy_weight_ema_beta,
+            "policy_weight_ema_mode": self.config.policy_weight_ema_mode,
+            "policy_ema_global_update_count": int(
+                self.policy_ema_global_update_count
+            ),
             "policy_weight_ema": {
                 action: {
                     "theta": list(self.policy_ema_theta[action]),
@@ -1647,6 +1694,11 @@ class OnlineTDRefinementController:
         snapshot_policy_ema_beta = float(
             snapshot.get("policy_weight_ema_beta", 0.0)
         )
+        # Snapshots created before global-step EMA existed used the historical
+        # action-specific clock, so default missing metadata accordingly.
+        snapshot_policy_ema_mode = str(
+            snapshot.get("policy_weight_ema_mode", "action_step")
+        )
         if (
             snapshot_schema != self.config.feature_schema
             or snapshot_version != self.config.feature_version
@@ -1659,6 +1711,10 @@ class OnlineTDRefinementController:
                 rel_tol=0.0,
                 abs_tol=1e-12,
             )
+            or (
+                (snapshot_policy_ema_beta > 0.0 or self.config.policy_weight_ema_beta > 0.0)
+                and snapshot_policy_ema_mode != self.config.policy_weight_ema_mode
+            )
         ):
             raise ValueError(
                 "snapshot feature schema does not match controller: "
@@ -1669,7 +1725,9 @@ class OnlineTDRefinementController:
                 f"snapshot_rho_warmup={snapshot_rho_warmup}, "
                 f"controller_rho_warmup={self.config.rho_warmup_boundaries}, "
                 f"snapshot_policy_ema_beta={snapshot_policy_ema_beta}, "
-                f"controller_policy_ema_beta={self.config.policy_weight_ema_beta}"
+                f"controller_policy_ema_beta={self.config.policy_weight_ema_beta}, "
+                f"snapshot_policy_ema_mode={snapshot_policy_ema_mode}, "
+                f"controller_policy_ema_mode={self.config.policy_weight_ema_mode}"
             )
         actions = snapshot.get("actions") or {}
         for action in (STOP, CONTINUE):
@@ -1729,6 +1787,14 @@ class OnlineTDRefinementController:
             self.policy_ema_update_count[action] = int(
                 state.get("update_count", 0)
             )
+        self.policy_ema_global_update_count = int(
+            snapshot.get(
+                "policy_ema_global_update_count",
+                min(self.policy_ema_update_count.values())
+                if self.config.policy_weight_ema_mode == "global_step"
+                else 0,
+            )
+        )
 
         uncertainty_state = snapshot.get("early_stop_uncertainty") or {}
         uncertainty = self.early_stop_uncertainty

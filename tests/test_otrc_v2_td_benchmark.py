@@ -40,6 +40,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             adaptive_rho_alpha=0.05,
             rho_warmup_boundaries=0,
             policy_weight_ema_beta=0.0,
+            policy_weight_ema_mode="global_step",
             adaptive_factual_ema_alpha=0.2,
             adaptive_risk_beta=1.0,
             adaptive_stop_probability_threshold=0.75,
@@ -124,10 +125,14 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
 
         self.assertEqual(
             method_name(args),
-            "otrc_v2_2_compact_factual_no_bootstrap_policy_ema0p99",
+            "otrc_v2_2_compact_factual_no_bootstrap_policy_ema0p99_global_step",
         )
         self.assertIn(
             "--adaptive-policy-weight-ema-beta 0.99",
+            " ".join(command),
+        )
+        self.assertIn(
+            "--adaptive-policy-weight-ema-mode global_step",
             " ".join(command),
         )
 

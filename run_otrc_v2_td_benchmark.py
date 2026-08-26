@@ -89,6 +89,11 @@ def parse_args():
     parser.add_argument("--adaptive_rho_alpha", type=float, default=0.05)
     parser.add_argument("--rho_warmup_boundaries", type=int, default=0)
     parser.add_argument("--policy_weight_ema_beta", type=float, default=0.0)
+    parser.add_argument(
+        "--policy_weight_ema_mode",
+        choices=("global_step", "action_step"),
+        default="global_step",
+    )
     parser.add_argument("--adaptive_factual_ema_alpha", type=float, default=0.2)
     parser.add_argument("--adaptive_risk_beta", type=float, default=1.0)
     parser.add_argument("--adaptive_stop_probability_threshold", type=float, default=0.75)
@@ -169,6 +174,7 @@ def method_name(args):
         if policy_beta:
             beta_label = f"{policy_beta:.6f}".rstrip("0").rstrip(".")
             base = f"{base}_policy_ema{beta_label.replace('.', 'p')}"
+            base = f"{base}_{args.policy_weight_ema_mode}"
         return base
     if args.credit_assignment == "verifier_boundary_factual":
         return (
@@ -231,6 +237,8 @@ def command_for(args, dataset, problem_ids, output_dir):
         str(args.rho_warmup_boundaries),
         "--adaptive-policy-weight-ema-beta",
         str(args.policy_weight_ema_beta),
+        "--adaptive-policy-weight-ema-mode",
+        str(args.policy_weight_ema_mode),
         "--adaptive-factual-ema-alpha", str(args.adaptive_factual_ema_alpha),
         "--adaptive-risk-beta", str(args.adaptive_risk_beta),
         "--adaptive-stop-probability-threshold",
@@ -271,6 +279,7 @@ def phase_complete(
     credit_assignment,
     rho_warmup_boundaries,
     policy_weight_ema_beta,
+    policy_weight_ema_mode,
 ):
     required = [
         directory / "benchmark_results.csv",
@@ -295,6 +304,11 @@ def phase_complete(
             - float(policy_weight_ema_beta)
         )
         <= 1e-12
+        and (
+            not float(policy_weight_ema_beta)
+            or state.get("policy_weight_ema_mode", "action_step")
+            == policy_weight_ema_mode
+        )
     )
 
 
@@ -308,6 +322,7 @@ def run_dataset(args, dataset, problem_ids):
         args.credit_assignment,
         args.rho_warmup_boundaries,
         args.policy_weight_ema_beta,
+        args.policy_weight_ema_mode,
     ):
         print(f"RESUME {dataset} {method}", flush=True)
         return output_dir

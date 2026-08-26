@@ -15,6 +15,7 @@ def factual_controller(
     credit_assignment="verifier_boundary_factual",
     rho_warmup_boundaries=0,
     policy_weight_ema_beta=0.0,
+    policy_weight_ema_mode="global_step",
 ):
     controller = OnlineTDRefinementController(
         AdaptiveTDConfig(
@@ -24,6 +25,7 @@ def factual_controller(
             profile_overhead=False,
             rho_warmup_boundaries=rho_warmup_boundaries,
             policy_weight_ema_beta=policy_weight_ema_beta,
+            policy_weight_ema_mode=policy_weight_ema_mode,
         )
     )
     controller.observe_round(1, 10.0)
@@ -51,10 +53,11 @@ class VerifierBoundaryFactualTests(unittest.TestCase):
                 policy_weight_ema_beta=0.99,
             )
 
-    def test_policy_weight_ema_updates_only_the_factual_action(self):
+    def test_action_step_policy_weight_ema_updates_only_factual_action(self):
         controller = factual_controller(
             "verifier_boundary_factual_no_bootstrap",
             policy_weight_ema_beta=0.5,
+            policy_weight_ema_mode="action_step",
         )
 
         controller.complete_trajectory(
@@ -101,6 +104,59 @@ class VerifierBoundaryFactualTests(unittest.TestCase):
         )
         self.assertEqual(controller.policy_ema_update_count[STOP], 2)
         self.assertEqual(controller.policy_ema_update_count[CONTINUE], 1)
+        self.assertEqual(controller.policy_ema_global_update_count, 0)
+
+    def test_global_step_policy_weight_ema_advances_both_heads(self):
+        controller = factual_controller(
+            "verifier_boundary_factual_no_bootstrap",
+            policy_weight_ema_beta=0.5,
+            policy_weight_ema_mode="global_step",
+        )
+
+        controller.complete_trajectory(
+            [record(STOP, 0.0, rho=0.0)],
+            emitted_tokens=2,
+            verifier_latency_ms=1.0,
+            post_verify_latency_ms=0.0,
+            terminal=False,
+        )
+
+        self.assertTrue(controller.policy_ema_initialized[STOP])
+        self.assertTrue(controller.policy_ema_initialized[CONTINUE])
+        self.assertEqual(controller.policy_ema_theta[STOP], controller.values[STOP].theta)
+        self.assertEqual(
+            controller.policy_ema_theta[CONTINUE],
+            controller.values[CONTINUE].theta,
+        )
+        self.assertEqual(controller.policy_ema_update_count, {STOP: 1, CONTINUE: 1})
+        self.assertEqual(controller.policy_ema_global_update_count, 1)
+
+        stop_ema_before = list(controller.policy_ema_theta[STOP])
+        stop_raw_before = list(controller.values[STOP].theta)
+        anchor = controller.algorithm_latency_ms
+        controller.complete_trajectory(
+            [record(CONTINUE, anchor, rho=0.0)],
+            emitted_tokens=3,
+            verifier_latency_ms=1.0,
+            post_verify_latency_ms=0.0,
+            terminal=False,
+        )
+
+        expected_stop = [
+            0.5 * averaged + 0.5 * raw
+            for averaged, raw in zip(stop_ema_before, stop_raw_before)
+        ]
+        for actual, expected in zip(
+            controller.policy_ema_theta[STOP],
+            expected_stop,
+        ):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(controller.policy_ema_update_count, {STOP: 2, CONTINUE: 2})
+        self.assertEqual(controller.policy_ema_global_update_count, 2)
+
+    def test_policy_weight_ema_mode_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "policy_weight_ema_mode"):
+            AdaptiveTDConfig(policy_weight_ema_mode="invalid")
 
     def test_policy_uses_ema_mean_while_logging_raw_shadow_policy(self):
         controller = OnlineTDRefinementController(AdaptiveTDConfig(
@@ -154,6 +210,10 @@ class VerifierBoundaryFactualTests(unittest.TestCase):
         self.assertEqual(
             restored.policy_ema_update_count,
             original.policy_ema_update_count,
+        )
+        self.assertEqual(
+            restored.policy_ema_global_update_count,
+            original.policy_ema_global_update_count,
         )
 
     def test_rho_warmup_rejects_bootstrapped_credit(self):
