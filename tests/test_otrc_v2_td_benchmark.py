@@ -9,7 +9,9 @@ from adaptive_td import V22_FEATURE_NAMES
 from run_otrc_v2_td_benchmark import (
     command_for,
     confidence_diagnostics,
+    factual_target_diagnostics,
     feature_diagnostics,
+    method_name,
     snapshot_diagnostics,
 )
 
@@ -18,6 +20,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
     def args(self):
         return Namespace(
             feature_schema="otrc_v2_2_td",
+            credit_assignment="per_step_td",
             warmup_questions=1,
             max_new_tokens=1024,
             spec_len=8,
@@ -65,6 +68,18 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertNotIn("causal_oracle", joined)
         self.assertNotIn("verifier_ar", joined)
 
+    def test_command_enables_factual_boundary_credit(self):
+        args = self.args()
+        args.credit_assignment = "verifier_boundary_factual"
+        command = command_for(args, "math", [2], Path("/tmp/out"))
+        joined = " ".join(command)
+
+        self.assertIn(
+            "--adaptive-credit-assignment verifier_boundary_factual",
+            joined,
+        )
+        self.assertEqual(method_name(args), "otrc_v2_2_factual")
+
     def test_feature_diagnostics_flags_constant_feature(self):
         decisions = pd.DataFrame({
             "features": [
@@ -110,6 +125,30 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["confidence_observations"], 2)
         self.assertAlmostEqual(result["min_confidence_mean"], 0.06)
         self.assertEqual(result["below_drafter_threshold_percent"], 50.0)
+
+    def test_factual_target_diagnostics_report_boundary_horizon(self):
+        transitions = pd.DataFrame({
+            "action": ["continue", "stop"],
+            "boundary_id": [1, 1],
+            "decisions_in_boundary": [2, 2],
+            "verifier_boundaries_spanned": [1, 1],
+            "delta_time_ms": [14.0, 12.0],
+            "post_boundary_latency_ms": [4.0, 4.0],
+            "emitted_tokens": [3, 3],
+            "rho_tokens_per_ms": [0.1, 0.1],
+            "bootstrap_value": [2.0, 2.0],
+            "td_target": [3.6, 3.8],
+            "td_error": [0.6, -0.2],
+            "terminal": [False, False],
+        })
+
+        summary, dynamics = factual_target_diagnostics("math", transitions)
+
+        self.assertEqual(summary.iloc[0].boundaries, 1)
+        self.assertEqual(summary.iloc[0].continue_updates, 1)
+        self.assertEqual(summary.iloc[0].stop_updates, 1)
+        self.assertEqual(summary.iloc[0].mean_post_boundary_latency_ms, 4.0)
+        self.assertFalse(dynamics.empty)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from run_math_feature_ablation_benchmark import aggregate_method
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "otrc_td_representation_benchmark_v3"
+VERSION = "otrc_td_representation_benchmark_v4"
 FEATURE_VARIANCE_EPS = 1e-8
 PROBLEM_IDS = {
     "math": [
@@ -42,6 +42,11 @@ def parse_args():
         "--feature_schema",
         choices=("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td"),
         default="otrc_v2_2_td",
+    )
+    parser.add_argument(
+        "--credit_assignment",
+        choices=("per_step_td", "verifier_boundary_factual"),
+        default="per_step_td",
     )
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
@@ -102,6 +107,20 @@ def validate_args(args):
         raise ValueError("--num_questions must be in [1, 25]")
     if args.spec_len != 8 or args.incr_len != 8:
         raise ValueError("the matched benchmark requires --spec_len=8 and --incr_len=8")
+    if (
+        args.credit_assignment == "verifier_boundary_factual"
+        and args.feature_schema != "otrc_v2_2_td"
+    ):
+        raise ValueError(
+            "verifier-boundary factual credit requires --feature_schema "
+            "otrc_v2_2_td"
+        )
+
+
+def method_name(args):
+    if args.credit_assignment == "verifier_boundary_factual":
+        return "otrc_v2_2_factual"
+    return args.feature_schema
 
 
 def run_streaming(command):
@@ -146,6 +165,7 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-td",
         "--adaptive-controller", "avg_td",
         "--adaptive-feature-schema", args.feature_schema,
+        "--adaptive-credit-assignment", args.credit_assignment,
         "--adaptive-learning-rate", str(args.adaptive_learning_rate),
         "--adaptive-mc-learning-rate", str(args.adaptive_mc_learning_rate),
         "--adaptive-mc-mix", str(args.adaptive_mc_mix),
@@ -184,7 +204,7 @@ def command_for(args, dataset, problem_ids, output_dir):
     ]
 
 
-def phase_complete(directory, problem_ids, feature_schema):
+def phase_complete(directory, problem_ids, feature_schema, credit_assignment):
     required = [
         directory / "benchmark_results.csv",
         directory / "adaptive_td_decisions.csv",
@@ -200,13 +220,19 @@ def phase_complete(directory, problem_ids, feature_schema):
     return (
         set(results.problem_id.astype(int)) == set(problem_ids)
         and state.get("feature_schema") == feature_schema
+        and state.get("credit_assignment", "per_step_td") == credit_assignment
     )
 
 
 def run_dataset(args, dataset, problem_ids):
-    method = args.feature_schema
+    method = method_name(args)
     output_dir = Path(args.output_dir) / "raw" / dataset / method
-    if args.resume and phase_complete(output_dir, problem_ids, args.feature_schema):
+    if args.resume and phase_complete(
+        output_dir,
+        problem_ids,
+        args.feature_schema,
+        args.credit_assignment,
+    ):
         print(f"RESUME {dataset} {method}", flush=True)
         return output_dir
     if output_dir.exists():
@@ -217,6 +243,107 @@ def run_dataset(args, dataset, problem_ids):
     print("=" * 100, flush=True)
     run_streaming(command_for(args, dataset, problem_ids, output_dir))
     return output_dir
+
+
+def factual_target_diagnostics(dataset, transitions):
+    if transitions.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    required = {
+        "action",
+        "boundary_id",
+        "decisions_in_boundary",
+        "verifier_boundaries_spanned",
+        "delta_time_ms",
+        "post_boundary_latency_ms",
+        "emitted_tokens",
+        "rho_tokens_per_ms",
+        "bootstrap_value",
+        "td_target",
+        "td_error",
+        "terminal",
+    }
+    missing = required.difference(transitions.columns)
+    if missing:
+        raise ValueError(
+            f"factual transition log is missing fields: {sorted(missing)}"
+        )
+    numeric = [
+        "decisions_in_boundary",
+        "verifier_boundaries_spanned",
+        "delta_time_ms",
+        "post_boundary_latency_ms",
+        "emitted_tokens",
+        "rho_tokens_per_ms",
+        "bootstrap_value",
+        "td_target",
+        "td_error",
+    ]
+    transitions = transitions.copy()
+    for column in numeric:
+        transitions[column] = pd.to_numeric(
+            transitions[column],
+            errors="coerce",
+        )
+    target_scale = max(float(transitions["td_target"].std(ddof=0)), 1e-9)
+    transitions["absolute_td_error"] = transitions["td_error"].abs()
+    transitions["normalized_absolute_td_error"] = (
+        transitions["absolute_td_error"] / target_scale
+    )
+    summary = pd.DataFrame([{
+        "dataset": dataset,
+        "transitions": int(len(transitions)),
+        "boundaries": int(transitions["boundary_id"].nunique()),
+        "stop_updates": int(transitions["action"].eq("stop").sum()),
+        "continue_updates": int(transitions["action"].eq("continue").sum()),
+        "terminal_updates": int(transitions["terminal"].astype(bool).sum()),
+        "mean_decisions_per_boundary": float(
+            transitions.groupby("boundary_id").size().mean()
+        ),
+        "mean_verifier_boundaries_spanned": float(
+            transitions["verifier_boundaries_spanned"].mean()
+        ),
+        "mean_delta_time_ms": float(transitions["delta_time_ms"].mean()),
+        "mean_post_boundary_latency_ms": float(
+            transitions["post_boundary_latency_ms"].mean()
+        ),
+        "mean_emitted_tokens": float(transitions["emitted_tokens"].mean()),
+        "mean_bootstrap_value": float(transitions["bootstrap_value"].mean()),
+        "mean_td_target": float(transitions["td_target"].mean()),
+        "td_target_std": target_scale,
+        "mean_absolute_td_error": float(
+            transitions["absolute_td_error"].mean()
+        ),
+        "normalized_mean_absolute_td_error": float(
+            transitions["normalized_absolute_td_error"].mean()
+        ),
+    }])
+    ordered = transitions.reset_index(drop=True)
+    bins = min(4, len(ordered))
+    ordered["time_bin"] = pd.qcut(
+        np.arange(len(ordered)),
+        bins,
+        labels=[f"Q{index + 1}" for index in range(bins)],
+    )
+    dynamics = ordered.groupby("time_bin", observed=True).agg(
+        transitions=("action", "size"),
+        boundaries=("boundary_id", "nunique"),
+        stop_rate_percent=(
+            "action",
+            lambda values: 100.0 * values.eq("stop").mean(),
+        ),
+        delta_time_ms_mean=("delta_time_ms", "mean"),
+        post_boundary_latency_ms_mean=("post_boundary_latency_ms", "mean"),
+        emitted_tokens_mean=("emitted_tokens", "mean"),
+        bootstrap_value_mean=("bootstrap_value", "mean"),
+        td_target_mean=("td_target", "mean"),
+        absolute_td_error_mean=("absolute_td_error", "mean"),
+        normalized_absolute_td_error_mean=(
+            "normalized_absolute_td_error",
+            "mean",
+        ),
+    ).reset_index()
+    dynamics.insert(0, "dataset", dataset)
+    return summary, dynamics
 
 
 def parse_feature_matrix(decisions, feature_names):
@@ -424,6 +551,8 @@ def main():
     weights = []
     snapshot_rows = []
     confidence_rows = []
+    factual_summary_frames = []
+    factual_dynamics_frames = []
     selected_ids = {}
     feature_names = FEATURE_SCHEMAS[args.feature_schema]
 
@@ -439,7 +568,8 @@ def main():
             )
         )
 
-        summary = aggregate_method(results, args.feature_schema)
+        method = method_name(args)
+        summary = aggregate_method(results, method)
         summary["dataset"] = dataset
         summary["controller_overhead_ms"] = float(
             pd.to_numeric(results["adaptive_controller_ms"], errors="coerce")
@@ -469,6 +599,18 @@ def main():
         ))
         pearson.to_csv(output_dir / f"{dataset}_feature_correlation_pearson.csv")
         spearman.to_csv(output_dir / f"{dataset}_feature_correlation_spearman.csv")
+        transition_path = phase_dir / "adaptive_full_stream_transitions.csv"
+        if args.credit_assignment == "verifier_boundary_factual":
+            if not transition_path.exists():
+                raise FileNotFoundError(
+                    f"missing factual transition report: {transition_path}"
+                )
+            factual_summary, factual_dynamics = factual_target_diagnostics(
+                dataset,
+                pd.read_csv(transition_path),
+            )
+            factual_summary_frames.append(factual_summary)
+            factual_dynamics_frames.append(factual_dynamics)
 
     pd.DataFrame(summaries).to_csv(
         output_dir / "dataset_method_summary.csv",
@@ -498,10 +640,21 @@ def main():
         output_dir / "confidence_diagnostics.csv",
         index=False,
     )
+    if factual_summary_frames:
+        pd.concat(factual_summary_frames, ignore_index=True).to_csv(
+            output_dir / "factual_target_summary.csv",
+            index=False,
+        )
+        pd.concat(factual_dynamics_frames, ignore_index=True).to_csv(
+            output_dir / "factual_target_learning_dynamics.csv",
+            index=False,
+        )
     manifest = {
         "version": VERSION,
         "feature_schema": args.feature_schema,
         "feature_names": list(feature_names),
+        "credit_assignment": args.credit_assignment,
+        "method": method_name(args),
         "datasets": list(args.datasets),
         "problem_ids": selected_ids,
         "arguments": vars(args),
@@ -514,7 +667,7 @@ def main():
         json.dumps(manifest, indent=2),
         encoding="utf-8",
     )
-    print(f"\n{args.feature_schema} DATASET SUMMARY", flush=True)
+    print(f"\n{method_name(args)} DATASET SUMMARY", flush=True)
     print(pd.DataFrame(summaries).to_string(index=False), flush=True)
     print(f"\nSaved: {output_dir}", flush=True)
 

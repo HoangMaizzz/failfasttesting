@@ -115,6 +115,7 @@ class AdaptiveTDConfig:
     min_action_probability: float = 0.10
     max_importance_weight: float = 5.0
     full_stream_bootstrap: bool = False
+    credit_assignment: str = "per_step_td"
     reverse_backup: bool = False
     disabled_features: tuple[str, ...] = ()
     factual_ema_alpha: float = 0.2
@@ -172,6 +173,14 @@ class AdaptiveTDConfig:
             raise ValueError("min_action_probability must be in (0, 0.5]")
         if self.max_importance_weight < 1.0:
             raise ValueError("max_importance_weight must be at least 1")
+        if self.credit_assignment not in {
+            "per_step_td",
+            "verifier_boundary_factual",
+        }:
+            raise ValueError(
+                "credit_assignment must be per_step_td or "
+                "verifier_boundary_factual"
+            )
         if not 0.0 < self.factual_ema_alpha <= 1.0:
             raise ValueError("factual_ema_alpha must be in (0, 1]")
         if self.weight_snapshot_interval < 0:
@@ -366,6 +375,12 @@ class OnlineTDRefinementController:
         self.factual_tokens_per_verifier_ema = None
         self.profile_samples: dict[str, list[float]] = {}
         self.pending_stop = None
+        self.pending_factual_boundary = None
+        self.algorithm_latency_ms = 0.0
+        self.algorithm_latency_components_ms: dict[str, float] = {}
+        self._draft_checkpoint_wall_s = None
+        self._draft_checkpoint_ledger_ms = None
+        self.factual_boundary_count = 0
         self.full_stream_transitions: list[dict] = []
         self.weight_snapshots: list[dict] = []
 
@@ -378,6 +393,82 @@ class OnlineTDRefinementController:
     def record_profile(self, name: str, elapsed_ms: float) -> None:
         if self.config.profile_overhead:
             self.profile_samples.setdefault(name, []).append(max(0.0, elapsed_ms))
+
+    @property
+    def uses_verifier_boundary_factual(self) -> bool:
+        return self.config.credit_assignment == "verifier_boundary_factual"
+
+    def advance_algorithm_latency(
+        self,
+        elapsed_ms: float,
+        *,
+        component: str,
+    ) -> float:
+        """Advance the selected-path latency ledger used by factual returns."""
+        if not self.uses_verifier_boundary_factual:
+            return self.algorithm_latency_ms
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        self.algorithm_latency_ms += elapsed_ms
+        self.algorithm_latency_components_ms[component] = (
+            self.algorithm_latency_components_ms.get(component, 0.0)
+            + elapsed_ms
+        )
+        return self.algorithm_latency_ms
+
+    def begin_factual_draft_round(self) -> None:
+        if not self.uses_verifier_boundary_factual:
+            return
+        self._draft_checkpoint_wall_s = time.perf_counter()
+        self._draft_checkpoint_ledger_ms = self.algorithm_latency_ms
+
+    def checkpoint_factual_draft_latency(self) -> float:
+        """Reconcile measured drafting time up to the current adaptive state."""
+        if not self.uses_verifier_boundary_factual:
+            return 0.0
+        if (
+            self._draft_checkpoint_wall_s is None
+            or self._draft_checkpoint_ledger_ms is None
+        ):
+            raise RuntimeError("factual draft checkpoint has not been started")
+        checkpoint_wall_s = time.perf_counter()
+        observed_draft_latency_ms = (
+            checkpoint_wall_s - self._draft_checkpoint_wall_s
+        ) * 1000.0
+        accounted_ms = max(
+            0.0,
+            self.algorithm_latency_ms - self._draft_checkpoint_ledger_ms,
+        )
+        residual_ms = max(
+            0.0,
+            float(observed_draft_latency_ms) - accounted_ms,
+        )
+        self.advance_algorithm_latency(
+            residual_ms,
+            component="draft_unattributed",
+        )
+        overshoot_ms = max(
+            0.0,
+            accounted_ms - float(observed_draft_latency_ms),
+        )
+        if overshoot_ms > 0.0:
+            self.algorithm_latency_components_ms["draft_reconciliation_overshoot"] = (
+                self.algorithm_latency_components_ms.get(
+                    "draft_reconciliation_overshoot",
+                    0.0,
+                )
+                + overshoot_ms
+            )
+        self._draft_checkpoint_wall_s = checkpoint_wall_s
+        self._draft_checkpoint_ledger_ms = self.algorithm_latency_ms
+        return residual_ms
+
+    def end_factual_draft_round(self) -> float:
+        if not self.uses_verifier_boundary_factual:
+            return 0.0
+        residual_ms = self.checkpoint_factual_draft_latency()
+        self._draft_checkpoint_wall_s = None
+        self._draft_checkpoint_ledger_ms = None
+        return residual_ms
 
     def evaluate(self, action: str, features: Sequence[float]) -> ActionEstimate:
         return self.values[action].estimate(features)
@@ -437,6 +528,11 @@ class OnlineTDRefinementController:
         emitted_tokens: int,
         latency_ms: float,
     ) -> None:
+        started = (
+            time.perf_counter()
+            if self.uses_verifier_boundary_factual
+            else None
+        )
         self.factual_verifier_latency_ema_ms = self._update_factual_ema(
             self.factual_verifier_latency_ema_ms,
             latency_ms,
@@ -445,6 +541,13 @@ class OnlineTDRefinementController:
             self.factual_tokens_per_verifier_ema,
             emitted_tokens,
         )
+        if started is not None:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self.record_profile("factual_verifier_ema_update", elapsed_ms)
+            self.advance_algorithm_latency(
+                elapsed_ms,
+                component="controller_verifier_ema_update",
+            )
 
     def _maybe_snapshot_weights(self) -> None:
         interval = self.config.weight_snapshot_interval
@@ -632,6 +735,10 @@ class OnlineTDRefinementController:
             )
         latency_ms = (time.perf_counter() - started) * 1000.0
         self.record_profile("decision_total", latency_ms)
+        self.advance_algorithm_latency(
+            latency_ms,
+            component="controller_decision",
+        )
         return AdaptiveDecision(
             action=action,
             reason=reason,
@@ -665,7 +772,11 @@ class OnlineTDRefinementController:
         next_stop_available: bool = True,
         observed_at: float | None = None,
     ) -> dict | None:
-        if not self.config.full_stream_bootstrap or self.pending_stop is None:
+        if (
+            self.uses_verifier_boundary_factual
+            or not self.config.full_stream_bootstrap
+            or self.pending_stop is None
+        ):
             return None
         update_started = time.perf_counter()
         pending = self.pending_stop
@@ -702,6 +813,219 @@ class OnlineTDRefinementController:
             (time.perf_counter() - update_started) * 1000.0,
         )
         return transition
+
+    def resolve_pending_factual_boundary(
+        self,
+        next_features: Sequence[float],
+        *,
+        next_stop_available: bool = True,
+    ) -> list[dict]:
+        """Resolve selected actions against the next real adaptive state."""
+        if not self.uses_verifier_boundary_factual:
+            return []
+        pending = self.pending_factual_boundary
+        if pending is None:
+            return []
+        self.pending_factual_boundary = None
+        update_started = time.perf_counter()
+        bootstrap_value = self.values[CONTINUE].mean(next_features)
+        if next_stop_available:
+            bootstrap_value = max(
+                self.values[STOP].mean(next_features),
+                bootstrap_value,
+            )
+        transitions = self._apply_factual_boundary(
+            pending,
+            end_algorithm_latency_ms=self.algorithm_latency_ms,
+            bootstrap_value=bootstrap_value,
+            terminal=False,
+        )
+        elapsed_ms = (time.perf_counter() - update_started) * 1000.0
+        self.record_profile("factual_boundary_resolution", elapsed_ms)
+        self.advance_algorithm_latency(
+            elapsed_ms,
+            component="controller_factual_update",
+        )
+        return transitions
+
+    def _apply_factual_boundary(
+        self,
+        pending: dict,
+        *,
+        end_algorithm_latency_ms: float,
+        bootstrap_value: float,
+        terminal: bool,
+    ) -> list[dict]:
+        transitions = []
+        boundary_id = int(pending["boundary_id"])
+        emitted_tokens = int(pending["emitted_tokens"])
+        boundary_algorithm_latency_ms = float(
+            pending["boundary_algorithm_latency_ms"]
+        )
+        first_boundary_algorithm_latency_ms = float(
+            pending["first_boundary_algorithm_latency_ms"]
+        )
+        verifier_boundaries_spanned = int(
+            pending["verifier_boundaries_spanned"]
+        )
+        records = list(pending["records"])
+        for decision_index, record in enumerate(records):
+            action = str(record["action"])
+            anchor_ms = float(record["algorithm_latency_anchor_ms"])
+            delta_time_ms = max(
+                0.0,
+                float(end_algorithm_latency_ms) - anchor_ms,
+            )
+            rho_t = max(0.0, float(record["rho_tokens_per_ms"]))
+            target = (
+                float(emitted_tokens)
+                - rho_t * delta_time_ms
+                + float(bootstrap_value)
+            )
+            residual = self.values[action].update(
+                record["features"],
+                target,
+                self.config.learning_rate,
+                observation_weight=float(record["importance_weight"]),
+            )
+            if action == STOP:
+                self.early_stop_observations = self.values[STOP].sample_count
+            transition = {
+                "credit_assignment": self.config.credit_assignment,
+                "boundary_id": boundary_id,
+                "decision_index_in_boundary": int(decision_index),
+                "decisions_in_boundary": int(len(records)),
+                "action": action,
+                "terminal": bool(terminal),
+                "emitted_tokens": emitted_tokens,
+                "algorithm_latency_anchor_ms": anchor_ms,
+                "boundary_algorithm_latency_ms": (
+                    boundary_algorithm_latency_ms
+                ),
+                "first_boundary_algorithm_latency_ms": (
+                    first_boundary_algorithm_latency_ms
+                ),
+                "verifier_boundaries_spanned": verifier_boundaries_spanned,
+                "end_algorithm_latency_ms": float(end_algorithm_latency_ms),
+                "delta_time_ms": delta_time_ms,
+                "post_boundary_latency_ms": max(
+                    0.0,
+                    float(end_algorithm_latency_ms)
+                    - boundary_algorithm_latency_ms,
+                ),
+                "rho_tokens_per_ms": rho_t,
+                "bootstrap_value": float(bootstrap_value),
+                "td_target": target,
+                "td_error": residual,
+                "importance_weight": float(record["importance_weight"]),
+                "selected_action_probability": float(
+                    record["selected_action_probability"]
+                ),
+            }
+            self.full_stream_transitions.append(transition)
+            transitions.append(transition)
+            source = record.get("source_record")
+            if source is not None:
+                source.update({
+                    "factual_boundary_id": boundary_id,
+                    "factual_target": target,
+                    "factual_td_error": residual,
+                    "factual_delta_time_ms": delta_time_ms,
+                    "factual_bootstrap_value": float(bootstrap_value),
+                })
+        return transitions
+
+    def _complete_verifier_boundary_factual(
+        self,
+        trajectory: Sequence[dict],
+        *,
+        emitted_tokens: int,
+        verifier_latency_ms: float,
+        post_verify_latency_ms: float,
+        terminal: bool,
+    ) -> None:
+        self.advance_algorithm_latency(
+            verifier_latency_ms,
+            component="verifier",
+        )
+        self.advance_algorithm_latency(
+            post_verify_latency_ms,
+            component="post_verify",
+        )
+        records = []
+        for item in trajectory:
+            if item.get("action") not in {STOP, CONTINUE}:
+                continue
+            if "algorithm_latency_anchor_ms" not in item:
+                continue
+            if item.get("counterfactual_replay_overrode_action", False):
+                continue
+            records.append({
+                "features": tuple(item["features"]),
+                "action": str(item["action"]),
+                "algorithm_latency_anchor_ms": float(
+                    item["algorithm_latency_anchor_ms"]
+                ),
+                "rho_tokens_per_ms": float(
+                    item.get("rho_tokens_per_ms", 0.0)
+                ),
+                "selected_action_probability": float(
+                    item.get("selected_action_probability", 1.0)
+                ),
+                "importance_weight": float(
+                    item.get("importance_weight", 1.0)
+                ),
+                "source_record": item,
+            })
+        if self.pending_factual_boundary is not None:
+            if records:
+                raise RuntimeError(
+                    "new factual decisions appeared before the previous "
+                    "boundary was resolved at an adaptive state"
+                )
+            pending = self.pending_factual_boundary
+            pending["emitted_tokens"] += int(emitted_tokens)
+            pending["boundary_algorithm_latency_ms"] = float(
+                self.algorithm_latency_ms
+            )
+            pending["verifier_boundaries_spanned"] += 1
+            if terminal:
+                self.pending_factual_boundary = None
+                update_started = time.perf_counter()
+                self._apply_factual_boundary(
+                    pending,
+                    end_algorithm_latency_ms=self.algorithm_latency_ms,
+                    bootstrap_value=0.0,
+                    terminal=True,
+                )
+                elapsed_ms = (time.perf_counter() - update_started) * 1000.0
+                self.record_profile("factual_terminal_resolution", elapsed_ms)
+            return
+        if not records:
+            return
+        self.factual_boundary_count += 1
+        pending = {
+            "boundary_id": int(self.factual_boundary_count),
+            "records": records,
+            "emitted_tokens": int(emitted_tokens),
+            "boundary_algorithm_latency_ms": float(self.algorithm_latency_ms),
+            "first_boundary_algorithm_latency_ms": float(
+                self.algorithm_latency_ms
+            ),
+            "verifier_boundaries_spanned": 1,
+        }
+        if terminal:
+            update_started = time.perf_counter()
+            self._apply_factual_boundary(
+                pending,
+                end_algorithm_latency_ms=self.algorithm_latency_ms,
+                bootstrap_value=0.0,
+                terminal=True,
+            )
+            elapsed_ms = (time.perf_counter() - update_started) * 1000.0
+            self.record_profile("factual_terminal_resolution", elapsed_ms)
+            return
+        self.pending_factual_boundary = pending
 
     def _complete_full_stream_trajectory(
         self,
@@ -783,7 +1107,11 @@ class OnlineTDRefinementController:
                 (1.0 - alpha) * self.forward_latency_ema_ms
                 + alpha * latency_ms
             )
-        if self.config.update_mode not in {"td", "mixed"} or self.rho <= 0.0:
+        if (
+            self.uses_verifier_boundary_factual
+            or self.config.update_mode not in {"td", "mixed"}
+            or self.rho <= 0.0
+        ):
             return None
         started = time.perf_counter() if self.config.profile_overhead else None
         if action not in self.values:
@@ -840,6 +1168,15 @@ class OnlineTDRefinementController:
         round_latency_ms: float | None = None,
         terminal: bool = False,
     ) -> None:
+        if self.uses_verifier_boundary_factual:
+            self._complete_verifier_boundary_factual(
+                trajectory,
+                emitted_tokens=emitted_tokens,
+                verifier_latency_ms=verifier_latency_ms,
+                post_verify_latency_ms=post_verify_latency_ms,
+                terminal=terminal,
+            )
+            return
         if not trajectory:
             return
         if self.config.full_stream_bootstrap:
@@ -947,7 +1284,12 @@ class OnlineTDRefinementController:
             )
 
     def observe_round(self, emitted_tokens: int, round_latency_ms: float) -> None:
-        started = time.perf_counter() if self.config.profile_overhead else None
+        started = (
+            time.perf_counter()
+            if self.config.profile_overhead
+            or self.uses_verifier_boundary_factual
+            else None
+        )
         alpha = self.config.rho_alpha
         if self.y_ema is None:
             self.y_ema = float(emitted_tokens)
@@ -960,9 +1302,11 @@ class OnlineTDRefinementController:
             )
         self.completed_rounds += 1
         if started is not None:
-            self.record_profile(
-                "throughput_ema_update",
-                (time.perf_counter() - started) * 1000.0,
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            self.record_profile("throughput_ema_update", elapsed_ms)
+            self.advance_algorithm_latency(
+                elapsed_ms,
+                component="controller_throughput_update",
             )
 
     def profile_summary(self) -> dict[str, dict[str, float]]:
@@ -1006,6 +1350,7 @@ class OnlineTDRefinementController:
             "stop_probability_threshold": self.config.stop_probability_threshold,
             "stop_z_threshold": self.stop_z_threshold,
             "policy_mode": self.config.policy_mode,
+            "credit_assignment": self.config.credit_assignment,
             "min_action_probability": self.config.min_action_probability,
             "max_importance_weight": self.config.max_importance_weight,
             "disabled_features": list(self.config.disabled_features),
@@ -1018,6 +1363,11 @@ class OnlineTDRefinementController:
             "factual_tokens_per_verifier_ema": (
                 self.factual_tokens_per_verifier_ema
             ),
+            "algorithm_latency_ms": self.algorithm_latency_ms,
+            "algorithm_latency_components_ms": dict(
+                self.algorithm_latency_components_ms
+            ),
+            "factual_boundary_count": self.factual_boundary_count,
             "actions": {
                 action: {
                     "theta": list(value.theta),
@@ -1049,7 +1399,15 @@ class OnlineTDRefinementController:
             "weight_snapshots": list(self.weight_snapshots),
             "full_stream": {
                 "enabled": self.config.full_stream_bootstrap,
-                "pending": self.pending_stop is not None,
+                "pending": (
+                    self.pending_stop is not None
+                    or self.pending_factual_boundary is not None
+                ),
+                "pending_factual_decisions": (
+                    0
+                    if self.pending_factual_boundary is None
+                    else len(self.pending_factual_boundary["records"])
+                ),
                 "transition_count": len(self.full_stream_transitions),
                 "terminal_transition_count": sum(
                     bool(item.get("terminal"))
@@ -1062,15 +1420,22 @@ class OnlineTDRefinementController:
         snapshot_schema = snapshot.get("feature_schema", "otrc_v1_td")
         snapshot_version = int(snapshot.get("feature_version", 1))
         snapshot_names = tuple(snapshot.get("feature_names") or V1_FEATURE_NAMES)
+        snapshot_credit_assignment = snapshot.get(
+            "credit_assignment",
+            "per_step_td",
+        )
         if (
             snapshot_schema != self.config.feature_schema
             or snapshot_version != self.config.feature_version
             or snapshot_names != self.feature_names
+            or snapshot_credit_assignment != self.config.credit_assignment
         ):
             raise ValueError(
                 "snapshot feature schema does not match controller: "
                 f"snapshot={snapshot_schema}/v{snapshot_version}, "
-                f"controller={self.config.feature_schema}/v{self.config.feature_version}"
+                f"controller={self.config.feature_schema}/v{self.config.feature_version}, "
+                f"snapshot_credit={snapshot_credit_assignment}, "
+                f"controller_credit={self.config.credit_assignment}"
             )
         actions = snapshot.get("actions") or {}
         for action in (STOP, CONTINUE):
@@ -1169,6 +1534,18 @@ class OnlineTDRefinementController:
         )
         self.factual_tokens_per_verifier_ema = snapshot.get(
             "factual_tokens_per_verifier_ema"
+        )
+        self.algorithm_latency_ms = float(
+            snapshot.get("algorithm_latency_ms", 0.0)
+        )
+        self.algorithm_latency_components_ms = {
+            str(name): float(value)
+            for name, value in (
+                snapshot.get("algorithm_latency_components_ms") or {}
+            ).items()
+        }
+        self.factual_boundary_count = int(
+            snapshot.get("factual_boundary_count", 0)
         )
         self.weight_snapshots = list(snapshot.get("weight_snapshots") or [])
 

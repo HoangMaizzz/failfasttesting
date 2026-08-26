@@ -1368,6 +1368,22 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 end_time.record()
                 torch.cuda.synchronize()
                 forward_pass_latencies.append(start_time.elapsed_time(end_time))
+                if (
+                    adaptive_enabled
+                    and adaptive_controller is not None
+                    and bool(
+                        getattr(
+                            adaptive_controller,
+                            "uses_verifier_boundary_factual",
+                            False,
+                        )
+                    )
+                    and not bool(getattr(args, "adaptive_freeze", False))
+                ):
+                    adaptive_controller.advance_algorithm_latency(
+                        forward_pass_latencies[-1],
+                        component="draft_forward_prefill",
+                    )
                 ##################End of timer##################
                 # logger.debug(f"{Colors.CYAN}Initial fwd pass to populate KV cache because input seqlen {input_ids.shape[1]} > block_size {block_size}{Colors.RESET}")
                 # logger.debug(f"{Colors.CYAN}The prefill pass operated on tokens up until index {input_ids.shape[1] // block_size * block_size}{Colors.RESET}")
@@ -1412,6 +1428,22 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     end_time.record()
                     torch.cuda.synchronize()
                     forward_pass_latencies.append(start_time.elapsed_time(end_time))
+                    if (
+                        adaptive_enabled
+                        and adaptive_controller is not None
+                        and bool(
+                            getattr(
+                                adaptive_controller,
+                                "uses_verifier_boundary_factual",
+                                False,
+                            )
+                        )
+                        and not bool(getattr(args, "adaptive_freeze", False))
+                    ):
+                        adaptive_controller.advance_algorithm_latency(
+                            forward_pass_latencies[-1],
+                            component="draft_forward_cache_update",
+                        )
                     ##################End of timer##################
                     num_forward_passes += 1
                     frontier_stats["forward_pass_breakdown"]["cache_update"] += 1
@@ -1477,6 +1509,22 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         end_time.record()
                         torch.cuda.synchronize()
                         forward_pass_latencies.append(start_time.elapsed_time(end_time))
+                        if (
+                            adaptive_enabled
+                            and adaptive_controller is not None
+                            and bool(
+                                getattr(
+                                    adaptive_controller,
+                                    "uses_verifier_boundary_factual",
+                                    False,
+                                )
+                            )
+                            and not bool(getattr(args, "adaptive_freeze", False))
+                        ):
+                            adaptive_controller.advance_algorithm_latency(
+                                forward_pass_latencies[-1],
+                                component="draft_forward_denoising",
+                            )
                         ##################End of timer##################
                         num_forward_passes += 1
                         frontier_stats["forward_pass_breakdown"]["denoising"] += 1
@@ -1494,6 +1542,20 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 forward_pass_latencies[-1]
                             )
                         logger.debug(f"{Colors.CYAN}block {block_idx}, small_block_idx {small_block_idx}, fwd pass. start {start}, end {end}.{Colors.RESET}")
+                        adaptive_state_prep_started = (
+                            time.perf_counter()
+                            if adaptive_enabled
+                            and adaptive_controller is not None
+                            and bool(
+                                getattr(
+                                    adaptive_controller,
+                                    "uses_verifier_boundary_factual",
+                                    False,
+                                )
+                            )
+                            and not bool(getattr(args, "adaptive_freeze", False))
+                            else None
+                        )
                         
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
                         # Select tokens with probability greater than threshold from p_1t
@@ -1546,7 +1608,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 time.perf_counter()
                                 if adaptive_enabled
                                 and adaptive_controller is not None
-                                and adaptive_controller.config.profile_overhead
+                                and (
+                                    adaptive_controller.config.profile_overhead
+                                    or bool(
+                                        getattr(
+                                            adaptive_controller,
+                                            "uses_verifier_boundary_factual",
+                                            False,
+                                        )
+                                    )
+                                )
                                 else None
                             )
                             if frontier_score_target_len != target_len:
@@ -1976,13 +2047,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     use_step=bool(getattr(args, "adaptive_use_step_feature", False)),
                                 )
                                 if adaptive_feature_started is not None:
+                                    adaptive_feature_elapsed_ms = (
+                                        time.perf_counter()
+                                        - adaptive_feature_started
+                                    ) * 1000.0
                                     adaptive_controller.record_profile(
                                         "feature_extraction",
-                                        (
-                                            time.perf_counter()
-                                            - adaptive_feature_started
-                                        )
-                                        * 1000.0,
+                                        adaptive_feature_elapsed_ms,
                                     )
                                 frontier_stats["adaptive_last_features"] = list(features)
                                 step_record["adaptive_features"] = list(features)
@@ -2037,7 +2108,42 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     for key, value in availability_fields.items()
                                 })
 
+                                factual_boundary_enabled = bool(
+                                    getattr(
+                                        adaptive_controller,
+                                        "uses_verifier_boundary_factual",
+                                        False,
+                                    )
+                                )
+                                if adaptive_state_prep_started is not None:
+                                    adaptive_controller.advance_algorithm_latency(
+                                        (
+                                            time.perf_counter()
+                                            - adaptive_state_prep_started
+                                        )
+                                        * 1000.0,
+                                        component="draft_state_preparation",
+                                    )
+                                if factual_boundary_enabled:
+                                    adaptive_controller.checkpoint_factual_draft_latency()
+                                state_algorithm_latency_ms = float(
+                                    getattr(
+                                        adaptive_controller,
+                                        "algorithm_latency_ms",
+                                        0.0,
+                                    )
+                                )
                                 if not bool(getattr(args, "adaptive_freeze", False)):
+                                    if factual_boundary_enabled:
+                                        factual_resolutions = (
+                                            adaptive_controller.resolve_pending_factual_boundary(
+                                                features,
+                                                next_stop_available=stop_available,
+                                            )
+                                        )
+                                        frontier_stats[
+                                            "adaptive_full_stream_resolutions"
+                                        ].extend(factual_resolutions)
                                     full_stream_resolution = adaptive_controller.resolve_pending_stop(
                                         features,
                                         next_stop_available=stop_available,
@@ -2217,6 +2323,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "controller_latency_ms": float(decision.latency_ms),
                                         "decision_monotonic_s": time.perf_counter(),
+                                        "algorithm_latency_anchor_ms": (
+                                            state_algorithm_latency_ms
+                                        ),
                                         **dict(decision.diagnostics),
                                         "completed_rounds_before": int(
                                             adaptive_controller.completed_rounds

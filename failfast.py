@@ -486,6 +486,11 @@ parser.add_argument(
     choices=["td", "factual_return", "mixed"],
     default="mixed",
 )
+parser.add_argument(
+    "--adaptive-credit-assignment",
+    choices=["per_step_td", "verifier_boundary_factual"],
+    default="per_step_td",
+)
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
 parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
 parser.add_argument("--adaptive-stop-probability-threshold", type=float, default=0.75)
@@ -702,6 +707,7 @@ def build_adaptive_controller(args):
             min_action_probability=args.adaptive_min_action_probability,
             max_importance_weight=args.adaptive_max_importance_weight,
             full_stream_bootstrap=True,
+            credit_assignment=args.adaptive_credit_assignment,
             disabled_features=tuple(args.adaptive_disable_features),
             factual_ema_alpha=args.adaptive_factual_ema_alpha,
             weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
@@ -1359,6 +1365,7 @@ def complete_adaptive_td_trajectory(
     *,
     emitted_tokens,
     verifier_latency_ms,
+    post_verify_latency_ms=0.0,
     round_latency_ms=None,
     terminal=False,
 ):
@@ -1374,6 +1381,7 @@ def complete_adaptive_td_trajectory(
         trajectory,
         emitted_tokens=int(emitted_tokens),
         verifier_latency_ms=float(verifier_latency_ms),
+        post_verify_latency_ms=float(post_verify_latency_ms),
         round_latency_ms=(
             None if round_latency_ms is None else float(round_latency_ms)
         ),
@@ -4083,6 +4091,13 @@ for problem_id, is_warmup in tqdm(
 
                     if orig_model_inputs["input_ids"].is_cuda:
                         torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                    if (
+                        draft_type == "dllm"
+                        and args.adaptive_td
+                        and args.adaptive_credit_assignment
+                        == "verifier_boundary_factual"
+                    ):
+                        args.adaptive_td_controller.begin_factual_draft_round()
                     draft_start = time.perf_counter()
                     if draft_type == "ar":
                         if freq_scheme == "sf":
@@ -4168,6 +4183,13 @@ for problem_id, is_warmup in tqdm(
                         torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
                     physical_draft_time = time.perf_counter() - draft_start
                     draft_time = physical_draft_time
+                    if (
+                        draft_type == "dllm"
+                        and args.adaptive_td
+                        and args.adaptive_credit_assignment
+                        == "verifier_boundary_factual"
+                    ):
+                        args.adaptive_td_controller.end_factual_draft_round()
                     frontier_stats_this_round = (
                         getattr(args, "last_frontier_stats", None)
                         if draft_type == "dllm"
@@ -4456,7 +4478,12 @@ for problem_id, is_warmup in tqdm(
                             checked_outcomes,
                         )
 
-                    if draft_type == "dllm" and args.adaptive_td:
+                    if (
+                        draft_type == "dllm"
+                        and args.adaptive_td
+                        and args.adaptive_credit_assignment
+                        != "verifier_boundary_factual"
+                    ):
                         complete_adaptive_td_trajectory(
                             args,
                             frontier_stats_this_round,
@@ -4479,6 +4506,27 @@ for problem_id, is_warmup in tqdm(
                         torch.cuda.synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
+                    if (
+                        draft_type == "dllm"
+                        and args.adaptive_td
+                        and args.adaptive_credit_assignment
+                        == "verifier_boundary_factual"
+                    ):
+                        complete_adaptive_td_trajectory(
+                            args,
+                            frontier_stats_this_round,
+                            emitted_tokens=len(tokens_to_append),
+                            verifier_latency_ms=verify_time * 1000.0,
+                            post_verify_latency_ms=post_verify_time * 1000.0,
+                            round_latency_ms=(
+                                draft_time + verify_time + post_verify_time
+                            )
+                            * 1000.0,
+                            terminal=(
+                                target_tokenizer.eos_token_id in tokens_to_append
+                                or len(current_token_ids) >= num_target_tokens
+                            ),
+                        )
                     audit_this_problem = (
                         args.audit_greedy_consistency
                         and (
