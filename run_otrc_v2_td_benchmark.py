@@ -22,6 +22,7 @@ FACTUAL_CREDIT_ASSIGNMENTS = {
     "verifier_boundary_factual_no_bootstrap",
 }
 PROBLEM_IDS = {
+    "aime": list(range(1, 30)),
     "math": [
         2, 6, 42, 51, 53, 57, 61, 108, 115, 123, 129, 148, 161,
         164, 179, 183, 193, 204, 216, 226, 231, 252, 258, 263, 281,
@@ -29,6 +30,12 @@ PROBLEM_IDS = {
     "gsm8k": [
         6, 24, 51, 157, 166, 184, 201, 211, 227, 244, 289, 431, 458,
         492, 516, 589, 590, 599, 633, 644, 655, 698, 713, 731, 745,
+    ],
+    "humaneval": [
+        1, 3, 4, 19, 20, 21, 23, 26, 27, 29, 31, 40, 47, 48, 54,
+        58, 59, 60, 62, 65, 74, 75, 81, 82, 83, 88, 90, 91, 92,
+        97, 102, 108, 109, 113, 116, 123, 126, 128, 129, 132, 135,
+        141, 143, 145, 147, 150, 151, 152, 154, 160,
     ],
 }
 
@@ -123,8 +130,12 @@ def parse_args():
 
 
 def validate_args(args):
-    if args.num_questions <= 0 or args.num_questions > 25:
-        raise ValueError("--num_questions must be in [1, 25]")
+    available = min(len(PROBLEM_IDS[dataset]) for dataset in args.datasets)
+    if args.num_questions <= 0 or args.num_questions > available:
+        raise ValueError(
+            f"--num_questions must be in [1, {available}] for "
+            f"datasets={args.datasets}"
+        )
     if args.spec_len != 8 or args.incr_len != 8:
         raise ValueError("the matched benchmark requires --spec_len=8 and --incr_len=8")
     if (
