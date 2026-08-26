@@ -176,10 +176,12 @@ class AdaptiveTDConfig:
         if self.credit_assignment not in {
             "per_step_td",
             "verifier_boundary_factual",
+            "verifier_boundary_factual_no_bootstrap",
         }:
             raise ValueError(
-                "credit_assignment must be per_step_td or "
-                "verifier_boundary_factual"
+                "credit_assignment must be per_step_td, "
+                "verifier_boundary_factual, or "
+                "verifier_boundary_factual_no_bootstrap"
             )
         if not 0.0 < self.factual_ema_alpha <= 1.0:
             raise ValueError("factual_ema_alpha must be in (0, 1]")
@@ -396,7 +398,17 @@ class OnlineTDRefinementController:
 
     @property
     def uses_verifier_boundary_factual(self) -> bool:
-        return self.config.credit_assignment == "verifier_boundary_factual"
+        return self.config.credit_assignment in {
+            "verifier_boundary_factual",
+            "verifier_boundary_factual_no_bootstrap",
+        }
+
+    @property
+    def uses_factual_no_bootstrap(self) -> bool:
+        return (
+            self.config.credit_assignment
+            == "verifier_boundary_factual_no_bootstrap"
+        )
 
     def advance_algorithm_latency(
         self,
@@ -1014,16 +1026,26 @@ class OnlineTDRefinementController:
             ),
             "verifier_boundaries_spanned": 1,
         }
-        if terminal:
+        if terminal or self.uses_factual_no_bootstrap:
             update_started = time.perf_counter()
             self._apply_factual_boundary(
                 pending,
                 end_algorithm_latency_ms=self.algorithm_latency_ms,
                 bootstrap_value=0.0,
-                terminal=True,
+                terminal=terminal,
             )
             elapsed_ms = (time.perf_counter() - update_started) * 1000.0
-            self.record_profile("factual_terminal_resolution", elapsed_ms)
+            profile_name = (
+                "factual_terminal_resolution"
+                if terminal
+                else "factual_no_bootstrap_resolution"
+            )
+            self.record_profile(profile_name, elapsed_ms)
+            if self.uses_factual_no_bootstrap:
+                self.advance_algorithm_latency(
+                    elapsed_ms,
+                    component="controller_factual_update",
+                )
             return
         self.pending_factual_boundary = pending
 

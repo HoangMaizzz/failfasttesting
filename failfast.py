@@ -488,7 +488,11 @@ parser.add_argument(
 )
 parser.add_argument(
     "--adaptive-credit-assignment",
-    choices=["per_step_td", "verifier_boundary_factual"],
+    choices=[
+        "per_step_td",
+        "verifier_boundary_factual",
+        "verifier_boundary_factual_no_bootstrap",
+    ],
     default="per_step_td",
 )
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
@@ -4094,8 +4098,10 @@ for problem_id, is_warmup in tqdm(
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
-                        and args.adaptive_credit_assignment
-                        == "verifier_boundary_factual"
+                        and args.adaptive_credit_assignment in {
+                            "verifier_boundary_factual",
+                            "verifier_boundary_factual_no_bootstrap",
+                        }
                     ):
                         args.adaptive_td_controller.begin_factual_draft_round()
                     draft_start = time.perf_counter()
@@ -4186,8 +4192,10 @@ for problem_id, is_warmup in tqdm(
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
-                        and args.adaptive_credit_assignment
-                        == "verifier_boundary_factual"
+                        and args.adaptive_credit_assignment in {
+                            "verifier_boundary_factual",
+                            "verifier_boundary_factual_no_bootstrap",
+                        }
                     ):
                         args.adaptive_td_controller.end_factual_draft_round()
                     frontier_stats_this_round = (
@@ -4481,8 +4489,10 @@ for problem_id, is_warmup in tqdm(
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
-                        and args.adaptive_credit_assignment
-                        != "verifier_boundary_factual"
+                        and args.adaptive_credit_assignment not in {
+                            "verifier_boundary_factual",
+                            "verifier_boundary_factual_no_bootstrap",
+                        }
                     ):
                         complete_adaptive_td_trajectory(
                             args,
@@ -4509,8 +4519,10 @@ for problem_id, is_warmup in tqdm(
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
-                        and args.adaptive_credit_assignment
-                        == "verifier_boundary_factual"
+                        and args.adaptive_credit_assignment in {
+                            "verifier_boundary_factual",
+                            "verifier_boundary_factual_no_bootstrap",
+                        }
                     ):
                         complete_adaptive_td_trajectory(
                             args,

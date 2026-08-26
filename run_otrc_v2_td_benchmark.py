@@ -15,8 +15,12 @@ from run_math_feature_ablation_benchmark import aggregate_method
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "otrc_td_representation_benchmark_v4"
+VERSION = "otrc_td_representation_benchmark_v5"
 FEATURE_VARIANCE_EPS = 1e-8
+FACTUAL_CREDIT_ASSIGNMENTS = {
+    "verifier_boundary_factual",
+    "verifier_boundary_factual_no_bootstrap",
+}
 PROBLEM_IDS = {
     "math": [
         2, 6, 42, 51, 53, 57, 61, 108, 115, 123, 129, 148, 161,
@@ -45,7 +49,11 @@ def parse_args():
     )
     parser.add_argument(
         "--credit_assignment",
-        choices=("per_step_td", "verifier_boundary_factual"),
+        choices=(
+            "per_step_td",
+            "verifier_boundary_factual",
+            "verifier_boundary_factual_no_bootstrap",
+        ),
         default="per_step_td",
     )
     parser.add_argument("--warmup_questions", type=int, default=1)
@@ -108,7 +116,7 @@ def validate_args(args):
     if args.spec_len != 8 or args.incr_len != 8:
         raise ValueError("the matched benchmark requires --spec_len=8 and --incr_len=8")
     if (
-        args.credit_assignment == "verifier_boundary_factual"
+        args.credit_assignment in FACTUAL_CREDIT_ASSIGNMENTS
         and args.feature_schema != "otrc_v2_2_td"
     ):
         raise ValueError(
@@ -118,6 +126,8 @@ def validate_args(args):
 
 
 def method_name(args):
+    if args.credit_assignment == "verifier_boundary_factual_no_bootstrap":
+        return "otrc_v2_2_factual_no_bootstrap"
     if args.credit_assignment == "verifier_boundary_factual":
         return "otrc_v2_2_factual"
     return args.feature_schema
@@ -600,7 +610,7 @@ def main():
         pearson.to_csv(output_dir / f"{dataset}_feature_correlation_pearson.csv")
         spearman.to_csv(output_dir / f"{dataset}_feature_correlation_spearman.csv")
         transition_path = phase_dir / "adaptive_full_stream_transitions.csv"
-        if args.credit_assignment == "verifier_boundary_factual":
+        if args.credit_assignment in FACTUAL_CREDIT_ASSIGNMENTS:
             if not transition_path.exists():
                 raise FileNotFoundError(
                     f"missing factual transition report: {transition_path}"

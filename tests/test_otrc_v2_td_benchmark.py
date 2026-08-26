@@ -80,6 +80,22 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(method_name(args), "otrc_v2_2_factual")
 
+    def test_command_enables_factual_no_bootstrap_credit(self):
+        args = self.args()
+        args.credit_assignment = "verifier_boundary_factual_no_bootstrap"
+        command = command_for(args, "math", [2], Path("/tmp/out"))
+        joined = " ".join(command)
+
+        self.assertIn(
+            "--adaptive-credit-assignment "
+            "verifier_boundary_factual_no_bootstrap",
+            joined,
+        )
+        self.assertEqual(
+            method_name(args),
+            "otrc_v2_2_factual_no_bootstrap",
+        )
+
     def test_feature_diagnostics_flags_constant_feature(self):
         decisions = pd.DataFrame({
             "features": [

@@ -11,10 +11,12 @@ from adaptive_td import (
 FEATURES = (1.0,) + (0.0,) * 12
 
 
-def factual_controller():
+def factual_controller(
+    credit_assignment="verifier_boundary_factual",
+):
     controller = OnlineTDRefinementController(
         AdaptiveTDConfig(
-            credit_assignment="verifier_boundary_factual",
+            credit_assignment=credit_assignment,
             full_stream_bootstrap=True,
             learning_rate=0.01,
             profile_overhead=False,
@@ -148,6 +150,55 @@ class VerifierBoundaryFactualTests(unittest.TestCase):
             "verifier_boundary_factual",
         )
         self.assertIn("algorithm_latency_components_ms", snapshot)
+
+    def test_no_bootstrap_resolves_immediately_at_verifier_boundary(self):
+        controller = factual_controller(
+            "verifier_boundary_factual_no_bootstrap"
+        )
+        controller.values[STOP].theta[0] = 100.0
+        controller.values[CONTINUE].theta[0] = 200.0
+        controller.advance_algorithm_latency(5.0, component="draft_forward")
+
+        controller.complete_trajectory(
+            [record(CONTINUE, 0.0)],
+            emitted_tokens=3,
+            verifier_latency_ms=3.0,
+            post_verify_latency_ms=2.0,
+            terminal=False,
+        )
+
+        self.assertIsNone(controller.pending_factual_boundary)
+        self.assertEqual(controller.values[CONTINUE].sample_count, 1)
+        self.assertEqual(controller.values[STOP].sample_count, 0)
+        transition = controller.full_stream_transitions[-1]
+        self.assertFalse(transition["terminal"])
+        self.assertEqual(transition["bootstrap_value"], 0.0)
+        self.assertAlmostEqual(transition["delta_time_ms"], 10.0)
+        self.assertEqual(transition["post_boundary_latency_ms"], 0.0)
+        self.assertAlmostEqual(transition["td_target"], 2.0)
+
+    def test_no_bootstrap_does_not_wait_for_next_adaptive_state(self):
+        controller = factual_controller(
+            "verifier_boundary_factual_no_bootstrap"
+        )
+        controller.advance_algorithm_latency(2.0, component="draft_forward")
+        controller.complete_trajectory(
+            [record(STOP, 0.0)],
+            emitted_tokens=2,
+            verifier_latency_ms=3.0,
+            post_verify_latency_ms=1.0,
+            terminal=False,
+        )
+
+        transition_count = len(controller.full_stream_transitions)
+        controller.advance_algorithm_latency(
+            7.0,
+            component="next_state_draft_forward",
+        )
+        resolved = controller.resolve_pending_factual_boundary(FEATURES)
+
+        self.assertEqual(resolved, [])
+        self.assertEqual(len(controller.full_stream_transitions), transition_count)
 
 
 if __name__ == "__main__":
