@@ -4,6 +4,7 @@ from argparse import Namespace
 from run_no_weight_ema_aime_humaneval import (
     DATASET_COUNTS,
     benchmark_command,
+    configure_dataset_counts,
     failfast_command,
     validate_args,
 )
@@ -68,6 +69,18 @@ class NoWeightEMAAimeHumanEvalTests(unittest.TestCase):
         args.warmup_questions = 0
         with self.assertRaisesRegex(ValueError, "one warmup"):
             validate_args(args)
+
+    def test_custom_dataset_counts_support_fifty_math_and_gsm8k(self):
+        args = self.args()
+        args.datasets = ["math", "gsm8k"]
+        args.num_questions = 50
+
+        self.assertEqual(
+            configure_dataset_counts(args),
+            {"math": 50, "gsm8k": 50},
+        )
+        self.assertGreaterEqual(len(PROBLEM_IDS["math"]), 50)
+        self.assertGreaterEqual(len(PROBLEM_IDS["gsm8k"]), 50)
 
 
 if __name__ == "__main__":

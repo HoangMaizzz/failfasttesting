@@ -12,7 +12,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "compact6_no_weight_ema_vs_failfast_aime29_humaneval29_v2"
+VERSION = "compact6_no_weight_ema_vs_failfast_v3"
 METHOD = "otrc_v2_2_compact_factual_no_bootstrap"
 DATASET_COUNTS = {"aime": 29, "humaneval": 29}
 REPORT_FILES = (
@@ -32,6 +32,12 @@ REPORT_FILES = (
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=tuple(PROBLEM_IDS),
+    )
+    parser.add_argument("--num_questions", type=int)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument(
@@ -52,6 +58,20 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--log_level", default="INFO")
     return parser.parse_args()
+
+
+def configure_dataset_counts(args):
+    datasets = getattr(args, "datasets", None)
+    num_questions = getattr(args, "num_questions", None)
+    if datasets is None and num_questions is None:
+        return dict(DATASET_COUNTS)
+    if not datasets or num_questions is None:
+        raise ValueError(
+            "--datasets and --num_questions must be provided together"
+        )
+    if num_questions <= 0:
+        raise ValueError("--num_questions must be positive")
+    return {dataset: num_questions for dataset in datasets}
 
 
 def validate_args(args):
@@ -442,7 +462,9 @@ def validate_outputs(output_dir):
 
 
 def main():
+    global DATASET_COUNTS
     args = parse_args()
+    DATASET_COUNTS = configure_dataset_counts(args)
     validate_args(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
