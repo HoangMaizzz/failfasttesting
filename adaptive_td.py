@@ -60,12 +60,21 @@ V22_FEATURE_NAMES = (
     "draft_verify_latency_ratio",
     "ema_tokens_per_verifier_ratio",
 )
+V22_COMPACT_FEATURE_NAMES = (
+    "bias",
+    "prefix_advance_ratio",
+    "failfast_margin",
+    "accumulated_spec_ratio",
+    "draft_verify_latency_ratio",
+    "ema_tokens_per_verifier_ratio",
+)
 FEATURE_NAMES = V1_FEATURE_NAMES
 FEATURE_SCHEMAS = {
     "otrc_v1_td": V1_FEATURE_NAMES,
     "otrc_v2_td": V2_FEATURE_NAMES,
     "otrc_v2_1_td": V21_FEATURE_NAMES,
     "otrc_v2_2_td": V22_FEATURE_NAMES,
+    "otrc_v2_2_compact_td": V22_COMPACT_FEATURE_NAMES,
 }
 
 
@@ -119,6 +128,7 @@ class AdaptiveTDConfig:
     reverse_backup: bool = False
     disabled_features: tuple[str, ...] = ()
     factual_ema_alpha: float = 0.2
+    rho_warmup_boundaries: int = 0
     weight_snapshot_interval: int = 100
 
     def __post_init__(self) -> None:
@@ -185,6 +195,16 @@ class AdaptiveTDConfig:
             )
         if not 0.0 < self.factual_ema_alpha <= 1.0:
             raise ValueError("factual_ema_alpha must be in (0, 1]")
+        if self.rho_warmup_boundaries < 0:
+            raise ValueError("rho_warmup_boundaries must be non-negative")
+        if (
+            self.rho_warmup_boundaries
+            and self.credit_assignment
+            != "verifier_boundary_factual_no_bootstrap"
+        ):
+            raise ValueError(
+                "rho warmup requires verifier-boundary factual no-bootstrap"
+            )
         if self.weight_snapshot_interval < 0:
             raise ValueError("weight_snapshot_interval must be non-negative")
         feature_names = FEATURE_SCHEMAS[self.feature_schema]
@@ -383,6 +403,9 @@ class OnlineTDRefinementController:
         self._draft_checkpoint_wall_s = None
         self._draft_checkpoint_ledger_ms = None
         self.factual_boundary_count = 0
+        self.factual_observed_verifier_boundaries = 0
+        self.factual_learning_update_count = 0
+        self.factual_warmup_transition_count = 0
         self.full_stream_transitions: list[dict] = []
         self.weight_snapshots: list[dict] = []
 
@@ -486,6 +509,16 @@ class OnlineTDRefinementController:
         return self.values[action].estimate(features)
 
     def build_features(self, **state) -> tuple[float, ...]:
+        if self.config.feature_schema == "otrc_v2_2_compact_td":
+            return build_v22_compact_state_features(
+                factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
+                factual_verifier_latency_ema_ms=self.factual_verifier_latency_ema_ms,
+                factual_tokens_per_verifier_ema=(
+                    self.factual_tokens_per_verifier_ema
+                ),
+                disabled_features=self.config.disabled_features,
+                **state,
+            )
         if self.config.feature_schema == "otrc_v2_2_td":
             return build_v22_state_features(
                 factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
@@ -881,6 +914,12 @@ class OnlineTDRefinementController:
             pending["verifier_boundaries_spanned"]
         )
         records = list(pending["records"])
+        verifier_boundary_index = int(
+            pending.get("verifier_boundary_index", boundary_id)
+        )
+        update_applied = (
+            verifier_boundary_index > self.config.rho_warmup_boundaries
+        )
         for decision_index, record in enumerate(records):
             action = str(record["action"])
             anchor_ms = float(record["algorithm_latency_anchor_ms"])
@@ -894,17 +933,23 @@ class OnlineTDRefinementController:
                 - rho_t * delta_time_ms
                 + float(bootstrap_value)
             )
-            residual = self.values[action].update(
-                record["features"],
-                target,
-                self.config.learning_rate,
-                observation_weight=float(record["importance_weight"]),
-            )
-            if action == STOP:
-                self.early_stop_observations = self.values[STOP].sample_count
+            if update_applied:
+                residual = self.values[action].update(
+                    record["features"],
+                    target,
+                    self.config.learning_rate,
+                    observation_weight=float(record["importance_weight"]),
+                )
+                self.factual_learning_update_count += 1
+                if action == STOP:
+                    self.early_stop_observations = self.values[STOP].sample_count
+            else:
+                residual = target - self.values[action].mean(record["features"])
+                self.factual_warmup_transition_count += 1
             transition = {
                 "credit_assignment": self.config.credit_assignment,
                 "boundary_id": boundary_id,
+                "verifier_boundary_index": verifier_boundary_index,
                 "decision_index_in_boundary": int(decision_index),
                 "decisions_in_boundary": int(len(records)),
                 "action": action,
@@ -929,6 +974,10 @@ class OnlineTDRefinementController:
                 "bootstrap_value": float(bootstrap_value),
                 "td_target": target,
                 "td_error": residual,
+                "update_applied": bool(update_applied),
+                "rho_warmup_boundaries": int(
+                    self.config.rho_warmup_boundaries
+                ),
                 "importance_weight": float(record["importance_weight"]),
                 "selected_action_probability": float(
                     record["selected_action_probability"]
@@ -944,6 +993,10 @@ class OnlineTDRefinementController:
                     "factual_td_error": residual,
                     "factual_delta_time_ms": delta_time_ms,
                     "factual_bootstrap_value": float(bootstrap_value),
+                    "factual_update_applied": bool(update_applied),
+                    "factual_rho_warmup_boundaries": int(
+                        self.config.rho_warmup_boundaries
+                    ),
                 })
         return transitions
 
@@ -964,6 +1017,7 @@ class OnlineTDRefinementController:
             post_verify_latency_ms,
             component="post_verify",
         )
+        self.factual_observed_verifier_boundaries += 1
         records = []
         for item in trajectory:
             if item.get("action") not in {STOP, CONTINUE}:
@@ -1025,6 +1079,9 @@ class OnlineTDRefinementController:
                 self.algorithm_latency_ms
             ),
             "verifier_boundaries_spanned": 1,
+            "verifier_boundary_index": int(
+                self.factual_observed_verifier_boundaries
+            ),
         }
         if terminal or self.uses_factual_no_bootstrap:
             update_started = time.perf_counter()
@@ -1390,6 +1447,14 @@ class OnlineTDRefinementController:
                 self.algorithm_latency_components_ms
             ),
             "factual_boundary_count": self.factual_boundary_count,
+            "factual_observed_verifier_boundaries": (
+                self.factual_observed_verifier_boundaries
+            ),
+            "factual_learning_update_count": self.factual_learning_update_count,
+            "factual_warmup_transition_count": (
+                self.factual_warmup_transition_count
+            ),
+            "rho_warmup_boundaries": self.config.rho_warmup_boundaries,
             "actions": {
                 action: {
                     "theta": list(value.theta),
@@ -1446,18 +1511,22 @@ class OnlineTDRefinementController:
             "credit_assignment",
             "per_step_td",
         )
+        snapshot_rho_warmup = int(snapshot.get("rho_warmup_boundaries", 0))
         if (
             snapshot_schema != self.config.feature_schema
             or snapshot_version != self.config.feature_version
             or snapshot_names != self.feature_names
             or snapshot_credit_assignment != self.config.credit_assignment
+            or snapshot_rho_warmup != self.config.rho_warmup_boundaries
         ):
             raise ValueError(
                 "snapshot feature schema does not match controller: "
                 f"snapshot={snapshot_schema}/v{snapshot_version}, "
                 f"controller={self.config.feature_schema}/v{self.config.feature_version}, "
                 f"snapshot_credit={snapshot_credit_assignment}, "
-                f"controller_credit={self.config.credit_assignment}"
+                f"controller_credit={self.config.credit_assignment}, "
+                f"snapshot_rho_warmup={snapshot_rho_warmup}, "
+                f"controller_rho_warmup={self.config.rho_warmup_boundaries}"
             )
         actions = snapshot.get("actions") or {}
         for action in (STOP, CONTINUE):
@@ -1568,6 +1637,18 @@ class OnlineTDRefinementController:
         }
         self.factual_boundary_count = int(
             snapshot.get("factual_boundary_count", 0)
+        )
+        self.factual_observed_verifier_boundaries = int(
+            snapshot.get(
+                "factual_observed_verifier_boundaries",
+                self.factual_boundary_count,
+            )
+        )
+        self.factual_learning_update_count = int(
+            snapshot.get("factual_learning_update_count", 0)
+        )
+        self.factual_warmup_transition_count = int(
+            snapshot.get("factual_warmup_transition_count", 0)
         )
         self.weight_snapshots = list(snapshot.get("weight_snapshots") or [])
 
@@ -1869,6 +1950,12 @@ def build_v22_state_features(
         if name in disabled:
             features[index] = 0.0
     return tuple(features)
+
+
+def build_v22_compact_state_features(**state) -> tuple[float, ...]:
+    full_features = build_v22_state_features(**state)
+    by_name = dict(zip(V22_FEATURE_NAMES, full_features))
+    return tuple(by_name[name] for name in V22_COMPACT_FEATURE_NAMES)
 
 
 def trajectory_forward_latency(trajectory: Iterable[dict]) -> float:

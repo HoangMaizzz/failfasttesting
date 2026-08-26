@@ -496,6 +496,7 @@ parser.add_argument(
     default="per_step_td",
 )
 parser.add_argument("--adaptive-rho-alpha", type=float, default=0.05)
+parser.add_argument("--adaptive-rho-warmup-boundaries", type=int, default=0)
 parser.add_argument("--adaptive-risk-beta", type=float, default=1.0)
 parser.add_argument("--adaptive-stop-probability-threshold", type=float, default=0.75)
 parser.add_argument("--adaptive-uncertainty-prior", type=float, default=1.0)
@@ -686,6 +687,7 @@ def build_adaptive_controller(args):
                 "otrc_v2_td": 2,
                 "otrc_v2_1_td": 21,
                 "otrc_v2_2_td": 22,
+                "otrc_v2_2_compact_td": 226,
             }[args.adaptive_feature_schema],
             learning_rate=args.adaptive_learning_rate,
             mc_learning_rate=args.adaptive_mc_learning_rate,
@@ -714,6 +716,7 @@ def build_adaptive_controller(args):
             credit_assignment=args.adaptive_credit_assignment,
             disabled_features=tuple(args.adaptive_disable_features),
             factual_ema_alpha=args.adaptive_factual_ema_alpha,
+            rho_warmup_boundaries=args.adaptive_rho_warmup_boundaries,
             weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
         )
     )
@@ -4600,7 +4603,12 @@ for problem_id, is_warmup in tqdm(
                                     "feature_schema",
                                     "otrc_v1_td",
                                 )
-                                in ("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td")
+                                in (
+                                    "otrc_v2_td",
+                                    "otrc_v2_1_td",
+                                    "otrc_v2_2_td",
+                                    "otrc_v2_2_compact_td",
+                                )
                             ):
                                 args.adaptive_td_controller.observe_factual_verifier_call(
                                     len(tokens_to_append),

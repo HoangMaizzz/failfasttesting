@@ -44,7 +44,12 @@ def parse_args():
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument(
         "--feature_schema",
-        choices=("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td"),
+        choices=(
+            "otrc_v2_td",
+            "otrc_v2_1_td",
+            "otrc_v2_2_td",
+            "otrc_v2_2_compact_td",
+        ),
         default="otrc_v2_2_td",
     )
     parser.add_argument(
@@ -82,6 +87,7 @@ def parse_args():
         default="mixed",
     )
     parser.add_argument("--adaptive_rho_alpha", type=float, default=0.05)
+    parser.add_argument("--rho_warmup_boundaries", type=int, default=0)
     parser.add_argument("--adaptive_factual_ema_alpha", type=float, default=0.2)
     parser.add_argument("--adaptive_risk_beta", type=float, default=1.0)
     parser.add_argument("--adaptive_stop_probability_threshold", type=float, default=0.75)
@@ -117,19 +123,42 @@ def validate_args(args):
         raise ValueError("the matched benchmark requires --spec_len=8 and --incr_len=8")
     if (
         args.credit_assignment in FACTUAL_CREDIT_ASSIGNMENTS
-        and args.feature_schema != "otrc_v2_2_td"
+        and args.feature_schema not in {
+            "otrc_v2_2_td",
+            "otrc_v2_2_compact_td",
+        }
     ):
         raise ValueError(
             "verifier-boundary factual credit requires --feature_schema "
-            "otrc_v2_2_td"
+            "otrc_v2_2_td or otrc_v2_2_compact_td"
+        )
+    if args.rho_warmup_boundaries < 0:
+        raise ValueError("--rho_warmup_boundaries must be non-negative")
+    if (
+        args.rho_warmup_boundaries
+        and args.credit_assignment
+        != "verifier_boundary_factual_no_bootstrap"
+    ):
+        raise ValueError(
+            "rho warmup is only supported by factual no-bootstrap credit"
         )
 
 
 def method_name(args):
     if args.credit_assignment == "verifier_boundary_factual_no_bootstrap":
-        return "otrc_v2_2_factual_no_bootstrap"
+        base = (
+            "otrc_v2_2_compact_factual_no_bootstrap"
+            if args.feature_schema == "otrc_v2_2_compact_td"
+            else "otrc_v2_2_factual_no_bootstrap"
+        )
+        warmup = int(getattr(args, "rho_warmup_boundaries", 0))
+        return f"{base}_rho_warmup{warmup}" if warmup else base
     if args.credit_assignment == "verifier_boundary_factual":
-        return "otrc_v2_2_factual"
+        return (
+            "otrc_v2_2_compact_factual"
+            if args.feature_schema == "otrc_v2_2_compact_td"
+            else "otrc_v2_2_factual"
+        )
     return args.feature_schema
 
 
@@ -181,6 +210,8 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-mc-mix", str(args.adaptive_mc_mix),
         "--adaptive-update-mode", args.adaptive_update_mode,
         "--adaptive-rho-alpha", str(args.adaptive_rho_alpha),
+        "--adaptive-rho-warmup-boundaries",
+        str(args.rho_warmup_boundaries),
         "--adaptive-factual-ema-alpha", str(args.adaptive_factual_ema_alpha),
         "--adaptive-risk-beta", str(args.adaptive_risk_beta),
         "--adaptive-stop-probability-threshold",
@@ -214,7 +245,13 @@ def command_for(args, dataset, problem_ids, output_dir):
     ]
 
 
-def phase_complete(directory, problem_ids, feature_schema, credit_assignment):
+def phase_complete(
+    directory,
+    problem_ids,
+    feature_schema,
+    credit_assignment,
+    rho_warmup_boundaries,
+):
     required = [
         directory / "benchmark_results.csv",
         directory / "adaptive_td_decisions.csv",
@@ -231,6 +268,8 @@ def phase_complete(directory, problem_ids, feature_schema, credit_assignment):
         set(results.problem_id.astype(int)) == set(problem_ids)
         and state.get("feature_schema") == feature_schema
         and state.get("credit_assignment", "per_step_td") == credit_assignment
+        and int(state.get("rho_warmup_boundaries", 0))
+        == int(rho_warmup_boundaries)
     )
 
 
@@ -242,6 +281,7 @@ def run_dataset(args, dataset, problem_ids):
         problem_ids,
         args.feature_schema,
         args.credit_assignment,
+        args.rho_warmup_boundaries,
     ):
         print(f"RESUME {dataset} {method}", flush=True)
         return output_dir
@@ -289,6 +329,12 @@ def factual_target_diagnostics(dataset, transitions):
         "td_error",
     ]
     transitions = transitions.copy()
+    if "update_applied" not in transitions:
+        transitions["update_applied"] = True
+    if "rho_warmup_boundaries" not in transitions:
+        transitions["rho_warmup_boundaries"] = 0
+    if "verifier_boundary_index" not in transitions:
+        transitions["verifier_boundary_index"] = transitions["boundary_id"]
     for column in numeric:
         transitions[column] = pd.to_numeric(
             transitions[column],
@@ -299,6 +345,9 @@ def factual_target_diagnostics(dataset, transitions):
     transitions["normalized_absolute_td_error"] = (
         transitions["absolute_td_error"] / target_scale
     )
+    learning_rows = transitions.loc[
+        transitions["update_applied"].astype(bool)
+    ]
     summary = pd.DataFrame([{
         "dataset": dataset,
         "transitions": int(len(transitions)),
@@ -306,6 +355,28 @@ def factual_target_diagnostics(dataset, transitions):
         "stop_updates": int(transitions["action"].eq("stop").sum()),
         "continue_updates": int(transitions["action"].eq("continue").sum()),
         "terminal_updates": int(transitions["terminal"].astype(bool).sum()),
+        "learning_updates": int(
+            transitions["update_applied"].astype(bool).sum()
+        ),
+        "warmup_transitions": int(
+            (~transitions["update_applied"].astype(bool)).sum()
+        ),
+        "rho_warmup_boundaries": int(
+            pd.to_numeric(
+                transitions["rho_warmup_boundaries"],
+                errors="coerce",
+            ).fillna(0).max()
+        ),
+        "first_learning_update_boundary": (
+            None
+            if learning_rows.empty
+            else int(learning_rows["verifier_boundary_index"].iloc[0])
+        ),
+        "rho_at_first_learning_update": (
+            None
+            if learning_rows.empty
+            else float(learning_rows["rho_tokens_per_ms"].iloc[0])
+        ),
         "mean_decisions_per_boundary": float(
             transitions.groupby("boundary_id").size().mean()
         ),
@@ -317,6 +388,9 @@ def factual_target_diagnostics(dataset, transitions):
             transitions["post_boundary_latency_ms"].mean()
         ),
         "mean_emitted_tokens": float(transitions["emitted_tokens"].mean()),
+        "mean_rho_tokens_per_ms": float(
+            transitions["rho_tokens_per_ms"].mean()
+        ),
         "mean_bootstrap_value": float(transitions["bootstrap_value"].mean()),
         "mean_td_target": float(transitions["td_target"].mean()),
         "td_target_std": target_scale,
@@ -344,6 +418,11 @@ def factual_target_diagnostics(dataset, transitions):
         delta_time_ms_mean=("delta_time_ms", "mean"),
         post_boundary_latency_ms_mean=("post_boundary_latency_ms", "mean"),
         emitted_tokens_mean=("emitted_tokens", "mean"),
+        rho_tokens_per_ms_mean=("rho_tokens_per_ms", "mean"),
+        learning_update_rate_percent=(
+            "update_applied",
+            lambda values: 100.0 * values.astype(bool).mean(),
+        ),
         bootstrap_value_mean=("bootstrap_value", "mean"),
         td_target_mean=("td_target", "mean"),
         absolute_td_error_mean=("absolute_td_error", "mean"),

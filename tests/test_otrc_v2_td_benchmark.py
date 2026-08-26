@@ -37,6 +37,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             adaptive_mc_mix=0.5,
             adaptive_update_mode="mixed",
             adaptive_rho_alpha=0.05,
+            rho_warmup_boundaries=0,
             adaptive_factual_ema_alpha=0.2,
             adaptive_risk_beta=1.0,
             adaptive_stop_probability_threshold=0.75,
@@ -94,6 +95,22 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             method_name(args),
             "otrc_v2_2_factual_no_bootstrap",
+        )
+
+    def test_compact_no_bootstrap_names_rho_warmup_separately(self):
+        args = self.args()
+        args.feature_schema = "otrc_v2_2_compact_td"
+        args.credit_assignment = "verifier_boundary_factual_no_bootstrap"
+        args.rho_warmup_boundaries = 32
+        command = command_for(args, "gsm8k", [6], Path("/tmp/out"))
+
+        self.assertEqual(
+            method_name(args),
+            "otrc_v2_2_compact_factual_no_bootstrap_rho_warmup32",
+        )
+        self.assertIn(
+            "--adaptive-rho-warmup-boundaries 32",
+            " ".join(command),
         )
 
     def test_feature_diagnostics_flags_constant_feature(self):

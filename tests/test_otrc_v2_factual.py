@@ -13,6 +13,7 @@ FEATURES = (1.0,) + (0.0,) * 12
 
 def factual_controller(
     credit_assignment="verifier_boundary_factual",
+    rho_warmup_boundaries=0,
 ):
     controller = OnlineTDRefinementController(
         AdaptiveTDConfig(
@@ -20,6 +21,7 @@ def factual_controller(
             full_stream_bootstrap=True,
             learning_rate=0.01,
             profile_overhead=False,
+            rho_warmup_boundaries=rho_warmup_boundaries,
         )
     )
     controller.observe_round(1, 10.0)
@@ -40,6 +42,13 @@ def record(action, anchor_ms, rho=0.1):
 
 
 class VerifierBoundaryFactualTests(unittest.TestCase):
+    def test_rho_warmup_rejects_bootstrapped_credit(self):
+        with self.assertRaisesRegex(ValueError, "no-bootstrap"):
+            AdaptiveTDConfig(
+                credit_assignment="verifier_boundary_factual",
+                rho_warmup_boundaries=1,
+            )
+
     def test_per_step_transition_is_disabled(self):
         controller = factual_controller()
 
@@ -199,6 +208,59 @@ class VerifierBoundaryFactualTests(unittest.TestCase):
 
         self.assertEqual(resolved, [])
         self.assertEqual(len(controller.full_stream_transitions), transition_count)
+
+    def test_rho_warmup_collects_targets_without_updating_q_heads(self):
+        controller = factual_controller(
+            "verifier_boundary_factual_no_bootstrap",
+            rho_warmup_boundaries=2,
+        )
+        actions = [STOP, CONTINUE, STOP]
+        for action in actions:
+            anchor = controller.algorithm_latency_ms
+            controller.advance_algorithm_latency(2.0, component="draft_forward")
+            controller.complete_trajectory(
+                [record(action, anchor)],
+                emitted_tokens=2,
+                verifier_latency_ms=3.0,
+                post_verify_latency_ms=1.0,
+                terminal=False,
+            )
+
+        transitions = controller.full_stream_transitions
+        self.assertEqual(
+            [item["update_applied"] for item in transitions],
+            [False, False, True],
+        )
+        self.assertEqual(controller.factual_warmup_transition_count, 2)
+        self.assertEqual(controller.factual_learning_update_count, 1)
+        self.assertEqual(controller.values[STOP].sample_count, 1)
+        self.assertEqual(controller.values[CONTINUE].sample_count, 0)
+
+    def test_rho_warmup_counts_verifier_boundaries_without_decisions(self):
+        controller = factual_controller(
+            "verifier_boundary_factual_no_bootstrap",
+            rho_warmup_boundaries=1,
+        )
+        controller.complete_trajectory(
+            [],
+            emitted_tokens=1,
+            verifier_latency_ms=3.0,
+            post_verify_latency_ms=1.0,
+            terminal=False,
+        )
+        anchor = controller.algorithm_latency_ms
+        controller.complete_trajectory(
+            [record(STOP, anchor)],
+            emitted_tokens=2,
+            verifier_latency_ms=3.0,
+            post_verify_latency_ms=1.0,
+            terminal=False,
+        )
+
+        self.assertEqual(controller.factual_observed_verifier_boundaries, 2)
+        self.assertTrue(
+            controller.full_stream_transitions[-1]["update_applied"]
+        )
 
 
 if __name__ == "__main__":

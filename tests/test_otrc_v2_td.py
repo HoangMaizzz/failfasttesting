@@ -5,14 +5,43 @@ from adaptive_td import (
     OnlineTDRefinementController,
     V21_FEATURE_NAMES,
     V22_FEATURE_NAMES,
+    V22_COMPACT_FEATURE_NAMES,
     V2_FEATURE_NAMES,
     build_v21_state_features,
     build_v22_state_features,
+    build_v22_compact_state_features,
     build_v2_state_features,
 )
 
 
 class OTRCV2TDTests(unittest.TestCase):
+    def test_v22_compact_keeps_only_nonredundant_features(self):
+        state = {
+            "proposal_length": 8,
+            "max_spec_len": 60,
+            "proposal_remaining_confidences": [0.2, 0.4],
+            "prefix_length": 5,
+            "prefix_advance": 2,
+            "failfast_candidate_min_confidence": 0.6,
+            "drafter_threshold": 0.05,
+            "failfast_threshold": 0.45,
+            "factual_draft_latency_ema_ms": 4.0,
+            "factual_verifier_latency_ema_ms": 10.0,
+            "factual_tokens_per_verifier_ema": 6.0,
+        }
+        full = dict(zip(
+            V22_FEATURE_NAMES,
+            build_v22_state_features(**state),
+        ))
+        compact = build_v22_compact_state_features(**state)
+
+        self.assertEqual(len(compact), 6)
+        self.assertEqual(
+            compact,
+            tuple(full[name] for name in V22_COMPACT_FEATURE_NAMES),
+        )
+        self.assertNotIn("prefix_resolved_ratio", V22_COMPACT_FEATURE_NAMES)
+        self.assertNotIn("min_remaining_confidence", V22_COMPACT_FEATURE_NAMES)
     def config(self, **overrides):
         values = {
             "feature_dim": len(V2_FEATURE_NAMES),
