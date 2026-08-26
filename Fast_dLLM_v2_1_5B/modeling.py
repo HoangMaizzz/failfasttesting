@@ -1017,7 +1017,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 adaptive_controller.config,
                                 "feature_schema",
                                 "otrc_v1_td",
-                            ) in ("otrc_v2_td", "otrc_v2_1_td")
+                            ) in ("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td")
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
                             adaptive_controller.observe_factual_draft_forward(
@@ -1487,7 +1487,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 adaptive_controller.config,
                                 "feature_schema",
                                 "otrc_v1_td",
-                            ) in ("otrc_v2_td", "otrc_v2_1_td")
+                            ) in ("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td")
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
                             adaptive_controller.observe_factual_draft_forward(
@@ -2149,6 +2149,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "proposal_remaining_confidence_coverage": float(
                                             proposal_remaining_confidence_coverage
+                                        ),
+                                        "proposal_remaining_min_confidence": (
+                                            None
+                                            if not proposal_remaining_confidences
+                                            else float(min(proposal_remaining_confidences))
                                         ),
                                         "proposal_snapshot_valid": bool(
                                             proposal_snapshot_valid

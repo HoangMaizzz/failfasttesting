@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from adaptive_td import V21_FEATURE_NAMES
+from adaptive_td import V22_FEATURE_NAMES
 from run_otrc_v2_td_benchmark import (
     command_for,
+    confidence_diagnostics,
     feature_diagnostics,
     snapshot_diagnostics,
 )
@@ -16,7 +17,7 @@ from run_otrc_v2_td_benchmark import (
 class OTRCV2TDBenchmarkTests(unittest.TestCase):
     def args(self):
         return Namespace(
-            feature_schema="otrc_v2_1_td",
+            feature_schema="otrc_v2_2_td",
             warmup_questions=1,
             max_new_tokens=1024,
             spec_len=8,
@@ -51,7 +52,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             log_level="INFO",
         )
 
-    def test_command_runs_only_v21(self):
+    def test_command_runs_only_v22(self):
         command = command_for(
             self.args(),
             "gsm8k",
@@ -59,7 +60,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             Path("/tmp/out"),
         )
         joined = " ".join(command)
-        self.assertIn("--adaptive-feature-schema otrc_v2_1_td", joined)
+        self.assertIn("--adaptive-feature-schema otrc_v2_2_td", joined)
         self.assertNotIn("strict_greedy", joined)
         self.assertNotIn("causal_oracle", joined)
         self.assertNotIn("verifier_ar", joined)
@@ -67,18 +68,18 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
     def test_feature_diagnostics_flags_constant_feature(self):
         decisions = pd.DataFrame({
             "features": [
-                "[1,0.5,0.2,0.1,0.8,-0.2,0.2,1.0,0.1]",
-                "[1,0.2,0.4,0.3,-0.5,0.1,0.4,0.5,0.2]",
+                "[1,0.5,0.2,0.1,-0.2,0.2,1.0,0.1]",
+                "[1,0.2,0.4,0.3,0.1,0.4,0.5,0.2]",
             ]
         })
         stats, pearson, spearman, conditioning = feature_diagnostics(
             "gsm8k",
             decisions,
-            V21_FEATURE_NAMES,
+            V22_FEATURE_NAMES,
         )
         bias = stats.loc[stats.feature.eq("bias")].iloc[0]
         self.assertEqual(bias.approximately_constant, 1)
-        self.assertEqual(conditioning.iloc[0].feature_dim, 9)
+        self.assertEqual(conditioning.iloc[0].feature_dim, 8)
         self.assertFalse(pearson.empty)
         self.assertFalse(spearman.empty)
 
@@ -98,6 +99,17 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["valid_snapshot_percent"], 100.0)
         self.assertEqual(result["mask_count_match_percent"], 100.0)
         self.assertEqual(result["confidence_coverage_mean"], 0.75)
+
+    def test_confidence_diagnostics_use_only_unresolved_states(self):
+        decisions = pd.DataFrame({
+            "proposal_remaining_masks": [4, 2, 0],
+            "proposal_remaining_min_confidence": [0.02, 0.10, None],
+        })
+        result = confidence_diagnostics("math", decisions, 0.05)
+        self.assertEqual(result["unresolved_decisions"], 2)
+        self.assertEqual(result["confidence_observations"], 2)
+        self.assertAlmostEqual(result["min_confidence_mean"], 0.06)
+        self.assertEqual(result["below_drafter_threshold_percent"], 50.0)
 
 
 if __name__ == "__main__":

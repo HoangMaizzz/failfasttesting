@@ -4,8 +4,10 @@ from adaptive_td import (
     AdaptiveTDConfig,
     OnlineTDRefinementController,
     V21_FEATURE_NAMES,
+    V22_FEATURE_NAMES,
     V2_FEATURE_NAMES,
     build_v21_state_features,
+    build_v22_state_features,
     build_v2_state_features,
 )
 
@@ -115,6 +117,51 @@ class OTRCV2TDTests(unittest.TestCase):
         gap_index = V21_FEATURE_NAMES.index("min_confidence_gap")
         self.assertAlmostEqual(features[gap_index], -0.5)
 
+    def test_v22_uses_compact_features_and_raw_remaining_confidence(self):
+        features = build_v22_state_features(
+            proposal_length=16,
+            max_spec_len=60,
+            proposal_remaining_confidences=[0.12, 0.37, 0.08],
+            prefix_length=10,
+            prefix_advance=2,
+            failfast_candidate_min_confidence=0.30,
+            drafter_threshold=0.05,
+            failfast_threshold=0.45,
+            factual_draft_latency_ema_ms=10.0,
+            factual_verifier_latency_ema_ms=40.0,
+            factual_tokens_per_verifier_ema=8.0,
+        )
+        self.assertEqual(len(features), len(V22_FEATURE_NAMES))
+        expected = [
+            1.0,
+            10.0 / 16.0,
+            2.0 / 16.0,
+            0.08,
+            (0.30 - 0.45) / 0.45,
+            16.0 / 60.0,
+            0.25,
+            8.0 / 61.0,
+        ]
+        for actual, wanted in zip(features, expected):
+            self.assertAlmostEqual(actual, wanted)
+
+    def test_v22_fully_resolved_proposal_uses_unit_confidence_sentinel(self):
+        features = build_v22_state_features(
+            proposal_length=8,
+            max_spec_len=60,
+            proposal_remaining_confidences=[],
+            prefix_length=8,
+            prefix_advance=1,
+            failfast_candidate_min_confidence=0.50,
+            drafter_threshold=0.05,
+            failfast_threshold=0.45,
+            factual_draft_latency_ema_ms=None,
+            factual_verifier_latency_ema_ms=None,
+            factual_tokens_per_verifier_ema=None,
+        )
+        confidence_index = V22_FEATURE_NAMES.index("min_remaining_confidence")
+        self.assertEqual(features[confidence_index], 1.0)
+
     def test_snapshot_rejects_cross_schema_loading(self):
         v2 = OnlineTDRefinementController(self.config())
         snapshot = v2.snapshot()
@@ -131,6 +178,20 @@ class OTRCV2TDTests(unittest.TestCase):
         v2 = OnlineTDRefinementController(self.config())
         with self.assertRaisesRegex(ValueError, "feature schema"):
             v2.load_snapshot(v21.snapshot())
+
+    def test_v22_snapshot_cannot_load_into_v21(self):
+        v22 = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=len(V22_FEATURE_NAMES),
+            feature_schema="otrc_v2_2_td",
+            feature_version=22,
+        ))
+        v21 = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=len(V21_FEATURE_NAMES),
+            feature_schema="otrc_v2_1_td",
+            feature_version=21,
+        ))
+        with self.assertRaisesRegex(ValueError, "feature schema"):
+            v21.load_snapshot(v22.snapshot())
 
     def test_snapshot_restores_v2_factual_state(self):
         original = OnlineTDRefinementController(self.config())

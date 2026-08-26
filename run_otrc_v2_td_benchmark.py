@@ -15,7 +15,7 @@ from run_math_feature_ablation_benchmark import aggregate_method
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "otrc_td_representation_benchmark_v2"
+VERSION = "otrc_td_representation_benchmark_v3"
 FEATURE_VARIANCE_EPS = 1e-8
 PROBLEM_IDS = {
     "math": [
@@ -40,8 +40,8 @@ def parse_args():
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument(
         "--feature_schema",
-        choices=("otrc_v2_td", "otrc_v2_1_td"),
-        default="otrc_v2_1_td",
+        choices=("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td"),
+        default="otrc_v2_2_td",
     )
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output_dir",
-        default="/content/failfasttesting/outputs_otrc_v2_1_td_test25",
+        default="/content/failfasttesting/outputs_otrc_v2_2_td_test25",
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -338,6 +338,51 @@ def snapshot_diagnostics(dataset, decisions):
     }
 
 
+def confidence_diagnostics(dataset, decisions, drafter_threshold):
+    required = {
+        "proposal_remaining_masks",
+        "proposal_remaining_min_confidence",
+    }
+    missing = required.difference(decisions.columns)
+    if missing:
+        raise ValueError(f"decision log is missing confidence fields: {sorted(missing)}")
+    remaining_masks = pd.to_numeric(
+        decisions["proposal_remaining_masks"], errors="coerce"
+    )
+    unresolved = remaining_masks.gt(0)
+    values = pd.to_numeric(
+        decisions.loc[unresolved, "proposal_remaining_min_confidence"],
+        errors="coerce",
+    ).dropna()
+    if values.empty:
+        return {
+            "dataset": dataset,
+            "unresolved_decisions": int(unresolved.sum()),
+            "confidence_observations": 0,
+            "min_confidence_mean": np.nan,
+            "min_confidence_std": np.nan,
+            "min_confidence_min": np.nan,
+            "min_confidence_max": np.nan,
+            "below_drafter_threshold_percent": np.nan,
+            "at_zero_percent": np.nan,
+            "at_one_percent": np.nan,
+        }
+    return {
+        "dataset": dataset,
+        "unresolved_decisions": int(unresolved.sum()),
+        "confidence_observations": int(len(values)),
+        "min_confidence_mean": float(values.mean()),
+        "min_confidence_std": float(values.std(ddof=0)),
+        "min_confidence_min": float(values.min()),
+        "min_confidence_max": float(values.max()),
+        "below_drafter_threshold_percent": 100.0 * float(
+            values.lt(float(drafter_threshold)).mean()
+        ),
+        "at_zero_percent": 100.0 * float(values.eq(0.0).mean()),
+        "at_one_percent": 100.0 * float(values.eq(1.0).mean()),
+    }
+
+
 def weight_rows(dataset, state, feature_names):
     records = []
     stop = state["actions"]["stop"]["theta"]
@@ -378,6 +423,7 @@ def main():
     dynamics_frames = []
     weights = []
     snapshot_rows = []
+    confidence_rows = []
     selected_ids = {}
     feature_names = FEATURE_SCHEMAS[args.feature_schema]
 
@@ -416,6 +462,11 @@ def main():
         dynamics_frames.append(learning_dynamics(dataset, decisions))
         weights.extend(weight_rows(dataset, state, feature_names))
         snapshot_rows.append(snapshot_diagnostics(dataset, decisions))
+        confidence_rows.append(confidence_diagnostics(
+            dataset,
+            decisions,
+            args.drafter_threshold,
+        ))
         pearson.to_csv(output_dir / f"{dataset}_feature_correlation_pearson.csv")
         spearman.to_csv(output_dir / f"{dataset}_feature_correlation_spearman.csv")
 
@@ -441,6 +492,10 @@ def main():
     )
     pd.DataFrame(snapshot_rows).to_csv(
         output_dir / "snapshot_invariants.csv",
+        index=False,
+    )
+    pd.DataFrame(confidence_rows).to_csv(
+        output_dir / "confidence_diagnostics.csv",
         index=False,
     )
     manifest = {

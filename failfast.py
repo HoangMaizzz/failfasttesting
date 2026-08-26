@@ -676,6 +676,7 @@ def build_adaptive_controller(args):
                 "otrc_v1_td": 1,
                 "otrc_v2_td": 2,
                 "otrc_v2_1_td": 21,
+                "otrc_v2_2_td": 22,
             }[args.adaptive_feature_schema],
             learning_rate=args.adaptive_learning_rate,
             mc_learning_rate=args.adaptive_mc_learning_rate,
@@ -4539,7 +4540,7 @@ for problem_id, is_warmup in tqdm(
                                     "feature_schema",
                                     "otrc_v1_td",
                                 )
-                                in ("otrc_v2_td", "otrc_v2_1_td")
+                                in ("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td")
                             ):
                                 args.adaptive_td_controller.observe_factual_verifier_call(
                                     len(tokens_to_append),
