@@ -1017,7 +1017,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 adaptive_controller.config,
                                 "feature_schema",
                                 "otrc_v1_td",
-                            ) in ("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td")
+                            ) in (
+                                "otrc_v2_td",
+                                "otrc_v2_1_td",
+                                "otrc_v2_2_td",
+                                "otrc_v2_2_compact_td",
+                            )
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
                             adaptive_controller.observe_factual_draft_forward(
@@ -1535,7 +1540,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 adaptive_controller.config,
                                 "feature_schema",
                                 "otrc_v1_td",
-                            ) in ("otrc_v2_td", "otrc_v2_1_td", "otrc_v2_2_td")
+                            ) in (
+                                "otrc_v2_td",
+                                "otrc_v2_1_td",
+                                "otrc_v2_2_td",
+                                "otrc_v2_2_compact_td",
+                            )
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
                             adaptive_controller.observe_factual_draft_forward(

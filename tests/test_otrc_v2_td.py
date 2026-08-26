@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from adaptive_td import (
     AdaptiveTDConfig,
@@ -15,6 +16,24 @@ from adaptive_td import (
 
 
 class OTRCV2TDTests(unittest.TestCase):
+    def test_compact_schema_updates_factual_draft_ema_in_bundled_model(self):
+        modeling_path = (
+            Path(__file__).resolve().parents[1]
+            / "Fast_dLLM_v2_1_5B"
+            / "modeling.py"
+        )
+        source = modeling_path.read_text(encoding="utf-8")
+        observation_calls = source.split(
+            "adaptive_controller.observe_factual_draft_forward"
+        )
+
+        self.assertEqual(len(observation_calls), 3)
+        for prefix in observation_calls[:-1]:
+            self.assertIn(
+                '"otrc_v2_2_compact_td"',
+                prefix[-600:],
+            )
+
     def test_v22_compact_keeps_only_nonredundant_features(self):
         state = {
             "proposal_length": 8,
