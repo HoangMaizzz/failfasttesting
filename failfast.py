@@ -59,6 +59,7 @@ from strict_greedy_oracle import (
     one_action_rollout_scripts,
     format_outer_path,
     load_verifier_profile,
+    predict_verifier_latency_ms,
 )
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -449,6 +450,14 @@ parser.add_argument("--strict_greedy_local_oracle", action="store_true")
 parser.add_argument("--strict_greedy_verifier_profile", type=str)
 parser.add_argument("--strict_greedy_epsilon_ms", type=float, default=1.0)
 parser.add_argument("--strict_greedy_replay_policy", type=str)
+parser.add_argument(
+    "--strict_greedy_capacity_collector",
+    action="store_true",
+    help=(
+        "Probe STOP/CONTINUE branches at FailFast decision states while "
+        "executing the unmodified FailFast CONTINUE support policy."
+    ),
+)
 parser.add_argument("--log_verifier_calls", action="store_true")
 parser.add_argument(
     "--audit_greedy_consistency",
@@ -682,12 +691,24 @@ if args.strict_greedy_local_oracle:
         raise ValueError("--strict_greedy_epsilon_ms must be non-negative")
 elif args.strict_greedy_verifier_profile:
     raise ValueError("--strict_greedy_verifier_profile requires strict greedy oracle")
+if args.strict_greedy_capacity_collector and not args.strict_greedy_local_oracle:
+    raise ValueError(
+        "--strict_greedy_capacity_collector requires --strict_greedy_local_oracle"
+    )
+if args.strict_greedy_capacity_collector and args.strict_greedy_replay_policy:
+    raise ValueError("capacity collector cannot replay an oracle policy")
 if args.strict_greedy_replay_policy and not args.strict_greedy_local_oracle:
     raise ValueError("--strict_greedy_replay_policy requires strict greedy oracle")
 def build_adaptive_controller(args):
     if args.global_oracle_graph or args.strict_greedy_local_oracle:
         return ScriptedOracleRefinementController(
             max_refinement_steps=max(64, args.adaptive_max_refinement_steps),
+            feature_schema=(
+                "otrc_v2_2_compact_td"
+                if args.strict_greedy_capacity_collector
+                else "otrc_v1_td"
+            ),
+            factual_ema_alpha=args.adaptive_factual_ema_alpha,
         )
     if not args.adaptive_td:
         return None
@@ -2164,6 +2185,9 @@ def run_strict_greedy_local_oracle_problem(
     profile = args.strict_greedy_profile
     mean_verify_ms = float(profile["mean_verify_latency_ms"])
     mean_tokens_per_verify = float(profile["mean_tokens_per_verify"])
+    capacity_collector = bool(args.strict_greedy_capacity_collector)
+    rho_profile = mean_tokens_per_verify / mean_verify_ms
+    feature_names = tuple(args.adaptive_td_controller.feature_names)
     eos_token_id = args.target_tokenizer.eos_token_id
     current_token_ids = []
     stats_each_round = []
@@ -2186,22 +2210,55 @@ def run_strict_greedy_local_oracle_problem(
             )
     selected_round_actions = []
 
-    def run_draft(script, default_action, reuse_selected_cache=False):
-        return run_oracle_draft_trajectory(
-            args,
-            dllm,
-            orig_model_inputs,
-            current_token_ids,
-            drafter_threshold,
-            lowconf_threshold,
-            max_spec_len,
-            incr_len,
-            action_script=script,
-            default_action=default_action,
-            prev_prefill_output=(
-                prev_prefill_output if reuse_selected_cache else None
-            ),
+    def snapshot_causal_profile():
+        controller = args.adaptive_td_controller
+        return (
+            controller.factual_draft_latency_ema_ms,
+            controller.factual_verifier_latency_ema_ms,
+            controller.factual_tokens_per_verifier_ema,
         )
+
+    def restore_causal_profile(snapshot):
+        controller = args.adaptive_td_controller
+        (
+            controller.factual_draft_latency_ema_ms,
+            controller.factual_verifier_latency_ema_ms,
+            controller.factual_tokens_per_verifier_ema,
+        ) = snapshot
+
+    round_causal_profile = snapshot_causal_profile()
+
+    def run_draft(
+        script,
+        default_action,
+        reuse_selected_cache=False,
+        preserve_causal_profile=False,
+    ):
+        if capacity_collector:
+            restore_causal_profile(round_causal_profile)
+        try:
+            result = run_oracle_draft_trajectory(
+                args,
+                dllm,
+                orig_model_inputs,
+                current_token_ids,
+                drafter_threshold,
+                lowconf_threshold,
+                max_spec_len,
+                incr_len,
+                action_script=script,
+                default_action=default_action,
+                prev_prefill_output=(
+                    prev_prefill_output if reuse_selected_cache else None
+                ),
+            )
+        except BaseException:
+            if capacity_collector:
+                restore_causal_profile(round_causal_profile)
+            raise
+        if capacity_collector and not preserve_causal_profile:
+            restore_causal_profile(round_causal_profile)
+        return result
 
     def evaluate_branch(script, decision_index, current_state):
         draft = run_draft(script, CONTINUE)
@@ -2254,6 +2311,15 @@ def run_strict_greedy_local_oracle_problem(
             remaining_forward_ms + draft_overhead_ms * remaining_fraction
         )
         local_post_verify_ms = float(verification["post_verify_latency_ms"])
+        branch_context_len = int(current_state.get(
+            "context_len",
+            orig_model_inputs["input_ids"].shape[1] + len(current_token_ids),
+        ))
+        predicted_verify_ms = predict_verifier_latency_ms(
+            profile,
+            branch_context_len,
+            draft["proposal_len"],
+        )
         target_len = int(current_state.get("proposal_length", 0))
         extension_events = [
             event
@@ -2264,8 +2330,10 @@ def run_strict_greedy_local_oracle_problem(
         return {
             "local_draft_ms": local_draft_ms,
             "local_post_verify_ms": local_post_verify_ms,
+            "predicted_verify_ms": predicted_verify_ms,
+            "measured_verify_ms": float(verification["verify_latency_ms"]),
             "local_cost_ms": (
-                local_draft_ms + mean_verify_ms + local_post_verify_ms
+                local_draft_ms + predicted_verify_ms + local_post_verify_ms
             ),
             "emitted_tokens": int(verification["emitted_len"]),
             "accepted_tokens": int(verification["accepted_len"]),
@@ -2376,7 +2444,13 @@ def run_strict_greedy_local_oracle_problem(
                         baseline_action=CONTINUE,
                     )
                     chosen_branch = (
-                        stop_branch if decision.action == STOP else continue_branch
+                        continue_branch
+                        if capacity_collector
+                        else (
+                            stop_branch
+                            if decision.action == STOP
+                            else continue_branch
+                        )
                     )
                     target_len = int(required.state.get("proposal_length", 0))
                     context_len = int(required.state.get(
@@ -2388,6 +2462,38 @@ def run_strict_greedy_local_oracle_problem(
                         required.state.get("refinement_step", 0)
                     )
                     draft_proposal = required.state.get("draft_proposal") or []
+                    features = list(required.state.get("features") or [])
+                    if capacity_collector and len(features) != len(feature_names):
+                        raise RuntimeError(
+                            "capacity collector received an unexpected feature vector: "
+                            f"{len(features)} != {len(feature_names)}"
+                        )
+                    delta_draft_ms = (
+                        continue_branch["local_draft_ms"]
+                        - stop_branch["local_draft_ms"]
+                    )
+                    delta_verify_profile_ms = (
+                        continue_branch["predicted_verify_ms"]
+                        - stop_branch["predicted_verify_ms"]
+                    )
+                    delta_post_ms = (
+                        continue_branch["local_post_verify_ms"]
+                        - stop_branch["local_post_verify_ms"]
+                    )
+                    delta_future_verify_penalty_ms = (
+                        decision.continue_penalty_ms - decision.stop_penalty_ms
+                    )
+                    delta_components_ms = (
+                        delta_draft_ms
+                        + delta_verify_profile_ms
+                        + delta_post_ms
+                        + delta_future_verify_penalty_ms
+                    )
+                    oracle_label = (
+                        "tie"
+                        if abs(decision.delta_j_ms) <= args.strict_greedy_epsilon_ms
+                        else decision.action
+                    )
                     row = {
                     "sample_id": int(problem_id),
                     "round_id": int(round_id),
@@ -2397,7 +2503,7 @@ def run_strict_greedy_local_oracle_problem(
                     "context_len": context_len,
                     "prefix_output_tokens": int(len(current_token_ids)),
                     "draft_proposal": json.dumps(draft_proposal),
-                    "features": json.dumps(required.state.get("features") or []),
+                    "features": json.dumps(features),
                     "state_key": build_oracle_state_key(
                         problem_id,
                         context_len,
@@ -2415,6 +2521,8 @@ def run_strict_greedy_local_oracle_problem(
                     "stop_local_post_verify_ms": stop_branch[
                         "local_post_verify_ms"
                     ],
+                    "stop_predicted_verify_ms": stop_branch["predicted_verify_ms"],
+                    "stop_measured_verify_ms": stop_branch["measured_verify_ms"],
                     "stop_Y": stop_branch["emitted_tokens"],
                     "stop_outer_path": stop_branch["outer_path"],
                     "stop_next_verify_proposal_length": stop_branch["proposal_len"],
@@ -2424,6 +2532,12 @@ def run_strict_greedy_local_oracle_problem(
                     ],
                     "continue_local_post_verify_ms": continue_branch[
                         "local_post_verify_ms"
+                    ],
+                    "continue_predicted_verify_ms": continue_branch[
+                        "predicted_verify_ms"
+                    ],
+                    "continue_measured_verify_ms": continue_branch[
+                        "measured_verify_ms"
                     ],
                     "continue_Y": continue_branch["emitted_tokens"],
                     "continue_outer_path": continue_branch["outer_path"],
@@ -2437,12 +2551,33 @@ def run_strict_greedy_local_oracle_problem(
                     "J_stop_ms": decision.stop_score_ms,
                     "J_continue_ms": decision.continue_score_ms,
                     "DeltaJ_ms": decision.delta_j_ms,
+                    "DeltaY_tokens": (
+                        continue_branch["emitted_tokens"]
+                        - stop_branch["emitted_tokens"]
+                    ),
+                    "Delta_draft_ms": delta_draft_ms,
+                    "Delta_verify_profile_ms": delta_verify_profile_ms,
+                    "Delta_post_verify_ms": delta_post_ms,
+                    "Delta_future_verify_penalty_ms": (
+                        delta_future_verify_penalty_ms
+                    ),
+                    "DeltaJ_component_sum_ms": delta_components_ms,
+                    "DeltaJ_identity_error_ms": (
+                        decision.delta_j_ms - delta_components_ms
+                    ),
+                    "rho_profile_tokens_per_ms": rho_profile,
+                    "DeltaG_profile_tokens": -rho_profile * decision.delta_j_ms,
                     "immediate_compute_difference_ms": (
                         continue_branch["local_cost_ms"]
                         - stop_branch["local_cost_ms"]
                     ),
                     "verifier_penalty_difference_ms": (
                         decision.continue_penalty_ms - decision.stop_penalty_ms
+                    ),
+                    "oracle_label": oracle_label,
+                    "oracle_action": decision.action,
+                    "executed_action": (
+                        CONTINUE if capacity_collector else decision.action
                     ),
                     "chosen_action": decision.action,
                     "differs_from_baseline": int(decision.action != CONTINUE),
@@ -2461,16 +2596,25 @@ def run_strict_greedy_local_oracle_problem(
                     ),
                     "selected_outer_path": chosen_branch["outer_path"],
                     }
+                    row.update({
+                        f"feature_{name}": float(value)
+                        for name, value in zip(feature_names, features)
+                    })
                     if getattr(args, "strict_greedy_record_diagnostics", True):
                         args.strict_greedy_decision_rows.append(row)
                     round_decisions.append(row)
-                    action_script.append(decision.action)
+                    action_script.append(
+                        CONTINUE if capacity_collector else decision.action
+                    )
                     if len(action_script) > 128:
                         raise RuntimeError(
                             "strict greedy oracle exceeded the refinement safety bound"
                         )
             final_draft = run_draft(
-                tuple(action_script), None, reuse_selected_cache=True
+                tuple(action_script),
+                None,
+                reuse_selected_cache=True,
+                preserve_causal_profile=capacity_collector,
             )
             if tuple(final_draft["action_script"]) != tuple(action_script):
                 raise RuntimeError(
@@ -2499,6 +2643,20 @@ def run_strict_greedy_local_oracle_problem(
         post_verify_latency_ms += float(verification["post_verify_latency_ms"])
         draft_passes += int(final_draft["draft_passes"])
         prev_prefill_output = final_draft["prefill_output"]
+        if capacity_collector:
+            args.adaptive_td_controller.observe_factual_verifier_call(
+                len(tokens_to_append),
+                float(verification["verify_latency_ms"]),
+            )
+            for decision_row in round_decisions:
+                decision_row["selected_path_measured_verify_ms"] = float(
+                    verification["verify_latency_ms"]
+                )
+                decision_row["continue_repeat_absolute_difference_ms"] = abs(
+                    float(decision_row["continue_measured_verify_ms"])
+                    - float(verification["verify_latency_ms"])
+                )
+            round_causal_profile = snapshot_causal_profile()
         stats_each_round.append({
             "target_tokens": tokens_to_append,
             "prefix_len": prefix_len,
@@ -2520,8 +2678,15 @@ def run_strict_greedy_local_oracle_problem(
         if getattr(args, "strict_greedy_record_diagnostics", True):
             args.verifier_call_rows.append({
                 "problem_id": int(problem_id),
-                "mode": "strict_greedy_local_oracle",
+                "mode": (
+                    "strict_greedy_capacity_collector"
+                    if capacity_collector
+                    else "strict_greedy_local_oracle"
+                ),
                 "round_id": int(round_id),
+                "context_length": int(
+                    orig_model_inputs["input_ids"].shape[1] + prefix_len
+                ),
                 "proposal_length": int(final_draft["proposal_len"]),
                 "accepted_tokens": int(verification["accepted_len"]),
                 "emitted_tokens": len(tokens_to_append),
@@ -4722,6 +4887,9 @@ for problem_id, is_warmup in tqdm(
                             "problem_id": int(problem_id),
                             "mode": benchmark_mode,
                             "round_id": int(num_speculation_rounds),
+                            "context_length": int(
+                                full_input_ids.shape[1] - len(draft_proposal)
+                            ),
                             "proposal_length": int(spec_len),
                             "accepted_tokens": int(accepted_len),
                             "emitted_tokens": len(tokens_to_append),

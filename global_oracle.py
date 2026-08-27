@@ -20,12 +20,27 @@ class OracleBranchRequired(RuntimeError):
 class ScriptedOracleRefinementController(OnlineTDRefinementController):
     controller_name = "exact_global_oracle"
 
-    def __init__(self, max_refinement_steps=64):
+    def __init__(
+        self,
+        max_refinement_steps=64,
+        feature_schema="otrc_v1_td",
+        factual_ema_alpha=0.2,
+    ):
         super().__init__(
             AdaptiveTDConfig(
                 max_refinement_steps=int(max_refinement_steps),
                 warmup_rounds=0,
                 early_stop_min_observations=0,
+                feature_schema=str(feature_schema),
+                feature_dim={
+                    "otrc_v1_td": 13,
+                    "otrc_v2_2_compact_td": 6,
+                }[str(feature_schema)],
+                feature_version={
+                    "otrc_v1_td": 1,
+                    "otrc_v2_2_compact_td": 226,
+                }[str(feature_schema)],
+                factual_ema_alpha=float(factual_ema_alpha),
             )
         )
         self.action_script = ()

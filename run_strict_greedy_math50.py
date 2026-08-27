@@ -187,6 +187,29 @@ def build_verifier_profile(prepass_dir, profile_path):
     emitted = calls["emitted_tokens"].astype(float)
     latency_stats = describe(latencies)
     emitted_stats = describe(emitted)
+    context_bucket_size = 256
+    proposal_bucket_size = 8
+    latency_bins = []
+    if "context_length" in calls.columns:
+        profiled = calls.copy()
+        profiled["context_bucket"] = (
+            profiled["context_length"].astype(int) // context_bucket_size
+        )
+        profiled["proposal_bucket"] = np.ceil(
+            profiled["proposal_length"].astype(float) / proposal_bucket_size
+        ).astype(int).clip(lower=1)
+        grouped = profiled.groupby(
+            ["context_bucket", "proposal_bucket"], as_index=False
+        )["verify_latency_ms"].agg(["mean", "count"]).reset_index()
+        latency_bins = [
+            {
+                "context_bucket": int(row.context_bucket),
+                "proposal_bucket": int(row.proposal_bucket),
+                "mean_verify_latency_ms": float(row["mean"]),
+                "observations": int(row["count"]),
+            }
+            for _, row in grouped.iterrows()
+        ]
     profile = {
         "mean_verify_latency_ms": latency_stats["mean"],
         "median_verify_latency_ms": latency_stats["median"],
@@ -197,7 +220,13 @@ def build_verifier_profile(prepass_dir, profile_path):
         "std_emitted_tokens": emitted_stats["std"],
         "verifier_calls": int(len(calls)),
         "total_emitted_tokens": int(emitted.sum()),
-        "source": "real warmed FailFast-8 prepass verifier calls",
+        "context_bucket_size": context_bucket_size,
+        "proposal_bucket_size": proposal_bucket_size,
+        "latency_bins": latency_bins,
+        "source": (
+            "frozen real warmed FailFast-8 profiling run; labels and branch "
+            "timings are not used for fitting"
+        ),
     }
     profile_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
     return profile

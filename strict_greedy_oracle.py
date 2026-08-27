@@ -60,6 +60,27 @@ def load_verifier_profile(path):
     return profile
 
 
+def predict_verifier_latency_ms(profile, context_len, proposal_len):
+    """Predict from a frozen binned profile, falling back to its global mean."""
+    bins = profile.get("latency_bins") or []
+    if not bins:
+        return float(profile["mean_verify_latency_ms"])
+    context_bucket = max(0, int(context_len) // int(profile["context_bucket_size"]))
+    proposal_bucket = max(
+        1,
+        math.ceil(int(proposal_len) / int(profile["proposal_bucket_size"])),
+    )
+    best = min(
+        bins,
+        key=lambda row: (
+            4 * abs(int(row["context_bucket"]) - context_bucket)
+            + abs(int(row["proposal_bucket"]) - proposal_bucket),
+            -int(row["observations"]),
+        ),
+    )
+    return float(best["mean_verify_latency_ms"])
+
+
 def format_outer_path(extension_count):
     extension_count = int(extension_count)
     if extension_count < 0:
