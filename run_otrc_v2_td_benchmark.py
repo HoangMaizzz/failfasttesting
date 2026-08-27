@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 
 from adaptive_td import FEATURE_SCHEMAS
-from run_math_feature_ablation_benchmark import aggregate_method
 
 
 ROOT = Path(__file__).resolve().parent
@@ -43,6 +42,46 @@ PROBLEM_IDS = {
         141, 143, 145, 147, 150, 151, 152, 154, 160,
     ],
 }
+
+
+def aggregate_method(results, method):
+    output_tokens = float(results["output_tokens"].sum())
+    drafted_tokens = float(results["drafted_tokens"].sum())
+    algorithm_time = float(results["actual_algorithm_time"].sum())
+    decisions = pd.to_numeric(
+        results.get("adaptive_decisions", pd.Series(0, index=results.index)),
+        errors="coerce",
+    ).fillna(0)
+    stops = pd.to_numeric(
+        results.get("adaptive_stop_actions", pd.Series(0, index=results.index)),
+        errors="coerce",
+    ).fillna(0)
+    return {
+        "method": method,
+        "num_questions": int(results["problem_id"].nunique()),
+        "output_tokens": int(output_tokens),
+        "algorithm_time_s": algorithm_time,
+        "ms_per_output_token": 1000.0 * algorithm_time / max(1.0, output_tokens),
+        "draft_time_s": float(results["actual_draft_time"].sum()),
+        "verify_time_s": float(results["actual_verify_time"].sum()),
+        "post_verify_time_s": float(results["actual_post_verify_time"].sum()),
+        "draft_passes": int(results["total_num_forward_passes"].sum()),
+        "verifier_rounds": int(results["num_speculation_rounds"].sum()),
+        "draft_passes_per_100_tokens": 100.0
+        * results["total_num_forward_passes"].sum()
+        / max(1.0, output_tokens),
+        "verifier_rounds_per_100_tokens": 100.0
+        * results["num_speculation_rounds"].sum()
+        / max(1.0, output_tokens),
+        "acceptance_rate_percent": 100.0
+        * results["accepted_tokens"].sum()
+        / max(1.0, drafted_tokens),
+        "adaptive_decisions": int(decisions.sum()),
+        "adaptive_stop_rate_percent": 100.0
+        * stops.sum()
+        / max(1.0, decisions.sum()),
+        "accuracy_percent": 100.0 * results["is_correct"].mean(),
+    }
 
 
 def parse_args():
@@ -339,14 +378,13 @@ def phase_complete(
 ):
     required = [
         directory / "benchmark_results.csv",
-        directory / "adaptive_td_decisions.csv",
         directory / "adaptive_td_runtime_state.json",
     ]
     if not all(path.exists() and path.stat().st_size for path in required):
         return False
     try:
         results = pd.read_csv(required[0])
-        state = json.loads(required[2].read_text(encoding="utf-8"))
+        state = json.loads(required[1].read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError, pd.errors.EmptyDataError):
         return False
     return (
@@ -879,7 +917,12 @@ def main():
         selected_ids[dataset] = problem_ids
         phase_dir = run_dataset(args, dataset, problem_ids)
         results = pd.read_csv(phase_dir / "benchmark_results.csv")
-        decisions = pd.read_csv(phase_dir / "adaptive_td_decisions.csv")
+        decision_path = phase_dir / "adaptive_td_decisions.csv"
+        decisions = (
+            pd.read_csv(decision_path)
+            if decision_path.exists() and decision_path.stat().st_size
+            else pd.DataFrame()
+        )
         state = json.loads(
             (phase_dir / "adaptive_td_runtime_state.json").read_text(
                 encoding="utf-8"
@@ -894,39 +937,42 @@ def main():
             .fillna(0.0)
             .sum()
         )
-        summary["exploration_rate_percent"] = 100.0 * float(
-            decisions["exploration_used"].astype(bool).mean()
+        summary["exploration_rate_percent"] = (
+            100.0 * float(decisions["exploration_used"].astype(bool).mean())
+            if not decisions.empty
+            else 0.0
         )
         summary["output_hash_unique"] = int(results.output_token_hash.nunique())
         summary["policy_weight_ema_beta"] = args.policy_weight_ema_beta
         summaries.append(summary)
 
-        stats, pearson, spearman, conditioning = feature_diagnostics(
-            dataset,
-            decisions,
-            feature_names,
-        )
-        feature_rows.extend(stats.to_dict("records"))
-        conditioning_frames.append(conditioning)
-        dynamics_frames.append(learning_dynamics(dataset, decisions))
         weights.extend(weight_rows(dataset, state, feature_names))
-        ema_summary, ema_dynamics = policy_ema_diagnostics(dataset, decisions)
-        policy_ema_rows.append(ema_summary)
-        policy_ema_dynamics_frames.append(ema_dynamics)
-        snapshot_rows.append(snapshot_diagnostics(dataset, decisions))
-        confidence_rows.append(confidence_diagnostics(
-            dataset,
-            decisions,
-            args.drafter_threshold,
-        ))
-        pearson.to_csv(output_dir / f"{dataset}_feature_correlation_pearson.csv")
-        spearman.to_csv(output_dir / f"{dataset}_feature_correlation_spearman.csv")
+        if not decisions.empty:
+            stats, pearson, spearman, conditioning = feature_diagnostics(
+                dataset,
+                decisions,
+                feature_names,
+            )
+            feature_rows.extend(stats.to_dict("records"))
+            conditioning_frames.append(conditioning)
+            dynamics_frames.append(learning_dynamics(dataset, decisions))
+            ema_summary, ema_dynamics = policy_ema_diagnostics(dataset, decisions)
+            policy_ema_rows.append(ema_summary)
+            policy_ema_dynamics_frames.append(ema_dynamics)
+            snapshot_rows.append(snapshot_diagnostics(dataset, decisions))
+            confidence_rows.append(confidence_diagnostics(
+                dataset,
+                decisions,
+                args.drafter_threshold,
+            ))
+            pearson.to_csv(output_dir / f"{dataset}_feature_correlation_pearson.csv")
+            spearman.to_csv(output_dir / f"{dataset}_feature_correlation_spearman.csv")
         transition_path = phase_dir / "adaptive_full_stream_transitions.csv"
-        if args.credit_assignment in FACTUAL_CREDIT_ASSIGNMENTS:
-            if not transition_path.exists():
-                raise FileNotFoundError(
-                    f"missing factual transition report: {transition_path}"
-                )
+        if (
+            args.credit_assignment in FACTUAL_CREDIT_ASSIGNMENTS
+            and transition_path.exists()
+            and transition_path.stat().st_size
+        ):
             factual_summary, factual_dynamics = factual_target_diagnostics(
                 dataset,
                 pd.read_csv(transition_path),
@@ -945,10 +991,14 @@ def main():
     pd.concat(conditioning_frames, ignore_index=True).to_csv(
         output_dir / "feature_conditioning.csv",
         index=False,
+    ) if conditioning_frames else pd.DataFrame().to_csv(
+        output_dir / "feature_conditioning.csv", index=False
     )
     pd.concat(dynamics_frames, ignore_index=True).to_csv(
         output_dir / "learning_dynamics.csv",
         index=False,
+    ) if dynamics_frames else pd.DataFrame().to_csv(
+        output_dir / "learning_dynamics.csv", index=False
     )
     pd.DataFrame(weights).to_csv(
         output_dir / "weight_trajectory.csv",
@@ -961,6 +1011,8 @@ def main():
     pd.concat(policy_ema_dynamics_frames, ignore_index=True).to_csv(
         output_dir / "policy_ema_learning_dynamics.csv",
         index=False,
+    ) if policy_ema_dynamics_frames else pd.DataFrame().to_csv(
+        output_dir / "policy_ema_learning_dynamics.csv", index=False
     )
     pd.DataFrame(snapshot_rows).to_csv(
         output_dir / "snapshot_invariants.csv",

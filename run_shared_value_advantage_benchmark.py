@@ -289,13 +289,23 @@ def validate_and_report(args):
             ADVANTAGE_LEARNING_RATE,
         ):
             raise RuntimeError(f"{dataset} advantage learning rate mismatch")
-        frame = pd.read_csv(phase_dir / "adaptive_td_decisions.csv")
-        frame.insert(0, "dataset", dataset)
-        decisions.append(frame)
+        decision_path = phase_dir / "adaptive_td_decisions.csv"
+        if decision_path.exists() and decision_path.stat().st_size:
+            frame = pd.read_csv(decision_path)
+            frame.insert(0, "dataset", dataset)
+            decisions.append(frame)
         states[dataset] = state
 
-    combined_decisions = pd.concat(decisions, ignore_index=True)
-    dynamics = shared_learning_dynamics(combined_decisions)
+    combined_decisions = (
+        pd.concat(decisions, ignore_index=True)
+        if decisions
+        else pd.DataFrame()
+    )
+    dynamics = (
+        shared_learning_dynamics(combined_decisions)
+        if not combined_decisions.empty
+        else pd.DataFrame()
+    )
     feature_names = manifest["feature_names"]
     trajectory = shared_parameter_trajectory(states, feature_names)
     dynamics.to_csv(
