@@ -78,6 +78,17 @@ FEATURE_SCHEMAS = {
 }
 
 
+def active_refinement_positions(remaining_positions, active_start, active_end):
+    """Select unresolved positions belonging to the small block just processed."""
+    start = int(active_start)
+    end = int(active_end)
+    return tuple(
+        int(position)
+        for position in remaining_positions
+        if start <= int(position) < end
+    )
+
+
 def _clip(value: float, low: float, high: float) -> float:
     value = float(value)
     if math.isnan(value):

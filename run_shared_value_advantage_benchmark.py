@@ -14,7 +14,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "compact6_shared_value_explicit_advantage_v1"
+VERSION = "compact6_shared_value_explicit_advantage_active_block_v2"
 METHOD = "otrc_v2_2_compact_factual_no_bootstrap_shared_value_advantage"
 DATASETS = ("math", "gsm8k", "aime", "humaneval")
 VALUE_LEARNING_RATE = 0.015
@@ -23,6 +23,12 @@ ADVANTAGE_LEARNING_RATE = 0.02
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=DATASETS,
+        default=list(DATASETS),
+    )
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
@@ -38,7 +44,7 @@ def parse_args():
         "--output_dir",
         default=(
             "/content/failfasttesting/"
-            "outputs_shared_value_advantage_test25"
+            "outputs_shared_value_advantage_active_block_test25"
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -54,7 +60,9 @@ def parse_args():
 def validate_args(args):
     if args.num_questions <= 0:
         raise ValueError("--num_questions must be positive")
-    available = min(len(PROBLEM_IDS[dataset]) for dataset in DATASETS)
+    if len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("--datasets must not contain duplicates")
+    available = min(len(PROBLEM_IDS[dataset]) for dataset in args.datasets)
     if args.num_questions > available:
         raise ValueError(f"--num_questions cannot exceed {available}")
     if args.warmup_questions != 1:
@@ -69,7 +77,7 @@ def benchmark_command(args):
         "-u",
         "run_otrc_v2_td_benchmark.py",
         "--datasets",
-        *DATASETS,
+        *args.datasets,
         "--num_questions",
         str(args.num_questions),
         "--feature_schema",
@@ -257,12 +265,12 @@ def validate_and_report(args):
     )
     if manifest.get("method") != METHOD:
         raise RuntimeError(f"unexpected benchmark method: {manifest.get('method')}")
-    if set(manifest.get("datasets", [])) != set(DATASETS):
-        raise RuntimeError("benchmark did not complete all four datasets")
+    if set(manifest.get("datasets", [])) != set(args.datasets):
+        raise RuntimeError("benchmark did not complete every requested dataset")
 
     decisions = []
     states = {}
-    for dataset in DATASETS:
+    for dataset in args.datasets:
         phase_dir = output_dir / "raw" / dataset / METHOD
         state = json.loads(
             (phase_dir / "adaptive_td_runtime_state.json").read_text(
@@ -332,7 +340,7 @@ def main():
     wrapper_manifest = {
         "version": VERSION,
         "method": METHOD,
-        "datasets": list(DATASETS),
+        "datasets": list(args.datasets),
         "num_questions_per_dataset": args.num_questions,
         "value_learning_rate": VALUE_LEARNING_RATE,
         "advantage_learning_rate": ADVANTAGE_LEARNING_RATE,

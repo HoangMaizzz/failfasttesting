@@ -32,6 +32,7 @@ from bucket_renewal import (
     position_bucket,
     predict_next_gain,
 )
+from adaptive_td import active_refinement_positions
 
 logging.set_verbosity_error()
 # logging.set_verbosity_warning()
@@ -1167,6 +1168,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         adaptive_pending_continue = None
         adaptive_pending_stop_extension = None
         adaptive_previous_proposal = None
+        adaptive_decision_counts = {}
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
@@ -1942,19 +1944,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         and current_token is not None
                                         and previous_token != current_token
                                     ]
-                                recoverable_positions = {
-                                    index
-                                    for index, token_id in enumerate(current_draft_tokens)
-                                    if token_id == mask_id
-                                    and draft_token_start_idx + index
-                                    in current_step_confidences
-                                }
-                                recoverable_confidences = [
-                                    confidences[index] for index in sorted(recoverable_positions)
-                                ]
-                                recoverable_margins = [
-                                    margins[index] for index in sorted(recoverable_positions)
-                                ]
                                 active_absolute_start = max(
                                     draft_token_start_idx,
                                     block_abs_start + small_block_start_idx,
@@ -1967,19 +1956,59 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     1,
                                     active_absolute_end - active_absolute_start,
                                 )
-                                active_remaining_positions = [
-                                    absolute_pos
-                                    for absolute_pos in range(
+                                active_remaining_positions = list(
+                                    active_refinement_positions(
+                                        remaining_absolute_positions,
                                         active_absolute_start,
                                         active_absolute_end,
                                     )
-                                    if current_draft_tokens[
-                                        absolute_pos - draft_token_start_idx
-                                    ] == mask_id
-                                ]
+                                )
                                 active_remaining_confidences = [
                                     float(current_step_confidences.get(absolute_pos, 0.0))
                                     for absolute_pos in active_remaining_positions
+                                ]
+                                recoverable_positions = {
+                                    absolute_pos - draft_token_start_idx
+                                    for absolute_pos in active_remaining_positions
+                                    if absolute_pos in current_step_confidences
+                                }
+                                recoverable_confidences = [
+                                    confidences[index]
+                                    for index in sorted(recoverable_positions)
+                                ]
+                                recoverable_margins = [
+                                    margins[index]
+                                    for index in sorted(recoverable_positions)
+                                ]
+                                future_remaining_positions = [
+                                    absolute_pos
+                                    for absolute_pos in remaining_absolute_positions
+                                    if not (
+                                        active_absolute_start
+                                        <= absolute_pos
+                                        < active_absolute_end
+                                    )
+                                ]
+                                adaptive_decision_key = (
+                                    int(target_len),
+                                    int(block_idx),
+                                    int(small_block_idx),
+                                )
+                                adaptive_refinement_step = (
+                                    int(
+                                        adaptive_decision_counts.get(
+                                            adaptive_decision_key,
+                                            0,
+                                        )
+                                    )
+                                    + 1
+                                )
+                                active_candidate_confidences = confidences[
+                                    : max(
+                                        0,
+                                        active_absolute_end
+                                        - draft_token_start_idx,
+                                    )
                                 ]
                                 prefix_length = 0
                                 prefix_length_before = 0
@@ -2030,11 +2059,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         proposal_remaining_confidences
                                     ),
                                     failfast_candidate_min_confidence=(
-                                        min(confidences) if confidences else 0.0
+                                        min(active_candidate_confidences)
+                                        if active_candidate_confidences
+                                        else 0.0
                                     ),
                                     drafter_threshold=threshold,
                                     failfast_threshold=tau_f,
-                                    remaining_masks=masks_remaining,
+                                    remaining_masks=len(active_remaining_positions),
                                     newly_unmasked=unmasked_this_step,
                                     recoverable_confidences=recoverable_confidences,
                                     recoverable_margins=recoverable_margins,
@@ -2051,7 +2082,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         len(recoverable_positions.intersection(changed_positions))
                                         / max(1, len(recoverable_positions))
                                     ),
-                                    refinement_step=current_step,
+                                    refinement_step=adaptive_refinement_step,
                                     use_margin=bool(getattr(args, "adaptive_use_margin_feature", True)),
                                     use_stability=bool(getattr(args, "adaptive_use_stability_feature", True)),
                                     use_step=bool(getattr(args, "adaptive_use_step_feature", False)),
@@ -2070,26 +2101,36 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                                 zero_cost_fill_available = all(
                                     absolute_pos in current_step_token_ids
-                                    for absolute_pos in remaining_absolute_positions
+                                    for absolute_pos in active_remaining_positions
                                 )
                                 baseline_would_verify = (
-                                    (
-                                        max_spec_len is not None
-                                        and int(spec_len) >= int(max_spec_len)
-                                    )
-                                    or any(
-                                        float(value) < tau_f
-                                        for value in confidences
+                                    not future_remaining_positions
+                                    and (
+                                        (
+                                            max_spec_len is not None
+                                            and int(spec_len) >= int(max_spec_len)
+                                        )
+                                        or any(
+                                            float(value) < tau_f
+                                            for value in active_candidate_confidences
+                                        )
                                     )
                                 )
-                                stop_available = zero_cost_fill_available
-                                if not zero_cost_fill_available:
+                                stop_available = bool(
+                                    active_remaining_positions
+                                ) and zero_cost_fill_available
+                                if not active_remaining_positions:
+                                    stop_availability_reason = "no_active_masks"
+                                elif not zero_cost_fill_available:
                                     stop_availability_reason = "candidate_coverage_unavailable"
                                 else:
                                     stop_availability_reason = "available"
-                                post_stop_outer_action = (
-                                    "verify" if baseline_would_verify else "extend"
-                                )
+                                if future_remaining_positions:
+                                    post_stop_outer_action = "continue_proposal"
+                                else:
+                                    post_stop_outer_action = (
+                                        "verify" if baseline_would_verify else "extend"
+                                    )
                                 availability_fields = {
                                     "candidate_coverage_available": bool(
                                         zero_cost_fill_available
@@ -2103,14 +2144,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "provisional_positions": int(
                                         sum(
                                             absolute_pos in current_step_token_ids
-                                            for absolute_pos in remaining_absolute_positions
+                                            for absolute_pos in active_remaining_positions
                                         )
                                     ),
                                     "missing_provisional_positions": int(
                                         sum(
                                             absolute_pos not in current_step_token_ids
-                                            for absolute_pos in remaining_absolute_positions
+                                            for absolute_pos in active_remaining_positions
                                         )
+                                    ),
+                                    "unprocessed_future_masks": int(
+                                        len(future_remaining_positions)
                                     ),
                                 }
                                 step_record.update({
@@ -2217,11 +2261,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ] = transition_residual is not None
                                     adaptive_pending_stop_extension = None
 
-                                if masks_remaining > 0:
+                                if active_remaining_positions:
+                                    adaptive_decision_counts[adaptive_decision_key] = (
+                                        adaptive_refinement_step
+                                    )
                                     decision = adaptive_controller.choose(
                                         features,
                                         allow_stop=stop_available,
-                                        refinement_step=current_step,
+                                        refinement_step=adaptive_refinement_step,
                                         context_len=int(draft_token_start_idx),
                                         draft_proposal=provisional_tokens,
                                         elapsed_draft_ms=sum(
@@ -2230,7 +2277,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         proposal_length=target_len,
                                         frontier_length=frontier_k,
-                                        remaining_masks=masks_remaining,
+                                        remaining_masks=len(
+                                            active_remaining_positions
+                                        ),
                                         newly_committed=unmasked_this_step,
                                         allow_exploration=not bool(
                                             getattr(
@@ -2241,7 +2290,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                     )
                                     adaptive_record = {
-                                        "step": int(current_step),
+                                        "step": int(adaptive_refinement_step),
+                                        "physical_denoising_pass": int(current_step),
                                         "target_len": int(target_len),
                                         "context_len": int(draft_token_start_idx),
                                         "draft_proposal": [
@@ -2251,7 +2301,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "features": list(features),
                                         "action": decision.action,
                                         "reason": decision.reason,
-                                        "remaining_masks": int(masks_remaining),
+                                        "remaining_masks": int(
+                                            len(active_remaining_positions)
+                                        ),
                                         "newly_unmasked": int(unmasked_this_step),
                                         "active_span_length": int(active_span_length),
                                         "active_remaining_masks": int(
@@ -2626,37 +2678,46 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "target_len": target_len,
                                     "masks_remaining": masks_remaining,
                                 })
-                                if masks_remaining > 0:
+                                if (
+                                    adaptive_enabled
+                                    and str(stop_reason).startswith("adaptive_")
+                                ):
+                                    remaining_absolute_positions = list(
+                                        active_remaining_positions
+                                    )
+                                elif masks_remaining > 0:
                                     draft_mask = (x_t[:, draft_token_start_idx:draft_end_idx] == mask_id)
                                     remaining_absolute_positions = [
                                         draft_token_start_idx + int(rel_pos)
                                         for rel_pos in draft_mask[0].nonzero(as_tuple=False).flatten().tolist()
                                     ]
-                                    for absolute_pos in remaining_absolute_positions:
-                                        token_id = torch.tensor(
-                                            [current_step_token_ids[absolute_pos]],
-                                            device=x_t.device,
-                                            dtype=x_t.dtype,
+                                else:
+                                    remaining_absolute_positions = []
+                                for absolute_pos in remaining_absolute_positions:
+                                    token_id = torch.tensor(
+                                        [current_step_token_ids[absolute_pos]],
+                                        device=x_t.device,
+                                        dtype=x_t.dtype,
+                                    )
+                                    token_confidence = current_step_confidences[absolute_pos]
+                                    token_margin = current_step_margins[absolute_pos]
+                                    x_t[:, absolute_pos] = token_id
+                                    committed_confidences[int(absolute_pos)] = float(token_confidence)
+                                    committed_margins[int(absolute_pos)] = float(token_margin)
+                                    committed_steps[int(absolute_pos)] = current_step
+                                    if not adaptive_enabled or bool(
+                                        getattr(args, "collect_bucket_oracle", False)
+                                    ):
+                                        committed_accept_probabilities.setdefault(
+                                            int(absolute_pos),
+                                            bucket_acceptance_probability(
+                                                token_confidence,
+                                                token_margin,
+                                                int(absolute_pos) - draft_token_start_idx,
+                                                current_step,
+                                            ),
                                         )
-                                        token_confidence = current_step_confidences[absolute_pos]
-                                        token_margin = current_step_margins[absolute_pos]
-                                        x_t[:, absolute_pos] = token_id
-                                        committed_confidences[int(absolute_pos)] = float(token_confidence)
-                                        committed_margins[int(absolute_pos)] = float(token_margin)
-                                        committed_steps[int(absolute_pos)] = current_step
-                                        if not adaptive_enabled or bool(
-                                            getattr(args, "collect_bucket_oracle", False)
-                                        ):
-                                            committed_accept_probabilities.setdefault(
-                                                int(absolute_pos),
-                                                bucket_acceptance_probability(
-                                                    token_confidence,
-                                                    token_margin,
-                                                    int(absolute_pos) - draft_token_start_idx,
-                                                    current_step,
-                                                ),
-                                            )
-                                        conf_of_unmasked_tokens.append(float(token_confidence))
+                                    conf_of_unmasked_tokens.append(float(token_confidence))
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")

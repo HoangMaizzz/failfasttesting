@@ -35,6 +35,7 @@ def shared_config(**overrides):
 class SharedValueAdvantageTests(unittest.TestCase):
     def args(self):
         return Namespace(
+            datasets=list(DATASETS),
             num_questions=25,
             warmup_questions=1,
             max_new_tokens=1024,
@@ -140,6 +141,18 @@ class SharedValueAdvantageTests(unittest.TestCase):
         )
         self.assertIn("--policy_weight_ema_beta 0.0", joined)
         self.assertIn("--resume", command)
+
+    def test_runner_can_limit_the_matched_run_to_math_and_gsm8k(self):
+        args = self.args()
+        args.datasets = ["math", "gsm8k"]
+        validate_args(args)
+        command = benchmark_command(args)
+        dataset_start = command.index("--datasets") + 1
+        question_index = command.index("--num_questions")
+        self.assertEqual(
+            command[dataset_start:question_index],
+            ["math", "gsm8k"],
+        )
 
     def test_shared_parameterization_has_distinct_method_name(self):
         args = Namespace(
