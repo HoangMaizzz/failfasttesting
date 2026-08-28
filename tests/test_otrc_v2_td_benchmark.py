@@ -73,6 +73,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertNotIn("strict_greedy", joined)
         self.assertNotIn("causal_oracle", joined)
         self.assertNotIn("verifier_ar", joined)
+        self.assertIn("--log_verifier_calls", command)
 
     def test_command_forwards_split_gpu_devices(self):
         args = self.args()

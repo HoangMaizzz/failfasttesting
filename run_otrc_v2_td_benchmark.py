@@ -381,6 +381,7 @@ def command_for(args, dataset, problem_ids, output_dir):
         str(args.adaptive_weight_snapshot_interval),
         "--adaptive-log-decisions",
         "--adaptive-profile-overhead",
+        "--log_verifier_calls",
         "--seed", str(args.seed),
         "--quiet_generation",
         "--disable_progress",
