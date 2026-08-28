@@ -5011,6 +5011,9 @@ for problem_id, is_warmup in tqdm(
                                 full_input_ids.shape[1] - len(draft_proposal)
                             ),
                             "proposal_length": int(spec_len),
+                            "terminal_draft": bool(
+                                draft_type == "dllm" and terminal_draft
+                            ),
                             "accepted_tokens": int(accepted_len),
                             "emitted_tokens": len(tokens_to_append),
                             "verify_latency_ms": verify_time * 1000.0,
