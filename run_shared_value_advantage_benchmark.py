@@ -14,7 +14,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "compact6_shared_value_explicit_advantage_active_block_v2"
+VERSION = "compact6_shared_value_explicit_advantage_active_block_v3"
 METHOD = "otrc_v2_2_compact_factual_no_bootstrap_shared_value_advantage"
 DATASETS = ("math", "gsm8k", "aime", "humaneval")
 VALUE_LEARNING_RATE = 0.015
@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--drafter_threshold", type=float, default=0.05)
+    parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument(
         "--target_model_name",
         default="Qwen/Qwen2.5-7B-Instruct",
@@ -69,6 +71,10 @@ def validate_args(args):
         raise ValueError("the matched benchmark requires one warmup question")
     if args.max_new_tokens <= 0:
         raise ValueError("--max_new_tokens must be positive")
+    if not 0.0 < args.drafter_threshold <= 1.0:
+        raise ValueError("--drafter_threshold must be in (0, 1]")
+    if not 0.0 <= args.lowconf_threshold <= 1.0:
+        raise ValueError("--lowconf_threshold must be in [0, 1]")
 
 
 def benchmark_command(args):
@@ -153,9 +159,9 @@ def benchmark_command(args):
         "--dllm_dir",
         args.dllm_dir,
         "--drafter_threshold",
-        "0.05",
+        str(args.drafter_threshold),
         "--lowconf_threshold",
-        "0.45",
+        str(args.lowconf_threshold),
         "--seed",
         "42",
         "--output_dir",

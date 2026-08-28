@@ -39,6 +39,8 @@ class SharedValueAdvantageTests(unittest.TestCase):
             num_questions=25,
             warmup_questions=1,
             max_new_tokens=1024,
+            drafter_threshold=0.05,
+            lowconf_threshold=0.45,
             target_model_name="Qwen/Qwen2.5-7B-Instruct",
             dllm_dir="/tmp/Fast_dLLM_v2_1.5B",
             output_dir="/tmp/shared_value_advantage",
@@ -153,6 +155,32 @@ class SharedValueAdvantageTests(unittest.TestCase):
             command[dataset_start:question_index],
             ["math", "gsm8k"],
         )
+
+    def test_runner_forwards_custom_confidence_thresholds(self):
+        args = self.args()
+        args.drafter_threshold = 0.30
+        args.lowconf_threshold = 0.50
+        validate_args(args)
+        command = benchmark_command(args)
+        self.assertEqual(
+            command[command.index("--drafter_threshold") + 1],
+            "0.3",
+        )
+        self.assertEqual(
+            command[command.index("--lowconf_threshold") + 1],
+            "0.5",
+        )
+
+    def test_runner_rejects_invalid_confidence_thresholds(self):
+        args = self.args()
+        args.drafter_threshold = 0.0
+        with self.assertRaisesRegex(ValueError, "drafter_threshold"):
+            validate_args(args)
+
+        args = self.args()
+        args.lowconf_threshold = 1.1
+        with self.assertRaisesRegex(ValueError, "lowconf_threshold"):
+            validate_args(args)
 
     def test_shared_parameterization_has_distinct_method_name(self):
         args = Namespace(
