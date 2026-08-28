@@ -4,3 +4,7 @@ outputs/
 slurm_logs/
 figures/
 .DS_Store
+.venv/
+/Fast_dLLM_v2_1.5B/
+/outputs_*/
+/outputs_*.zip
