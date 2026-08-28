@@ -1,13 +1,25 @@
 import unittest
 from pathlib import Path
 
-from adaptive_td import active_refinement_positions
+from adaptive_td import active_refinement_positions, logical_refinement_span
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ActiveBlockRefinementTests(unittest.TestCase):
+    def test_logical_span_starts_at_the_verifier_boundary(self):
+        self.assertEqual(
+            logical_refinement_span(118, 126, 112, 120, 8),
+            (0, 118, 126),
+        )
+
+    def test_extension_uses_the_next_proposal_relative_span(self):
+        self.assertEqual(
+            logical_refinement_span(118, 134, 126, 134, 8),
+            (1, 126, 134),
+        )
+
     def test_future_small_block_masks_are_not_refinement_candidates(self):
         proposal_positions = tuple(range(118, 126))
         active = active_refinement_positions(
@@ -29,13 +41,19 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         source = (ROOT / "Fast_dLLM_v2_1_5B" / "modeling.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("if active_remaining_positions:", source)
+        self.assertIn(
+            "if active_remaining_positions and stop_available:",
+            source,
+        )
         self.assertIn(
             "remaining_absolute_positions = list(\n"
             "                                        active_remaining_positions",
             source,
         )
         self.assertIn('"unprocessed_future_masks"', source)
+        self.assertIn("logical_refinement_span(", source)
+        self.assertIn('"logical_block_index"', source)
+        self.assertIn('"physical_small_block_index"', source)
 
 
 if __name__ == "__main__":

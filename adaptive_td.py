@@ -89,6 +89,26 @@ def active_refinement_positions(remaining_positions, active_start, active_end):
     )
 
 
+def logical_refinement_span(
+    draft_start,
+    draft_end,
+    physical_start,
+    physical_end,
+    span_size,
+):
+    """Map a physical model segment to its proposal-relative logical span."""
+    if int(span_size) <= 0:
+        raise ValueError("span_size must be positive")
+    intersection_start = max(int(draft_start), int(physical_start))
+    intersection_end = min(int(draft_end), int(physical_end))
+    if intersection_start >= intersection_end:
+        return None
+    logical_index = (intersection_start - int(draft_start)) // int(span_size)
+    logical_start = int(draft_start) + logical_index * int(span_size)
+    logical_end = min(int(draft_end), logical_start + int(span_size))
+    return logical_index, logical_start, logical_end
+
+
 def _clip(value: float, low: float, high: float) -> float:
     value = float(value)
     if math.isnan(value):

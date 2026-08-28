@@ -32,7 +32,7 @@ from bucket_renewal import (
     position_bucket,
     predict_next_gain,
 )
-from adaptive_td import active_refinement_positions
+from adaptive_td import active_refinement_positions, logical_refinement_span
 
 logging.set_verbosity_error()
 # logging.set_verbosity_warning()
@@ -1944,14 +1944,22 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         and current_token is not None
                                         and previous_token != current_token
                                     ]
-                                active_absolute_start = max(
+                                logical_span = logical_refinement_span(
                                     draft_token_start_idx,
-                                    block_abs_start + small_block_start_idx,
-                                )
-                                active_absolute_end = min(
                                     draft_end_idx,
+                                    block_abs_start + small_block_start_idx,
                                     block_abs_start + small_block_end_idx,
+                                    small_block_size,
                                 )
+                                if logical_span is None:
+                                    raise RuntimeError(
+                                        "adaptive decision has no logical proposal span"
+                                    )
+                                (
+                                    logical_block_idx,
+                                    active_absolute_start,
+                                    active_absolute_end,
+                                ) = logical_span
                                 active_span_length = max(
                                     1,
                                     active_absolute_end - active_absolute_start,
@@ -1991,8 +1999,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 ]
                                 adaptive_decision_key = (
                                     int(target_len),
-                                    int(block_idx),
-                                    int(small_block_idx),
+                                    int(logical_block_idx),
                                 )
                                 adaptive_refinement_step = (
                                     int(
@@ -2003,12 +2010,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )
                                     + 1
                                 )
+                                logical_relative_start = (
+                                    active_absolute_start - draft_token_start_idx
+                                )
+                                logical_relative_end = (
+                                    active_absolute_end - draft_token_start_idx
+                                )
                                 active_candidate_confidences = confidences[
-                                    : max(
-                                        0,
-                                        active_absolute_end
-                                        - draft_token_start_idx,
-                                    )
+                                    logical_relative_start:logical_relative_end
                                 ]
                                 prefix_length = 0
                                 prefix_length_before = 0
@@ -2261,7 +2270,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ] = transition_residual is not None
                                     adaptive_pending_stop_extension = None
 
-                                if active_remaining_positions:
+                                if active_remaining_positions and stop_available:
                                     adaptive_decision_counts[adaptive_decision_key] = (
                                         adaptive_refinement_step
                                     )
@@ -2306,6 +2315,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "newly_unmasked": int(unmasked_this_step),
                                         "active_span_length": int(active_span_length),
+                                        "logical_block_index": int(
+                                            logical_block_idx
+                                        ),
+                                        "logical_block_start_relative": int(
+                                            active_absolute_start
+                                            - draft_token_start_idx
+                                        ),
+                                        "logical_block_end_relative": int(
+                                            active_absolute_end
+                                            - draft_token_start_idx
+                                        ),
+                                        "physical_block_index": int(block_idx),
+                                        "physical_small_block_index": int(
+                                            small_block_idx
+                                        ),
                                         "active_remaining_masks": int(
                                             len(active_remaining_positions)
                                         ),
