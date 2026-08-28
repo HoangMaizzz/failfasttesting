@@ -45,6 +45,7 @@ class SharedValueAdvantageTests(unittest.TestCase):
             lowconf_threshold=0.45,
             target_device=0,
             drafter_device=0,
+            target_quantization="none",
             target_model_name="Qwen/Qwen2.5-7B-Instruct",
             dllm_dir="/tmp/Fast_dLLM_v2_1.5B",
             output_dir="/tmp/shared_value_advantage",

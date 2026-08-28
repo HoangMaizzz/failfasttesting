@@ -101,6 +101,24 @@ def aggregate_method(results, method):
         * stops.sum()
         / max(1.0, decisions.sum()),
         "accuracy_percent": 100.0 * results["is_correct"].mean(),
+        "gpu_peak_allocated_gib": float(
+            pd.to_numeric(
+                results.get(
+                    "gpu_peak_allocated_gib",
+                    pd.Series(0.0, index=results.index),
+                ),
+                errors="coerce",
+            ).max()
+        ),
+        "gpu_peak_reserved_gib": float(
+            pd.to_numeric(
+                results.get(
+                    "gpu_peak_reserved_gib",
+                    pd.Series(0.0, index=results.index),
+                ),
+                errors="coerce",
+            ).max()
+        ),
     }
 
 
@@ -151,6 +169,11 @@ def parse_args():
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
+    parser.add_argument(
+        "--target_quantization",
+        choices=("none", "int8", "int4"),
+        default="none",
+    )
     parser.add_argument("--adaptive_learning_rate", type=float, default=0.02)
     parser.add_argument(
         "--value_parameterization",
@@ -342,6 +365,8 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--dllm_dir", args.dllm_dir,
         "--target_device", str(args.target_device),
         "--drafter_device", str(args.drafter_device),
+        "--target_quantization",
+        str(getattr(args, "target_quantization", "none")),
         "--drafter_thresholds", str(args.drafter_threshold),
         "--sweep_lowconf_threshold", str(args.lowconf_threshold),
         "--sweep_max_spec_len", str(args.max_spec_len),

@@ -26,6 +26,11 @@ def parse_args():
     parser.add_argument("--lowconf_threshold", type=float, default=0.50)
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=1)
+    parser.add_argument(
+        "--target_quantization",
+        choices=("none", "int8", "int4"),
+        default="none",
+    )
     parser.add_argument("--target_model_name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument(
         "--dllm_dir",
@@ -84,6 +89,8 @@ def command_for(args, dataset, output_dir):
         "--dllm_dir", args.dllm_dir,
         "--target_device", str(args.target_device),
         "--drafter_device", str(args.drafter_device),
+        "--target_quantization",
+        getattr(args, "target_quantization", "none"),
         "--drafter_thresholds", str(args.drafter_threshold),
         "--sweep_lowconf_threshold", str(args.lowconf_threshold),
         "--sweep_max_spec_len", "64",

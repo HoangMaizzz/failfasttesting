@@ -29,6 +29,7 @@ class MatchedFailFastBaselineTests(unittest.TestCase):
             lowconf_threshold=0.50,
             target_device=0,
             drafter_device=1,
+            target_quantization="int8",
             target_model_name="Qwen/Qwen2.5-7B-Instruct",
             dllm_dir="/tmp/Fast_dLLM_v2_1.5B",
             output_dir="/tmp/out",
@@ -45,6 +46,10 @@ class MatchedFailFastBaselineTests(unittest.TestCase):
         self.assertEqual(command[command.index("--sweep_lowconf_threshold") + 1], "0.5")
         self.assertEqual(command[command.index("--target_device") + 1], "0")
         self.assertEqual(command[command.index("--drafter_device") + 1], "1")
+        self.assertEqual(
+            command[command.index("--target_quantization") + 1],
+            "int8",
+        )
         self.assertEqual(command[command.index("--sweep_max_spec_len") + 1], "64")
         self.assertNotIn("--adaptive-td", command)
 

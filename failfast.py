@@ -33,6 +33,39 @@ def _record_transfer(args, elapsed):
     )
 
 
+def target_model_load_kwargs(args):
+    kwargs = {
+        "device_map": {"": args.target_device},
+        "attn_implementation": "sdpa",
+    }
+    quantization = getattr(args, "target_quantization", "none")
+    if quantization == "none":
+        kwargs["torch_dtype"] = "auto"
+        return kwargs
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError as exc:
+        raise RuntimeError(
+            "target quantization requires transformers with BitsAndBytesConfig"
+        ) from exc
+    if quantization == "int8":
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=False,
+        )
+    elif quantization == "int4":
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        raise ValueError(f"unknown target quantization: {quantization}")
+    kwargs["torch_dtype"] = torch.float16
+    return kwargs
+
+
 def timed_device_copy(tensor, device, args):
     device = torch.device(device)
     if tensor.device == device:
@@ -464,6 +497,11 @@ parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--target_device", type=int, default=0)
 parser.add_argument("--drafter_device", type=int, default=0)
+parser.add_argument(
+    "--target_quantization",
+    choices=["none", "int8", "int4"],
+    default="none",
+)
 parser.add_argument("--num_questions", type=int, default=1)
 parser.add_argument("--problem_ids", type=int, nargs="+")
 parser.add_argument("--warmup_questions", type=int, default=0)
@@ -954,6 +992,10 @@ BENCHMARK_CSV_COLUMNS = [
     "predicted_answer",
     "reference_answer",
     "is_correct",
+    "target_quantization",
+    "gpu_peak_allocated_gib",
+    "gpu_peak_reserved_gib",
+    "gpu_memory_used_after_generation_gib",
 ]
 
 FRONTIER_ROUND_DIAGNOSTIC_COLUMNS = [
@@ -1656,6 +1698,7 @@ def build_benchmark_row(
     reference_answer,
     frontier_diagnostics,
     device_transfer_time_total,
+    gpu_memory_stats,
 ):
     latency = args.latency["vLLM_A6000"]
     actual_draft_time = draft_time_total
@@ -1719,6 +1762,8 @@ def build_benchmark_row(
         "predicted_answer": predicted_answer,
         "reference_answer": reference_answer,
         "is_correct": predicted_answer is not None and predicted_answer == reference_answer,
+        "target_quantization": args.target_quantization,
+        **gpu_memory_stats,
     }
 
 def append_benchmark_rows(args, rows):
@@ -4124,9 +4169,12 @@ if not args.read_pickle:
     try:
         target_model = AutoModelForCausalLM.from_pretrained(
             args.target_model_name,
-            torch_dtype="auto",
-            device_map={"": args.target_device},
-            attn_implementation="sdpa"
+            **target_model_load_kwargs(args),
+        )
+        logging.info(
+            "Target quantization=%s; memory footprint=%.3f GiB",
+            args.target_quantization,
+            target_model.get_memory_footprint() / (1024 ** 3),
         )
     except Exception as e:
         msg = str(e).lower()
@@ -4304,6 +4352,11 @@ for problem_id, is_warmup in tqdm(
                 "num_target_tokens": num_target_tokens,
                 "stats_each_round": [],
             }
+
+            if orig_model_inputs["input_ids"].is_cuda:
+                torch.cuda.reset_peak_memory_stats(
+                    orig_model_inputs["input_ids"].device
+                )
 
             if orig_model_inputs["input_ids"].is_cuda:
                 torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
@@ -5166,6 +5219,27 @@ for problem_id, is_warmup in tqdm(
                 stats_each_round,
             )
 
+        gpu_memory_stats = {
+            "gpu_peak_allocated_gib": None,
+            "gpu_peak_reserved_gib": None,
+            "gpu_memory_used_after_generation_gib": None,
+        }
+        if not args.read_pickle and orig_model_inputs["input_ids"].is_cuda:
+            memory_device = orig_model_inputs["input_ids"].device
+            torch.cuda.synchronize(memory_device)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(memory_device)
+            gpu_memory_stats = {
+                "gpu_peak_allocated_gib": (
+                    torch.cuda.max_memory_allocated(memory_device) / (1024 ** 3)
+                ),
+                "gpu_peak_reserved_gib": (
+                    torch.cuda.max_memory_reserved(memory_device) / (1024 ** 3)
+                ),
+                "gpu_memory_used_after_generation_gib": (
+                    (total_bytes - free_bytes) / (1024 ** 3)
+                ),
+            }
+
         problem_benchmark_rows.append(build_benchmark_row(
             args,
             problem_id,
@@ -5183,6 +5257,7 @@ for problem_id, is_warmup in tqdm(
             reference_answer,
             summarize_frontier_diagnostics(stats_each_round),
             device_transfer_time_total,
+            gpu_memory_stats,
         ))
 
     baseline_row = next((row for row in problem_benchmark_rows if row["mode"] == "verifier_ar"), None)

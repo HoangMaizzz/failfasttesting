@@ -37,6 +37,11 @@ def parse_args():
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument(
+        "--target_quantization",
+        choices=("none", "int8", "int4"),
+        default="none",
+    )
+    parser.add_argument(
         "--target_model_name",
         default="Qwen/Qwen2.5-7B-Instruct",
     )
@@ -184,6 +189,8 @@ def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
         str(args.target_device),
         "--drafter_device",
         str(args.drafter_device),
+        "--target_quantization",
+        getattr(args, "target_quantization", "none"),
         "--drafter_threshold",
         str(args.drafter_threshold),
         "--lowconf_threshold",
@@ -233,6 +240,8 @@ def failfast_baseline_command(args):
         str(args.target_device),
         "--drafter_device",
         str(args.drafter_device),
+        "--target_quantization",
+        getattr(args, "target_quantization", "none"),
         "--target_model_name",
         args.target_model_name,
         "--dllm_dir",

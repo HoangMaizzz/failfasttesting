@@ -35,6 +35,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             lowconf_threshold=0.45,
             target_device=0,
             drafter_device=0,
+            target_quantization="none",
             adaptive_learning_rate=0.02,
             adaptive_mc_learning_rate=0.01,
             adaptive_mc_mix=0.5,
@@ -82,6 +83,15 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         command = command_for(args, "gsm8k", [6], Path("/tmp/out"))
         self.assertEqual(command[command.index("--target_device") + 1], "0")
         self.assertEqual(command[command.index("--drafter_device") + 1], "1")
+
+    def test_command_forwards_target_quantization(self):
+        args = self.args()
+        args.target_quantization = "int8"
+        command = command_for(args, "gsm8k", [6], Path("/tmp/out"))
+        self.assertEqual(
+            command[command.index("--target_quantization") + 1],
+            "int8",
+        )
 
     def test_policy_control_freezes_learning_and_has_distinct_method(self):
         args = self.args()
