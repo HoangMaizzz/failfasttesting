@@ -4477,6 +4477,25 @@ for problem_id, is_warmup in tqdm(
                                                                         )
                             prev_prefill_output = prefill_output
                             spec_len = actual_spec_len
+
+                        spec_len = len(draft_proposal)
+                        terminal_draft = any(
+                            token_id in {
+                                int(target_tokenizer.eos_token_id),
+                                151645,
+                            }
+                            for token_id in draft_proposal
+                        )
+                        if (
+                            args.adaptive_td
+                            and not terminal_draft
+                            and spec_len % args.small_block_size != 0
+                        ):
+                            raise RuntimeError(
+                                "adaptive proposal sent to verifier must contain "
+                                f"a whole logical frame of {args.small_block_size} "
+                                f"tokens; got {spec_len}"
+                            )
                             
                     if draft_type == "dllm":
                         if not args.quiet_generation:

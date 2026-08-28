@@ -1125,6 +1125,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             or getattr(args, "strict_greedy_local_oracle", False)
         ) if args is not None else False
         adaptive_controller = getattr(args, "adaptive_td_controller", None) if adaptive_enabled else None
+        if adaptive_enabled and is_drafter:
+            frame_size = int(small_block_size)
+            frame_values = {
+                "spec_len": spec_len,
+                "incr_len": incr_len,
+                "max_spec_len": max_spec_len,
+            }
+            for frame_name, frame_value in frame_values.items():
+                if frame_value is None or int(frame_value) % frame_size != 0:
+                    raise ValueError(
+                        f"adaptive logical-frame mode requires {frame_name} "
+                        f"to be a multiple of {frame_size}; got {frame_value}"
+                    )
         frontier_stats = {
             "enabled": bool(return_frontier_stats),
             "mode": frontier_mode,
@@ -2812,6 +2825,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             else:
                                 logger.debug(f"{Colors.GREEN}All draft tokens ({draft_token_start_idx}:{draft_token_end_idx}) unmasked. All are high-confidence, continue speculating.{Colors.RESET}")
                                 extension = min(incr_len, max_spec_len - spec_len)
+                                if adaptive_enabled and extension != small_block_size:
+                                    raise RuntimeError(
+                                        "adaptive logical-frame extension must add "
+                                        f"exactly {small_block_size} tokens; got {extension}"
+                                    )
                                 record_extension_event(
                                     "high_confidence_extend",
                                     extension,

@@ -14,7 +14,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "compact6_shared_value_explicit_advantage_active_block_v3"
+VERSION = "compact6_shared_value_explicit_advantage_logical_frame_v4"
 METHOD = "otrc_v2_2_compact_factual_no_bootstrap_shared_value_advantage"
 DATASETS = ("math", "gsm8k", "aime", "humaneval")
 VALUE_LEARNING_RATE = 0.015
@@ -153,7 +153,7 @@ def benchmark_command(args):
         "--incr_len",
         "8",
         "--max_spec_len",
-        "60",
+        "64",
         "--block_size",
         "32",
         "--small_block_size",

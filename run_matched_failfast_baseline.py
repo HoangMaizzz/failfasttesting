@@ -86,7 +86,7 @@ def command_for(args, dataset, output_dir):
         "--drafter_device", str(args.drafter_device),
         "--drafter_thresholds", str(args.drafter_threshold),
         "--sweep_lowconf_threshold", str(args.lowconf_threshold),
-        "--sweep_max_spec_len", "60",
+        "--sweep_max_spec_len", "64",
         "--sweep_incr_len", "8",
         "--seed", "42",
         "--quiet_generation",

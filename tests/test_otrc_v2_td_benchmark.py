@@ -26,7 +26,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             max_new_tokens=1024,
             spec_len=8,
             incr_len=8,
-            max_spec_len=60,
+            max_spec_len=64,
             block_size=32,
             small_block_size=8,
             target_model_name="Qwen/Qwen2.5-7B-Instruct",

@@ -45,6 +45,7 @@ class MatchedFailFastBaselineTests(unittest.TestCase):
         self.assertEqual(command[command.index("--sweep_lowconf_threshold") + 1], "0.5")
         self.assertEqual(command[command.index("--target_device") + 1], "0")
         self.assertEqual(command[command.index("--drafter_device") + 1], "1")
+        self.assertEqual(command[command.index("--sweep_max_spec_len") + 1], "64")
         self.assertNotIn("--adaptive-td", command)
 
 

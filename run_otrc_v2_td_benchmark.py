@@ -136,7 +136,7 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--spec_len", type=int, default=8)
     parser.add_argument("--incr_len", type=int, default=8)
-    parser.add_argument("--max_spec_len", type=int, default=60)
+    parser.add_argument("--max_spec_len", type=int, default=64)
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--small_block_size", type=int, default=8)
     parser.add_argument(
@@ -215,6 +215,8 @@ def validate_args(args):
         )
     if args.spec_len != 8 or args.incr_len != 8:
         raise ValueError("the matched benchmark requires --spec_len=8 and --incr_len=8")
+    if args.max_spec_len < args.spec_len or args.max_spec_len % 8:
+        raise ValueError("the matched benchmark requires --max_spec_len to be a multiple of 8")
     if (
         args.credit_assignment in FACTUAL_CREDIT_ASSIGNMENTS
         and args.feature_schema not in {

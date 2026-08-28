@@ -144,6 +144,7 @@ class SharedValueAdvantageTests(unittest.TestCase):
             joined,
         )
         self.assertIn("--policy_weight_ema_beta 0.0", joined)
+        self.assertIn("--max_spec_len 64", joined)
         self.assertIn("--resume", command)
 
     def test_runner_can_limit_the_matched_run_to_math_and_gsm8k(self):

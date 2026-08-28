@@ -65,6 +65,10 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         )
         self.assertIn('"logical_block_index"', source)
         self.assertIn('"physical_small_block_index"', source)
+        self.assertIn(
+            "adaptive logical-frame extension must add",
+            source,
+        )
 
 
 if __name__ == "__main__":
