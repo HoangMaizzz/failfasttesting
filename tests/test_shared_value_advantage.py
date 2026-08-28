@@ -12,6 +12,7 @@ from run_shared_value_advantage_benchmark import (
     DATASETS,
     VALUE_LEARNING_RATE,
     benchmark_command,
+    failfast_baseline_command,
     validate_args,
 )
 from run_otrc_v2_td_benchmark import method_name
@@ -47,6 +48,7 @@ class SharedValueAdvantageTests(unittest.TestCase):
             dllm_dir="/tmp/Fast_dLLM_v2_1.5B",
             output_dir="/tmp/shared_value_advantage",
             resume=True,
+            include_failfast_baseline=False,
             skip_archive=False,
             log_level="INFO",
         )
@@ -181,6 +183,30 @@ class SharedValueAdvantageTests(unittest.TestCase):
         command = benchmark_command(args)
         self.assertEqual(command[command.index("--target_device") + 1], "0")
         self.assertEqual(command[command.index("--drafter_device") + 1], "1")
+
+    def test_integrated_failfast_command_is_matched(self):
+        args = self.args()
+        args.datasets = ["math", "gsm8k"]
+        args.include_failfast_baseline = True
+        args.drafter_threshold = 0.30
+        args.lowconf_threshold = 0.50
+        command = failfast_baseline_command(args)
+        joined = " ".join(command)
+        self.assertIn("run_matched_failfast_baseline.py", command)
+        self.assertIn("--datasets math gsm8k", joined)
+        self.assertIn("--drafter_threshold 0.3", joined)
+        self.assertIn("--lowconf_threshold 0.5", joined)
+        self.assertIn("--target_device 0", joined)
+        self.assertIn("--drafter_device 0", joined)
+        self.assertIn("--skip_archive", command)
+        self.assertIn("--resume", command)
+
+    def test_integrated_baseline_rejects_unsupported_dataset(self):
+        args = self.args()
+        args.datasets = ["aime"]
+        args.include_failfast_baseline = True
+        with self.assertRaisesRegex(ValueError, "math and gsm8k"):
+            validate_args(args)
 
     def test_runner_rejects_invalid_confidence_thresholds(self):
         args = self.args()
