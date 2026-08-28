@@ -6,6 +6,19 @@ from run_matched_failfast_baseline import command_for, validate_args
 
 
 class MatchedFailFastBaselineTests(unittest.TestCase):
+    def test_transfer_metrics_are_part_of_benchmark_csv_schema(self):
+        expected = {
+            "device_transfer_time",
+            "device_transfer_ms_per_output_token",
+            "actual_e2e_time_excluding_transfer",
+            "e2e_ms_per_output_token_excluding_transfer",
+        }
+        source = (Path(__file__).resolve().parents[1] / "failfast.py").read_text(
+            encoding="utf-8"
+        )
+        schema = source.split("BENCHMARK_CSV_COLUMNS = [", 1)[1].split("]", 1)[0]
+        self.assertTrue(all(f'"{field}"' in schema for field in expected))
+
     def args(self):
         return Namespace(
             datasets=["math", "gsm8k"],
