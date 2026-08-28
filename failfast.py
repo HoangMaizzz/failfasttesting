@@ -606,6 +606,11 @@ parser.add_argument(
     choices=["legacy", "symmetric"],
     default="legacy",
 )
+parser.add_argument(
+    "--adaptive-policy-ablation",
+    choices=["learned", "frozen_stop", "random_stop"],
+    default="learned",
+)
 parser.add_argument("--adaptive-min-action-probability", type=float, default=0.10)
 parser.add_argument("--adaptive-max-importance-weight", type=float, default=5.0)
 parser.add_argument("--adaptive-use-step-feature", action="store_true")
@@ -832,6 +837,7 @@ def build_adaptive_controller(args):
             profile_overhead=args.adaptive_profile_overhead,
             seed=args.seed,
             policy_mode=args.adaptive_policy_mode,
+            policy_ablation=args.adaptive_policy_ablation,
             min_action_probability=args.adaptive_min_action_probability,
             max_importance_weight=args.adaptive_max_importance_weight,
             full_stream_bootstrap=True,

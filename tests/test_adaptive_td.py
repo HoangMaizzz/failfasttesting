@@ -518,6 +518,42 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertTrue(all(item.selected_action_probability == 1.0 for item in decisions))
         self.assertTrue(all(not item.exploration_used for item in decisions))
 
+    def test_frozen_stop_control_always_stops_when_available(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(policy_ablation="frozen_stop")
+        )
+        decision = controller.choose(
+            synthetic_features(1, 3),
+            allow_stop=True,
+            refinement_step=1,
+            allow_exploration=False,
+        )
+        self.assertEqual(decision.action, STOP)
+        self.assertEqual(decision.reason, "frozen_stop_control")
+
+    def test_random_stop_control_is_seeded_half_probability(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(policy_ablation="random_stop", seed=31)
+        )
+        decisions = [
+            controller.choose(
+                synthetic_features(1, 3),
+                allow_stop=True,
+                refinement_step=1,
+                allow_exploration=False,
+            )
+            for _ in range(1000)
+        ]
+        stop_rate = sum(item.action == STOP for item in decisions) / len(decisions)
+        self.assertGreater(stop_rate, 0.45)
+        self.assertLess(stop_rate, 0.55)
+        self.assertTrue(
+            all(item.reason == "random_stop_control" for item in decisions)
+        )
+        self.assertTrue(
+            all(item.selected_action_probability == 0.5 for item in decisions)
+        )
+
     def test_symmetric_policy_mirrors_stop_and_continue_values(self):
         features = synthetic_features(1, 3)
         first = OnlineTDRefinementController(

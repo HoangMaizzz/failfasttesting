@@ -13,6 +13,7 @@ from run_shared_value_advantage_benchmark import (
     VALUE_LEARNING_RATE,
     benchmark_command,
     failfast_baseline_command,
+    policy_control_command,
     validate_args,
 )
 from run_otrc_v2_td_benchmark import method_name
@@ -49,6 +50,7 @@ class SharedValueAdvantageTests(unittest.TestCase):
             output_dir="/tmp/shared_value_advantage",
             resume=True,
             include_failfast_baseline=False,
+            include_policy_controls=False,
             skip_archive=False,
             log_level="INFO",
         )
@@ -207,6 +209,21 @@ class SharedValueAdvantageTests(unittest.TestCase):
         args.include_failfast_baseline = True
         with self.assertRaisesRegex(ValueError, "math and gsm8k"):
             validate_args(args)
+
+    def test_policy_controls_are_frozen_and_use_distinct_outputs(self):
+        args = self.args()
+        args.datasets = ["math", "gsm8k"]
+        for control in ("frozen_stop", "random_stop"):
+            command = policy_control_command(args, control)
+            joined = " ".join(command)
+            self.assertIn(f"--policy_ablation {control}", joined)
+            control_output = command[command.index("--output_dir") + 1]
+            self.assertIn("policy_controls", control_output)
+            self.assertTrue(control_output.endswith(control))
+
+    def test_unknown_policy_control_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown policy control"):
+            policy_control_command(self.args(), "unknown")
 
     def test_runner_rejects_invalid_confidence_thresholds(self):
         args = self.args()

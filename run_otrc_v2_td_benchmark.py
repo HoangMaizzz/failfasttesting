@@ -192,6 +192,11 @@ def parse_args():
     parser.add_argument("--adaptive_min_action_probability", type=float, default=0.10)
     parser.add_argument("--adaptive_max_importance_weight", type=float, default=5.0)
     parser.add_argument("--adaptive_weight_snapshot_interval", type=int, default=100)
+    parser.add_argument(
+        "--policy_ablation",
+        choices=("learned", "frozen_stop", "random_stop"),
+        default="learned",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--output_dir",
@@ -287,6 +292,9 @@ def method_name(args):
             "shared_value_advantage"
         ):
             base = f"{base}_shared_value_advantage"
+        policy_ablation = getattr(args, "policy_ablation", "learned")
+        if policy_ablation != "learned":
+            base = f"{base}_{policy_ablation}"
         return base
     if args.credit_assignment == "verifier_boundary_factual":
         return (
@@ -315,7 +323,7 @@ def run_streaming(command):
 
 
 def command_for(args, dataset, problem_ids, output_dir):
-    return [
+    command = [
         sys.executable,
         "-u",
         "failfast.py",
@@ -373,6 +381,8 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-early-stop-min-observations",
         str(args.adaptive_early_stop_min_observations),
         "--adaptive-policy-mode", "symmetric",
+        "--adaptive-policy-ablation",
+        str(getattr(args, "policy_ablation", "learned")),
         "--adaptive-min-action-probability",
         str(args.adaptive_min_action_probability),
         "--adaptive-max-importance-weight",
@@ -391,6 +401,13 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--output_dir", str(output_dir),
         "--log_level", args.log_level,
     ]
+    return _append_policy_control_flags(command, args)
+
+
+def _append_policy_control_flags(command, args):
+    if getattr(args, "policy_ablation", "learned") != "learned":
+        command.append("--adaptive-freeze")
+    return command
 
 
 def phase_complete(
@@ -402,6 +419,7 @@ def phase_complete(
     policy_weight_ema_beta,
     policy_weight_ema_mode,
     value_parameterization,
+    policy_ablation,
 ):
     required = [
         directory / "benchmark_results.csv",
@@ -432,6 +450,7 @@ def phase_complete(
         )
         and state.get("value_parameterization", "independent_q")
         == value_parameterization
+        and state.get("policy_ablation", "learned") == policy_ablation
     )
 
 
@@ -447,6 +466,7 @@ def run_dataset(args, dataset, problem_ids):
         args.policy_weight_ema_beta,
         args.policy_weight_ema_mode,
         getattr(args, "value_parameterization", "independent_q"),
+        getattr(args, "policy_ablation", "learned"),
     ):
         print(f"RESUME {dataset} {method}", flush=True)
         return output_dir

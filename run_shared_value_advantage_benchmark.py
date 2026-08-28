@@ -57,6 +57,11 @@ def parse_args():
         action="store_true",
         help="Run the matched original FailFast baseline and build paired reports.",
     )
+    parser.add_argument(
+        "--include_policy_controls",
+        action="store_true",
+        help="Run frozen-STOP and seeded random-STOP controls.",
+    )
     parser.add_argument("--skip_archive", action="store_true")
     parser.add_argument(
         "--log_level",
@@ -92,7 +97,7 @@ def validate_args(args):
         )
 
 
-def benchmark_command(args):
+def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
     command = [
         sys.executable,
         "-u",
@@ -155,6 +160,8 @@ def benchmark_command(args):
         "5.0",
         "--adaptive_weight_snapshot_interval",
         "100",
+        "--policy_ablation",
+        policy_ablation,
         "--warmup_questions",
         str(args.warmup_questions),
         "--max_new_tokens",
@@ -184,13 +191,24 @@ def benchmark_command(args):
         "--seed",
         "42",
         "--output_dir",
-        args.output_dir,
+        str(output_dir or args.output_dir),
         "--log_level",
         args.log_level,
     ]
     if args.resume:
         command.append("--resume")
     return command
+
+
+def policy_control_command(args, policy_ablation):
+    if policy_ablation not in {"frozen_stop", "random_stop"}:
+        raise ValueError(f"unknown policy control: {policy_ablation}")
+    output_dir = Path(args.output_dir) / "policy_controls" / policy_ablation
+    return benchmark_command(
+        args,
+        policy_ablation=policy_ablation,
+        output_dir=output_dir,
+    )
 
 
 def failfast_baseline_command(args):
@@ -583,6 +601,203 @@ def build_integrated_comparison(args, shared_summary):
     return comparison, paired
 
 
+def build_policy_control_comparison(args, shared_summary):
+    output_dir = Path(args.output_dir)
+    comparison = _prefixed_summary(shared_summary, "shared_va")
+    paired_frames = []
+    control_methods = {
+        "frozen_stop": f"{METHOD}_frozen_stop",
+        "random_stop": f"{METHOD}_random_stop",
+    }
+
+    for control, method in control_methods.items():
+        control_dir = output_dir / "policy_controls" / control
+        control_summary = pd.read_csv(control_dir / "dataset_method_summary.csv")
+        comparison = comparison.merge(
+            _prefixed_summary(control_summary, control),
+            on="dataset",
+            how="inner",
+            validate="one_to_one",
+        )
+
+    for control in control_methods:
+        comparison[f"shared_va_speedup_vs_{control}"] = (
+            comparison[f"{control}_ms_per_output_token"]
+            / comparison["shared_va_ms_per_output_token"]
+        )
+
+    for dataset in args.datasets:
+        shared_path = output_dir / "raw" / dataset / METHOD / "benchmark_results.csv"
+        shared = pd.read_csv(shared_path)
+        columns = [
+            "problem_id",
+            "actual_algorithm_time",
+            "actual_draft_time",
+            "actual_verify_time",
+            "actual_post_verify_time",
+            "output_tokens",
+            "accepted_tokens",
+            "drafted_tokens",
+            "num_speculation_rounds",
+            "total_num_forward_passes",
+            "acceptance_rate_percent",
+            "adaptive_decisions",
+            "adaptive_stop_actions",
+            "is_correct",
+            "output_token_hash",
+        ]
+        missing = set(columns).difference(shared.columns)
+        if missing:
+            raise ValueError(
+                f"{dataset} shared_va results are missing: {sorted(missing)}"
+            )
+        paired = shared[columns].rename(
+            columns={
+                column: f"shared_va_{column}"
+                for column in columns
+                if column != "problem_id"
+            }
+        )
+        for control, method in control_methods.items():
+            path = (
+                output_dir
+                / "policy_controls"
+                / control
+                / "raw"
+                / dataset
+                / method
+                / "benchmark_results.csv"
+            )
+            frame = pd.read_csv(path)
+            missing = set(columns).difference(frame.columns)
+            if missing:
+                raise ValueError(
+                    f"{dataset} {control} results are missing: {sorted(missing)}"
+                )
+            paired = paired.merge(
+                frame[columns].rename(
+                    columns={
+                        column: f"{control}_{column}"
+                        for column in columns
+                        if column != "problem_id"
+                    }
+                ),
+                on="problem_id",
+                how="inner",
+                validate="one_to_one",
+            )
+        expected_ids = set(PROBLEM_IDS[dataset][: args.num_questions])
+        if set(paired.problem_id) != expected_ids:
+            raise RuntimeError(
+                f"{dataset} policy-control report has mismatched problem ids"
+            )
+        paired.insert(0, "dataset", dataset)
+        for prefix in ("shared_va", *control_methods):
+            paired[f"{prefix}_ms_per_output_token"] = (
+                1000.0
+                * paired[f"{prefix}_actual_algorithm_time"]
+                / paired[f"{prefix}_output_tokens"].clip(lower=1)
+            )
+        for control in control_methods:
+            paired[f"shared_va_speedup_vs_{control}"] = (
+                paired[f"{control}_ms_per_output_token"]
+                / paired["shared_va_ms_per_output_token"]
+            )
+            paired[f"shared_va_faster_than_{control}"] = (
+                paired["shared_va_ms_per_output_token"]
+                < paired[f"{control}_ms_per_output_token"]
+            )
+            paired[f"shared_va_output_matches_{control}"] = (
+                paired["shared_va_output_token_hash"].astype(str)
+                == paired[f"{control}_output_token_hash"].astype(str)
+            )
+        paired_frames.append(paired)
+
+    paired = pd.concat(paired_frames, ignore_index=True)
+    statistics = []
+    for dataset, frame in paired.groupby("dataset"):
+        row = {"dataset": dataset, "paired_questions": len(frame)}
+        for control in control_methods:
+            speedups = frame[f"shared_va_speedup_vs_{control}"]
+            row[f"shared_va_win_rate_vs_{control}_percent"] = 100.0 * float(
+                frame[f"shared_va_faster_than_{control}"].mean()
+            )
+            row[f"shared_va_speedup_vs_{control}_geomean"] = float(
+                math.exp(speedups.map(math.log).mean())
+            )
+            row[f"output_match_vs_{control}_percent"] = 100.0 * float(
+                frame[f"shared_va_output_matches_{control}"].mean()
+            )
+        statistics.append(row)
+    comparison = comparison.merge(
+        pd.DataFrame(statistics),
+        on="dataset",
+        how="left",
+        validate="one_to_one",
+    )
+    comparison.to_csv(
+        output_dir / "shared_va_vs_policy_controls_dataset_comparison.csv",
+        index=False,
+    )
+    paired.to_csv(
+        output_dir / "shared_va_vs_policy_controls_paired_comparison.csv",
+        index=False,
+    )
+    return comparison, paired
+
+
+def build_all_method_summary(args, shared_summary):
+    output_dir = Path(args.output_dir)
+    frames = []
+
+    def add(frame, label):
+        item = frame.copy()
+        item["method"] = label
+        frames.append(item)
+
+    add(shared_summary, "shared_va_learned")
+    if args.include_failfast_baseline:
+        add(
+            pd.read_csv(
+                output_dir
+                / "matched_failfast_baseline"
+                / "dataset_method_summary.csv"
+            ),
+            "failfast_original",
+        )
+    if args.include_policy_controls:
+        for control in ("frozen_stop", "random_stop"):
+            add(
+                pd.read_csv(
+                    output_dir
+                    / "policy_controls"
+                    / control
+                    / "dataset_method_summary.csv"
+                ),
+                control,
+            )
+
+    summary = pd.concat(frames, ignore_index=True)
+    learned_latency = shared_summary[["dataset", "ms_per_output_token"]].rename(
+        columns={"ms_per_output_token": "shared_va_ms_per_output_token"}
+    )
+    summary = summary.merge(
+        learned_latency,
+        on="dataset",
+        how="left",
+        validate="many_to_one",
+    )
+    summary["shared_va_speedup_vs_method"] = (
+        summary["ms_per_output_token"]
+        / summary["shared_va_ms_per_output_token"]
+    )
+    summary.to_csv(
+        output_dir / "all_methods_dataset_summary.csv",
+        index=False,
+    )
+    return summary
+
+
 def main():
     args = parse_args()
     validate_args(args)
@@ -590,11 +805,23 @@ def main():
     run_streaming(benchmark_command(args))
     summary, dynamics, pooled = validate_and_report(args)
 
+    control_comparison = pd.DataFrame()
+    control_paired = pd.DataFrame()
+    if args.include_policy_controls:
+        for policy_ablation in ("frozen_stop", "random_stop"):
+            run_streaming(policy_control_command(args, policy_ablation))
+        control_comparison, control_paired = build_policy_control_comparison(
+            args,
+            summary,
+        )
+
     comparison = pd.DataFrame()
     paired = pd.DataFrame()
     if args.include_failfast_baseline:
         run_streaming(failfast_baseline_command(args))
         comparison, paired = build_integrated_comparison(args, summary)
+
+    all_method_summary = build_all_method_summary(args, summary)
 
     output_dir = Path(args.output_dir)
     wrapper_manifest = {
@@ -618,6 +845,7 @@ def main():
         ).strip(),
         "arguments": vars(args),
         "includes_matched_failfast_baseline": args.include_failfast_baseline,
+        "includes_policy_controls": args.include_policy_controls,
         "elapsed_hours": (time.time() - started) / 3600.0,
     }
     (output_dir / "shared_value_advantage_manifest.json").write_text(
@@ -648,6 +876,12 @@ def main():
             f"{len(paired)}; output match: {100.0 * paired.output_match.mean():.2f}%",
             flush=True,
         )
+    if not control_comparison.empty:
+        print("\nSHARED V+A VS FROZEN/RANDOM STOP CONTROLS", flush=True)
+        print(control_comparison.to_string(index=False), flush=True)
+        print(f"\nPolicy-control paired rows: {len(control_paired)}", flush=True)
+    print("\nALL METHODS DATASET SUMMARY", flush=True)
+    print(all_method_summary.to_string(index=False), flush=True)
     print(f"\nSaved: {output_dir}", flush=True)
     if archive_path:
         print(f"Archive: {archive_path}", flush=True)

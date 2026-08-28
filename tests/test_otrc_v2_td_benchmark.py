@@ -83,6 +83,20 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertEqual(command[command.index("--target_device") + 1], "0")
         self.assertEqual(command[command.index("--drafter_device") + 1], "1")
 
+    def test_policy_control_freezes_learning_and_has_distinct_method(self):
+        args = self.args()
+        args.credit_assignment = "verifier_boundary_factual_no_bootstrap"
+        args.feature_schema = "otrc_v2_2_compact_td"
+        args.value_parameterization = "shared_value_advantage"
+        args.policy_ablation = "random_stop"
+        command = command_for(args, "gsm8k", [6], Path("/tmp/out"))
+        self.assertIn("--adaptive-freeze", command)
+        self.assertIn(
+            "--adaptive-policy-ablation random_stop",
+            " ".join(command),
+        )
+        self.assertTrue(method_name(args).endswith("_random_stop"))
+
     def test_command_enables_factual_boundary_credit(self):
         args = self.args()
         args.credit_assignment = "verifier_boundary_factual"

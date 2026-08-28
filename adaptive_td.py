@@ -152,6 +152,7 @@ class AdaptiveTDConfig:
     seed: int = 42
     td_error_clip: float = 32.0
     policy_mode: str = "legacy"
+    policy_ablation: str = "learned"
     min_action_probability: float = 0.10
     max_importance_weight: float = 5.0
     full_stream_bootstrap: bool = False
@@ -215,6 +216,14 @@ class AdaptiveTDConfig:
             raise ValueError("td_error_clip must be positive")
         if self.policy_mode not in {"legacy", "symmetric"}:
             raise ValueError("policy_mode must be legacy or symmetric")
+        if self.policy_ablation not in {
+            "learned",
+            "frozen_stop",
+            "random_stop",
+        }:
+            raise ValueError(
+                "policy_ablation must be learned, frozen_stop, or random_stop"
+            )
         if not 0.0 < self.min_action_probability <= 0.5:
             raise ValueError("min_action_probability must be in (0, 0.5]")
         if self.max_importance_weight < 1.0:
@@ -952,6 +961,16 @@ class OnlineTDRefinementController:
             action, reason = CONTINUE, "provisional_proposal_unavailable"
         elif not finite_estimates:
             action, reason = STOP, "invalid_numeric_state"
+        elif self.config.policy_ablation == "frozen_stop":
+            action, reason = STOP, "frozen_stop_control"
+        elif self.config.policy_ablation == "random_stop":
+            symmetric_sampling_used = True
+            behavior_stop_probability = 0.5
+            selected_action_probability = 0.5
+            if self.rng.random() < 0.5:
+                action, reason = STOP, "random_stop_control"
+            else:
+                action, reason = CONTINUE, "random_stop_control"
         elif self.config.force_continue:
             action, reason = CONTINUE, "force_continue"
         elif self.config.fixed_refinement_steps is not None:
@@ -1756,6 +1775,7 @@ class OnlineTDRefinementController:
             "stop_probability_threshold": self.config.stop_probability_threshold,
             "stop_z_threshold": self.stop_z_threshold,
             "policy_mode": self.config.policy_mode,
+            "policy_ablation": self.config.policy_ablation,
             "credit_assignment": self.config.credit_assignment,
             "value_parameterization": self.config.value_parameterization,
             "shared_value_learning_rate": (
@@ -1868,6 +1888,7 @@ class OnlineTDRefinementController:
             "value_parameterization",
             "independent_q",
         )
+        snapshot_policy_ablation = snapshot.get("policy_ablation", "learned")
         snapshot_shared_value_rate = float(
             snapshot.get(
                 "shared_value_learning_rate",
@@ -1896,6 +1917,7 @@ class OnlineTDRefinementController:
             or snapshot_credit_assignment != self.config.credit_assignment
             or snapshot_value_parameterization
             != self.config.value_parameterization
+            or snapshot_policy_ablation != self.config.policy_ablation
             or not math.isclose(
                 snapshot_shared_value_rate,
                 self.config.shared_value_learning_rate,
@@ -1930,6 +1952,8 @@ class OnlineTDRefinementController:
                 f"{snapshot_value_parameterization}, "
                 f"controller_value_parameterization="
                 f"{self.config.value_parameterization}, "
+                f"snapshot_policy_ablation={snapshot_policy_ablation}, "
+                f"controller_policy_ablation={self.config.policy_ablation}, "
                 f"snapshot_rho_warmup={snapshot_rho_warmup}, "
                 f"controller_rho_warmup={self.config.rho_warmup_boundaries}, "
                 f"snapshot_policy_ema_beta={snapshot_policy_ema_beta}, "
