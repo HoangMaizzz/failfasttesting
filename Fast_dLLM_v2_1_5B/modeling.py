@@ -1600,6 +1600,18 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             )
                             and lowconf_threshold is not None
                             and draft_token_end_idx <= x_t.shape[1]
+                            and (
+                                x_t.shape[1]
+                                - block_size
+                                + small_block_start_idx
+                                < draft_token_end_idx
+                            )
+                            and (
+                                x_t.shape[1]
+                                - block_size
+                                + small_block_end_idx
+                                > draft_token_start_idx
+                            )
                         )
                         if not collect_step_stats:
                             conf_of_unmasked_tokens.extend(
@@ -1952,14 +1964,22 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     small_block_size,
                                 )
                                 if logical_span is None:
-                                    raise RuntimeError(
-                                        "adaptive decision has no logical proposal span"
+                                    logical_block_idx = -1
+                                    active_absolute_start = max(
+                                        draft_token_start_idx,
+                                        min(
+                                            draft_end_idx,
+                                            block_abs_start
+                                            + small_block_start_idx,
+                                        ),
                                     )
-                                (
-                                    logical_block_idx,
-                                    active_absolute_start,
-                                    active_absolute_end,
-                                ) = logical_span
+                                    active_absolute_end = active_absolute_start
+                                else:
+                                    (
+                                        logical_block_idx,
+                                        active_absolute_start,
+                                        active_absolute_end,
+                                    ) = logical_span
                                 active_span_length = max(
                                     1,
                                     active_absolute_end - active_absolute_start,

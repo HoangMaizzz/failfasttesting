@@ -20,6 +20,11 @@ class ActiveBlockRefinementTests(unittest.TestCase):
             (1, 126, 134),
         )
 
+    def test_physical_padding_outside_the_proposal_has_no_logical_span(self):
+        self.assertIsNone(
+            logical_refinement_span(118, 126, 128, 136, 8)
+        )
+
     def test_future_small_block_masks_are_not_refinement_candidates(self):
         proposal_positions = tuple(range(118, 126))
         active = active_refinement_positions(
@@ -52,6 +57,12 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         )
         self.assertIn('"unprocessed_future_masks"', source)
         self.assertIn("logical_refinement_span(", source)
+        self.assertIn("if logical_span is None:", source)
+        self.assertIn(
+            "+ small_block_start_idx\n"
+            "                                < draft_token_end_idx",
+            source,
+        )
         self.assertIn('"logical_block_index"', source)
         self.assertIn('"physical_small_block_index"', source)
 
