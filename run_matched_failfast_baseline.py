@@ -131,6 +131,8 @@ def main():
         results_path = phase_dir / "benchmark_results.csv"
         selected_ids[dataset] = PROBLEM_IDS[dataset][: args.num_questions]
         if not (args.resume and results_path.exists()):
+            if phase_dir.exists():
+                shutil.rmtree(phase_dir)
             print(f"\nRUN {dataset.upper()} | FailFast | questions={args.num_questions}", flush=True)
             run_streaming(command_for(args, dataset, phase_dir))
         results = pd.read_csv(results_path)
