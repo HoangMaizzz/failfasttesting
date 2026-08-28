@@ -65,6 +65,26 @@ def aggregate_method(results, method):
         "draft_time_s": float(results["actual_draft_time"].sum()),
         "verify_time_s": float(results["actual_verify_time"].sum()),
         "post_verify_time_s": float(results["actual_post_verify_time"].sum()),
+        "device_transfer_time_s": float(
+            pd.to_numeric(
+                results.get(
+                    "device_transfer_time",
+                    pd.Series(0.0, index=results.index),
+                ),
+                errors="coerce",
+            ).fillna(0.0).sum()
+        ),
+        "e2e_ms_per_output_token_excluding_transfer": 1000.0
+        * float(
+            pd.to_numeric(
+                results.get(
+                    "actual_e2e_time_excluding_transfer",
+                    pd.Series(0.0, index=results.index),
+                ),
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+        / max(1.0, output_tokens),
         "draft_passes": int(results["total_num_forward_passes"].sum()),
         "verifier_rounds": int(results["num_speculation_rounds"].sum()),
         "draft_passes_per_100_tokens": 100.0
@@ -129,6 +149,8 @@ def parse_args():
     )
     parser.add_argument("--drafter_threshold", type=float, default=0.05)
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
+    parser.add_argument("--target_device", type=int, default=0)
+    parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument("--adaptive_learning_rate", type=float, default=0.02)
     parser.add_argument(
         "--value_parameterization",
@@ -308,6 +330,8 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--small_block_size", str(args.small_block_size),
         "--target_model_name", args.target_model_name,
         "--dllm_dir", args.dllm_dir,
+        "--target_device", str(args.target_device),
+        "--drafter_device", str(args.drafter_device),
         "--drafter_thresholds", str(args.drafter_threshold),
         "--sweep_lowconf_threshold", str(args.lowconf_threshold),
         "--sweep_max_spec_len", str(args.max_spec_len),

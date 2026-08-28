@@ -33,6 +33,8 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             dllm_dir="/tmp/Fast_dLLM_v2_1.5B",
             drafter_threshold=0.05,
             lowconf_threshold=0.45,
+            target_device=0,
+            drafter_device=0,
             adaptive_learning_rate=0.02,
             adaptive_mc_learning_rate=0.01,
             adaptive_mc_mix=0.5,
@@ -71,6 +73,14 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
         self.assertNotIn("strict_greedy", joined)
         self.assertNotIn("causal_oracle", joined)
         self.assertNotIn("verifier_ar", joined)
+
+    def test_command_forwards_split_gpu_devices(self):
+        args = self.args()
+        args.target_device = 0
+        args.drafter_device = 1
+        command = command_for(args, "gsm8k", [6], Path("/tmp/out"))
+        self.assertEqual(command[command.index("--target_device") + 1], "0")
+        self.assertEqual(command[command.index("--drafter_device") + 1], "1")
 
     def test_command_enables_factual_boundary_credit(self):
         args = self.args()

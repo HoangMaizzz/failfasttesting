@@ -20,6 +20,51 @@ from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
+def _synchronize_device(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _record_transfer(args, elapsed):
+    args.device_transfer_time_total = (
+        getattr(args, "device_transfer_time_total", 0.0) + elapsed
+    )
+
+
+def timed_device_copy(tensor, device, args):
+    device = torch.device(device)
+    if tensor.device == device:
+        return tensor
+    _synchronize_device(tensor.device)
+    started = time.perf_counter()
+    copied = tensor.to(device)
+    _synchronize_device(device)
+    _record_transfer(args, time.perf_counter() - started)
+    return copied
+
+
+def timed_tensor_to_list(tensor, args):
+    if args.target_device == args.drafter_device:
+        return tensor.tolist()
+    _synchronize_device(tensor.device)
+    started = time.perf_counter()
+    values = tensor.tolist()
+    _record_transfer(args, time.perf_counter() - started)
+    return values
+
+
+def timed_token_tensor(values, device, args):
+    if args.target_device == args.drafter_device:
+        return torch.tensor([values], device=device, dtype=torch.long)
+    _synchronize_device(device)
+    started = time.perf_counter()
+    tensor = torch.tensor([values], device=device, dtype=torch.long)
+    _synchronize_device(device)
+    _record_transfer(args, time.perf_counter() - started)
+    return tensor
+
 from adaptive_td import (
     FEATURE_NAMES,
     FEATURE_SCHEMAS,
@@ -218,12 +263,14 @@ def get_next_tokens_ar(
 
 def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_len, output_seqlen, small_block_size, threshold, is_drafter, prev_prefill_output=None):
     num_tokens_in_prompt = orig_model_inputs['input_ids'].shape[1]
-    new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
+    prompt_ids = timed_device_copy(orig_model_inputs['input_ids'], dllm.device, args)
+    prompt_mask = timed_device_copy(orig_model_inputs['attention_mask'], dllm.device, args)
+    new_tokens = torch.tensor(token_ids_so_far, device=dllm.device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
 
     new_model_inputs = {
-        'input_ids': torch.cat([orig_model_inputs['input_ids'], new_tokens], dim=1),
-        'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
+        'input_ids': torch.cat([prompt_ids, new_tokens], dim=1),
+        'attention_mask': torch.cat([prompt_mask, new_mask], dim=1)
     }
     return_frontier_stats = False
     frontier_stats = None
@@ -275,7 +322,7 @@ def get_next_n_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec
     full_output_seqlen = generated_ids.shape[1]
     assert full_output_seqlen > num_tokens_in_prompt + len(token_ids_so_far), f"full_output_seqlen {full_output_seqlen}, num_tokens_in_prompt {num_tokens_in_prompt}, len(token_ids_so_far) {len(token_ids_so_far)}"
     generated_ids = generated_ids[0][len(new_model_inputs["input_ids"][0]):]
-    generated_ids = generated_ids.tolist()[:spec_len]
+    generated_ids = timed_tensor_to_list(generated_ids, args)[:spec_len]
     
     if any(x in generated_ids for x in [151665, 151645]):
         special_token = "MASK" if 151665 in generated_ids else "STOP"
@@ -295,12 +342,14 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
     if controller_enabled:
         ensure_frontier_runtime_state(args)
     num_tokens_in_prompt = orig_model_inputs['input_ids'].shape[1]
-    new_tokens = torch.tensor(token_ids_so_far, device=orig_model_inputs['input_ids'].device, dtype=torch.long).unsqueeze(0)
+    prompt_ids = timed_device_copy(orig_model_inputs['input_ids'], dllm.device, args)
+    prompt_mask = timed_device_copy(orig_model_inputs['attention_mask'], dllm.device, args)
+    new_tokens = torch.tensor(token_ids_so_far, device=dllm.device, dtype=torch.long).unsqueeze(0)
     new_mask = torch.ones_like(new_tokens, dtype=torch.long)
 
     new_model_inputs = {
-        'input_ids': torch.cat([orig_model_inputs['input_ids'], new_tokens], dim=1),
-        'attention_mask': torch.cat([orig_model_inputs['attention_mask'], new_mask], dim=1)
+        'input_ids': torch.cat([prompt_ids, new_tokens], dim=1),
+        'attention_mask': torch.cat([prompt_mask, new_mask], dim=1)
     }
     if controller_enabled:
         args.bucket_current_context_len = int(new_model_inputs['input_ids'].shape[1])
@@ -365,7 +414,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
     full_output_seqlen = generated_ids.shape[1]
     assert full_output_seqlen > num_tokens_in_prompt + len(token_ids_so_far), f"full_output_seqlen {full_output_seqlen}, num_tokens_in_prompt {num_tokens_in_prompt}, len(token_ids_so_far) {len(token_ids_so_far)}"
     generated_ids = generated_ids[0][len(new_model_inputs["input_ids"][0]):]
-    generated_ids = generated_ids.tolist()[:actual_spec_len]
+    generated_ids = timed_tensor_to_list(generated_ids, args)[:actual_spec_len]
     
     if any(x in generated_ids for x in [151665, 151645]):
         special_token = "MASK" if 151665 in generated_ids else "STOP"
@@ -413,6 +462,8 @@ parser.add_argument("--target_model_name", type=str, default=None)
 parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
 parser.add_argument("--dllm_dir", type=str, default=None)
+parser.add_argument("--target_device", type=int, default=0)
+parser.add_argument("--drafter_device", type=int, default=0)
 parser.add_argument("--num_questions", type=int, default=1)
 parser.add_argument("--problem_ids", type=int, nargs="+")
 parser.add_argument("--warmup_questions", type=int, default=0)
@@ -610,6 +661,15 @@ parser.add_argument('--reuse_drafts', action='store_true')
 parser.add_argument('--disable_reusing_drafter_kvs', action='store_true')
 parser.add_argument('--read_pickle', action='store_true')
 args, _ = parser.parse_known_args()
+if args.target_device < 0 or args.drafter_device < 0:
+    raise ValueError("CUDA device indices must be non-negative")
+if torch.cuda.is_available():
+    required_devices = max(args.target_device, args.drafter_device) + 1
+    if torch.cuda.device_count() < required_devices:
+        raise ValueError(
+            f"requested CUDA device index requires {required_devices} GPUs, "
+            f"but only {torch.cuda.device_count()} are visible"
+        )
 
 if args.target_model_name is None:
     args.target_model_name = args.verifier_model_name
@@ -1585,6 +1645,7 @@ def build_benchmark_row(
     predicted_answer,
     reference_answer,
     frontier_diagnostics,
+    device_transfer_time_total,
 ):
     latency = args.latency["vLLM_A6000"]
     actual_draft_time = draft_time_total
@@ -1598,6 +1659,10 @@ def build_benchmark_row(
     modeled_ms_per_output_token = safe_div(theo_total_time, output_tokens)
     actual_e2e_ms_per_output_token = safe_div(actual_e2e_time * 1000.0, output_tokens)
     actual_unattributed_core_time = max(0.0, actual_e2e_time - actual_algorithm_time)
+    e2e_time_excluding_transfer = max(
+        0.0,
+        actual_e2e_time - device_transfer_time_total,
+    )
     return {
         "problem_id": problem_id,
         "mode": mode,
@@ -1618,6 +1683,18 @@ def build_benchmark_row(
         "output_tokens_per_ms": safe_div(output_tokens, actual_e2e_time * 1000.0),
         "actual_post_verify_time": post_verify_time_total,
         "actual_algorithm_time": actual_algorithm_time,
+        "device_transfer_time": device_transfer_time_total,
+        "device_transfer_ms_per_output_token": safe_div(
+            device_transfer_time_total * 1000.0,
+            output_tokens,
+        ),
+        "actual_e2e_time_excluding_transfer": (
+            e2e_time_excluding_transfer
+        ),
+        "e2e_ms_per_output_token_excluding_transfer": safe_div(
+            e2e_time_excluding_transfer * 1000.0,
+            output_tokens,
+        ),
         "actual_algorithm_ms_per_output_token": safe_div(actual_algorithm_time * 1000.0, output_tokens),
         "actual_unattributed_core_time": actual_unattributed_core_time,
         "output_tokens": output_tokens,
@@ -4038,7 +4115,7 @@ if not args.read_pickle:
         target_model = AutoModelForCausalLM.from_pretrained(
             args.target_model_name,
             torch_dtype="auto",
-            device_map={"": 0},
+            device_map={"": args.target_device},
             attn_implementation="sdpa"
         )
     except Exception as e:
@@ -4082,7 +4159,7 @@ if not args.read_pickle:
             dllm = AutoModelForCausalLM.from_pretrained(
                 dllm_path,
                 torch_dtype="auto",
-                device_map={"": 0},
+                device_map={"": args.drafter_device},
                 trust_remote_code=True,
                 local_files_only=True,
                 attn_implementation="sdpa"
@@ -4108,7 +4185,7 @@ if not args.read_pickle:
             draft_model = AutoModelForCausalLM.from_pretrained(
                 args.drafter_model_name,
                 torch_dtype="auto",
-                device_map={"": 0}
+                device_map={"": args.drafter_device}
             )
         except Exception as e:
             msg = str(e).lower()
@@ -4191,6 +4268,10 @@ for problem_id, is_warmup in tqdm(
             draft_time_total = sum(x.get("draft_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
             verify_time_total = sum(x.get("verify_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
             post_verify_time_total = sum(x.get("post_verify_time_ms", 0.0) for x in pickled_data["stats_each_round"]) / 1000.0
+            device_transfer_time_total = sum(
+                x.get("device_transfer_time_ms", 0.0)
+                for x in pickled_data["stats_each_round"]
+            ) / 1000.0
             actual_e2e_time = pickled_data.get("actual_e2e_time", draft_time_total + verify_time_total)
         else:
             orig_model_inputs = {key: value.clone() for key, value in base_orig_model_inputs.items()}
@@ -4204,6 +4285,8 @@ for problem_id, is_warmup in tqdm(
             draft_time_total = 0.0
             verify_time_total = 0.0
             post_verify_time_total = 0.0
+            device_transfer_time_total = 0.0
+            args.device_transfer_time_total = 0.0
             oracle_diagnostic_time_total = 0.0
             pickled_data = {
                 "orig_model_inputs": orig_model_inputs["input_ids"][0].tolist(),
@@ -4542,7 +4625,11 @@ for problem_id, is_warmup in tqdm(
                     
                     prefix_len = len(current_token_ids)
                     combined_ids = current_token_ids + draft_proposal
-                    verify_input_tensor = torch.tensor([combined_ids], device=target_model.device, dtype=torch.long)
+                    verify_input_tensor = timed_token_tensor(
+                        combined_ids,
+                        target_model.device,
+                        args,
+                    )
                     full_input_ids = torch.cat([orig_model_inputs['input_ids'], verify_input_tensor], dim=1)
 
                     verify_mask_tensor = torch.ones_like(verify_input_tensor)
@@ -4876,12 +4963,22 @@ for problem_id, is_warmup in tqdm(
                         "draft_time_ms": draft_time * 1000.0,
                         "verify_time_ms": verify_time * 1000.0,
                         "post_verify_time_ms": post_verify_time * 1000.0,
+                        "device_transfer_time_ms": max(
+                            0.0,
+                            getattr(args, "device_transfer_time_total", 0.0)
+                            - device_transfer_time_total,
+                        ) * 1000.0,
                         "final_token": final_token,
                         "bonus_token": bonus_token,
                         "emitted_tokens": tokens_to_append,
                         "frontier_stats": frontier_stats_this_round,
                     }
                     pickled_data["stats_each_round"].append(info_this_round)
+                    device_transfer_time_total = getattr(
+                        args,
+                        "device_transfer_time_total",
+                        0.0,
+                    )
                     if args.log_verifier_calls and not is_warmup:
                         args.verifier_call_rows.append({
                             "problem_id": int(problem_id),
@@ -4940,6 +5037,14 @@ for problem_id, is_warmup in tqdm(
         total_output_tokens = len(current_token_ids)
         logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Avg fwd passes/round: {safe_div(total_num_forward_passes, num_speculation_rounds):.2f} ({total_num_forward_passes}/{num_speculation_rounds}) (total output tokens: {total_output_tokens}){Colors.RESET}")
         logging.info(f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] Total draft time: {draft_time_total * 1000.0:.1f}ms, total verify time: {verify_time_total * 1000.0:.1f}ms{Colors.RESET}")
+        if device_transfer_time_total > 0.0:
+            logging.info(
+                f"{Colors.CYAN}[Problem {problem_id}, {drafter_name}] "
+                f"Two-GPU transfer time: {device_transfer_time_total * 1000.0:.1f}ms; "
+                f"E2E excluding transfer: "
+                f"{max(0.0, actual_e2e_time - device_transfer_time_total) * 1000.0:.1f}ms"
+                f"{Colors.RESET}"
+            )
         for hardware in args.latency.keys():
             latency_draft = total_num_forward_passes * args.latency[hardware]["draft_fwd_pass"]
             latency_target = num_speculation_rounds * args.latency[hardware]["target_tpt"][args.target_model_name_clean]
@@ -4993,6 +5098,11 @@ for problem_id, is_warmup in tqdm(
         pickled_data["actual_e2e_time"] = actual_e2e_time
         pickled_data["actual_post_verify_time"] = post_verify_time_total
         pickled_data["actual_algorithm_time"] = draft_time_total + verify_time_total + post_verify_time_total
+        pickled_data["device_transfer_time"] = device_transfer_time_total
+        pickled_data["actual_e2e_time_excluding_transfer"] = max(
+            0.0,
+            actual_e2e_time - device_transfer_time_total,
+        )
         pickled_data["generated_text"] = generated_text
         pickled_data["predicted_answer"] = predicted_answer
         pickled_data["reference_answer"] = reference_answer
@@ -5040,6 +5150,7 @@ for problem_id, is_warmup in tqdm(
             predicted_answer,
             reference_answer,
             summarize_frontier_diagnostics(stats_each_round),
+            device_transfer_time_total,
         ))
 
     baseline_row = next((row for row in problem_benchmark_rows if row["mode"] == "verifier_ar"), None)

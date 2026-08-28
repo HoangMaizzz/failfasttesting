@@ -34,6 +34,8 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--drafter_threshold", type=float, default=0.05)
     parser.add_argument("--lowconf_threshold", type=float, default=0.45)
+    parser.add_argument("--target_device", type=int, default=0)
+    parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument(
         "--target_model_name",
         default="Qwen/Qwen2.5-7B-Instruct",
@@ -75,6 +77,8 @@ def validate_args(args):
         raise ValueError("--drafter_threshold must be in (0, 1]")
     if not 0.0 <= args.lowconf_threshold <= 1.0:
         raise ValueError("--lowconf_threshold must be in [0, 1]")
+    if args.target_device < 0 or args.drafter_device < 0:
+        raise ValueError("CUDA device indices must be non-negative")
 
 
 def benchmark_command(args):
@@ -158,6 +162,10 @@ def benchmark_command(args):
         args.target_model_name,
         "--dllm_dir",
         args.dllm_dir,
+        "--target_device",
+        str(args.target_device),
+        "--drafter_device",
+        str(args.drafter_device),
         "--drafter_threshold",
         str(args.drafter_threshold),
         "--lowconf_threshold",
@@ -334,6 +342,16 @@ def validate_and_report(args):
         "draft_time_s": float(summary.draft_time_s.sum()),
         "verify_time_s": float(summary.verify_time_s.sum()),
         "post_verify_time_s": float(summary.post_verify_time_s.sum()),
+        "device_transfer_time_s": float(
+            summary.device_transfer_time_s.sum()
+        ),
+        "e2e_ms_per_output_token_excluding_transfer": (
+            float(
+                (summary.e2e_ms_per_output_token_excluding_transfer
+                 * summary.output_tokens).sum()
+            )
+            / max(1.0, float(summary.output_tokens.sum()))
+        ),
         "draft_passes": int(summary.draft_passes.sum()),
         "verifier_rounds": int(summary.verifier_rounds.sum()),
         "controller_overhead_ms": float(summary.controller_overhead_ms.sum()),
