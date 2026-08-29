@@ -6,7 +6,9 @@ from adaptive_td import (
     STOP,
     AdaptiveTDConfig,
     OnlineTDRefinementController,
+    active_refinement_positions,
     build_state_features,
+    build_v23_compact7_state_features,
     trajectory_forward_latency,
 )
 
@@ -30,6 +32,120 @@ def synthetic_features(step, preferred_depth):
 
 
 class AdaptiveTDTests(unittest.TestCase):
+    def test_compact7_uses_only_active_span_masks_and_real_refinement_step(self):
+        features = build_v23_compact7_state_features(
+            proposal_length=16,
+            max_spec_len=64,
+            active_span_length=8,
+            active_remaining_masks=3,
+            refinement_step=2,
+            max_refinement_steps=16,
+            proposal_remaining_confidences=[0.4] * 11,
+            prefix_length=4,
+            prefix_advance=2,
+            failfast_candidate_min_confidence=0.45,
+            drafter_threshold=0.30,
+            failfast_threshold=0.50,
+            factual_draft_latency_ema_ms=4.0,
+            factual_verifier_latency_ema_ms=8.0,
+        )
+        self.assertEqual(len(features), 7)
+        self.assertEqual(features[0], 1.0)
+        self.assertAlmostEqual(features[5], 3.0 / 8.0)
+        self.assertAlmostEqual(features[6], 2.0 / 16.0)
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in features[5:]))
+
+    def test_compact7_rejects_proposal_wide_mask_count(self):
+        with self.assertRaisesRegex(ValueError, "processed active span"):
+            build_v23_compact7_state_features(
+                proposal_length=16,
+                max_spec_len=64,
+                active_span_length=8,
+                active_remaining_masks=11,
+                refinement_step=1,
+                max_refinement_steps=16,
+                proposal_remaining_confidences=[0.4] * 11,
+                prefix_length=1,
+                prefix_advance=1,
+                failfast_candidate_min_confidence=0.4,
+                drafter_threshold=0.30,
+                failfast_threshold=0.50,
+                factual_draft_latency_ema_ms=4.0,
+                factual_verifier_latency_ema_ms=8.0,
+            )
+
+    def test_annealed_policy_bootstraps_first_64_valid_decisions(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                policy_mode="symmetric_annealed",
+                bootstrap_decisions=64,
+                seed=42,
+            )
+        )
+        features = synthetic_features(1, 3)
+        decisions = [
+            controller.choose(features, allow_stop=True, refinement_step=1)
+            for _ in range(65)
+        ]
+        self.assertTrue(all(
+            item.behavior_stop_probability == 0.5
+            and item.diagnostics["bootstrap_active"]
+            and item.selected_action_probability == 0.5
+            and item.importance_weight == 2.0
+            for item in decisions[:64]
+        ))
+        self.assertEqual({item.action for item in decisions[:64]}, {STOP, CONTINUE})
+        self.assertFalse(decisions[64].diagnostics["bootstrap_active"])
+        self.assertAlmostEqual(
+            decisions[64].diagnostics["exploration_floor"],
+            0.10,
+        )
+
+    def test_annealed_floor_decays_and_never_crosses_minimum(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                policy_mode="symmetric_annealed",
+                bootstrap_decisions=64,
+                explore_epsilon=0.10,
+                explore_min=0.02,
+                explore_decay=0.998,
+            )
+        )
+        floors = [
+            controller._annealed_exploration_floor(step)
+            for step in (64, 65, 1000, 100000)
+        ]
+        self.assertAlmostEqual(floors[0], 0.10)
+        self.assertTrue(all(a >= b for a, b in zip(floors, floors[1:])))
+        self.assertGreaterEqual(min(floors), 0.02)
+        self.assertAlmostEqual(floors[-1], 0.02)
+
+    def test_annealed_policy_clips_behavior_probability(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                policy_mode="symmetric_annealed",
+                bootstrap_decisions=0,
+                explore_epsilon=0.10,
+                explore_min=0.02,
+            )
+        )
+        features = synthetic_features(1, 3)
+        controller.values[STOP].theta[0] = 100.0
+        high = controller.choose(features, allow_stop=True, refinement_step=1)
+        self.assertLessEqual(high.behavior_stop_probability, 0.90)
+        controller.values[STOP].theta[0] = -100.0
+        low = controller.choose(features, allow_stop=True, refinement_step=1)
+        self.assertGreaterEqual(low.behavior_stop_probability, 0.10 * 0.998)
+
+    def test_future_masks_are_not_active_refinement_leftovers(self):
+        active = active_refinement_positions(
+            remaining_positions=(2, 5, 8, 11, 15),
+            active_start=0,
+            active_end=8,
+        )
+        self.assertEqual(active, (2, 5))
+        self.assertTrue(set(active).isdisjoint({8, 11, 15}))
+
     def test_default_exploration_schedule_supports_online_stop_learning(self):
         config = AdaptiveTDConfig()
         self.assertEqual(config.explore_epsilon, 0.10)

@@ -15,6 +15,7 @@ from run_shared_value_advantage_benchmark import (
     failfast_baseline_command,
     policy_control_command,
     selected_policy_controls,
+    shared_method_name,
     validate_args,
 )
 from run_otrc_v2_td_benchmark import method_name
@@ -42,8 +43,11 @@ class SharedValueAdvantageTests(unittest.TestCase):
             num_questions=25,
             warmup_questions=1,
             max_new_tokens=1024,
-            drafter_threshold=0.05,
-            lowconf_threshold=0.45,
+            drafter_threshold=0.30,
+            lowconf_threshold=0.50,
+            feature_schema="otrc_v2_3_compact7_td",
+            exploration_policy="annealed",
+            bootstrap_decisions=64,
             target_device=0,
             drafter_device=0,
             target_quantization="none",
@@ -143,6 +147,10 @@ class SharedValueAdvantageTests(unittest.TestCase):
             "--value_parameterization shared_value_advantage",
             joined,
         )
+        self.assertIn("--feature_schema otrc_v2_3_compact7_td", joined)
+        self.assertIn("--adaptive_policy_mode symmetric_annealed", joined)
+        self.assertIn("--adaptive_bootstrap_decisions 64", joined)
+        self.assertIn("--adaptive_explore_min 0.02", joined)
         self.assertIn(
             f"--shared_value_learning_rate {VALUE_LEARNING_RATE}",
             joined,
@@ -154,6 +162,20 @@ class SharedValueAdvantageTests(unittest.TestCase):
         self.assertIn("--policy_weight_ema_beta 0.0", joined)
         self.assertIn("--max_spec_len 64", joined)
         self.assertIn("--resume", command)
+
+    def test_compact6_annealed_ablation_is_explicitly_selectable(self):
+        args = self.args()
+        args.feature_schema = "otrc_v2_2_compact_td"
+        args.exploration_policy = "annealed"
+        command = benchmark_command(args)
+        joined = " ".join(command)
+        self.assertIn("--feature_schema otrc_v2_2_compact_td", joined)
+        self.assertIn("--adaptive_policy_mode symmetric_annealed", joined)
+        self.assertEqual(
+            shared_method_name(args),
+            "otrc_v2_2_compact_factual_no_bootstrap_"
+            "shared_value_advantage_annealed",
+        )
 
     def test_runner_can_limit_the_matched_run_to_math_and_gsm8k(self):
         args = self.args()

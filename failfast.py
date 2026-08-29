@@ -637,11 +637,17 @@ parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
 parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.10)
 parser.add_argument("--adaptive-explore-min", type=float, default=0.01)
 parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
+parser.add_argument("--adaptive-bootstrap-decisions", type=int, default=64)
 parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
 parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
 parser.add_argument(
     "--adaptive-policy-mode",
-    choices=["legacy", "symmetric", "symmetric_greedy"],
+    choices=[
+        "legacy",
+        "symmetric",
+        "symmetric_annealed",
+        "symmetric_greedy",
+    ],
     default="legacy",
 )
 parser.add_argument(
@@ -846,6 +852,7 @@ def build_adaptive_controller(args):
                 "otrc_v2_1_td": 21,
                 "otrc_v2_2_td": 22,
                 "otrc_v2_2_compact_td": 226,
+                "otrc_v2_3_compact7_td": 237,
             }[args.adaptive_feature_schema],
             learning_rate=args.adaptive_learning_rate,
             value_parameterization=args.adaptive_value_parameterization,
@@ -867,6 +874,7 @@ def build_adaptive_controller(args):
             explore_epsilon=args.adaptive_explore_epsilon,
             explore_min=args.adaptive_explore_min,
             explore_decay=args.adaptive_explore_decay,
+            bootstrap_decisions=args.adaptive_bootstrap_decisions,
             warmup_rounds=args.adaptive_warmup_rounds,
             early_stop_min_observations=args.adaptive_early_stop_min_observations,
             max_refinement_steps=args.adaptive_max_refinement_steps,
@@ -4985,6 +4993,7 @@ for problem_id, is_warmup in tqdm(
                                     "otrc_v2_1_td",
                                     "otrc_v2_2_td",
                                     "otrc_v2_2_compact_td",
+                                    "otrc_v2_3_compact7_td",
                                 )
                             ):
                                 args.adaptive_td_controller.observe_factual_verifier_call(

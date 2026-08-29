@@ -1023,6 +1023,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "otrc_v2_1_td",
                                 "otrc_v2_2_td",
                                 "otrc_v2_2_compact_td",
+                                "otrc_v2_3_compact7_td",
                             )
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
@@ -1560,6 +1561,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "otrc_v2_1_td",
                                 "otrc_v2_2_td",
                                 "otrc_v2_2_compact_td",
+                                "otrc_v2_3_compact7_td",
                             )
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
@@ -2008,6 +2010,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     float(current_step_confidences.get(absolute_pos, 0.0))
                                     for absolute_pos in active_remaining_positions
                                 ]
+                                active_confidence_count = sum(
+                                    absolute_pos in current_step_confidences
+                                    for absolute_pos in active_remaining_positions
+                                )
+                                active_confidence_coverage = (
+                                    active_confidence_count
+                                    / max(1, len(active_remaining_positions))
+                                )
                                 recoverable_positions = {
                                     absolute_pos - draft_token_start_idx
                                     for absolute_pos in active_remaining_positions
@@ -2143,6 +2153,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
 
                                 zero_cost_fill_available = all(
                                     absolute_pos in current_step_token_ids
+                                    and absolute_pos in current_step_confidences
                                     for absolute_pos in active_remaining_positions
                                 )
                                 baseline_would_verify = (
@@ -2366,6 +2377,23 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "active_remaining_masks": int(
                                             len(active_remaining_positions)
                                         ),
+                                        "active_remaining_mask_ratio": float(
+                                            len(active_remaining_positions)
+                                            / max(1, active_span_length)
+                                        ),
+                                        "refinement_step": int(
+                                            adaptive_refinement_step
+                                        ),
+                                        "normalized_refinement_step": float(
+                                            min(
+                                                adaptive_refinement_step,
+                                                adaptive_controller.config.max_refinement_steps,
+                                            )
+                                            / max(
+                                                1,
+                                                adaptive_controller.config.max_refinement_steps,
+                                            )
+                                        ),
                                         "proposal_remaining_masks": int(
                                             masks_remaining
                                         ),
@@ -2382,6 +2410,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "proposal_snapshot_valid": bool(
                                             proposal_snapshot_valid
+                                        ),
+                                        "snapshot_valid": bool(
+                                            zero_cost_fill_available
+                                        ),
+                                        "confidence_coverage": float(
+                                            active_confidence_coverage
                                         ),
                                         "proposal_snapshot_phase": "post_commit_pre_decision",
                                         "prefix_length": int(prefix_length),

@@ -14,8 +14,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "compact6_shared_value_explicit_advantage_logical_frame_v4"
-METHOD = "otrc_v2_2_compact_factual_no_bootstrap_shared_value_advantage"
+VERSION = "compact7_shared_value_annealed_symmetric_v5"
 DATASETS = ("math", "gsm8k", "aime", "humaneval")
 VALUE_LEARNING_RATE = 0.015
 ADVANTAGE_LEARNING_RATE = 0.02
@@ -32,8 +31,19 @@ def parse_args():
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--drafter_threshold", type=float, default=0.05)
-    parser.add_argument("--lowconf_threshold", type=float, default=0.45)
+    parser.add_argument("--drafter_threshold", type=float, default=0.30)
+    parser.add_argument("--lowconf_threshold", type=float, default=0.50)
+    parser.add_argument(
+        "--feature_schema",
+        choices=("otrc_v2_2_compact_td", "otrc_v2_3_compact7_td"),
+        default="otrc_v2_3_compact7_td",
+    )
+    parser.add_argument(
+        "--exploration_policy",
+        choices=("fixed", "annealed"),
+        default="annealed",
+    )
+    parser.add_argument("--bootstrap_decisions", type=int, default=64)
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument(
@@ -53,7 +63,7 @@ def parse_args():
         "--output_dir",
         default=(
             "/content/failfasttesting/"
-            "outputs_shared_value_advantage_active_block_test25"
+            "outputs_shared_value_advantage_compact7_annealed_test25"
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -110,6 +120,12 @@ def validate_args(args):
         raise ValueError("--drafter_threshold must be in (0, 1]")
     if not 0.0 <= args.lowconf_threshold <= 1.0:
         raise ValueError("--lowconf_threshold must be in [0, 1]")
+    if not math.isclose(args.drafter_threshold, 0.30):
+        raise ValueError("the Compact7 experiment fixes --drafter_threshold=0.30")
+    if not math.isclose(args.lowconf_threshold, 0.50):
+        raise ValueError("the Compact7 experiment fixes --lowconf_threshold=0.50")
+    if args.bootstrap_decisions < 0:
+        raise ValueError("--bootstrap_decisions must be non-negative")
     if args.target_device < 0 or args.drafter_device < 0:
         raise ValueError("CUDA device indices must be non-negative")
     if args.include_failfast_baseline and not set(args.datasets).issubset(
@@ -121,6 +137,12 @@ def validate_args(args):
 
 
 def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
+    if args.greedy_policy:
+        policy_mode = "symmetric_greedy"
+    elif args.exploration_policy == "annealed":
+        policy_mode = "symmetric_annealed"
+    else:
+        policy_mode = "symmetric"
     command = [
         sys.executable,
         "-u",
@@ -130,7 +152,7 @@ def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
         "--num_questions",
         str(args.num_questions),
         "--feature_schema",
-        "otrc_v2_2_compact_td",
+        args.feature_schema,
         "--credit_assignment",
         "verifier_boundary_factual_no_bootstrap",
         "--value_parameterization",
@@ -170,15 +192,21 @@ def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
         "--adaptive_explore_epsilon",
         "0.0" if args.greedy_policy else "0.10",
         "--adaptive_explore_min",
-        "0.0" if args.greedy_policy else "0.01",
+        (
+            "0.0"
+            if args.greedy_policy
+            else "0.02" if args.exploration_policy == "annealed" else "0.01"
+        ),
         "--adaptive_explore_decay",
         "0.998",
         "--adaptive_warmup_rounds",
         "20",
         "--adaptive_early_stop_min_observations",
         "32",
+        "--adaptive_bootstrap_decisions",
+        str(args.bootstrap_decisions),
         "--adaptive_policy_mode",
-        "symmetric_greedy" if args.greedy_policy else "symmetric",
+        policy_mode,
         "--adaptive_min_action_probability",
         "0.10",
         "--adaptive_max_importance_weight",
@@ -243,6 +271,20 @@ def selected_policy_controls(args):
     if getattr(args, "include_policy_controls", False):
         selected.extend(("frozen_stop", "random_stop"))
     return tuple(dict.fromkeys(selected))
+
+
+def shared_method_name(args, policy_ablation="learned"):
+    base = (
+        "otrc_v2_3_compact7_factual_no_bootstrap"
+        if args.feature_schema == "otrc_v2_3_compact7_td"
+        else "otrc_v2_2_compact_factual_no_bootstrap"
+    )
+    base = f"{base}_shared_value_advantage"
+    if not args.greedy_policy and args.exploration_policy == "annealed":
+        base = f"{base}_annealed"
+    if policy_ablation != "learned":
+        base = f"{base}_{policy_ablation}"
+    return base
 
 
 def failfast_baseline_command(args):
@@ -379,7 +421,8 @@ def validate_and_report(args):
     manifest = json.loads(
         (output_dir / "benchmark_manifest.json").read_text(encoding="utf-8")
     )
-    if manifest.get("method") != METHOD:
+    method = shared_method_name(args)
+    if manifest.get("method") != method:
         raise RuntimeError(f"unexpected benchmark method: {manifest.get('method')}")
     if set(manifest.get("datasets", [])) != set(args.datasets):
         raise RuntimeError("benchmark did not complete every requested dataset")
@@ -387,7 +430,7 @@ def validate_and_report(args):
     decisions = []
     states = {}
     for dataset in args.datasets:
-        phase_dir = output_dir / "raw" / dataset / METHOD
+        phase_dir = output_dir / "raw" / dataset / method
         state = json.loads(
             (phase_dir / "adaptive_td_runtime_state.json").read_text(
                 encoding="utf-8"
@@ -527,7 +570,10 @@ def build_integrated_comparison(args, shared_summary):
 
     paired_frames = []
     for dataset in args.datasets:
-        shared_path = output_dir / "raw" / dataset / METHOD / "benchmark_results.csv"
+        shared_path = (
+            output_dir / "raw" / dataset / shared_method_name(args)
+            / "benchmark_results.csv"
+        )
         baseline_path = (
             baseline_dir
             / "raw"
@@ -642,8 +688,8 @@ def build_policy_control_comparison(args, shared_summary):
     comparison = _prefixed_summary(shared_summary, "shared_va")
     paired_frames = []
     all_control_methods = {
-        "frozen_stop": f"{METHOD}_frozen_stop",
-        "random_stop": f"{METHOD}_random_stop",
+        control: shared_method_name(args, control)
+        for control in ("frozen_stop", "random_stop")
     }
     control_methods = {
         control: all_control_methods[control]
@@ -669,7 +715,10 @@ def build_policy_control_comparison(args, shared_summary):
         )
 
     for dataset in args.datasets:
-        shared_path = output_dir / "raw" / dataset / METHOD / "benchmark_results.csv"
+        shared_path = (
+            output_dir / "raw" / dataset / shared_method_name(args)
+            / "benchmark_results.csv"
+        )
         shared = pd.read_csv(shared_path)
         columns = [
             "problem_id",
@@ -868,7 +917,7 @@ def main():
     output_dir = Path(args.output_dir)
     wrapper_manifest = {
         "version": VERSION,
-        "method": METHOD,
+        "method": shared_method_name(args),
         "datasets": list(args.datasets),
         "num_questions_per_dataset": args.num_questions,
         "value_learning_rate": VALUE_LEARNING_RATE,

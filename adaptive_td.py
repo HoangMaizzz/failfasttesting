@@ -68,6 +68,15 @@ V22_COMPACT_FEATURE_NAMES = (
     "draft_verify_latency_ratio",
     "ema_tokens_per_verifier_ratio",
 )
+V23_COMPACT7_FEATURE_NAMES = (
+    "bias",
+    "prefix_advance_ratio",
+    "failfast_margin",
+    "accumulated_spec_ratio",
+    "draft_verify_latency_ratio",
+    "active_remaining_mask_ratio",
+    "normalized_refinement_step",
+)
 FEATURE_NAMES = V1_FEATURE_NAMES
 FEATURE_SCHEMAS = {
     "otrc_v1_td": V1_FEATURE_NAMES,
@@ -75,6 +84,7 @@ FEATURE_SCHEMAS = {
     "otrc_v2_1_td": V21_FEATURE_NAMES,
     "otrc_v2_2_td": V22_FEATURE_NAMES,
     "otrc_v2_2_compact_td": V22_COMPACT_FEATURE_NAMES,
+    "otrc_v2_3_compact7_td": V23_COMPACT7_FEATURE_NAMES,
 }
 
 
@@ -143,6 +153,7 @@ class AdaptiveTDConfig:
     explore_epsilon: float = 0.10
     explore_min: float = 0.01
     explore_decay: float = 0.998
+    bootstrap_decisions: int = 64
     warmup_rounds: int = 20
     early_stop_min_observations: int = 32
     max_refinement_steps: int = 16
@@ -202,6 +213,8 @@ class AdaptiveTDConfig:
             raise ValueError("exploration rates must satisfy 0 <= min <= epsilon <= 1")
         if not 0.0 < self.explore_decay <= 1.0:
             raise ValueError("explore_decay must be in (0, 1]")
+        if self.bootstrap_decisions < 0:
+            raise ValueError("bootstrap_decisions must be non-negative")
         if not 0.0 <= self.mc_mix <= 1.0:
             raise ValueError("mc_mix must be in [0, 1]")
         if self.risk_beta < 0.0 or self.epistemic_scale < 0.0:
@@ -217,10 +230,12 @@ class AdaptiveTDConfig:
         if self.policy_mode not in {
             "legacy",
             "symmetric",
+            "symmetric_annealed",
             "symmetric_greedy",
         }:
             raise ValueError(
-                "policy_mode must be legacy, symmetric, or symmetric_greedy"
+                "policy_mode must be legacy, symmetric, symmetric_annealed, "
+                "or symmetric_greedy"
             )
         if self.policy_ablation not in {
             "learned",
@@ -494,6 +509,7 @@ class OnlineTDRefinementController:
         self.t_ema_ms = None
         self.completed_rounds = 0
         self.decision_count = 0
+        self.annealed_decision_count = 0
         self.exploration_count = 0
         self.early_stop_observations = 0
         self.forward_latency_ema_ms = None
@@ -678,6 +694,18 @@ class OnlineTDRefinementController:
             return 0.0
         return 0.5
 
+    def _annealed_exploration_floor(self, decision_count: int | None = None) -> float:
+        count = (
+            self.annealed_decision_count
+            if decision_count is None
+            else max(0, int(decision_count))
+        )
+        age = max(0, count - self.config.bootstrap_decisions)
+        return max(
+            self.config.explore_min,
+            self.config.explore_epsilon * (self.config.explore_decay ** age),
+        )
+
     def advance_algorithm_latency(
         self,
         elapsed_ms: float,
@@ -754,6 +782,14 @@ class OnlineTDRefinementController:
         return self.values[action].estimate(features)
 
     def build_features(self, **state) -> tuple[float, ...]:
+        if self.config.feature_schema == "otrc_v2_3_compact7_td":
+            return build_v23_compact7_state_features(
+                factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
+                factual_verifier_latency_ema_ms=self.factual_verifier_latency_ema_ms,
+                max_refinement_steps=self.config.max_refinement_steps,
+                disabled_features=self.config.disabled_features,
+                **state,
+            )
         if self.config.feature_schema == "otrc_v2_2_compact_td":
             return build_v22_compact_state_features(
                 factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
@@ -940,6 +976,8 @@ class OnlineTDRefinementController:
         behavior_stop_probability = stop_probability
         selected_action_probability = 1.0
         symmetric_sampling_used = False
+        bootstrap_active = False
+        exploration_floor = 0.0
         action_started = time.perf_counter() if profiling else None
         exploration_used = False
         finite_estimates = all(
@@ -986,12 +1024,51 @@ class OnlineTDRefinementController:
                 action, reason = CONTINUE, "fixed_refinement_depth"
         elif refinement_step >= self.config.max_refinement_steps:
             action, reason = STOP, "max_refinement_steps"
+        elif self.config.policy_mode == "symmetric_annealed":
+            greedy_action = (
+                STOP if advantage_mean > self.config.q_margin else CONTINUE
+            )
+            if allow_exploration:
+                symmetric_sampling_used = True
+                bootstrap_active = (
+                    self.annealed_decision_count
+                    < self.config.bootstrap_decisions
+                )
+                if bootstrap_active:
+                    behavior_stop_probability = 0.5
+                    exploration_floor = 0.5
+                    reason = "symmetric_balanced_bootstrap"
+                else:
+                    exploration_floor = self._annealed_exploration_floor()
+                    behavior_stop_probability = _clip(
+                        stop_probability,
+                        exploration_floor,
+                        1.0 - exploration_floor,
+                    )
+                    reason = "symmetric_annealed_sample"
+                if self.rng.random() < behavior_stop_probability:
+                    action = STOP
+                    selected_action_probability = behavior_stop_probability
+                else:
+                    action = CONTINUE
+                    selected_action_probability = (
+                        1.0 - behavior_stop_probability
+                    )
+                exploration_used = action != greedy_action
+                if exploration_used:
+                    self.exploration_count += 1
+                self.annealed_decision_count += 1
+            elif advantage_mean > self.config.q_margin:
+                action, reason = STOP, "symmetric_greedy_stop"
+            else:
+                action, reason = CONTINUE, "symmetric_greedy_continue"
         elif self.config.policy_mode in {"symmetric", "symmetric_greedy"}:
             if (
                 self.config.policy_mode == "symmetric"
                 and allow_exploration
             ):
                 symmetric_sampling_used = True
+                exploration_floor = self.config.min_action_probability
                 behavior_stop_probability = _clip(
                     stop_probability,
                     self.config.min_action_probability,
@@ -1114,6 +1191,13 @@ class OnlineTDRefinementController:
                 "ema_advantage": advantage_mean,
                 "raw_stop_probability": raw_stop_probability,
                 "ema_stop_probability": stop_probability,
+                "bootstrap_active": bootstrap_active,
+                "bootstrap_decisions": self.config.bootstrap_decisions,
+                "number_of_bootstrap_decisions_seen": min(
+                    self.annealed_decision_count,
+                    self.config.bootstrap_decisions,
+                ),
+                "exploration_floor": exploration_floor,
                 "raw_greedy_action": (
                     STOP
                     if raw_advantage_mean > self.config.q_margin
@@ -1778,6 +1862,29 @@ class OnlineTDRefinementController:
             "feature_names": list(self.feature_names),
             "completed_rounds": self.completed_rounds,
             "decision_count": self.decision_count,
+            "bootstrap_decisions": self.config.bootstrap_decisions,
+            "number_of_bootstrap_decisions_seen": min(
+                self.annealed_decision_count,
+                self.config.bootstrap_decisions,
+            ),
+            "annealed_decision_count": self.annealed_decision_count,
+            "explore_initial": self.config.explore_epsilon,
+            "explore_min": self.config.explore_min,
+            "explore_decay": self.config.explore_decay,
+            "current_exploration_floor": (
+                (
+                    0.5
+                    if self.annealed_decision_count
+                    < self.config.bootstrap_decisions
+                    else self._annealed_exploration_floor()
+                )
+                if self.config.policy_mode == "symmetric_annealed"
+                else (
+                    self.config.min_action_probability
+                    if self.config.policy_mode == "symmetric"
+                    else 0.0
+                )
+            ),
             "exploration_count": self.exploration_count,
             "early_stop_observations": self.early_stop_observations,
             "early_stop_min_observations": self.config.early_stop_min_observations,
@@ -1898,6 +2005,7 @@ class OnlineTDRefinementController:
             "independent_q",
         )
         snapshot_policy_ablation = snapshot.get("policy_ablation", "learned")
+        snapshot_policy_mode = snapshot.get("policy_mode", "legacy")
         snapshot_shared_value_rate = float(
             snapshot.get(
                 "shared_value_learning_rate",
@@ -1927,6 +2035,7 @@ class OnlineTDRefinementController:
             or snapshot_value_parameterization
             != self.config.value_parameterization
             or snapshot_policy_ablation != self.config.policy_ablation
+            or snapshot_policy_mode != self.config.policy_mode
             or not math.isclose(
                 snapshot_shared_value_rate,
                 self.config.shared_value_learning_rate,
@@ -1963,6 +2072,8 @@ class OnlineTDRefinementController:
                 f"{self.config.value_parameterization}, "
                 f"snapshot_policy_ablation={snapshot_policy_ablation}, "
                 f"controller_policy_ablation={self.config.policy_ablation}, "
+                f"snapshot_policy_mode={snapshot_policy_mode}, "
+                f"controller_policy_mode={self.config.policy_mode}, "
                 f"snapshot_rho_warmup={snapshot_rho_warmup}, "
                 f"controller_rho_warmup={self.config.rho_warmup_boundaries}, "
                 f"snapshot_policy_ema_beta={snapshot_policy_ema_beta}, "
@@ -2102,6 +2213,9 @@ class OnlineTDRefinementController:
 
         self.completed_rounds = int(snapshot.get("completed_rounds", 0))
         self.decision_count = int(snapshot.get("decision_count", 0))
+        self.annealed_decision_count = int(
+            snapshot.get("annealed_decision_count", 0)
+        )
         self.exploration_count = int(snapshot.get("exploration_count", 0))
         self.early_stop_observations = int(
             snapshot.get("early_stop_observations", 0)
@@ -2448,6 +2562,55 @@ def build_v22_compact_state_features(**state) -> tuple[float, ...]:
     full_features = build_v22_state_features(**state)
     by_name = dict(zip(V22_FEATURE_NAMES, full_features))
     return tuple(by_name[name] for name in V22_COMPACT_FEATURE_NAMES)
+
+
+def build_v23_compact7_state_features(
+    *,
+    active_span_length: int,
+    active_remaining_masks: int,
+    refinement_step: int,
+    max_refinement_steps: int,
+    disabled_features: Sequence[str] = (),
+    **state,
+) -> tuple[float, ...]:
+    """Build Compact7 strictly from the processed logical active span."""
+    active_span_length = int(active_span_length)
+    active_remaining_masks = int(active_remaining_masks)
+    max_refinement_steps = int(max_refinement_steps)
+    if active_span_length <= 0:
+        raise ValueError("active_span_length must be positive")
+    if not 0 <= active_remaining_masks <= active_span_length:
+        raise ValueError(
+            "active_remaining_masks must belong to the processed active span"
+        )
+    if max_refinement_steps <= 0:
+        raise ValueError("max_refinement_steps must be positive")
+
+    full_features = build_v22_state_features(
+        factual_tokens_per_verifier_ema=None,
+        disabled_features=(),
+        **state,
+    )
+    by_name = dict(zip(V22_FEATURE_NAMES, full_features))
+    by_name.update({
+        "active_remaining_mask_ratio": _clip(
+            active_remaining_masks / active_span_length,
+            0.0,
+            1.0,
+        ),
+        "normalized_refinement_step": _clip(
+            min(max(0, int(refinement_step)), max_refinement_steps)
+            / max_refinement_steps,
+            0.0,
+            1.0,
+        ),
+    })
+    features = [by_name[name] for name in V23_COMPACT7_FEATURE_NAMES]
+    disabled = set(disabled_features)
+    for index, name in enumerate(V23_COMPACT7_FEATURE_NAMES):
+        if name in disabled:
+            features[index] = 0.0
+    return tuple(features)
 
 
 def trajectory_forward_latency(trajectory: Iterable[dict]) -> float:
