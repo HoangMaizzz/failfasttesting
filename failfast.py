@@ -4713,18 +4713,38 @@ for problem_id, is_warmup in tqdm(
                             else:
                                 last_round_rejected = None
                             
-                            draft_proposal, actual_spec_len, prefill_output, num_forward_passes, forward_pass_latencies = get_next_tokens_dllm(dllm, args, orig_model_inputs, current_token_ids, 
-                                                                        spec_len=args.spec_len,
-                                                                        output_seqlen=3*args.block_size,
-                                                                        small_block_size=args.small_block_size,
-                                                                        threshold=drafter_threshold,
-                                                                        is_drafter=True,
-                                                                        prev_prefill_output=prev_prefill_output,
-                                                                        lowconf_threshold=lowconf_threshold,
-                                                                        max_spec_len=max_spec_len,
-                                                                        incr_len=incr_len,
-                                                                        last_round_rejected=last_round_rejected,
-                                                                        )
+                            dllm_draft_result = get_next_tokens_dllm(
+                                dllm,
+                                args,
+                                orig_model_inputs,
+                                current_token_ids,
+                                spec_len=args.spec_len,
+                                output_seqlen=3 * args.block_size,
+                                small_block_size=args.small_block_size,
+                                threshold=drafter_threshold,
+                                is_drafter=True,
+                                prev_prefill_output=prev_prefill_output,
+                                lowconf_threshold=lowconf_threshold,
+                                max_spec_len=max_spec_len,
+                                incr_len=incr_len,
+                                last_round_rejected=last_round_rejected,
+                            )
+                            if args.disable_reusing_drafter_kvs:
+                                (
+                                    draft_proposal,
+                                    actual_spec_len,
+                                    num_forward_passes,
+                                    forward_pass_latencies,
+                                ) = dllm_draft_result
+                                prefill_output = None
+                            else:
+                                (
+                                    draft_proposal,
+                                    actual_spec_len,
+                                    prefill_output,
+                                    num_forward_passes,
+                                    forward_pass_latencies,
+                                ) = dllm_draft_result
                             prev_prefill_output = prefill_output
                             spec_len = actual_spec_len
 
