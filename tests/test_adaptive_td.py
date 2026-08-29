@@ -518,6 +518,33 @@ class AdaptiveTDTests(unittest.TestCase):
         self.assertTrue(all(item.selected_action_probability == 1.0 for item in decisions))
         self.assertTrue(all(not item.exploration_used for item in decisions))
 
+    def test_symmetric_greedy_never_samples_with_learning_enabled(self):
+        controller = OnlineTDRefinementController(
+            AdaptiveTDConfig(
+                policy_mode="symmetric_greedy",
+                explore_epsilon=1.0,
+                explore_min=1.0,
+            )
+        )
+        features = synthetic_features(1, 3)
+        controller.values[STOP].theta[0] = 2.0
+        controller.values[CONTINUE].theta[0] = 1.0
+        decisions = [
+            controller.choose(
+                features,
+                allow_stop=True,
+                refinement_step=1,
+                allow_exploration=True,
+            )
+            for _ in range(10)
+        ]
+        self.assertTrue(all(item.action == STOP for item in decisions))
+        self.assertTrue(
+            all(item.reason == "symmetric_greedy_stop" for item in decisions)
+        )
+        self.assertTrue(all(not item.exploration_used for item in decisions))
+        self.assertTrue(all(item.importance_weight == 1.0 for item in decisions))
+
     def test_frozen_stop_control_always_stops_when_available(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(policy_ablation="frozen_stop")

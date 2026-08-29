@@ -52,6 +52,7 @@ class SharedValueAdvantageTests(unittest.TestCase):
             resume=True,
             include_failfast_baseline=False,
             include_policy_controls=False,
+            greedy_policy=False,
             skip_archive=False,
             log_level="INFO",
         )
@@ -163,6 +164,17 @@ class SharedValueAdvantageTests(unittest.TestCase):
             command[dataset_start:question_index],
             ["math", "gsm8k"],
         )
+
+    def test_greedy_runner_disables_sampling_without_freezing_learning(self):
+        args = self.args()
+        args.datasets = ["math", "gsm8k"]
+        args.greedy_policy = True
+        command = benchmark_command(args)
+        joined = " ".join(command)
+        self.assertIn("--adaptive_policy_mode symmetric_greedy", joined)
+        self.assertIn("--adaptive_explore_epsilon 0.0", joined)
+        self.assertIn("--adaptive_explore_min 0.0", joined)
+        self.assertNotIn("--adaptive-freeze", command)
 
     def test_runner_forwards_custom_confidence_thresholds(self):
         args = self.args()

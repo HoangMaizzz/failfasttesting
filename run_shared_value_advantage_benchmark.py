@@ -67,6 +67,14 @@ def parse_args():
         action="store_true",
         help="Run frozen-STOP and seeded random-STOP controls.",
     )
+    parser.add_argument(
+        "--greedy_policy",
+        action="store_true",
+        help=(
+            "Use deterministic Shared V+A actions (STOP iff Q_STOP - Q_CONTINUE "
+            "> q_margin) while keeping online factual learning enabled."
+        ),
+    )
     parser.add_argument("--skip_archive", action="store_true")
     parser.add_argument(
         "--log_level",
@@ -150,15 +158,17 @@ def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
         "--adaptive_q_margin",
         "0.0",
         "--adaptive_explore_epsilon",
-        "0.10",
+        "0.0" if args.greedy_policy else "0.10",
         "--adaptive_explore_min",
-        "0.01",
+        "0.0" if args.greedy_policy else "0.01",
         "--adaptive_explore_decay",
         "0.998",
         "--adaptive_warmup_rounds",
         "20",
         "--adaptive_early_stop_min_observations",
         "32",
+        "--adaptive_policy_mode",
+        "symmetric_greedy" if args.greedy_policy else "symmetric",
         "--adaptive_min_action_probability",
         "0.10",
         "--adaptive_max_importance_weight",
@@ -853,6 +863,11 @@ def main():
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
         "arguments": vars(args),
+        "executed_policy": (
+            "deterministic_greedy"
+            if args.greedy_policy
+            else "symmetric_sampling"
+        ),
         "includes_matched_failfast_baseline": args.include_failfast_baseline,
         "includes_policy_controls": args.include_policy_controls,
         "elapsed_hours": (time.time() - started) / 3600.0,

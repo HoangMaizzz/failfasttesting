@@ -214,8 +214,14 @@ class AdaptiveTDConfig:
             raise ValueError("residual_prior_variance must be non-negative")
         if self.td_error_clip <= 0.0:
             raise ValueError("td_error_clip must be positive")
-        if self.policy_mode not in {"legacy", "symmetric"}:
-            raise ValueError("policy_mode must be legacy or symmetric")
+        if self.policy_mode not in {
+            "legacy",
+            "symmetric",
+            "symmetric_greedy",
+        }:
+            raise ValueError(
+                "policy_mode must be legacy, symmetric, or symmetric_greedy"
+            )
         if self.policy_ablation not in {
             "learned",
             "frozen_stop",
@@ -980,8 +986,11 @@ class OnlineTDRefinementController:
                 action, reason = CONTINUE, "fixed_refinement_depth"
         elif refinement_step >= self.config.max_refinement_steps:
             action, reason = STOP, "max_refinement_steps"
-        elif self.config.policy_mode == "symmetric":
-            if allow_exploration:
+        elif self.config.policy_mode in {"symmetric", "symmetric_greedy"}:
+            if (
+                self.config.policy_mode == "symmetric"
+                and allow_exploration
+            ):
                 symmetric_sampling_used = True
                 behavior_stop_probability = _clip(
                     stop_probability,

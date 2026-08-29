@@ -212,6 +212,11 @@ def parse_args():
     parser.add_argument("--adaptive_explore_decay", type=float, default=0.998)
     parser.add_argument("--adaptive_warmup_rounds", type=int, default=20)
     parser.add_argument("--adaptive_early_stop_min_observations", type=int, default=32)
+    parser.add_argument(
+        "--adaptive_policy_mode",
+        choices=("symmetric", "symmetric_greedy"),
+        default="symmetric",
+    )
     parser.add_argument("--adaptive_min_action_probability", type=float, default=0.10)
     parser.add_argument("--adaptive_max_importance_weight", type=float, default=5.0)
     parser.add_argument("--adaptive_weight_snapshot_interval", type=int, default=100)
@@ -405,7 +410,7 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-warmup-rounds", str(args.adaptive_warmup_rounds),
         "--adaptive-early-stop-min-observations",
         str(args.adaptive_early_stop_min_observations),
-        "--adaptive-policy-mode", "symmetric",
+        "--adaptive-policy-mode", args.adaptive_policy_mode,
         "--adaptive-policy-ablation",
         str(getattr(args, "policy_ablation", "learned")),
         "--adaptive-min-action-probability",

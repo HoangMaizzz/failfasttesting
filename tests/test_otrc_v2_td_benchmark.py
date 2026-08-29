@@ -55,6 +55,7 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             adaptive_explore_decay=0.998,
             adaptive_warmup_rounds=20,
             adaptive_early_stop_min_observations=32,
+            adaptive_policy_mode="symmetric",
             adaptive_min_action_probability=0.1,
             adaptive_max_importance_weight=5.0,
             adaptive_weight_snapshot_interval=100,

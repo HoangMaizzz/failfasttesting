@@ -641,7 +641,7 @@ parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
 parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
 parser.add_argument(
     "--adaptive-policy-mode",
-    choices=["legacy", "symmetric"],
+    choices=["legacy", "symmetric", "symmetric_greedy"],
     default="legacy",
 )
 parser.add_argument(
