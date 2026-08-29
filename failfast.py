@@ -388,6 +388,7 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
         args.bucket_current_context_len = int(new_model_inputs['input_ids'].shape[1])
     return_frontier_stats = (
         controller_enabled
+        or getattr(args, "global_oracle_graph", False)
         or getattr(args, "collect_draft_diagnostics", False)
         or getattr(args, "collect_bucket_oracle", False)
     )
@@ -759,8 +760,6 @@ if args.global_oracle_graph:
         raise ValueError("--global_oracle_graph requires greedy decoding")
     if args.benchmark_modes != ["dllm_ar"]:
         raise ValueError("--global_oracle_graph requires --benchmark_modes dllm_ar")
-    if not args.collect_bucket_oracle:
-        raise ValueError("--global_oracle_graph requires --collect_bucket_oracle")
     if args.reuse_drafts:
         raise ValueError("--global_oracle_graph does not support --reuse_drafts")
     if not args.disable_reusing_drafter_kvs:
@@ -2191,7 +2190,11 @@ def enumerate_global_oracle_round_edges(
         extension_events = frontier_stats.get("extension_events") or []
         verify_latency_ms = float(verification["verify_latency_ms"])
         post_verify_latency_ms = float(verification["post_verify_latency_ms"])
-        draft_latency_ms = float(sum(forward_pass_latencies))
+        draft_forward_latency_ms = float(sum(forward_pass_latencies))
+        # A completed scripted replay follows one legal inference path. Its wall
+        # time includes normal mask bookkeeping and proposal finalization, which
+        # are part of the measured algorithm latency used by the benchmark.
+        draft_latency_ms = float(draft_replay_wall_time_ms)
         edge = {
             "candidate_index": len(edges),
             "state": len(current_token_ids),
@@ -2199,6 +2202,7 @@ def enumerate_global_oracle_round_edges(
             "step": len(script),
             "draft_passes": int(num_forward_passes),
             "draft_latency_ms": draft_latency_ms,
+            "draft_forward_latency_ms": draft_forward_latency_ms,
             "verify_latency_ms": verify_latency_ms,
             "post_verify_latency_ms": post_verify_latency_ms,
             "edge_latency_ms": (
@@ -2218,10 +2222,10 @@ def enumerate_global_oracle_round_edges(
             "child_tokens": child_tokens,
             "final_token": int(verification["final_token"]),
             "is_failfast": int(all(action == CONTINUE for action in script)),
-            "replay_forward_latency_ms": float(sum(forward_pass_latencies)),
+            "replay_forward_latency_ms": draft_forward_latency_ms,
             "draft_replay_wall_time_ms": draft_replay_wall_time_ms,
             "draft_non_forward_replay_ms": max(
-                0.0, draft_replay_wall_time_ms - draft_latency_ms
+                0.0, draft_replay_wall_time_ms - draft_forward_latency_ms
             ),
             "stop_reason": frontier_stats.get("stop_reason"),
             "extension_events": extension_events,
@@ -2238,6 +2242,104 @@ def enumerate_global_oracle_round_edges(
         "decision_states": decision_states,
         "replays": replay_count,
         "search_wall_time_ms": (time.perf_counter() - search_started) * 1000.0,
+    }
+
+
+def replay_global_oracle_policy_path(
+    args,
+    problem_id,
+    target_model,
+    dllm,
+    orig_model_inputs,
+    num_target_tokens,
+    drafter_threshold,
+    lowconf_threshold,
+    max_spec_len,
+    incr_len,
+    expected_path,
+    policy_name,
+):
+    current_token_ids = []
+    replay_edges = []
+    replay_started = time.perf_counter()
+    eos_token_id = args.target_tokenizer.eos_token_id
+
+    for round_id, expected in enumerate(expected_path):
+        if len(current_token_ids) != int(expected["state"]):
+            raise RuntimeError(
+                f"{policy_name} replay prefix diverged before round {round_id}"
+            )
+        trajectory = run_oracle_draft_trajectory(
+            args,
+            dllm,
+            orig_model_inputs,
+            current_token_ids,
+            drafter_threshold,
+            lowconf_threshold,
+            max_spec_len,
+            incr_len,
+            action_script=tuple(expected["action_script"]),
+            default_action=None,
+        )
+        proposal = trajectory["proposal"]
+        if proposal != [int(token) for token in expected["draft_proposal"]]:
+            raise RuntimeError(
+                f"{policy_name} replay proposal diverged at round {round_id}"
+            )
+        verification = evaluate_oracle_proposal_tokens(
+            target_model,
+            orig_model_inputs,
+            current_token_ids,
+            proposal,
+            max_append_tokens=num_target_tokens - len(current_token_ids),
+            eos_token_id=eos_token_id,
+        )
+        emitted = [int(token) for token in verification["tokens_to_append"]]
+        if emitted != [int(token) for token in expected["tokens_to_append"]]:
+            raise RuntimeError(
+                f"{policy_name} replay verifier output diverged at round {round_id}"
+            )
+        state = len(current_token_ids)
+        current_token_ids.extend(emitted)
+        draft_latency_ms = float(trajectory["draft_wall_time_ms"])
+        replay_edges.append({
+            **expected,
+            "state": state,
+            "child_state": len(current_token_ids),
+            "draft_passes": int(trajectory["draft_passes"]),
+            "draft_latency_ms": draft_latency_ms,
+            "draft_forward_latency_ms": float(trajectory["draft_latency_ms"]),
+            "verify_latency_ms": float(verification["verify_latency_ms"]),
+            "post_verify_latency_ms": float(
+                verification["post_verify_latency_ms"]
+            ),
+            "edge_latency_ms": (
+                draft_latency_ms
+                + float(verification["verify_latency_ms"])
+                + float(verification["post_verify_latency_ms"])
+            ),
+            "accepted_len": int(verification["accepted_len"]),
+            "emitted_len": int(verification["emitted_len"]),
+            "tokens_to_append": emitted,
+            "policy": policy_name,
+            "round_id": round_id,
+        })
+        if eos_token_id in emitted or len(current_token_ids) >= num_target_tokens:
+            break
+
+    if len(replay_edges) != len(expected_path):
+        raise RuntimeError(
+            f"{policy_name} replay terminated after {len(replay_edges)} of "
+            f"{len(expected_path)} expected rounds"
+        )
+    summary = summarize_policy_path(replay_edges)
+    summary["replay_wall_time_ms"] = (
+        time.perf_counter() - replay_started
+    ) * 1000.0
+    return {
+        "current_token_ids": current_token_ids,
+        "edges": replay_edges,
+        "summary": summary,
     }
 
 
@@ -3538,13 +3640,13 @@ def run_global_oracle_problem(
         raise RuntimeError("global oracle root cannot reach the terminal state")
 
     solved = solve_canonical_oracle_graph(pruned_edges, terminal_length)
-    path_summaries = {
+    modeled_path_summaries = {
         policy: summarize_policy_path(path)
         for policy, path in solved["paths"].items()
     }
     global_path = solved["paths"]["global"]
     failfast_path = solved["paths"]["failfast"]
-    current_token_ids = list(prefix_by_length[terminal_length])
+    canonical_token_ids = list(prefix_by_length[terminal_length])
     if [edge["tokens_to_append"] for edge in global_path] != [
         edge["tokens_to_append"] for edge in failfast_path
     ]:
@@ -3552,6 +3654,45 @@ def run_global_oracle_problem(
         failfast_output = [token for edge in failfast_path for token in edge["tokens_to_append"]]
         if global_output != failfast_output:
             raise RuntimeError("global and FailFast paths did not reproduce identical output")
+
+    graph_search_wall_time_ms = (time.perf_counter() - problem_started) * 1000.0
+    oracle_replay = replay_global_oracle_policy_path(
+        args,
+        problem_id,
+        target_model,
+        dllm,
+        orig_model_inputs,
+        num_target_tokens,
+        drafter_threshold,
+        lowconf_threshold,
+        max_spec_len,
+        incr_len,
+        global_path,
+        "perfect_stop_oracle",
+    )
+    failfast_replay = replay_global_oracle_policy_path(
+        args,
+        problem_id,
+        target_model,
+        dllm,
+        orig_model_inputs,
+        num_target_tokens,
+        drafter_threshold,
+        lowconf_threshold,
+        max_spec_len,
+        incr_len,
+        failfast_path,
+        "failfast_fallback",
+    )
+    current_token_ids = list(oracle_replay["current_token_ids"])
+    if current_token_ids != canonical_token_ids:
+        raise RuntimeError("selected oracle replay did not reproduce canonical greedy output")
+    if failfast_replay["current_token_ids"] != canonical_token_ids:
+        raise RuntimeError("FailFast replay did not reproduce canonical greedy output")
+    replay_path_summaries = {
+        "global": oracle_replay["summary"],
+        "failfast": failfast_replay["summary"],
+    }
 
     optimal_states = {int(edge["state"]) for edge in global_path}
     failfast_states = {int(edge["state"]) for edge in failfast_path}
@@ -3802,9 +3943,11 @@ def run_global_oracle_problem(
                 ),
             })
             previous_elapsed_ms = elapsed_ms
-    search_wall_time_ms = (time.perf_counter() - problem_started) * 1000.0
-    global_summary = path_summaries["global"]
-    failfast_summary = path_summaries["failfast"]
+    total_profiling_wall_time_ms = (time.perf_counter() - problem_started) * 1000.0
+    global_summary = replay_path_summaries["global"]
+    failfast_summary = replay_path_summaries["failfast"]
+    modeled_global_summary = modeled_path_summaries["global"]
+    modeled_failfast_summary = modeled_path_summaries["failfast"]
     summary_row = {
         "problem_id": int(problem_id),
         "generated_tokens": terminal_length,
@@ -3814,6 +3957,16 @@ def run_global_oracle_problem(
         "oracle_speedup": safe_div(
             failfast_summary["total_latency_ms"],
             global_summary["total_latency_ms"],
+        ),
+        "modeled_baseline_total_latency_ms": modeled_failfast_summary[
+            "total_latency_ms"
+        ],
+        "modeled_oracle_optimal_latency_ms": modeled_global_summary[
+            "total_latency_ms"
+        ],
+        "modeled_oracle_speedup": safe_div(
+            modeled_failfast_summary["total_latency_ms"],
+            modeled_global_summary["total_latency_ms"],
         ),
         "baseline_dllm_forwards": failfast_summary["draft_passes"],
         "oracle_dllm_forwards": global_summary["draft_passes"],
@@ -3829,7 +3982,19 @@ def run_global_oracle_problem(
         "oracle_tokens_per_second": safe_div(
             terminal_length * 1000.0, global_summary["total_latency_ms"]
         ),
-        "oracle_search_wall_time_ms": search_wall_time_ms,
+        "oracle_search_wall_time_ms": graph_search_wall_time_ms,
+        "oracle_total_profiling_wall_time_ms": total_profiling_wall_time_ms,
+        "oracle_selected_path_replay_wall_time_ms": oracle_replay["summary"][
+            "replay_wall_time_ms"
+        ],
+        "failfast_path_replay_wall_time_ms": failfast_replay["summary"][
+            "replay_wall_time_ms"
+        ],
+        "oracle_replay_vs_modeled_error_percent": 100.0 * safe_div(
+            global_summary["total_latency_ms"]
+            - modeled_global_summary["total_latency_ms"],
+            modeled_global_summary["total_latency_ms"],
+        ),
         "unique_dp_states": len(pruned_edges) + 1,
         "dp_calls": dp_calls,
         "memo_hits": memo_hits,
@@ -3852,6 +4017,10 @@ def run_global_oracle_problem(
             row["patience"] == 3 and row["would_fail"] for row in patience_rows
         ),
         "global_never_slower_validation": int(
+            modeled_global_summary["total_latency_ms"]
+            <= modeled_failfast_summary["total_latency_ms"] + 1e-6
+        ),
+        "replay_oracle_not_slower_than_failfast": int(
             global_summary["total_latency_ms"]
             <= failfast_summary["total_latency_ms"] + 1e-6
         ),
@@ -3868,6 +4037,20 @@ def run_global_oracle_problem(
         ("global_oracle_optimal_trace.csv", optimal_trace),
         ("global_oracle_optimal_rounds.csv", optimal_rounds),
         ("global_oracle_failfast_trace.csv", failfast_trace),
+        (
+            "global_oracle_selected_path_replay.csv",
+            [
+                public_edge(edge, "perfect_stop_oracle", round_id)
+                for round_id, edge in enumerate(oracle_replay["edges"])
+            ],
+        ),
+        (
+            "global_oracle_failfast_path_replay.csv",
+            [
+                public_edge(edge, "failfast_fallback", round_id)
+                for round_id, edge in enumerate(failfast_replay["edges"])
+            ],
+        ),
         ("global_oracle_problem_summary.csv", [summary_row]),
     ):
         if rows:
@@ -3875,7 +4058,7 @@ def run_global_oracle_problem(
             append_csv_rows(os.path.join(args.output_dir, filename), columns, rows)
 
     stats_each_round = []
-    for edge in global_path:
+    for edge in oracle_replay["edges"]:
         stats_each_round.append({
             "target_tokens": edge["tokens_to_append"],
             "prefix_len": int(edge["state"]),
