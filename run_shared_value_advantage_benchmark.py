@@ -68,6 +68,16 @@ def parse_args():
         help="Run frozen-STOP and seeded random-STOP controls.",
     )
     parser.add_argument(
+        "--policy_controls",
+        nargs="*",
+        choices=("frozen_stop", "random_stop"),
+        default=[],
+        help=(
+            "Run only the selected controls. For example, "
+            "--policy_controls frozen_stop runs the Always-STOP control only."
+        ),
+    )
+    parser.add_argument(
         "--greedy_policy",
         action="store_true",
         help=(
@@ -226,6 +236,13 @@ def policy_control_command(args, policy_ablation):
         policy_ablation=policy_ablation,
         output_dir=output_dir,
     )
+
+
+def selected_policy_controls(args):
+    selected = list(getattr(args, "policy_controls", []) or [])
+    if getattr(args, "include_policy_controls", False):
+        selected.extend(("frozen_stop", "random_stop"))
+    return tuple(dict.fromkeys(selected))
 
 
 def failfast_baseline_command(args):
@@ -624,10 +641,16 @@ def build_policy_control_comparison(args, shared_summary):
     output_dir = Path(args.output_dir)
     comparison = _prefixed_summary(shared_summary, "shared_va")
     paired_frames = []
-    control_methods = {
+    all_control_methods = {
         "frozen_stop": f"{METHOD}_frozen_stop",
         "random_stop": f"{METHOD}_random_stop",
     }
+    control_methods = {
+        control: all_control_methods[control]
+        for control in selected_policy_controls(args)
+    }
+    if not control_methods:
+        return pd.DataFrame(), pd.DataFrame()
 
     for control, method in control_methods.items():
         control_dir = output_dir / "policy_controls" / control
@@ -784,17 +807,16 @@ def build_all_method_summary(args, shared_summary):
             ),
             "failfast_original",
         )
-    if args.include_policy_controls:
-        for control in ("frozen_stop", "random_stop"):
-            add(
-                pd.read_csv(
-                    output_dir
-                    / "policy_controls"
-                    / control
-                    / "dataset_method_summary.csv"
-                ),
-                control,
-            )
+    for control in selected_policy_controls(args):
+        add(
+            pd.read_csv(
+                output_dir
+                / "policy_controls"
+                / control
+                / "dataset_method_summary.csv"
+            ),
+            control,
+        )
 
     summary = pd.concat(frames, ignore_index=True)
     learned_latency = shared_summary[["dataset", "ms_per_output_token"]].rename(
@@ -826,8 +848,9 @@ def main():
 
     control_comparison = pd.DataFrame()
     control_paired = pd.DataFrame()
-    if args.include_policy_controls:
-        for policy_ablation in ("frozen_stop", "random_stop"):
+    controls = selected_policy_controls(args)
+    if controls:
+        for policy_ablation in controls:
             run_streaming(policy_control_command(args, policy_ablation))
         control_comparison, control_paired = build_policy_control_comparison(
             args,
@@ -869,7 +892,7 @@ def main():
             else "symmetric_sampling"
         ),
         "includes_matched_failfast_baseline": args.include_failfast_baseline,
-        "includes_policy_controls": args.include_policy_controls,
+        "included_policy_controls": list(controls),
         "elapsed_hours": (time.time() - started) / 3600.0,
     }
     (output_dir / "shared_value_advantage_manifest.json").write_text(

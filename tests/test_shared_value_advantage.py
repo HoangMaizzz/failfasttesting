@@ -14,6 +14,7 @@ from run_shared_value_advantage_benchmark import (
     benchmark_command,
     failfast_baseline_command,
     policy_control_command,
+    selected_policy_controls,
     validate_args,
 )
 from run_otrc_v2_td_benchmark import method_name
@@ -52,6 +53,7 @@ class SharedValueAdvantageTests(unittest.TestCase):
             resume=True,
             include_failfast_baseline=False,
             include_policy_controls=False,
+            policy_controls=[],
             greedy_policy=False,
             skip_archive=False,
             log_level="INFO",
@@ -233,6 +235,12 @@ class SharedValueAdvantageTests(unittest.TestCase):
             control_output = command[command.index("--output_dir") + 1]
             self.assertIn("policy_controls", control_output)
             self.assertTrue(control_output.endswith(control))
+
+    def test_runner_can_select_only_frozen_stop_control(self):
+        args = self.args()
+        args.datasets = ["math", "gsm8k"]
+        args.policy_controls = ["frozen_stop"]
+        self.assertEqual(selected_policy_controls(args), ("frozen_stop",))
 
     def test_unknown_policy_control_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown policy control"):
