@@ -2573,7 +2573,9 @@ def run_strict_greedy_local_oracle_problem(
             "predicted_verify_ms": predicted_verify_ms,
             "measured_verify_ms": float(verification["verify_latency_ms"]),
             "local_cost_ms": (
-                local_draft_ms + predicted_verify_ms + local_post_verify_ms
+                local_draft_ms
+                + float(verification["verify_latency_ms"])
+                + local_post_verify_ms
             ),
             "emitted_tokens": int(verification["emitted_len"]),
             "accepted_tokens": int(verification["accepted_len"]),
