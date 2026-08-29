@@ -125,12 +125,6 @@ def validate_args(args):
         raise ValueError("the Compact7 experiment fixes --lowconf_threshold=0.50")
     if args.target_device < 0 or args.drafter_device < 0:
         raise ValueError("CUDA device indices must be non-negative")
-    if args.include_failfast_baseline and not set(args.datasets).issubset(
-        {"math", "gsm8k"}
-    ):
-        raise ValueError(
-            "the integrated FailFast baseline currently supports math and gsm8k"
-        )
 
 
 def benchmark_command(args, *, policy_ablation="learned", output_dir=None):

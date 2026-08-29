@@ -12,7 +12,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS, aggregate_method
 
 
 ROOT = Path(__file__).resolve().parent
-DATASETS = ("math", "gsm8k")
+DATASETS = tuple(PROBLEM_IDS)
 METHOD = "failfast_matched"
 
 

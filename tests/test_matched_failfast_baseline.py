@@ -53,6 +53,13 @@ class MatchedFailFastBaselineTests(unittest.TestCase):
         self.assertEqual(command[command.index("--sweep_max_spec_len") + 1], "64")
         self.assertNotIn("--adaptive-td", command)
 
+    def test_aime_and_humaneval_are_supported(self):
+        args = self.args()
+        args.datasets = ["aime", "humaneval"]
+        validate_args(args)
+        command = command_for(args, "aime", Path("/tmp/out"))
+        self.assertEqual(command[command.index("--num_questions") + 1], "25")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -238,12 +238,13 @@ class SharedValueAdvantageTests(unittest.TestCase):
         self.assertIn("--skip_archive", command)
         self.assertIn("--resume", command)
 
-    def test_integrated_baseline_rejects_unsupported_dataset(self):
+    def test_integrated_baseline_supports_aime_and_humaneval(self):
         args = self.args()
-        args.datasets = ["aime"]
+        args.datasets = ["aime", "humaneval"]
         args.include_failfast_baseline = True
-        with self.assertRaisesRegex(ValueError, "math and gsm8k"):
-            validate_args(args)
+        validate_args(args)
+        command = failfast_baseline_command(args)
+        self.assertIn("--datasets aime humaneval", " ".join(command))
 
     def test_policy_controls_are_frozen_and_use_distinct_outputs(self):
         args = self.args()
