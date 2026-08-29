@@ -43,7 +43,6 @@ def parse_args():
         choices=("fixed", "annealed"),
         default="annealed",
     )
-    parser.add_argument("--bootstrap_decisions", type=int, default=64)
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument(
@@ -124,8 +123,6 @@ def validate_args(args):
         raise ValueError("the Compact7 experiment fixes --drafter_threshold=0.30")
     if not math.isclose(args.lowconf_threshold, 0.50):
         raise ValueError("the Compact7 experiment fixes --lowconf_threshold=0.50")
-    if args.bootstrap_decisions < 0:
-        raise ValueError("--bootstrap_decisions must be non-negative")
     if args.target_device < 0 or args.drafter_device < 0:
         raise ValueError("CUDA device indices must be non-negative")
     if args.include_failfast_baseline and not set(args.datasets).issubset(
@@ -203,8 +200,6 @@ def benchmark_command(args, *, policy_ablation="learned", output_dir=None):
         "20",
         "--adaptive_early_stop_min_observations",
         "32",
-        "--adaptive_bootstrap_decisions",
-        str(args.bootstrap_decisions),
         "--adaptive_policy_mode",
         policy_mode,
         "--adaptive_min_action_probability",

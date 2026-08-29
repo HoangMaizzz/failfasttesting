@@ -211,7 +211,6 @@ def parse_args():
     parser.add_argument("--adaptive_explore_epsilon", type=float, default=0.10)
     parser.add_argument("--adaptive_explore_min", type=float, default=0.01)
     parser.add_argument("--adaptive_explore_decay", type=float, default=0.998)
-    parser.add_argument("--adaptive_bootstrap_decisions", type=int, default=64)
     parser.add_argument("--adaptive_warmup_rounds", type=int, default=20)
     parser.add_argument("--adaptive_early_stop_min_observations", type=int, default=32)
     parser.add_argument(
@@ -267,8 +266,6 @@ def validate_args(args):
         )
     if args.rho_warmup_boundaries < 0:
         raise ValueError("--rho_warmup_boundaries must be non-negative")
-    if args.adaptive_bootstrap_decisions < 0:
-        raise ValueError("--adaptive_bootstrap_decisions must be non-negative")
     if (
         args.rho_warmup_boundaries
         and args.credit_assignment
@@ -420,8 +417,6 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-explore-epsilon", str(args.adaptive_explore_epsilon),
         "--adaptive-explore-min", str(args.adaptive_explore_min),
         "--adaptive-explore-decay", str(args.adaptive_explore_decay),
-        "--adaptive-bootstrap-decisions",
-        str(args.adaptive_bootstrap_decisions),
         "--adaptive-warmup-rounds", str(args.adaptive_warmup_rounds),
         "--adaptive-early-stop-min-observations",
         str(args.adaptive_early_stop_min_observations),

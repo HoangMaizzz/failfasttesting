@@ -53,7 +53,6 @@ class OTRCV2TDBenchmarkTests(unittest.TestCase):
             adaptive_explore_epsilon=0.1,
             adaptive_explore_min=0.01,
             adaptive_explore_decay=0.998,
-            adaptive_bootstrap_decisions=64,
             adaptive_warmup_rounds=20,
             adaptive_early_stop_min_observations=32,
             adaptive_policy_mode="symmetric",

@@ -47,7 +47,6 @@ class SharedValueAdvantageTests(unittest.TestCase):
             lowconf_threshold=0.50,
             feature_schema="otrc_v2_3_compact7_td",
             exploration_policy="annealed",
-            bootstrap_decisions=64,
             target_device=0,
             drafter_device=0,
             target_quantization="none",
@@ -149,7 +148,6 @@ class SharedValueAdvantageTests(unittest.TestCase):
         )
         self.assertIn("--feature_schema otrc_v2_3_compact7_td", joined)
         self.assertIn("--adaptive_policy_mode symmetric_annealed", joined)
-        self.assertIn("--adaptive_bootstrap_decisions 64", joined)
         self.assertIn("--adaptive_explore_min 0.02", joined)
         self.assertIn(
             f"--shared_value_learning_rate {VALUE_LEARNING_RATE}",

@@ -74,30 +74,27 @@ class AdaptiveTDTests(unittest.TestCase):
                 factual_verifier_latency_ema_ms=8.0,
             )
 
-    def test_annealed_policy_bootstraps_first_64_valid_decisions(self):
+    def test_annealed_policy_starts_from_first_decision(self):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(
                 policy_mode="symmetric_annealed",
-                bootstrap_decisions=64,
+                explore_epsilon=0.10,
+                explore_min=0.02,
                 seed=42,
             )
         )
         features = synthetic_features(1, 3)
-        decisions = [
-            controller.choose(features, allow_stop=True, refinement_step=1)
-            for _ in range(65)
-        ]
-        self.assertTrue(all(
-            item.behavior_stop_probability == 0.5
-            and item.diagnostics["bootstrap_active"]
-            and item.selected_action_probability == 0.5
-            and item.importance_weight == 2.0
-            for item in decisions[:64]
-        ))
-        self.assertEqual({item.action for item in decisions[:64]}, {STOP, CONTINUE})
-        self.assertFalse(decisions[64].diagnostics["bootstrap_active"])
+        decision = controller.choose(
+            features,
+            allow_stop=True,
+            refinement_step=1,
+        )
+        self.assertEqual(decision.behavior_stop_probability, 0.5)
+        self.assertEqual(decision.selected_action_probability, 0.5)
+        self.assertEqual(decision.importance_weight, 2.0)
+        self.assertEqual(decision.reason, "symmetric_annealed_sample")
         self.assertAlmostEqual(
-            decisions[64].diagnostics["exploration_floor"],
+            decision.diagnostics["exploration_floor"],
             0.10,
         )
 
@@ -105,7 +102,6 @@ class AdaptiveTDTests(unittest.TestCase):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(
                 policy_mode="symmetric_annealed",
-                bootstrap_decisions=64,
                 explore_epsilon=0.10,
                 explore_min=0.02,
                 explore_decay=0.998,
@@ -113,7 +109,7 @@ class AdaptiveTDTests(unittest.TestCase):
         )
         floors = [
             controller._annealed_exploration_floor(step)
-            for step in (64, 65, 1000, 100000)
+            for step in (0, 1, 100, 300, 500, 100000)
         ]
         self.assertAlmostEqual(floors[0], 0.10)
         self.assertTrue(all(a >= b for a, b in zip(floors, floors[1:])))
@@ -124,7 +120,6 @@ class AdaptiveTDTests(unittest.TestCase):
         controller = OnlineTDRefinementController(
             AdaptiveTDConfig(
                 policy_mode="symmetric_annealed",
-                bootstrap_decisions=0,
                 explore_epsilon=0.10,
                 explore_min=0.02,
             )

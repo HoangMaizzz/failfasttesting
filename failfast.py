@@ -637,7 +637,6 @@ parser.add_argument("--adaptive-q-margin", type=float, default=0.0)
 parser.add_argument("--adaptive-explore-epsilon", type=float, default=0.10)
 parser.add_argument("--adaptive-explore-min", type=float, default=0.01)
 parser.add_argument("--adaptive-explore-decay", type=float, default=0.998)
-parser.add_argument("--adaptive-bootstrap-decisions", type=int, default=64)
 parser.add_argument("--adaptive-warmup-rounds", type=int, default=20)
 parser.add_argument("--adaptive-early-stop-min-observations", type=int, default=32)
 parser.add_argument(
@@ -874,7 +873,6 @@ def build_adaptive_controller(args):
             explore_epsilon=args.adaptive_explore_epsilon,
             explore_min=args.adaptive_explore_min,
             explore_decay=args.adaptive_explore_decay,
-            bootstrap_decisions=args.adaptive_bootstrap_decisions,
             warmup_rounds=args.adaptive_warmup_rounds,
             early_stop_min_observations=args.adaptive_early_stop_min_observations,
             max_refinement_steps=args.adaptive_max_refinement_steps,

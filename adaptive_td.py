@@ -153,7 +153,6 @@ class AdaptiveTDConfig:
     explore_epsilon: float = 0.10
     explore_min: float = 0.01
     explore_decay: float = 0.998
-    bootstrap_decisions: int = 64
     warmup_rounds: int = 20
     early_stop_min_observations: int = 32
     max_refinement_steps: int = 16
@@ -213,8 +212,6 @@ class AdaptiveTDConfig:
             raise ValueError("exploration rates must satisfy 0 <= min <= epsilon <= 1")
         if not 0.0 < self.explore_decay <= 1.0:
             raise ValueError("explore_decay must be in (0, 1]")
-        if self.bootstrap_decisions < 0:
-            raise ValueError("bootstrap_decisions must be non-negative")
         if not 0.0 <= self.mc_mix <= 1.0:
             raise ValueError("mc_mix must be in [0, 1]")
         if self.risk_beta < 0.0 or self.epistemic_scale < 0.0:
@@ -700,10 +697,9 @@ class OnlineTDRefinementController:
             if decision_count is None
             else max(0, int(decision_count))
         )
-        age = max(0, count - self.config.bootstrap_decisions)
         return max(
             self.config.explore_min,
-            self.config.explore_epsilon * (self.config.explore_decay ** age),
+            self.config.explore_epsilon * (self.config.explore_decay ** count),
         )
 
     def advance_algorithm_latency(
@@ -976,7 +972,6 @@ class OnlineTDRefinementController:
         behavior_stop_probability = stop_probability
         selected_action_probability = 1.0
         symmetric_sampling_used = False
-        bootstrap_active = False
         exploration_floor = 0.0
         action_started = time.perf_counter() if profiling else None
         exploration_used = False
@@ -1030,22 +1025,13 @@ class OnlineTDRefinementController:
             )
             if allow_exploration:
                 symmetric_sampling_used = True
-                bootstrap_active = (
-                    self.annealed_decision_count
-                    < self.config.bootstrap_decisions
+                exploration_floor = self._annealed_exploration_floor()
+                behavior_stop_probability = _clip(
+                    stop_probability,
+                    exploration_floor,
+                    1.0 - exploration_floor,
                 )
-                if bootstrap_active:
-                    behavior_stop_probability = 0.5
-                    exploration_floor = 0.5
-                    reason = "symmetric_balanced_bootstrap"
-                else:
-                    exploration_floor = self._annealed_exploration_floor()
-                    behavior_stop_probability = _clip(
-                        stop_probability,
-                        exploration_floor,
-                        1.0 - exploration_floor,
-                    )
-                    reason = "symmetric_annealed_sample"
+                reason = "symmetric_annealed_sample"
                 if self.rng.random() < behavior_stop_probability:
                     action = STOP
                     selected_action_probability = behavior_stop_probability
@@ -1191,12 +1177,6 @@ class OnlineTDRefinementController:
                 "ema_advantage": advantage_mean,
                 "raw_stop_probability": raw_stop_probability,
                 "ema_stop_probability": stop_probability,
-                "bootstrap_active": bootstrap_active,
-                "bootstrap_decisions": self.config.bootstrap_decisions,
-                "number_of_bootstrap_decisions_seen": min(
-                    self.annealed_decision_count,
-                    self.config.bootstrap_decisions,
-                ),
                 "exploration_floor": exploration_floor,
                 "raw_greedy_action": (
                     STOP
@@ -1862,22 +1842,12 @@ class OnlineTDRefinementController:
             "feature_names": list(self.feature_names),
             "completed_rounds": self.completed_rounds,
             "decision_count": self.decision_count,
-            "bootstrap_decisions": self.config.bootstrap_decisions,
-            "number_of_bootstrap_decisions_seen": min(
-                self.annealed_decision_count,
-                self.config.bootstrap_decisions,
-            ),
             "annealed_decision_count": self.annealed_decision_count,
             "explore_initial": self.config.explore_epsilon,
             "explore_min": self.config.explore_min,
             "explore_decay": self.config.explore_decay,
             "current_exploration_floor": (
-                (
-                    0.5
-                    if self.annealed_decision_count
-                    < self.config.bootstrap_decisions
-                    else self._annealed_exploration_floor()
-                )
+                self._annealed_exploration_floor()
                 if self.config.policy_mode == "symmetric_annealed"
                 else (
                     self.config.min_action_probability
