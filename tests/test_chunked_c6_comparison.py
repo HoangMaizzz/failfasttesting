@@ -1,5 +1,9 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+
+import pandas as pd
 
 from run_chunked_c6_comparison_test50 import (
     adaptive_flags,
@@ -8,6 +12,7 @@ from run_chunked_c6_comparison_test50 import (
     chunks,
     failure_category,
     RunFailure,
+    summarize,
 )
 
 
@@ -52,6 +57,34 @@ class ChunkedC6ComparisonTests(unittest.TestCase):
     def test_oom_failure_is_classified(self):
         error = RunFailure(1, ["python"], ["torch.OutOfMemoryError: CUDA out of memory\n"])
         self.assertEqual(failure_category(error), "cuda_oom")
+
+    def test_summary_builds_failfast_latency_before_speedups(self):
+        with TemporaryDirectory() as temporary:
+            runs = {}
+            for dataset in ("math", "gsm8k"):
+                for index, method in enumerate(("c6_annealed", "always_stop", "failfast")):
+                    directory = Path(temporary) / dataset / method
+                    directory.mkdir(parents=True)
+                    pd.DataFrame([{
+                        "problem_id": 1,
+                        "actual_algorithm_time": 1.0 + index,
+                        "output_tokens": 10,
+                        "drafted_tokens": 12,
+                        "output_token_hash": "same",
+                        "accepted_tokens": 8,
+                        "actual_draft_time": 0.4,
+                        "actual_verify_time": 0.6,
+                        "actual_post_verify_time": 0.0,
+                        "total_num_forward_passes": 2,
+                        "num_speculation_rounds": 1,
+                        "is_correct": True,
+                    }]).to_csv(directory / "benchmark_results.csv", index=False)
+                    runs[(dataset, method)] = [directory]
+            args = SimpleNamespace(output_dir=temporary)
+            summarize(args, runs)
+            paired = pd.read_csv(Path(temporary) / "paired_problem_comparison.csv")
+            self.assertIn("failfast_ms_per_output_token", paired.columns)
+            self.assertIn("c6_annealed_speedup_vs_failfast", paired.columns)
 
 
 if __name__ == "__main__":

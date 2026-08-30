@@ -321,8 +321,12 @@ def summarize(args, runs):
             item = frame[columns].copy().rename(columns={c: f"{method}_{c}" for c in columns if c != "problem_id"})
             paired = item if paired is None else paired.merge(item, on="problem_id", validate="one_to_one")
         paired.insert(0, "dataset", dataset)
+        # Materialize every method's latency before deriving any speedup.  The
+        # method order starts with C6, so computing both in one loop attempts
+        # to read the FailFast latency column before it exists.
         for method in METHODS:
             paired[f"{method}_ms_per_output_token"] = 1000.0 * paired[f"{method}_actual_algorithm_time"] / paired[f"{method}_output_tokens"].clip(lower=1)
+        for method in METHODS:
             paired[f"{method}_speedup_vs_failfast"] = paired["failfast_ms_per_output_token"] / paired[f"{method}_ms_per_output_token"]
             paired[f"{method}_output_matches_failfast"] = paired[f"{method}_output_token_hash"].astype(str) == paired["failfast_output_token_hash"].astype(str)
         paired_frames.append(paired)
