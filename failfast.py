@@ -2653,6 +2653,11 @@ def run_strict_greedy_local_oracle_problem(
                     final_draft = run_draft(tuple(action_script), None)
                     break
                 except OracleBranchRequired as required:
+                    # The exception traceback retains the complete drafter call
+                    # frame, including CUDA tensors, while both verifier probes
+                    # run inside this handler.  The oracle only needs the copied
+                    # decision metadata, so release those frames before probing.
+                    required.__traceback__ = None
                     if required.decision_index != len(action_script):
                         raise RuntimeError(
                             "strict greedy replay consumed an inconsistent script"
