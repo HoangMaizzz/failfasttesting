@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from run_chunked_c6_comparison_test50 import (
     adaptive_flags,
     base_command,
+    candidate_pool,
     chunks,
+    failure_category,
+    RunFailure,
 )
 
 
@@ -37,6 +40,18 @@ class ChunkedC6ComparisonTests(unittest.TestCase):
         self.assertIn("--target_quantization int8", joined)
         self.assertIn("--drafter_thresholds 0.3", joined)
         self.assertIn("--sweep_lowconf_threshold 0.5", joined)
+
+    def test_candidate_pool_keeps_preferred_ids_then_unique_backups(self):
+        pool = candidate_pool("math", 50)
+        self.assertEqual(pool[:50], [int(value) for value in __import__(
+            "run_otrc_v2_td_benchmark"
+        ).PROBLEM_IDS["math"][:50]])
+        self.assertEqual(len(pool), len(set(pool)))
+        self.assertGreater(len(pool), 50)
+
+    def test_oom_failure_is_classified(self):
+        error = RunFailure(1, ["python"], ["torch.OutOfMemoryError: CUDA out of memory\n"])
+        self.assertEqual(failure_category(error), "cuda_oom")
 
 
 if __name__ == "__main__":
