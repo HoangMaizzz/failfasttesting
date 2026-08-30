@@ -21,9 +21,10 @@ class PairedBoundaryFeatureProbeTests(unittest.TestCase):
 
     def test_behavior_policy_preserves_actions_and_marks_selected_states(self):
         decisions = pd.DataFrame([
-            {"problem_id": 7, "round_id": 0, "decision_id": 0, "action": "continue"},
-            {"problem_id": 7, "round_id": 0, "decision_id": 1, "action": "stop"},
-            {"problem_id": 7, "round_id": 1, "decision_id": 0, "action": "continue"},
+            {"problem_id": 7, "round_id": 0, "decision_id": 0, "action": "continue", "stop_available": False},
+            {"problem_id": 7, "round_id": 0, "decision_id": 1, "action": "continue", "stop_available": True},
+            {"problem_id": 7, "round_id": 0, "decision_id": 2, "action": "stop", "stop_available": True},
+            {"problem_id": 7, "round_id": 1, "decision_id": 0, "action": "continue", "stop_available": True},
         ])
         results = pd.DataFrame([
             {"problem_id": 7, "num_speculation_rounds": 2},

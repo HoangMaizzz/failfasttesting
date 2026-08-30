@@ -137,12 +137,33 @@ def evenly_spaced_positions(length, limit):
     return sorted(set(np.linspace(0, length - 1, count).round().astype(int).tolist()))
 
 
+def legal_decision_rows(decisions):
+    if "stop_available" not in decisions.columns:
+        return decisions.copy()
+    values = decisions["stop_available"]
+    if values.dtype == bool:
+        mask = values
+    else:
+        mask = values.astype(str).str.strip().str.lower().isin(
+            {"1", "true", "yes"}
+        )
+    return decisions.loc[mask].copy()
+
+
 def build_behavior_policy(decisions, results, max_states_per_problem):
     policies = {}
     selected_rows = []
-    decisions = decisions.sort_values(
+    decisions = legal_decision_rows(decisions).sort_values(
         ["problem_id", "round_id", "decision_id"]
     ).copy()
+    decisions["logged_decision_id"] = pd.to_numeric(
+        decisions["decision_id"]
+    ).astype(int)
+    decisions["decision_id"] = (
+        decisions.groupby(["problem_id", "round_id"], sort=False)
+        .cumcount()
+        .astype(int)
+    )
     for problem_id, result in results.groupby("problem_id", sort=False):
         problem_id = int(problem_id)
         problem_rows = decisions[decisions.problem_id.astype(int) == problem_id]
