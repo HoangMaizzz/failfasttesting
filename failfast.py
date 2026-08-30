@@ -5294,6 +5294,22 @@ for problem_id, is_warmup in tqdm(
                             "emitted_tokens": len(tokens_to_append),
                             "verify_latency_ms": verify_time * 1000.0,
                         })
+
+                    if not (
+                        draft_type == "dllm"
+                        and args.collect_bucket_oracle
+                        and not args.causal_oracle
+                        and not is_warmup
+                    ):
+                        del verify_logits, outputs
+                        if bonus_token is not None:
+                            del final_token_logits
+                    del (
+                        full_input_ids,
+                        full_attention_mask,
+                        verify_input_tensor,
+                        verify_mask_tensor,
+                    )
                     
                     num_speculation_rounds += 1
                     
