@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from statistics import NormalDist
 from typing import Iterable, Sequence
 
+from adaptive_nonlinear import OnlineNonlinearVA
+
 
 STOP = "stop"
 CONTINUE = "continue"
@@ -177,6 +179,11 @@ class AdaptiveTDConfig:
     value_parameterization: str = "independent_q"
     shared_value_learning_rate: float = 0.015
     shared_advantage_learning_rate: float = 0.02
+    value_model: str = "linear"
+    nonlinear_learning_rate: float = 1e-3
+    nonlinear_weight_decay: float = 0.0
+    nonlinear_grad_clip: float = 1.0
+    nonlinear_device: str = "cpu"
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -293,6 +300,15 @@ class AdaptiveTDConfig:
                 "value_parameterization must be independent_q or "
                 "shared_value_advantage"
             )
+        if self.value_model not in {"linear", "nam", "ga2m"}:
+            raise ValueError("value_model must be linear, nam, or ga2m")
+        if self.value_model != "linear":
+            if self.feature_schema != "otrc_v2_2_compact_td":
+                raise ValueError("NAM/GA2M require Compact6")
+            if self.value_parameterization != "shared_value_advantage":
+                raise ValueError("NAM/GA2M require shared value/advantage")
+            if self.credit_assignment != "verifier_boundary_factual_no_bootstrap":
+                raise ValueError("NAM/GA2M require factual no-bootstrap")
         if (
             self.shared_value_learning_rate < 0.0
             or self.shared_advantage_learning_rate < 0.0
@@ -480,6 +496,8 @@ class OnlineTDRefinementController:
         )
         if config.value_parameterization == "shared_value_advantage":
             self.controller_name += "_shared_value_advantage"
+        if config.value_model != "linear":
+            self.controller_name += f"_{config.value_model}"
         self.feature_names = FEATURE_SCHEMAS[config.feature_schema]
         self.values = {
             STOP: _LinearActionValue(config.feature_dim, config),
@@ -526,6 +544,17 @@ class OnlineTDRefinementController:
         self.factual_warmup_transition_count = 0
         self.full_stream_transitions: list[dict] = []
         self.weight_snapshots: list[dict] = []
+        self.nonlinear_value = (
+            None if config.value_model == "linear" else OnlineNonlinearVA(
+                config.value_model,
+                learning_rate=config.nonlinear_learning_rate,
+                weight_decay=config.nonlinear_weight_decay,
+                grad_clip=config.nonlinear_grad_clip,
+                huber_delta=config.td_error_clip,
+                seed=config.seed,
+                device=config.nonlinear_device,
+            )
+        )
 
     @property
     def rho(self) -> float:
@@ -585,6 +614,17 @@ class OnlineTDRefinementController:
         *,
         observation_weight: float,
     ) -> float:
+        if self.nonlinear_value is not None:
+            raw_residual = self.values[action].update(
+                features,
+                target,
+                rate=0.0,
+                observation_weight=observation_weight,
+            )
+            update = self.nonlinear_value.update(
+                action, features, target, observation_weight
+            )
+            return float(update["residual"])
         if not self.uses_shared_value_advantage:
             return self.values[action].update(
                 features,
@@ -908,6 +948,11 @@ class OnlineTDRefinementController:
             "value_parameterization": self.config.value_parameterization,
             "shared_value_theta": list(self.shared_value_theta),
             "shared_advantage_theta": list(self.shared_advantage_theta),
+            "value_model": self.config.value_model,
+            "nonlinear_diagnostics": (
+                self.nonlinear_value.diagnostics()
+                if self.nonlinear_value is not None else None
+            ),
         })
 
     def choose(
@@ -922,16 +967,32 @@ class OnlineTDRefinementController:
         started = time.perf_counter()
         profiling = self.config.profile_overhead
         stop_started = time.perf_counter() if profiling else None
-        raw_stop_mean = self.values[STOP].mean(features)
-        stop_mean = self._policy_mean(STOP, features)
+        nonlinear_prediction = (
+            self.nonlinear_value.predict(features)
+            if self.nonlinear_value is not None else None
+        )
+        raw_stop_mean = (
+            nonlinear_prediction[2] if nonlinear_prediction is not None
+            else self.values[STOP].mean(features)
+        )
+        stop_mean = (
+            raw_stop_mean if nonlinear_prediction is not None
+            else self._policy_mean(STOP, features)
+        )
         if stop_started is not None:
             self.record_profile(
                 "q_stop",
                 (time.perf_counter() - stop_started) * 1000.0,
             )
         continue_started = time.perf_counter() if profiling else None
-        raw_continue_mean = self.values[CONTINUE].mean(features)
-        continue_mean = self._policy_mean(CONTINUE, features)
+        raw_continue_mean = (
+            nonlinear_prediction[3] if nonlinear_prediction is not None
+            else self.values[CONTINUE].mean(features)
+        )
+        continue_mean = (
+            raw_continue_mean if nonlinear_prediction is not None
+            else self._policy_mean(CONTINUE, features)
+        )
         if continue_started is not None:
             self.record_profile(
                 "q_continue",
@@ -1151,13 +1212,24 @@ class OnlineTDRefinementController:
                 "shared_value_mean": _dot(
                     self.shared_value_theta,
                     features,
-                ) if self.uses_shared_value_advantage else 0.5 * (
+                ) if self.uses_shared_value_advantage and nonlinear_prediction is None else (
+                    nonlinear_prediction[0] if nonlinear_prediction is not None else 0.5 * (
                     raw_stop_mean + raw_continue_mean
+                    )
                 ),
                 "explicit_advantage_mean": _dot(
                     self.shared_advantage_theta,
                     features,
-                ) if self.uses_shared_value_advantage else raw_advantage_mean,
+                ) if self.uses_shared_value_advantage and nonlinear_prediction is None else (
+                    nonlinear_prediction[1] if nonlinear_prediction is not None else raw_advantage_mean
+                ),
+                "value_model": self.config.value_model,
+                "nonlinear_loss": (
+                    self.nonlinear_value.last_loss if self.nonlinear_value else 0.0
+                ),
+                "nonlinear_gradient_norm": (
+                    self.nonlinear_value.last_gradient_norm if self.nonlinear_value else 0.0
+                ),
                 "legacy_advantage_risk": advantage_risk,
                 "greedy_action": (
                     STOP if advantage_mean > self.config.q_margin else CONTINUE
@@ -1386,6 +1458,15 @@ class OnlineTDRefinementController:
                 ),
                 "importance_weight": float(record["importance_weight"]),
                 "value_parameterization": self.config.value_parameterization,
+                "value_model": self.config.value_model,
+                "nonlinear_loss": (
+                    self.nonlinear_value.last_loss
+                    if self.nonlinear_value is not None and update_applied else 0.0
+                ),
+                "nonlinear_gradient_norm": (
+                    self.nonlinear_value.last_gradient_norm
+                    if self.nonlinear_value is not None and update_applied else 0.0
+                ),
                 "decision_shared_value": float(
                     record.get("decision_shared_value", 0.0)
                 ),
@@ -1410,6 +1491,8 @@ class OnlineTDRefinementController:
                     "factual_rho_warmup_boundaries": int(
                         self.config.rho_warmup_boundaries
                     ),
+                    "factual_loss": transition["nonlinear_loss"],
+                    "factual_gradient_norm": transition["nonlinear_gradient_norm"],
                 })
         return transitions
 
@@ -1873,6 +1956,10 @@ class OnlineTDRefinementController:
             ),
             "shared_value_theta": list(self.shared_value_theta),
             "shared_advantage_theta": list(self.shared_advantage_theta),
+            "value_model": self.config.value_model,
+            "nonlinear_value": (
+                self.nonlinear_value.snapshot() if self.nonlinear_value else None
+            ),
             "min_action_probability": self.config.min_action_probability,
             "max_importance_weight": self.config.max_importance_weight,
             "disabled_features": list(self.config.disabled_features),
@@ -1975,6 +2062,7 @@ class OnlineTDRefinementController:
             "value_parameterization",
             "independent_q",
         )
+        snapshot_value_model = snapshot.get("value_model", "linear")
         snapshot_policy_ablation = snapshot.get("policy_ablation", "learned")
         snapshot_policy_mode = snapshot.get("policy_mode", "legacy")
         snapshot_shared_value_rate = float(
@@ -2005,6 +2093,7 @@ class OnlineTDRefinementController:
             or snapshot_credit_assignment != self.config.credit_assignment
             or snapshot_value_parameterization
             != self.config.value_parameterization
+            or snapshot_value_model != self.config.value_model
             or snapshot_policy_ablation != self.config.policy_ablation
             or snapshot_policy_mode != self.config.policy_mode
             or not math.isclose(
@@ -2088,6 +2177,12 @@ class OnlineTDRefinementController:
             value.residual_m2 = (
                 residual_variance * value.residual_degrees_of_freedom()
             )
+
+        if self.nonlinear_value is not None:
+            nonlinear_snapshot = snapshot.get("nonlinear_value")
+            if not nonlinear_snapshot:
+                raise ValueError("snapshot is missing nonlinear value state")
+            self.nonlinear_value.load_snapshot(nonlinear_snapshot)
 
         if self.uses_shared_value_advantage:
             shared_value = [

@@ -187,6 +187,11 @@ def parse_args():
         type=float,
         default=0.02,
     )
+    parser.add_argument("--value_model", choices=("linear", "nam", "ga2m"), default="linear")
+    parser.add_argument("--nonlinear_learning_rate", type=float, default=1e-3)
+    parser.add_argument("--nonlinear_weight_decay", type=float, default=0.0)
+    parser.add_argument("--nonlinear_grad_clip", type=float, default=1.0)
+    parser.add_argument("--nonlinear_device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--adaptive_mc_learning_rate", type=float, default=0.01)
     parser.add_argument("--adaptive_mc_mix", type=float, default=0.5)
     parser.add_argument(
@@ -326,6 +331,9 @@ def method_name(args):
             "shared_value_advantage"
         ):
             base = f"{base}_shared_value_advantage"
+        value_model = getattr(args, "value_model", "linear")
+        if value_model != "linear":
+            base = f"{base}_{value_model}"
         if getattr(args, "adaptive_policy_mode", "symmetric") == (
             "symmetric_annealed"
         ):
@@ -393,6 +401,11 @@ def command_for(args, dataset, problem_ids, output_dir):
         "--adaptive-learning-rate", str(args.adaptive_learning_rate),
         "--adaptive-value-parameterization",
         getattr(args, "value_parameterization", "independent_q"),
+        "--adaptive-value-model", getattr(args, "value_model", "linear"),
+        "--adaptive-nonlinear-learning-rate", str(getattr(args, "nonlinear_learning_rate", 1e-3)),
+        "--adaptive-nonlinear-weight-decay", str(getattr(args, "nonlinear_weight_decay", 0.0)),
+        "--adaptive-nonlinear-grad-clip", str(getattr(args, "nonlinear_grad_clip", 1.0)),
+        "--adaptive-nonlinear-device", str(getattr(args, "nonlinear_device", "cpu")),
         "--adaptive-shared-value-learning-rate",
         str(getattr(args, "shared_value_learning_rate", 0.015)),
         "--adaptive-shared-advantage-learning-rate",

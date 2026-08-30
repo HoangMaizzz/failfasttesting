@@ -627,6 +627,15 @@ parser.add_argument(
     default="independent_q",
 )
 parser.add_argument(
+    "--adaptive-value-model",
+    choices=["linear", "nam", "ga2m"],
+    default="linear",
+)
+parser.add_argument("--adaptive-nonlinear-learning-rate", type=float, default=1e-3)
+parser.add_argument("--adaptive-nonlinear-weight-decay", type=float, default=0.0)
+parser.add_argument("--adaptive-nonlinear-grad-clip", type=float, default=1.0)
+parser.add_argument("--adaptive-nonlinear-device", choices=["cpu", "cuda"], default="cpu")
+parser.add_argument(
     "--adaptive-shared-value-learning-rate",
     type=float,
     default=0.015,
@@ -936,6 +945,11 @@ def build_adaptive_controller(args):
             shared_advantage_learning_rate=(
                 args.adaptive_shared_advantage_learning_rate
             ),
+            value_model=args.adaptive_value_model,
+            nonlinear_learning_rate=args.adaptive_nonlinear_learning_rate,
+            nonlinear_weight_decay=args.adaptive_nonlinear_weight_decay,
+            nonlinear_grad_clip=args.adaptive_nonlinear_grad_clip,
+            nonlinear_device=args.adaptive_nonlinear_device,
             mc_learning_rate=args.adaptive_mc_learning_rate,
             mc_mix=args.adaptive_mc_mix,
             update_mode=args.adaptive_update_mode,
