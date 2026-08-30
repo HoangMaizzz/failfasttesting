@@ -4,6 +4,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import copy
 import csv
+import gc
 import hashlib
 import json
 import math
@@ -163,6 +164,7 @@ from strict_greedy_oracle import (
     load_verifier_profile,
     predict_verifier_latency_ms,
 )
+from exact_boundary_oracle import BoundaryLeaf, solve_exact_boundary_tree
 
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -576,6 +578,19 @@ parser.add_argument(
         "executing the unmodified FailFast CONTINUE support policy."
     ),
 )
+parser.add_argument(
+    "--strict_greedy_exact_boundary",
+    action="store_true",
+    help=(
+        "Enumerate every STOP/CONTINUE action sequence to the next verifier "
+        "boundary for rounds marked by the behavior policy."
+    ),
+)
+parser.add_argument(
+    "--strict_greedy_exact_max_states",
+    type=int,
+    default=256,
+)
 parser.add_argument("--log_verifier_calls", action="store_true")
 parser.add_argument(
     "--audit_greedy_consistency",
@@ -840,6 +855,17 @@ if args.strict_greedy_capacity_collector and not args.strict_greedy_local_oracle
     raise ValueError(
         "--strict_greedy_capacity_collector requires --strict_greedy_local_oracle"
     )
+if args.strict_greedy_exact_boundary:
+    if not args.strict_greedy_capacity_collector:
+        raise ValueError(
+            "--strict_greedy_exact_boundary requires the capacity collector"
+        )
+    if not args.strict_greedy_behavior_policy:
+        raise ValueError(
+            "--strict_greedy_exact_boundary requires a behavior policy"
+        )
+    if args.strict_greedy_exact_max_states <= 0:
+        raise ValueError("--strict_greedy_exact_max_states must be positive")
 if args.strict_greedy_capacity_collector and args.strict_greedy_replay_policy:
     raise ValueError("capacity collector cannot replay an oracle policy")
 if args.strict_greedy_behavior_policy and not args.strict_greedy_capacity_collector:
@@ -947,6 +973,7 @@ args.strict_greedy_profile = (
     else None
 )
 args.strict_greedy_decision_rows = []
+args.exact_boundary_summary_rows = []
 args.verifier_call_rows = []
 args.greedy_consistency_rows = []
 args.output_token_rows = []
@@ -2643,6 +2670,193 @@ def run_strict_greedy_local_oracle_problem(
             "extension_count": len(extension_events),
         }
 
+    def run_exact_boundary_search(behavior_round):
+        behavior_actions = tuple(behavior_round.get("actions") or [])
+        max_states = int(args.strict_greedy_exact_max_states)
+        mean_draft_forward_ms = float(
+            profile.get("mean_draft_forward_latency_ms", 6.1)
+        )
+        mean_post_verify_ms = float(
+            profile.get("mean_post_verify_latency_ms", 0.0)
+        )
+        exact_rho = float(profile.get("rho_tokens_per_ms", rho_profile))
+        stack = [tuple()]
+        nodes = {}
+        leaves = []
+        verifier_cache = {}
+        state_key_counts = {}
+        unresolved_reason = ""
+        branch_runs = 0
+
+        while stack:
+            script = stack.pop()
+            try:
+                draft = run_draft(script, None)
+                branch_runs += 1
+            except OracleBranchRequired as required:
+                required.__traceback__ = None
+                branch_runs += 1
+                if required.decision_index != len(script):
+                    raise RuntimeError(
+                        "exact boundary replay consumed an inconsistent script"
+                    )
+                state = dict(required.state)
+                proposal = state.get("draft_proposal") or []
+                context_len = int(state.get(
+                    "context_len",
+                    orig_model_inputs["input_ids"].shape[1]
+                    + len(current_token_ids),
+                ))
+                proposal_len = int(state.get("proposal_length", 0))
+                refinement_step = int(state.get("refinement_step", 0))
+                state_key = build_oracle_state_key(
+                    problem_id,
+                    context_len,
+                    proposal_len,
+                    refinement_step,
+                    proposal,
+                )
+                state_key_counts[state_key] = state_key_counts.get(state_key, 0) + 1
+                nodes[script] = {
+                    "state": state,
+                    "state_key": state_key,
+                    "context_len": context_len,
+                    "proposal_length": proposal_len,
+                    "refinement_step": refinement_step,
+                    "draft_proposal": proposal,
+                }
+                if len(nodes) > max_states:
+                    unresolved_reason = "max_unique_states"
+                    break
+                # Reverse push order so STOP is evaluated first.  Only one
+                # branch is resident on the GPU at any time.
+                stack.append(script + (CONTINUE,))
+                stack.append(script + (STOP,))
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            executed = tuple(draft.get("action_script") or [])
+            if executed != script:
+                raise RuntimeError(
+                    "exact boundary leaf did not consume its complete script"
+                )
+            prefill_output = draft.pop("prefill_output", None)
+            del prefill_output
+            proposal = tuple(int(value) for value in draft["proposal"])
+            proposal_payload = json.dumps(
+                proposal, separators=(",", ":")
+            ).encode("utf-8")
+            proposal_hash = hashlib.sha256(proposal_payload).hexdigest()
+            if proposal_hash not in verifier_cache:
+                verification = evaluate_oracle_proposal_tokens(
+                    target_model,
+                    orig_model_inputs,
+                    current_token_ids,
+                    list(proposal),
+                    max_append_tokens=num_target_tokens - len(current_token_ids),
+                    eos_token_id=eos_token_id,
+                )
+                verifier_cache[proposal_hash] = {
+                    "emitted_tokens": int(verification["emitted_len"]),
+                    "measured_verify_ms": float(
+                        verification["verify_latency_ms"]
+                    ),
+                }
+                del verification
+            cached = verifier_cache[proposal_hash]
+            context_len = int(
+                orig_model_inputs["input_ids"].shape[1]
+                + len(current_token_ids)
+            )
+            leaves.append(BoundaryLeaf(
+                script=script,
+                emitted_tokens=int(cached["emitted_tokens"]),
+                draft_passes=int(draft["draft_passes"]),
+                predicted_verify_ms=predict_verifier_latency_ms(
+                    profile, context_len, len(proposal)
+                ),
+                measured_verify_ms=float(cached["measured_verify_ms"]),
+                proposal_length=len(proposal),
+                proposal_hash=proposal_hash,
+            ))
+            del draft
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        summary = {
+            "problem_id": int(problem_id),
+            "round_id": int(round_id),
+            "resolved": int(not unresolved_reason),
+            "unresolved_reason": unresolved_reason,
+            "decision_states": int(len(nodes)),
+            "leaf_paths": int(len(leaves)),
+            "unique_verifier_proposals": int(len(verifier_cache)),
+            "verifier_cache_hits": int(len(leaves) - len(verifier_cache)),
+            "duplicate_state_visits": int(
+                sum(max(0, count - 1) for count in state_key_counts.values())
+            ),
+            "branch_runs": int(branch_runs),
+            "rho_profile_tokens_per_ms": exact_rho,
+            "mean_draft_forward_latency_ms": mean_draft_forward_ms,
+            "mean_post_verify_latency_ms": mean_post_verify_ms,
+        }
+        args.exact_boundary_summary_rows.append(summary)
+        if unresolved_reason:
+            del leaves, verifier_cache, nodes
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return
+
+        solved = solve_exact_boundary_tree(
+            nodes.keys(),
+            leaves,
+            rho_tokens_per_ms=exact_rho,
+            mean_draft_forward_ms=mean_draft_forward_ms,
+            mean_post_verify_ms=mean_post_verify_ms,
+            epsilon_ms=args.strict_greedy_epsilon_ms,
+        )
+        solved_by_prefix = {
+            tuple(row["action_prefix"]): row for row in solved
+        }
+        for script, metadata in nodes.items():
+            row = dict(solved_by_prefix[script])
+            state = metadata["state"]
+            on_behavior_path = (
+                script == behavior_actions[: len(script)]
+            )
+            row.update({
+                "oracle_type": "exact_verifier_boundary_dp",
+                "sample_id": int(problem_id),
+                "round_id": int(round_id),
+                "decision_id": int(len(script)),
+                "on_behavior_path": int(on_behavior_path),
+                "behavior_action": (
+                    behavior_actions[len(script)]
+                    if len(script) < len(behavior_actions)
+                    else ""
+                ),
+                "state_key": metadata["state_key"],
+                "context_len": metadata["context_len"],
+                "accumulated_proposal_length": metadata["proposal_length"],
+                "refinement_step": metadata["refinement_step"],
+                "remaining_masks": int(state.get("remaining_masks", 0)),
+                "draft_proposal": json.dumps(metadata["draft_proposal"]),
+                "features": json.dumps(state.get("features") or []),
+                "tree_decision_states": int(len(nodes)),
+                "tree_leaf_paths": int(len(leaves)),
+                "tree_unique_verifier_proposals": int(len(verifier_cache)),
+            })
+            args.strict_greedy_decision_rows.append(row)
+
+        del leaves, verifier_cache, nodes
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     while len(current_token_ids) < num_target_tokens and eos_token_id not in current_token_ids:
         round_decisions = []
         behavior_round = None
@@ -2716,6 +2930,21 @@ def run_strict_greedy_local_oracle_problem(
                     }
                     args.strict_greedy_decision_rows.append(row)
                     round_decisions.append(row)
+        elif capacity_collector and args.strict_greedy_exact_boundary:
+            if bool(behavior_round.get("exact_boundary_probe", False)):
+                run_exact_boundary_search(behavior_round)
+            action_script = list(behavior_round.get("actions") or [])
+            final_draft = run_draft(
+                tuple(action_script),
+                None,
+                reuse_selected_cache=True,
+                preserve_causal_profile=True,
+            )
+            if tuple(final_draft["action_script"]) != tuple(action_script):
+                raise RuntimeError(
+                    f"exact boundary behavior replay diverged at "
+                    f"problem={problem_id}, round={round_id}"
+                )
         else:
             action_script = []
             while True:
@@ -5682,6 +5911,23 @@ if args.strict_greedy_local_oracle and args.strict_greedy_decision_rows:
         writer = csv.DictWriter(handle, fieldnames=decision_columns)
         writer.writeheader()
         writer.writerows(args.strict_greedy_decision_rows)
+
+if args.strict_greedy_exact_boundary and args.exact_boundary_summary_rows:
+    os.makedirs(args.output_dir, exist_ok=True)
+    summary_columns = sorted({
+        column
+        for row in args.exact_boundary_summary_rows
+        for column in row
+    })
+    with open(
+        os.path.join(args.output_dir, "exact_boundary_tree_summary.csv"),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=summary_columns)
+        writer.writeheader()
+        writer.writerows(args.exact_boundary_summary_rows)
 
 if (
     args.strict_greedy_local_oracle
