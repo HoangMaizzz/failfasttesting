@@ -567,6 +567,7 @@ parser.add_argument("--strict_greedy_local_oracle", action="store_true")
 parser.add_argument("--strict_greedy_verifier_profile", type=str)
 parser.add_argument("--strict_greedy_epsilon_ms", type=float, default=1.0)
 parser.add_argument("--strict_greedy_replay_policy", type=str)
+parser.add_argument("--strict_greedy_behavior_policy", type=str)
 parser.add_argument(
     "--strict_greedy_capacity_collector",
     action="store_true",
@@ -841,6 +842,13 @@ if args.strict_greedy_capacity_collector and not args.strict_greedy_local_oracle
     )
 if args.strict_greedy_capacity_collector and args.strict_greedy_replay_policy:
     raise ValueError("capacity collector cannot replay an oracle policy")
+if args.strict_greedy_behavior_policy and not args.strict_greedy_capacity_collector:
+    raise ValueError(
+        "--strict_greedy_behavior_policy requires "
+        "--strict_greedy_capacity_collector"
+    )
+if args.strict_greedy_behavior_policy and args.strict_greedy_replay_policy:
+    raise ValueError("behavior policy and replay policy are mutually exclusive")
 if args.strict_greedy_replay_policy and not args.strict_greedy_local_oracle:
     raise ValueError("--strict_greedy_replay_policy requires strict greedy oracle")
 def build_adaptive_controller(args):
@@ -945,6 +953,11 @@ args.output_token_rows = []
 args.strict_greedy_replay_data = (
     json.loads(Path(args.strict_greedy_replay_policy).read_text(encoding="utf-8"))
     if args.strict_greedy_replay_policy
+    else None
+)
+args.strict_greedy_behavior_data = (
+    json.loads(Path(args.strict_greedy_behavior_policy).read_text(encoding="utf-8"))
+    if args.strict_greedy_behavior_policy
     else None
 )
 args.strict_greedy_selected_policy = {}
@@ -2485,6 +2498,15 @@ def run_strict_greedy_local_oracle_problem(
             raise ValueError(
                 f"strict greedy replay policy has no problem_id={problem_id}"
             )
+    behavior_rounds = None
+    if args.strict_greedy_behavior_data is not None:
+        behavior_rounds = args.strict_greedy_behavior_data.get("policies", {}).get(
+            str(problem_id)
+        )
+        if behavior_rounds is None:
+            raise ValueError(
+                f"strict greedy behavior policy has no problem_id={problem_id}"
+            )
     selected_round_actions = []
 
     def snapshot_causal_profile():
@@ -2623,6 +2645,17 @@ def run_strict_greedy_local_oracle_problem(
 
     while len(current_token_ids) < num_target_tokens and eos_token_id not in current_token_ids:
         round_decisions = []
+        behavior_round = None
+        if behavior_rounds is not None:
+            if round_id >= len(behavior_rounds):
+                raise RuntimeError(
+                    f"strict greedy behavior policy exhausted at round {round_id}"
+                )
+            behavior_round = behavior_rounds[round_id]
+            if int(behavior_round.get("round_id", round_id)) != round_id:
+                raise RuntimeError(
+                    f"strict greedy behavior round mismatch at {round_id}"
+                )
         if replay_rounds is not None:
             if round_id >= len(replay_rounds):
                 raise RuntimeError(
@@ -2700,6 +2733,28 @@ def run_strict_greedy_local_oracle_problem(
                             "strict greedy replay consumed an inconsistent script"
                         )
                     decision_index = len(action_script)
+                    behavior_action = CONTINUE
+                    probe_this_decision = True
+                    if behavior_round is not None:
+                        behavior_actions = behavior_round.get("actions") or []
+                        if decision_index >= len(behavior_actions):
+                            raise RuntimeError(
+                                "strict greedy behavior action script ended before "
+                                f"decision {decision_index} in round {round_id}"
+                            )
+                        behavior_action = str(behavior_actions[decision_index])
+                        if behavior_action not in {STOP, CONTINUE}:
+                            raise RuntimeError(
+                                f"invalid behavior action: {behavior_action}"
+                            )
+                        probe_ids = {
+                            int(value)
+                            for value in behavior_round.get("probe_decision_ids", [])
+                        }
+                        probe_this_decision = decision_index in probe_ids
+                    if capacity_collector and not probe_this_decision:
+                        action_script.append(behavior_action)
+                        continue
                     stop_script, continue_script = one_action_rollout_scripts(
                         action_script
                     )
@@ -2728,7 +2783,11 @@ def run_strict_greedy_local_oracle_problem(
                         baseline_action=CONTINUE,
                     )
                     chosen_branch = (
-                        continue_branch
+                        (
+                            stop_branch
+                            if behavior_action == STOP
+                            else continue_branch
+                        )
                         if capacity_collector
                         else (
                             stop_branch
@@ -2861,7 +2920,7 @@ def run_strict_greedy_local_oracle_problem(
                     "oracle_label": oracle_label,
                     "oracle_action": decision.action,
                     "executed_action": (
-                        CONTINUE if capacity_collector else decision.action
+                        behavior_action if capacity_collector else decision.action
                     ),
                     "chosen_action": decision.action,
                     "differs_from_baseline": int(decision.action != CONTINUE),
@@ -2888,7 +2947,7 @@ def run_strict_greedy_local_oracle_problem(
                         args.strict_greedy_decision_rows.append(row)
                     round_decisions.append(row)
                     action_script.append(
-                        CONTINUE if capacity_collector else decision.action
+                        behavior_action if capacity_collector else decision.action
                     )
                     if len(action_script) > 128:
                         raise RuntimeError(
@@ -2981,6 +3040,10 @@ def run_strict_greedy_local_oracle_problem(
     if replay_rounds is not None and round_id != len(replay_rounds):
         raise RuntimeError(
             f"strict greedy replay used {round_id}/{len(replay_rounds)} rounds"
+        )
+    if behavior_rounds is not None and round_id != len(behavior_rounds):
+        raise RuntimeError(
+            f"strict greedy behavior used {round_id}/{len(behavior_rounds)} rounds"
         )
     if replay_rounds is None and args.strict_greedy_replay_data is None:
         args.strict_greedy_selected_policy[str(problem_id)] = selected_round_actions
