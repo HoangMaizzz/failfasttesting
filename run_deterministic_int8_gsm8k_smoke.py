@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument("--num_questions", type=int, default=DEFAULT_SMOKE_QUESTIONS)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--warmup_questions", type=int, default=1)
     parser.add_argument(
         "--target_quantization",
         choices=("int8_deterministic", "torchao_int8_weight_only"),
@@ -62,8 +64,10 @@ def run_method(args, method, problem_ids):
         shutil.rmtree(directory)
     directory.mkdir(parents=True)
     command = base_command(
-        command_args(args), "gsm8k", problem_ids, directory, 1,
+        command_args(args), "gsm8k", problem_ids, directory,
+        args.warmup_questions,
     )
+    command[command.index("--max_new_tokens") + 1] = str(args.max_new_tokens)
     if adaptive:
         command.extend(adaptive_flags(method))
     print("\n" + "=" * 96, flush=True)
