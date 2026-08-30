@@ -297,6 +297,10 @@ def classification_metrics(labels, scores, advantage):
     stop_recall = tp / max(1, tp + fn)
     continue_recall = tn / max(1, tn + fp)
     wrong = predicted != actual
+    score_series = pd.Series(scores)
+    advantage_series = pd.Series(advantage)
+    score_ranks = score_series.rank(method="average")
+    advantage_ranks = advantage_series.rank(method="average")
     return {
         "states": int(len(labels)),
         "stop_states": int(actual.sum()),
@@ -311,10 +315,10 @@ def classification_metrics(labels, scores, advantage):
         "continue_recall": continue_recall,
         "auc": rank_auc(labels, scores),
         "pearson_advantage": float(
-            pd.Series(scores).corr(pd.Series(advantage), method="pearson")
+            score_series.corr(advantage_series, method="pearson")
         ),
         "spearman_advantage": float(
-            pd.Series(scores).corr(pd.Series(advantage), method="spearman")
+            score_ranks.corr(advantage_ranks, method="pearson")
         ),
         "mean_regret_tokens": float(np.where(wrong, np.abs(advantage), 0.0).mean()),
     }
