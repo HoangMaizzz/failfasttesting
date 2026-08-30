@@ -34,9 +34,12 @@ def _record_transfer(args, elapsed):
 
 
 def target_model_load_kwargs(args):
+    deterministic_int8 = (
+        getattr(args, "target_quantization", "none") == "int8_deterministic"
+    )
     kwargs = {
         "device_map": {"": args.target_device},
-        "attn_implementation": "sdpa",
+        "attn_implementation": "eager" if deterministic_int8 else "sdpa",
     }
     quantization = getattr(args, "target_quantization", "none")
     if quantization == "none":
@@ -48,10 +51,13 @@ def target_model_load_kwargs(args):
         raise RuntimeError(
             "target quantization requires transformers with BitsAndBytesConfig"
         ) from exc
-    if quantization == "int8":
+    if quantization in {"int8", "int8_deterministic"}:
         kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_8bit=True,
             llm_int8_enable_fp32_cpu_offload=False,
+            # Disable the data-dependent FP16 outlier path in the deterministic
+            # variant.  This also avoids its transient outlier-column buffer.
+            llm_int8_threshold=0.0 if deterministic_int8 else 6.0,
         )
     elif quantization == "int4":
         kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -500,7 +506,7 @@ parser.add_argument("--target_device", type=int, default=0)
 parser.add_argument("--drafter_device", type=int, default=0)
 parser.add_argument(
     "--target_quantization",
-    choices=["none", "int8", "int4"],
+    choices=["none", "int8", "int8_deterministic", "int4"],
     default="none",
 )
 parser.add_argument("--num_questions", type=int, default=1)
@@ -710,6 +716,14 @@ parser.add_argument('--reuse_drafts', action='store_true')
 parser.add_argument('--disable_reusing_drafter_kvs', action='store_true')
 parser.add_argument('--read_pickle', action='store_true')
 args, _ = parser.parse_known_args()
+if args.target_quantization == "int8_deterministic":
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    # bitsandbytes custom operators are outside PyTorch's deterministic-op
+    # registry; warn_only keeps the diagnostic backend usable while still
+    # enforcing determinism for registered PyTorch operations.
+    torch.use_deterministic_algorithms(True, warn_only=True)
 if args.target_device < 0 or args.drafter_device < 0:
     raise ValueError("CUDA device indices must be non-negative")
 if torch.cuda.is_available():
