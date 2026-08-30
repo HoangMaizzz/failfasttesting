@@ -241,6 +241,11 @@ def exact_command(args, dataset, problem_id, directory, profile, policy):
     )
     command[command.index("--max_new_tokens") + 1] = str(args.max_new_tokens)
     command.extend([
+        # Exact replay repeatedly forks drafter trajectories.  Keeping a
+        # selected-path KV cache alive while the int8 verifier runs leaves too
+        # little headroom on 16 GB cards; exact scoring already uses the frozen
+        # latency profile, so recomputing the cache does not bias the objective.
+        "--disable_reusing_drafter_kvs",
         "--strict_greedy_local_oracle",
         "--strict_greedy_capacity_collector",
         "--strict_greedy_exact_boundary",

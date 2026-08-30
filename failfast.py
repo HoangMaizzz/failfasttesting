@@ -866,6 +866,11 @@ if args.strict_greedy_exact_boundary:
         )
     if args.strict_greedy_exact_max_states <= 0:
         raise ValueError("--strict_greedy_exact_max_states must be positive")
+    if not args.disable_reusing_drafter_kvs:
+        raise ValueError(
+            "--strict_greedy_exact_boundary requires "
+            "--disable_reusing_drafter_kvs to bound branch memory"
+        )
 if args.strict_greedy_capacity_collector and args.strict_greedy_replay_policy:
     raise ValueError("capacity collector cannot replay an oracle policy")
 if args.strict_greedy_behavior_policy and not args.strict_greedy_capacity_collector:
