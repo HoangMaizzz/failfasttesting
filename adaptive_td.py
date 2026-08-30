@@ -1856,6 +1856,7 @@ class OnlineTDRefinementController:
                 )
             ),
             "exploration_count": self.exploration_count,
+            "rng_state": self.rng.getstate(),
             "early_stop_observations": self.early_stop_observations,
             "early_stop_min_observations": self.config.early_stop_min_observations,
             "stop_probability_threshold": self.config.stop_probability_threshold,
@@ -2187,6 +2188,13 @@ class OnlineTDRefinementController:
             snapshot.get("annealed_decision_count", 0)
         )
         self.exploration_count = int(snapshot.get("exploration_count", 0))
+        if snapshot.get("rng_state") is not None:
+            def tuple_tree(value):
+                if isinstance(value, list):
+                    return tuple(tuple_tree(item) for item in value)
+                return value
+
+            self.rng.setstate(tuple_tree(snapshot["rng_state"]))
         self.early_stop_observations = int(
             snapshot.get("early_stop_observations", 0)
         )

@@ -128,6 +128,15 @@ class SharedValueAdvantageTests(unittest.TestCase):
             original.evaluate(STOP, features).mean,
         )
 
+    def test_snapshot_restores_exploration_rng_stream(self):
+        original = OnlineTDRefinementController(shared_config())
+        original.rng.random()
+        snapshot = original.snapshot()
+        expected = original.rng.random()
+        restored = OnlineTDRefinementController(shared_config())
+        restored.load_snapshot(snapshot)
+        self.assertEqual(restored.rng.random(), expected)
+
     def test_shared_mode_rejects_bootstrap_and_policy_weight_ema(self):
         with self.assertRaisesRegex(ValueError, "no-bootstrap"):
             AdaptiveTDConfig(value_parameterization="shared_value_advantage")
