@@ -37,13 +37,31 @@ def target_model_load_kwargs(args):
     deterministic_int8 = (
         getattr(args, "target_quantization", "none") == "int8_deterministic"
     )
+    torchao_weight_only = (
+        getattr(args, "target_quantization", "none") == "torchao_int8_weight_only"
+    )
     kwargs = {
         "device_map": {"": args.target_device},
-        "attn_implementation": "eager" if deterministic_int8 else "sdpa",
+        "attn_implementation": (
+            "eager" if deterministic_int8 or torchao_weight_only else "sdpa"
+        ),
     }
     quantization = getattr(args, "target_quantization", "none")
     if quantization == "none":
         kwargs["torch_dtype"] = "auto"
+        return kwargs
+    if torchao_weight_only:
+        try:
+            from transformers import TorchAoConfig
+            from torchao.quantization import Int8WeightOnlyConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "torchao_int8_weight_only requires torchao and TorchAoConfig"
+            ) from exc
+        kwargs["quantization_config"] = TorchAoConfig(
+            quant_type=Int8WeightOnlyConfig(version=2),
+        )
+        kwargs["torch_dtype"] = torch.float16
         return kwargs
     try:
         from transformers import BitsAndBytesConfig
@@ -506,7 +524,10 @@ parser.add_argument("--target_device", type=int, default=0)
 parser.add_argument("--drafter_device", type=int, default=0)
 parser.add_argument(
     "--target_quantization",
-    choices=["none", "int8", "int8_deterministic", "int4"],
+    choices=[
+        "none", "int8", "int8_deterministic",
+        "torchao_int8_weight_only", "int4",
+    ],
     default="none",
 )
 parser.add_argument("--num_questions", type=int, default=1)
@@ -716,7 +737,9 @@ parser.add_argument('--reuse_drafts', action='store_true')
 parser.add_argument('--disable_reusing_drafter_kvs', action='store_true')
 parser.add_argument('--read_pickle', action='store_true')
 args, _ = parser.parse_known_args()
-if args.target_quantization == "int8_deterministic":
+if args.target_quantization in {
+    "int8_deterministic", "torchao_int8_weight_only",
+}:
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False

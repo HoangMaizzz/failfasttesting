@@ -16,7 +16,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS, aggregate_method
 
 
 ROOT = Path(__file__).resolve().parent
-PROBLEM_IDS_SMOKE = [int(value) for value in PROBLEM_IDS["gsm8k"][:5]]
+DEFAULT_SMOKE_QUESTIONS = 5
 
 
 def parse_args():
@@ -31,6 +31,12 @@ def parse_args():
     )
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
+    parser.add_argument("--num_questions", type=int, default=DEFAULT_SMOKE_QUESTIONS)
+    parser.add_argument(
+        "--target_quantization",
+        choices=("int8_deterministic", "torchao_int8_weight_only"),
+        default="int8_deterministic",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--log_level", default="INFO")
     return parser.parse_args()
@@ -41,40 +47,48 @@ def command_args(args):
         dllm_dir=args.dllm_dir,
         target_device=args.target_device,
         drafter_device=args.drafter_device,
-        target_quantization="int8_deterministic",
+        target_quantization=args.target_quantization,
         log_level=args.log_level,
     )
 
 
-def run_method(args, method):
+def run_method(args, method, problem_ids):
     directory = Path(args.output_dir) / "raw" / method
     adaptive = method == "c6_annealed"
-    if args.resume and complete(directory, PROBLEM_IDS_SMOKE, adaptive):
+    if args.resume and complete(directory, problem_ids, adaptive):
         print(f"SKIP completed method={method}", flush=True)
         return directory
     if directory.exists():
         shutil.rmtree(directory)
     directory.mkdir(parents=True)
     command = base_command(
-        command_args(args), "gsm8k", PROBLEM_IDS_SMOKE, directory, 1,
+        command_args(args), "gsm8k", problem_ids, directory, 1,
     )
     if adaptive:
         command.extend(adaptive_flags(method))
     print("\n" + "=" * 96, flush=True)
-    print(f"RUN GSM8K deterministic INT8 | {method} | ids={PROBLEM_IDS_SMOKE}", flush=True)
+    print(
+        f"RUN GSM8K {args.target_quantization} | {method} | ids={problem_ids}",
+        flush=True,
+    )
     print("=" * 96, flush=True)
     run_streaming(command)
-    if not complete(directory, PROBLEM_IDS_SMOKE, adaptive):
+    if not complete(directory, problem_ids, adaptive):
         raise RuntimeError(f"incomplete smoke result: {directory}")
     return directory
 
 
 def main():
     args = parse_args()
+    if args.num_questions <= 0 or args.num_questions > len(PROBLEM_IDS["gsm8k"]):
+        raise ValueError("--num_questions is outside the fixed GSM8K ID pool")
+    problem_ids = [
+        int(value) for value in PROBLEM_IDS["gsm8k"][:args.num_questions]
+    ]
     root = Path(args.output_dir)
     root.mkdir(parents=True, exist_ok=True)
     directories = {
-        method: run_method(args, method)
+        method: run_method(args, method, problem_ids)
         for method in ("c6_annealed", "failfast")
     }
     frames = {
@@ -121,9 +135,9 @@ def main():
     summary = pd.DataFrame(rows)
     summary.to_csv(root / "summary.csv", index=False)
     (root / "manifest.json").write_text(json.dumps({
-        "backend": "bitsandbytes_int8_threshold0_eager_deterministic",
+        "backend": args.target_quantization,
         "dataset": "gsm8k",
-        "problem_ids": PROBLEM_IDS_SMOKE,
+        "problem_ids": problem_ids,
         "decoding": "greedy",
         "timing": "measured draft + verifier + post-verifier/controller; no audit replay",
         "arguments": vars(args),
