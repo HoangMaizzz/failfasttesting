@@ -14,6 +14,7 @@ from adaptive_td import CONTINUE, STOP
 from run_chunked_c6_comparison_test50 import adaptive_flags, base_command, complete
 from run_local_stop_continue_oracle import build_verifier_profile
 from run_otrc_v2_td_benchmark import PROBLEM_IDS
+from raw_state_experiment import parse_nested
 
 
 ROOT = Path(__file__).resolve().parent
@@ -316,6 +317,30 @@ def concat_existing(paths):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def validate_exact_raw_states(rows):
+    required = {
+        "raw_previous_state",
+        "raw_current_state",
+        "has_previous_state",
+        "active_block_start",
+        "active_block_end",
+    }
+    missing = required.difference(rows.columns)
+    if missing:
+        raise RuntimeError(f"exact raw-state log is missing: {sorted(missing)}")
+    for row in rows.itertuples(index=False):
+        previous = parse_nested(row.raw_previous_state)
+        current = parse_nested(row.raw_current_state)
+        if len(previous) != 8 or len(current) != 8:
+            raise RuntimeError("exact raw-state snapshot must contain 8 positions")
+        if any(len(values) != 5 for values in previous + current):
+            raise RuntimeError("exact raw-state positions must contain 5 values")
+        if not bool(int(row.has_previous_state)) and previous != current:
+            raise RuntimeError("first exact raw state did not copy current to previous")
+        if int(row.active_block_end) - int(row.active_block_start) != 8:
+            raise RuntimeError("exact raw state crossed an active-block boundary")
+
+
 def summarize_subset(
     root, behavior_dirs, selected_by_dataset, ids_by_dataset, datasets, label
 ):
@@ -363,6 +388,7 @@ def summarize_subset(
         ])
         if rows.empty:
             continue
+        validate_exact_raw_states(rows)
         rows = rows[rows.on_behavior_path.astype(int) == 1].copy()
         rows = rows.rename(columns={"sample_id": "problem_id"})
         selected = selected_by_dataset[dataset]

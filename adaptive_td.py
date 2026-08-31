@@ -79,6 +79,36 @@ V23_COMPACT7_FEATURE_NAMES = (
     "active_remaining_mask_ratio",
     "normalized_refinement_step",
 )
+RAW_STATE_BLOCK_SIZE = 8
+RAW_TOKEN_FIELDS = (
+    "mask_indicator",
+    "top1_probability",
+    "top2_probability",
+    "normalized_entropy",
+    "normalized_position",
+)
+RAW_GLOBAL_FEATURE_NAMES = (
+    "accumulated_spec_ratio",
+    "draft_verify_latency_ratio",
+    "ema_tokens_per_verifier_ratio",
+    "normalized_refinement_step",
+    "has_previous_state",
+)
+
+
+def _raw_state_feature_names(block_size: int = RAW_STATE_BLOCK_SIZE):
+    names = []
+    for state_name in ("previous", "current"):
+        for position in range(int(block_size)):
+            names.extend(
+                f"{state_name}_position_{position}_{field}"
+                for field in RAW_TOKEN_FIELDS
+            )
+    names.extend(RAW_GLOBAL_FEATURE_NAMES)
+    return tuple(names)
+
+
+RAW_STATE_FEATURE_NAMES = _raw_state_feature_names()
 FEATURE_NAMES = V1_FEATURE_NAMES
 FEATURE_SCHEMAS = {
     "otrc_v1_td": V1_FEATURE_NAMES,
@@ -87,6 +117,7 @@ FEATURE_SCHEMAS = {
     "otrc_v2_2_td": V22_FEATURE_NAMES,
     "otrc_v2_2_compact_td": V22_COMPACT_FEATURE_NAMES,
     "otrc_v2_3_compact7_td": V23_COMPACT7_FEATURE_NAMES,
+    "otrc_raw_state_v1": RAW_STATE_FEATURE_NAMES,
 }
 
 
@@ -300,15 +331,26 @@ class AdaptiveTDConfig:
                 "value_parameterization must be independent_q or "
                 "shared_value_advantage"
             )
-        if self.value_model not in {"linear", "nam", "ga2m"}:
-            raise ValueError("value_model must be linear, nam, or ga2m")
-        if self.value_model != "linear":
+        if self.value_model not in {
+            "linear", "nam", "ga2m", "raw_linear", "raw_mlp"
+        }:
+            raise ValueError(
+                "value_model must be linear, nam, ga2m, raw_linear, or raw_mlp"
+            )
+        if self.value_model in {"nam", "ga2m"}:
             if self.feature_schema != "otrc_v2_2_compact_td":
                 raise ValueError("NAM/GA2M require Compact6")
             if self.value_parameterization != "shared_value_advantage":
                 raise ValueError("NAM/GA2M require shared value/advantage")
             if self.credit_assignment != "verifier_boundary_factual_no_bootstrap":
                 raise ValueError("NAM/GA2M require factual no-bootstrap")
+        if self.value_model in {"raw_linear", "raw_mlp"}:
+            if self.feature_schema != "otrc_raw_state_v1":
+                raise ValueError("raw value models require raw-state features")
+            if self.value_parameterization != "shared_value_advantage":
+                raise ValueError("raw value models require shared value/advantage")
+            if self.credit_assignment != "verifier_boundary_factual_no_bootstrap":
+                raise ValueError("raw value models require factual no-bootstrap")
         if (
             self.shared_value_learning_rate < 0.0
             or self.shared_advantage_learning_rate < 0.0
@@ -552,6 +594,7 @@ class OnlineTDRefinementController:
                 grad_clip=config.nonlinear_grad_clip,
                 huber_delta=config.td_error_clip,
                 seed=config.seed,
+                feature_dim=config.feature_dim,
                 device=config.nonlinear_device,
             )
         )
@@ -624,6 +667,23 @@ class OnlineTDRefinementController:
             update = self.nonlinear_value.update(
                 action, features, target, observation_weight
             )
+            interval = self.config.weight_snapshot_interval
+            if (
+                interval > 0
+                and self.nonlinear_value.update_count % interval == 0
+            ):
+                self.weight_snapshots.append({
+                    "learning_update_count": int(
+                        self.nonlinear_value.update_count
+                    ),
+                    "decision_count": int(self.decision_count),
+                    "value_model": self.config.value_model,
+                    "normalization_state": {
+                        "mode": "fixed_bounded_raw_state",
+                        "feature_names": list(self.feature_names),
+                    },
+                    "nonlinear_value": self.nonlinear_value.snapshot(),
+                })
             return float(update["residual"])
         if not self.uses_shared_value_advantage:
             return self.values[action].update(
@@ -818,6 +878,16 @@ class OnlineTDRefinementController:
         return self.values[action].estimate(features)
 
     def build_features(self, **state) -> tuple[float, ...]:
+        if self.config.feature_schema == "otrc_raw_state_v1":
+            return build_raw_state_features(
+                max_refinement_steps=self.config.max_refinement_steps,
+                factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
+                factual_verifier_latency_ema_ms=self.factual_verifier_latency_ema_ms,
+                factual_tokens_per_verifier_ema=(
+                    self.factual_tokens_per_verifier_ema
+                ),
+                **state,
+            )
         if self.config.feature_schema == "otrc_v2_3_compact7_td":
             return build_v23_compact7_state_features(
                 factual_draft_latency_ema_ms=self.factual_draft_latency_ema_ms,
@@ -1465,6 +1535,19 @@ class OnlineTDRefinementController:
                 ),
                 "nonlinear_gradient_norm": (
                     self.nonlinear_value.last_gradient_norm
+                    if self.nonlinear_value is not None and update_applied else 0.0
+                ),
+                "clipped_td_error": (
+                    self.nonlinear_value.last_clipped_residual
+                    if self.nonlinear_value is not None and update_applied
+                    else _clip(
+                        residual,
+                        -self.config.td_error_clip,
+                        self.config.td_error_clip,
+                    )
+                ),
+                "nonlinear_parameter_norm": (
+                    self.nonlinear_value.last_parameter_norm
                     if self.nonlinear_value is not None and update_applied else 0.0
                 ),
                 "decision_shared_value": float(
@@ -2684,6 +2767,68 @@ def build_v23_compact7_state_features(
         if name in disabled:
             features[index] = 0.0
     return tuple(features)
+
+
+def build_raw_state_features(
+    *,
+    raw_previous_state,
+    raw_current_state,
+    has_previous_state,
+    proposal_length,
+    max_spec_len,
+    refinement_step,
+    max_refinement_steps,
+    factual_draft_latency_ema_ms=None,
+    factual_verifier_latency_ema_ms=None,
+    factual_tokens_per_verifier_ema=None,
+    **_unused,
+) -> tuple[float, ...]:
+    """Build the fixed-width raw denoising input used by Raw Shared V+A.
+
+    The raw snapshots are already reduced from vocabulary logits on the GPU.
+    This function only validates their shape and appends non-token cost context.
+    """
+    expected_values = RAW_STATE_BLOCK_SIZE * len(RAW_TOKEN_FIELDS)
+
+    def flatten(snapshot, label):
+        if len(snapshot) != RAW_STATE_BLOCK_SIZE:
+            raise ValueError(
+                f"{label} must contain {RAW_STATE_BLOCK_SIZE} positions, "
+                f"got {len(snapshot)}"
+            )
+        values = []
+        for row in snapshot:
+            if len(row) != len(RAW_TOKEN_FIELDS):
+                raise ValueError(
+                    f"{label} rows must contain {len(RAW_TOKEN_FIELDS)} values"
+                )
+            values.extend(float(value) for value in row)
+        if len(values) != expected_values or not all(
+            math.isfinite(value) for value in values
+        ):
+            raise ValueError(f"{label} contains invalid raw-state values")
+        return values
+
+    previous = flatten(raw_previous_state, "raw_previous_state")
+    current = flatten(raw_current_state, "raw_current_state")
+    proposal_length = max(0, int(proposal_length))
+    max_spec_len = max(1, int(max_spec_len))
+    max_refinement_steps = max(1, int(max_refinement_steps))
+    draft_ms = max(0.0, float(factual_draft_latency_ema_ms or 0.0))
+    verify_ms = max(0.0, float(factual_verifier_latency_ema_ms or 0.0))
+    tokens_per_verify = max(0.0, float(factual_tokens_per_verifier_ema or 0.0))
+    global_state = [
+        _clip(proposal_length / max_spec_len, 0.0, 1.0),
+        _clip(draft_ms / max(verify_ms, 1e-9), 0.0, 2.0)
+        if verify_ms > 0.0 else 0.0,
+        _clip(tokens_per_verify / (max_spec_len + 1.0), 0.0, 1.0),
+        _clip(int(refinement_step) / max_refinement_steps, 0.0, 1.0),
+        1.0 if bool(has_previous_state) else 0.0,
+    ]
+    features = tuple(previous + current + global_state)
+    if len(features) != len(RAW_STATE_FEATURE_NAMES):
+        raise RuntimeError("raw-state feature dimension changed unexpectedly")
+    return features
 
 
 def trajectory_forward_latency(trajectory: Iterable[dict]) -> float:

@@ -139,6 +139,7 @@ def parse_args():
             "otrc_v2_2_td",
             "otrc_v2_2_compact_td",
             "otrc_v2_3_compact7_td",
+            "otrc_raw_state_v1",
         ),
         default="otrc_v2_2_td",
     )
@@ -187,7 +188,11 @@ def parse_args():
         type=float,
         default=0.02,
     )
-    parser.add_argument("--value_model", choices=("linear", "nam", "ga2m"), default="linear")
+    parser.add_argument(
+        "--value_model",
+        choices=("linear", "nam", "ga2m", "raw_linear", "raw_mlp"),
+        default="linear",
+    )
     parser.add_argument("--nonlinear_learning_rate", type=float, default=1e-3)
     parser.add_argument("--nonlinear_weight_decay", type=float, default=0.0)
     parser.add_argument("--nonlinear_grad_clip", type=float, default=1.0)
@@ -262,12 +267,13 @@ def validate_args(args):
             "otrc_v2_2_td",
             "otrc_v2_2_compact_td",
             "otrc_v2_3_compact7_td",
+            "otrc_raw_state_v1",
         }
     ):
         raise ValueError(
             "verifier-boundary factual credit requires --feature_schema "
             "otrc_v2_2_td, otrc_v2_2_compact_td, or "
-            "otrc_v2_3_compact7_td"
+            "otrc_v2_3_compact7_td, or otrc_raw_state_v1"
         )
     if args.rho_warmup_boundaries < 0:
         raise ValueError("--rho_warmup_boundaries must be non-negative")
@@ -318,6 +324,7 @@ def method_name(args):
             "otrc_v2_3_compact7_td": (
                 "otrc_v2_3_compact7_factual_no_bootstrap"
             ),
+            "otrc_raw_state_v1": "otrc_raw_state_factual_no_bootstrap",
         }.get(args.feature_schema, "otrc_v2_2_factual_no_bootstrap")
         warmup = int(getattr(args, "rho_warmup_boundaries", 0))
         if warmup:

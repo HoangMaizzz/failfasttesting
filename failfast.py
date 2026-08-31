@@ -628,7 +628,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--adaptive-value-model",
-    choices=["linear", "nam", "ga2m"],
+    choices=["linear", "nam", "ga2m", "raw_linear", "raw_mlp"],
     default="linear",
 )
 parser.add_argument("--adaptive-nonlinear-learning-rate", type=float, default=1e-3)
@@ -936,6 +936,7 @@ def build_adaptive_controller(args):
                 "otrc_v2_2_td": 22,
                 "otrc_v2_2_compact_td": 226,
                 "otrc_v2_3_compact7_td": 237,
+                "otrc_raw_state_v1": 301,
             }[args.adaptive_feature_schema],
             learning_rate=args.adaptive_learning_rate,
             value_parameterization=args.adaptive_value_parameterization,
@@ -2865,6 +2866,19 @@ def run_strict_greedy_local_oracle_problem(
                 "remaining_masks": int(state.get("remaining_masks", 0)),
                 "draft_proposal": json.dumps(metadata["draft_proposal"]),
                 "features": json.dumps(state.get("features") or []),
+                "raw_previous_state": json.dumps(
+                    state.get("raw_previous_state") or []
+                ),
+                "raw_current_state": json.dumps(
+                    state.get("raw_current_state") or []
+                ),
+                "has_previous_state": int(
+                    bool(state.get("has_previous_state", False))
+                ),
+                "active_block_start": int(
+                    state.get("active_block_start", -1)
+                ),
+                "active_block_end": int(state.get("active_block_end", -1)),
                 "tree_decision_states": int(len(nodes)),
                 "tree_leaf_paths": int(len(leaves)),
                 "tree_unique_verifier_proposals": int(len(verifier_cache)),

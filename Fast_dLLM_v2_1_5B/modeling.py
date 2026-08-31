@@ -32,7 +32,11 @@ from bucket_renewal import (
     position_bucket,
     predict_next_gain,
 )
-from adaptive_td import active_refinement_positions, logical_refinement_span
+from adaptive_td import (
+    RAW_STATE_BLOCK_SIZE,
+    active_refinement_positions,
+    logical_refinement_span,
+)
 
 logging.set_verbosity_error()
 # logging.set_verbosity_warning()
@@ -1024,6 +1028,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "otrc_v2_2_td",
                                 "otrc_v2_2_compact_td",
                                 "otrc_v2_3_compact7_td",
+                                "otrc_raw_state_v1",
                             )
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
@@ -1183,6 +1188,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         adaptive_pending_stop_extension = None
         adaptive_previous_proposal = None
         adaptive_decision_counts = {}
+        adaptive_previous_raw_states = {}
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
@@ -1562,6 +1568,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 "otrc_v2_2_td",
                                 "otrc_v2_2_compact_td",
                                 "otrc_v2_3_compact7_td",
+                                "otrc_raw_state_v1",
                             )
                             and not bool(getattr(args, "adaptive_freeze", False))
                         ):
@@ -1593,6 +1600,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             or frontier_mode not in ("disabled", "none", "off")
                             or bool(getattr(args, "collect_bucket_oracle", False))
                             or bool(getattr(args, "adaptive_use_margin_feature", True))
+                            or (
+                                adaptive_enabled
+                                and adaptive_controller is not None
+                                and adaptive_controller.config.feature_schema
+                                == "otrc_raw_state_v1"
+                            )
                         )
                         if margin_required:
                             top2_probs = torch.topk(p_1t, k=2, dim=-1).values
@@ -1999,6 +2012,111 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     1,
                                     active_absolute_end - active_absolute_start,
                                 )
+                                raw_current_state = None
+                                raw_previous_state = None
+                                raw_has_previous_state = False
+                                physical_small_start = (
+                                    block_abs_start + small_block_start_idx
+                                )
+                                raw_local_indices = [
+                                    absolute_pos - physical_small_start
+                                    for absolute_pos in range(
+                                        active_absolute_start,
+                                        active_absolute_end,
+                                    )
+                                ]
+                                raw_state_requested = bool(
+                                    adaptive_controller.config.feature_schema
+                                    == "otrc_raw_state_v1"
+                                    or getattr(
+                                        args,
+                                        "strict_greedy_capacity_collector",
+                                        False,
+                                    )
+                                )
+                                if raw_state_requested:
+                                    if (
+                                        active_span_length
+                                        != RAW_STATE_BLOCK_SIZE
+                                        or len(raw_local_indices)
+                                        != RAW_STATE_BLOCK_SIZE
+                                        or min(raw_local_indices, default=-1) < 0
+                                        or max(raw_local_indices, default=-1)
+                                        >= p_1t.shape[1]
+                                    ):
+                                        raise RuntimeError(
+                                            "raw-state controller requires a complete "
+                                            f"{RAW_STATE_BLOCK_SIZE}-token active block"
+                                        )
+                                    raw_probabilities = p_1t[
+                                        0, raw_local_indices, :
+                                    ].float()
+                                    raw_top2 = torch.topk(
+                                        raw_probabilities, k=2, dim=-1
+                                    ).values
+                                    raw_entropy = -torch.sum(
+                                        raw_probabilities
+                                        * torch.log(
+                                            torch.clamp(
+                                                raw_probabilities, min=1e-12
+                                            )
+                                        ),
+                                        dim=-1,
+                                    ) / max(
+                                        1.0,
+                                        float(torch.log(torch.tensor(
+                                            raw_probabilities.shape[-1],
+                                            device=raw_probabilities.device,
+                                            dtype=torch.float32,
+                                        )).item()),
+                                    )
+                                    raw_post_mask = torch.tensor(
+                                        [
+                                            float(
+                                                int(x_t[0, absolute_pos].item())
+                                                == mask_id
+                                            )
+                                            for absolute_pos in range(
+                                                active_absolute_start,
+                                                active_absolute_end,
+                                            )
+                                        ],
+                                        device=raw_probabilities.device,
+                                    )
+                                    raw_positions = torch.linspace(
+                                        0.0,
+                                        1.0,
+                                        RAW_STATE_BLOCK_SIZE,
+                                        device=raw_probabilities.device,
+                                    )
+                                    raw_snapshot = torch.stack(
+                                        (
+                                            raw_post_mask,
+                                            raw_top2[:, 0],
+                                            raw_top2[:, 1],
+                                            torch.clamp(raw_entropy, 0.0, 1.0),
+                                            raw_positions,
+                                        ),
+                                        dim=-1,
+                                    ).cpu().tolist()
+                                    raw_current_state = [
+                                        [float(value) for value in row]
+                                        for row in raw_snapshot
+                                    ]
+                                    raw_state_key = (
+                                        int(active_absolute_start),
+                                        int(active_absolute_end),
+                                    )
+                                    raw_previous_state = (
+                                        adaptive_previous_raw_states.get(
+                                            raw_state_key
+                                        )
+                                    )
+                                    raw_has_previous_state = (
+                                        raw_previous_state is not None
+                                    )
+                                    if raw_previous_state is None:
+                                        raw_previous_state = raw_current_state
                                 active_remaining_positions = list(
                                     active_refinement_positions(
                                         remaining_absolute_positions,
@@ -2138,6 +2256,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     use_margin=bool(getattr(args, "adaptive_use_margin_feature", True)),
                                     use_stability=bool(getattr(args, "adaptive_use_stability_feature", True)),
                                     use_step=bool(getattr(args, "adaptive_use_step_feature", False)),
+                                    raw_previous_state=raw_previous_state,
+                                    raw_current_state=raw_current_state,
+                                    has_previous_state=raw_has_previous_state,
                                 )
                                 if adaptive_feature_started is not None:
                                     adaptive_feature_elapsed_ms = (
@@ -2334,6 +2455,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             active_remaining_positions
                                         ),
                                         newly_committed=unmasked_this_step,
+                                        raw_previous_state=raw_previous_state,
+                                        raw_current_state=raw_current_state,
+                                        has_previous_state=raw_has_previous_state,
+                                        active_block_start=int(
+                                            active_absolute_start
+                                        ),
+                                        active_block_end=int(active_absolute_end),
                                         allow_exploration=not bool(
                                             getattr(
                                                 args,
@@ -2352,6 +2480,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             for token_id in provisional_tokens
                                         ],
                                         "features": list(features),
+                                        "raw_previous_state": raw_previous_state,
+                                        "raw_current_state": raw_current_state,
+                                        "has_previous_state": bool(
+                                            raw_has_previous_state
+                                        ),
                                         "action": decision.action,
                                         "reason": decision.reason,
                                         "remaining_masks": int(
@@ -2516,6 +2649,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         adaptive_pending_stop_extension = None
                                         stop_reason = None
                                 adaptive_previous_proposal = provisional_tokens
+                                if raw_current_state is not None:
+                                    adaptive_previous_raw_states[
+                                        (
+                                            int(active_absolute_start),
+                                            int(active_absolute_end),
+                                        )
+                                    ] = raw_current_state
 
                             if adaptive_enabled:
                                 bucket_gain = None

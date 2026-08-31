@@ -79,6 +79,35 @@ class CompactNonlinearVA(nn.Module):
         return total[..., 0], total[..., 1]
 
 
+class RawSharedVA(nn.Module):
+    """Linear or tiny-MLP Shared V+A model over a fixed raw-state vector."""
+
+    def __init__(self, model_type: str, input_dim: int, seed: int) -> None:
+        super().__init__()
+        if model_type not in {"raw_linear", "raw_mlp"}:
+            raise ValueError(f"unknown raw value model: {model_type}")
+        torch.manual_seed(int(seed))
+        self.model_type = model_type
+        self.input_dim = int(input_dim)
+        if model_type == "raw_linear":
+            self.network = nn.Linear(self.input_dim, 2)
+        else:
+            self.network = nn.Sequential(
+                nn.Linear(self.input_dim, 32),
+                nn.SiLU(),
+                nn.Linear(32, 16),
+                nn.SiLU(),
+                nn.Linear(16, 2),
+            )
+        output = self.network if model_type == "raw_linear" else self.network[-1]
+        nn.init.zeros_(output.weight)
+        nn.init.zeros_(output.bias)
+
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        output = self.network(features)
+        return output[..., 0], output[..., 1]
+
+
 class OnlineNonlinearVA:
     def __init__(
         self,
@@ -89,10 +118,17 @@ class OnlineNonlinearVA:
         grad_clip: float,
         huber_delta: float,
         seed: int,
+        feature_dim: int = 6,
         device: str = "cpu",
     ) -> None:
         self.device = torch.device(device)
-        self.model = CompactNonlinearVA(model_type, seed=seed).to(self.device)
+        self.model_type = str(model_type)
+        self.feature_dim = int(feature_dim)
+        self.model = (
+            RawSharedVA(self.model_type, self.feature_dim, seed)
+            if self.model_type in {"raw_linear", "raw_mlp"}
+            else CompactNonlinearVA(self.model_type, seed=seed)
+        ).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=float(learning_rate),
@@ -103,14 +139,21 @@ class OnlineNonlinearVA:
         self.update_count = 0
         self.last_loss = 0.0
         self.last_gradient_norm = 0.0
+        self.last_clipped_residual = 0.0
+        self.last_parameter_norm = 0.0
 
     @property
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.model.parameters())
 
-    @staticmethod
-    def _dynamic(features) -> list[float]:
+    def _dynamic(self, features) -> list[float]:
         values = [float(value) for value in features]
+        if self.model_type in {"raw_linear", "raw_mlp"}:
+            if len(values) != self.feature_dim:
+                raise ValueError(
+                    f"raw value model requires {self.feature_dim} inputs"
+                )
+            return values
         if len(values) != 6:
             raise ValueError("Compact6 nonlinear models require six inputs")
         return values[1:]
@@ -134,13 +177,18 @@ class OnlineNonlinearVA:
         sign = 1.0 if action == STOP else -1.0
         prediction = value[0] + 0.5 * sign * advantage[0]
         residual = float(target) - float(prediction.detach().item())
-        absolute = torch.abs(prediction - target_tensor)
-        delta = self.huber_delta
-        loss = torch.where(
-            absolute <= delta,
-            0.5 * (prediction - target_tensor) ** 2,
-            delta * (absolute - 0.5 * delta),
-        ) * float(weight)
+        if self.model_type in {"raw_linear", "raw_mlp"}:
+            clipped_residual = max(-self.huber_delta, min(self.huber_delta, residual))
+            clipped_target = prediction.detach() + float(clipped_residual)
+            loss = 0.5 * (prediction - clipped_target) ** 2 * float(weight)
+        else:
+            absolute = torch.abs(prediction - target_tensor)
+            delta = self.huber_delta
+            loss = torch.where(
+                absolute <= delta,
+                0.5 * (prediction - target_tensor) ** 2,
+                delta * (absolute - 0.5 * delta),
+            ) * float(weight)
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(
@@ -150,10 +198,16 @@ class OnlineNonlinearVA:
         self.update_count += 1
         self.last_loss = float(loss.detach().item())
         self.last_gradient_norm = float(norm.item()) if torch.is_tensor(norm) else float(norm)
+        self.last_clipped_residual = max(
+            -self.huber_delta, min(self.huber_delta, residual)
+        )
+        self.last_parameter_norm = self.diagnostics()["parameter_norm"]
         return {
             "residual": residual,
+            "clipped_residual": self.last_clipped_residual,
             "loss": self.last_loss,
             "gradient_norm": self.last_gradient_norm,
+            "parameter_norm": self.last_parameter_norm,
         }
 
     def snapshot(self) -> dict:
@@ -168,6 +222,8 @@ class OnlineNonlinearVA:
             "update_count": self.update_count,
             "last_loss": self.last_loss,
             "last_gradient_norm": self.last_gradient_norm,
+            "last_clipped_residual": self.last_clipped_residual,
+            "last_parameter_norm": self.last_parameter_norm,
             "torch_state_base64": base64.b64encode(payload.getvalue()).decode("ascii"),
         }
 
@@ -177,16 +233,18 @@ class OnlineNonlinearVA:
                 float(torch.sum(parameter * parameter).item())
                 for parameter in self.model.parameters()
             ))
-            interaction_norms = {
-                f"{left}_{right}": math.sqrt(sum(
-                    float(torch.sum(parameter * parameter).item())
-                    for parameter in module.parameters()
-                ))
-                for module, (left, right) in zip(
-                    self.model.interactions,
-                    self.model.interaction_pairs,
-                )
-            }
+            interaction_norms = {}
+            if hasattr(self.model, "interactions"):
+                interaction_norms = {
+                    f"{left}_{right}": math.sqrt(sum(
+                        float(torch.sum(parameter * parameter).item())
+                        for parameter in module.parameters()
+                    ))
+                    for module, (left, right) in zip(
+                        self.model.interactions,
+                        self.model.interaction_pairs,
+                    )
+                }
         return {
             "parameter_count": self.parameter_count,
             "parameter_norm": parameter_norm,
@@ -194,6 +252,8 @@ class OnlineNonlinearVA:
             "update_count": self.update_count,
             "last_loss": self.last_loss,
             "last_gradient_norm": self.last_gradient_norm,
+            "last_clipped_residual": self.last_clipped_residual,
+            "last_parameter_norm": self.last_parameter_norm,
         }
 
     def load_snapshot(self, snapshot: dict) -> None:
@@ -204,3 +264,9 @@ class OnlineNonlinearVA:
         self.update_count = int(snapshot.get("update_count", 0))
         self.last_loss = float(snapshot.get("last_loss", 0.0))
         self.last_gradient_norm = float(snapshot.get("last_gradient_norm", 0.0))
+        self.last_clipped_residual = float(
+            snapshot.get("last_clipped_residual", 0.0)
+        )
+        self.last_parameter_norm = float(
+            snapshot.get("last_parameter_norm", 0.0)
+        )
