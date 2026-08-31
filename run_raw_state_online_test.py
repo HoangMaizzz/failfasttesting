@@ -119,7 +119,7 @@ def validate_method(directory, model):
             [json.loads(value) for value in decisions.features],
             dtype=np.float32,
         )
-        if matrix.ndim != 2 or matrix.shape[1] != 85 or not np.isfinite(matrix).all():
+        if matrix.ndim != 2 or matrix.shape[1] != 101 or not np.isfinite(matrix).all():
             raise RuntimeError(f"{dataset}/{model} raw-state matrix is invalid")
         np.savez_compressed(
             phase / "adaptive_raw_states.npz",
