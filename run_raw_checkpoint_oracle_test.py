@@ -35,20 +35,51 @@ def parse_args():
     return parser.parse_args()
 
 
+def binary_auc(labels, scores):
+    labels = np.asarray(labels, dtype=bool)
+    scores = np.asarray(scores, dtype=np.float64)
+    positives = int(labels.sum())
+    negatives = int((~labels).sum())
+    if positives == 0 or negatives == 0:
+        return np.nan
+    ranks = pd.Series(scores).rank(method="average").to_numpy()
+    return float(
+        (ranks[labels].sum() - positives * (positives + 1) / 2.0)
+        / (positives * negatives)
+    )
+
+
 def metrics(qs, qc, advantage):
     actual = qs - qc
+    evaluated = np.abs(actual) > 1e-12
+    qs = qs[evaluated]
+    qc = qc[evaluated]
+    actual = actual[evaluated]
+    advantage = advantage[evaluated]
     truth_stop = actual > 0
     predicted_stop = advantage > 0
+    tp = int((predicted_stop & truth_stop).sum())
+    fp = int((predicted_stop & ~truth_stop).sum())
+    fn = int((~predicted_stop & truth_stop).sum())
+    tn = int((~predicted_stop & ~truth_stop).sum())
     stop_recall = predicted_stop[truth_stop].mean() if truth_stop.any() else np.nan
     continue_recall = (~predicted_stop[~truth_stop]).mean() if (~truth_stop).any() else np.nan
     selected = np.where(predicted_stop, qs, qc)
     regret = np.maximum(qs, qc) - selected
     return {
-        "states": len(qs),
+        "states": len(actual),
+        "ties_excluded": int((~evaluated).sum()),
+        "stop_states": int(truth_stop.sum()),
+        "continue_states": int((~truth_stop).sum()),
+        "true_stop": tp,
+        "false_stop": fp,
+        "false_continue": fn,
+        "true_continue": tn,
         "sign_accuracy": float((truth_stop == predicted_stop).mean()),
         "balanced_accuracy": float(0.5 * (stop_recall + continue_recall)),
         "stop_recall": float(stop_recall),
         "continue_recall": float(continue_recall),
+        "advantage_auc": binary_auc(truth_stop, advantage),
         "advantage_spearman": float(
             pd.Series(advantage).rank().corr(pd.Series(actual).rank())
         ),

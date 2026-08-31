@@ -55,20 +55,50 @@ def rank_corr(left, right):
     return float(pd.Series(left).rank().corr(pd.Series(right).rank()))
 
 
+def binary_auc(labels, scores):
+    labels = np.asarray(labels, dtype=bool)
+    scores = np.asarray(scores, dtype=np.float64)
+    positives = int(labels.sum())
+    negatives = int((~labels).sum())
+    if positives == 0 or negatives == 0:
+        return math.nan
+    ranks = pd.Series(scores).rank(method="average").to_numpy()
+    return float(
+        (ranks[labels].sum() - positives * (positives + 1) / 2.0)
+        / (positives * negatives)
+    )
+
+
 def metrics(qs, qc, predicted_advantage):
     actual = qs - qc
+    evaluated = np.abs(actual) > 1e-12
+    qs = qs[evaluated]
+    qc = qc[evaluated]
+    actual = actual[evaluated]
+    predicted_advantage = predicted_advantage[evaluated]
     truth_stop = actual > 0.0
     predicted_stop = predicted_advantage > 0.0
+    tp = int((predicted_stop & truth_stop).sum())
+    fp = int((predicted_stop & ~truth_stop).sum())
+    fn = int((~predicted_stop & truth_stop).sum())
+    tn = int((~predicted_stop & ~truth_stop).sum())
     stop_recall = float(predicted_stop[truth_stop].mean()) if truth_stop.any() else math.nan
     continue_recall = float((~predicted_stop[~truth_stop]).mean()) if (~truth_stop).any() else math.nan
     selected = np.where(predicted_stop, qs, qc)
     regret = np.maximum(qs, qc) - selected
     always_stop_regret = np.maximum(qs, qc) - qs
     return {
-        "states": len(qs),
+        "states": len(actual),
+        "ties_excluded": int((~evaluated).sum()),
+        "true_stop": tp,
+        "false_stop": fp,
+        "false_continue": fn,
+        "true_continue": tn,
+        "sign_accuracy": float((truth_stop == predicted_stop).mean()),
         "balanced_accuracy": 0.5 * (stop_recall + continue_recall),
         "stop_recall": stop_recall,
         "continue_recall": continue_recall,
+        "advantage_auc": binary_auc(truth_stop, predicted_advantage),
         "spearman_advantage": rank_corr(predicted_advantage, actual),
         "mean_oracle_regret": float(regret.mean()),
         "always_stop_mean_regret": float(always_stop_regret.mean()),
