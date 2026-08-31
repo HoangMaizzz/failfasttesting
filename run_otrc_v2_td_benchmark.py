@@ -845,6 +845,11 @@ def confidence_diagnostics(dataset, decisions, drafter_threshold):
 
 
 def weight_rows(dataset, state, feature_names):
+    # Nonlinear raw-state controllers persist complete model/optimizer
+    # checkpoints. They do not expose the legacy per-action theta vectors;
+    # checkpoint evaluation is handled by the dedicated T4 runner.
+    if state.get("nonlinear_value") is not None:
+        return []
     records = []
     stop = state["actions"]["stop"]["theta"]
     continue_ = state["actions"]["continue"]["theta"]
