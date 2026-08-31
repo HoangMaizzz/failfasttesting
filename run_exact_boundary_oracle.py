@@ -17,7 +17,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-DATASETS = ("math", "gsm8k")
+DEFAULT_DATASETS = ("math", "gsm8k")
 
 
 def parse_args():
@@ -28,6 +28,12 @@ def parse_args():
         )
     )
     parser.add_argument("--num_questions", type=int, default=10)
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=sorted(PROBLEM_IDS),
+        default=list(DEFAULT_DATASETS),
+    )
     parser.add_argument("--pilot_questions", type=int, default=2)
     parser.add_argument("--boundaries_per_problem", type=int, default=5)
     parser.add_argument("--max_states_per_boundary", type=int, default=256)
@@ -66,7 +72,9 @@ def validate_args(args):
         raise ValueError("--boundaries_per_problem must be positive")
     if args.max_states_per_boundary <= 1:
         raise ValueError("--max_states_per_boundary must exceed one")
-    for dataset in DATASETS:
+    if len(args.datasets) != 2 or len(set(args.datasets)) != 2:
+        raise ValueError("--datasets requires exactly two distinct datasets")
+    for dataset in args.datasets:
         if args.num_questions > len(PROBLEM_IDS[dataset]):
             raise ValueError(f"not enough fixed IDs for {dataset}")
 
@@ -308,13 +316,15 @@ def concat_existing(paths):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def summarize_subset(root, behavior_dirs, selected_by_dataset, ids_by_dataset, label):
+def summarize_subset(
+    root, behavior_dirs, selected_by_dataset, ids_by_dataset, datasets, label
+):
     report_dir = root / label
     report_dir.mkdir(parents=True, exist_ok=True)
     all_alignment = []
     all_trees = []
     output_checks = []
-    for dataset in DATASETS:
+    for dataset in datasets:
         allowed = set(ids_by_dataset[dataset])
         exact_dirs = [
             root / "raw" / dataset / "exact" / f"id_{problem_id}"
@@ -457,13 +467,14 @@ def main():
     validate_args(args)
     root = Path(args.output_dir)
     root.mkdir(parents=True, exist_ok=True)
-    ids = {dataset: fixed_ids(dataset, args.num_questions) for dataset in DATASETS}
+    datasets = tuple(args.datasets)
+    ids = {dataset: fixed_ids(dataset, args.num_questions) for dataset in datasets}
     behavior_dirs = {}
     selected = {}
     policies = {}
     profile_paths = {}
 
-    for dataset in DATASETS:
+    for dataset in datasets:
         profile_dir = run_method(
             args,
             dataset,
@@ -497,7 +508,7 @@ def main():
         selected[dataset] = selected_states
 
     per_problem_policies = {}
-    for dataset in DATASETS:
+    for dataset in datasets:
         directory = root / dataset / "behavior_policies"
         directory.mkdir(parents=True, exist_ok=True)
         for problem_id in ids[dataset]:
@@ -507,7 +518,7 @@ def main():
 
     # Complete both datasets' pilot before moving to the remaining questions.
     for problem_index in range(args.pilot_questions):
-        for dataset in DATASETS:
+        for dataset in datasets:
             problem_id = ids[dataset][problem_index]
             run_exact_problem(
                 args,
@@ -521,13 +532,13 @@ def main():
         for dataset, values in ids.items()
     }
     summarize_subset(
-        root, behavior_dirs, selected, pilot_ids, "pilot4_report"
+        root, behavior_dirs, selected, pilot_ids, datasets, "pilot4_report"
     )
     if not args.skip_archive:
         archive(root, "pilot4")
 
     for problem_index in range(args.pilot_questions, args.num_questions):
-        for dataset in DATASETS:
+        for dataset in datasets:
             problem_id = ids[dataset][problem_index]
             run_exact_problem(
                 args,
@@ -536,10 +547,10 @@ def main():
                 profile_paths[dataset],
                 per_problem_policies[(dataset, problem_id)],
             )
-    summarize_subset(root, behavior_dirs, selected, ids, "final_report")
+    summarize_subset(root, behavior_dirs, selected, ids, datasets, "final_report")
     manifest = {
         "version": "exact_verifier_boundary_oracle_v1",
-        "datasets": list(DATASETS),
+        "datasets": list(datasets),
         "problem_ids": ids,
         "boundaries_per_problem": args.boundaries_per_problem,
         "max_states_per_boundary": args.max_states_per_boundary,
