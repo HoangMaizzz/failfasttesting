@@ -31,6 +31,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow_output_mismatch", action="store_true")
     return parser.parse_args()
 
 
@@ -187,7 +188,12 @@ def main():
         columns="raw_model",
         values="output_token_hash",
     )
-    if not bool((hashes.raw_linear == hashes.raw_mlp).all()):
+    hashes["output_match"] = hashes.raw_linear == hashes.raw_mlp
+    hashes.reset_index().to_csv(root / "raw_model_output_match.csv", index=False)
+    if (
+        not bool(hashes.output_match.all())
+        and not args.allow_output_mismatch
+    ):
         raise RuntimeError("raw Linear and raw MLP changed greedy target output")
     pd.concat(summary_frames, ignore_index=True).to_csv(
         root / "raw_online_method_summary.csv", index=False
