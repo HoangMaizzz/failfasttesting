@@ -127,6 +127,12 @@ class ActiveBlockRefinementTests(unittest.TestCase):
             source,
         )
 
+    def test_long_runs_release_per_problem_gpu_cache(self):
+        source = (ROOT / "failfast.py").read_text(encoding="utf-8")
+        self.assertIn("orig_model_inputs = None", source)
+        self.assertIn("prefill_output = None", source)
+        self.assertIn("torch.cuda.empty_cache()", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5871,6 +5871,15 @@ for problem_id, is_warmup in tqdm(
     if not is_warmup:
         append_benchmark_rows(args, problem_benchmark_rows)
 
+    # Long benchmark processes keep both models resident, but per-problem
+    # inputs and drafter KV state must not survive into the next question.
+    orig_model_inputs = None
+    prefill_output = None
+    draft_proposal = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 if args.frontier_stop_mode == "bucket_renewal":
     ensure_frontier_runtime_state(args)
     runtime_report = {
