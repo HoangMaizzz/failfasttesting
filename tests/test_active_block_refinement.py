@@ -47,6 +47,29 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "span 8 positions"):
             complete_raw_probability_frame({}, 118, 125)
 
+    def test_every_verifier_prefix_offset_keeps_relative_eight_token_frames(self):
+        for offset in range(8):
+            draft_start = 112 + offset
+            draft_end = draft_start + 24
+            expected = [
+                (index, draft_start + index * 8, draft_start + (index + 1) * 8)
+                for index in range(3)
+            ]
+            observed = []
+            physical_start = 112
+            while physical_start < draft_end:
+                span = logical_refinement_span(
+                    draft_start,
+                    draft_end,
+                    physical_start,
+                    physical_start + 8,
+                    8,
+                )
+                if span is not None and span not in observed:
+                    observed.append(span)
+                physical_start += 8
+            self.assertEqual(observed, expected)
+
     def test_physical_padding_outside_the_proposal_has_no_logical_span(self):
         self.assertIsNone(
             logical_refinement_span(118, 126, 128, 136, 8)
@@ -98,6 +121,11 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         )
         self.assertIn("adaptive_raw_probability_cache", source)
         self.assertIn("raw_state_incomplete", source)
+        self.assertIn(
+            "not adaptive_enabled\n"
+            "                                        and num_salvagable_tokens",
+            source,
+        )
 
 
 if __name__ == "__main__":

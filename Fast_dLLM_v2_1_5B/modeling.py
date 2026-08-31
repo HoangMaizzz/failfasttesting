@@ -3035,7 +3035,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     logger.debug(f"{Colors.GREEN}Current proposal: {curr_proposal}{Colors.RESET}")
                                     num_salvagable_tokens, start_index_rejected, start_index_proposal = \
                                         get_rejected_overlap_info(last_round_rejected, curr_proposal)
-                                    if num_salvagable_tokens != 0 and start_index_proposal != len(curr_proposal) - 1:
+                                    if (
+                                        not adaptive_enabled
+                                        and num_salvagable_tokens != 0
+                                        and start_index_proposal
+                                        != len(curr_proposal) - 1
+                                    ):
                                         logger.debug(f"{Colors.GREEN}last_round_rejected: {last_round_rejected}{Colors.RESET}, start_index_rejected {start_index_rejected}, start_index_proposal {start_index_proposal}")
                                         veri_len = start_index_proposal + num_salvagable_tokens
                                         
