@@ -1,7 +1,11 @@
 import unittest
 from pathlib import Path
 
-from adaptive_td import active_refinement_positions, logical_refinement_span
+from adaptive_td import (
+    active_refinement_positions,
+    complete_raw_probability_frame,
+    logical_refinement_span,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +23,29 @@ class ActiveBlockRefinementTests(unittest.TestCase):
             logical_refinement_span(118, 134, 126, 134, 8),
             (1, 126, 134),
         )
+
+    def test_raw_frame_waits_for_both_physical_segments(self):
+        cache = {
+            position: (float(position), 0.0, 0.0)
+            for position in range(112, 120)
+        }
+        self.assertIsNone(
+            complete_raw_probability_frame(cache, 118, 126)
+        )
+
+        cache.update({
+            position: (float(position), 0.0, 0.0)
+            for position in range(120, 128)
+        })
+        frame = complete_raw_probability_frame(cache, 118, 126)
+        self.assertEqual(
+            [values[0] for values in frame],
+            [float(position) for position in range(118, 126)],
+        )
+
+    def test_raw_frame_rejects_non_eight_token_span(self):
+        with self.assertRaisesRegex(ValueError, "span 8 positions"):
+            complete_raw_probability_frame({}, 118, 125)
 
     def test_physical_padding_outside_the_proposal_has_no_logical_span(self):
         self.assertIsNone(
@@ -69,6 +96,8 @@ class ActiveBlockRefinementTests(unittest.TestCase):
             "adaptive logical-frame extension must add",
             source,
         )
+        self.assertIn("adaptive_raw_probability_cache", source)
+        self.assertIn("raw_state_incomplete", source)
 
 
 if __name__ == "__main__":

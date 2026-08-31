@@ -27,7 +27,7 @@ def parse_args():
         "--output_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_shared_va_math_gsm8k_test25"
+            "outputs_raw_aligned_shared_va_math_gsm8k_test25"
         ),
     )
     parser.add_argument("--resume", action="store_true")
@@ -121,6 +121,22 @@ def validate_method(directory, model):
         )
         if matrix.ndim != 2 or matrix.shape[1] != 101 or not np.isfinite(matrix).all():
             raise RuntimeError(f"{dataset}/{model} raw-state matrix is invalid")
+        observed_columns = [
+            state_index * 48 + position * 6 + 1
+            for state_index in range(2)
+            for position in range(8)
+        ]
+        if not np.allclose(matrix[:, observed_columns], 1.0):
+            raise RuntimeError(
+                f"{dataset}/{model} contains incomplete raw-state decisions"
+            )
+        if (
+            state.get("factual_verifier_latency_ema_ms") is None
+            or state.get("factual_tokens_per_verifier_ema") is None
+        ):
+            raise RuntimeError(
+                f"{dataset}/{model} did not update factual verifier features"
+            )
         np.savez_compressed(
             phase / "adaptive_raw_states.npz",
             X=matrix,

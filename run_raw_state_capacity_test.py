@@ -35,14 +35,14 @@ def parse_args():
         "--oracle_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_state_oracle_math_gsm8k_test10/raw_capacity_dataset"
+            "outputs_raw_state_aligned_oracle_math_gsm8k_test10/raw_capacity_dataset"
         ),
     )
     parser.add_argument(
         "--output_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_state_capacity_math_gsm8k"
+            "outputs_raw_state_aligned_capacity_math_gsm8k"
         ),
     )
     parser.add_argument("--epochs", type=int, default=400)

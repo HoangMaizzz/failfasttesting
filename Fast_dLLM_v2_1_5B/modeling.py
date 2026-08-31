@@ -35,6 +35,7 @@ from bucket_renewal import (
 from adaptive_td import (
     RAW_STATE_BLOCK_SIZE,
     active_refinement_positions,
+    complete_raw_probability_frame,
     logical_refinement_span,
 )
 
@@ -1189,6 +1190,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         adaptive_previous_proposal = None
         adaptive_decision_counts = {}
         adaptive_previous_raw_states = {}
+        adaptive_raw_probability_cache = {}
 
         def frontier_bin(value):
             return str(max(0, min(9, int(float(value) * 10.0))))
@@ -1984,22 +1986,33 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         and current_token is not None
                                         and previous_token != current_token
                                     ]
+                                physical_small_start = (
+                                    block_abs_start + small_block_start_idx
+                                )
+                                physical_small_end = (
+                                    block_abs_start + small_block_end_idx
+                                )
+                                raw_state_requested = bool(
+                                    adaptive_controller.config.feature_schema
+                                    == "otrc_raw_state_v1"
+                                    or getattr(
+                                        args,
+                                        "strict_greedy_capacity_collector",
+                                        False,
+                                    )
+                                )
                                 logical_span = logical_refinement_span(
                                     draft_token_start_idx,
                                     draft_end_idx,
-                                    block_abs_start + small_block_start_idx,
-                                    block_abs_start + small_block_end_idx,
+                                    physical_small_start,
+                                    physical_small_end,
                                     small_block_size,
                                 )
                                 if logical_span is None:
                                     logical_block_idx = -1
                                     active_absolute_start = max(
                                         draft_token_start_idx,
-                                        min(
-                                            draft_end_idx,
-                                            block_abs_start
-                                            + small_block_start_idx,
-                                        ),
+                                        min(draft_end_idx, physical_small_start),
                                     )
                                     active_absolute_end = active_absolute_start
                                 else:
@@ -2015,9 +2028,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 raw_current_state = None
                                 raw_previous_state = None
                                 raw_has_previous_state = False
-                                physical_small_start = (
-                                    block_abs_start + small_block_start_idx
-                                )
+                                raw_state_complete = False
                                 raw_local_indices = [
                                     absolute_pos - physical_small_start
                                     for absolute_pos in range(
@@ -2025,15 +2036,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         active_absolute_end,
                                     )
                                 ]
-                                raw_state_requested = bool(
-                                    adaptive_controller.config.feature_schema
-                                    == "otrc_raw_state_v1"
-                                    or getattr(
-                                        args,
-                                        "strict_greedy_capacity_collector",
-                                        False,
-                                    )
-                                )
                                 if raw_state_requested:
                                     if (
                                         active_span_length
@@ -2053,6 +2055,51 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             dtype=torch.float32,
                                         )).item()),
                                     )
+                                    physical_probabilities = p_1t[0].float()
+                                    physical_top2 = torch.topk(
+                                        physical_probabilities, k=2, dim=-1
+                                    ).values
+                                    physical_entropy = -torch.sum(
+                                        physical_probabilities
+                                        * torch.log(torch.clamp(
+                                            physical_probabilities, min=1e-12
+                                        )),
+                                        dim=-1,
+                                    ) / raw_entropy_scale
+                                    for physical_local_index in range(
+                                        int(p_1t.shape[1])
+                                    ):
+                                        absolute_pos = (
+                                            physical_small_start
+                                            + physical_local_index
+                                        )
+                                        adaptive_raw_probability_cache[
+                                            int(absolute_pos)
+                                        ] = (
+                                            float(physical_top2[
+                                                physical_local_index, 0
+                                            ].item()),
+                                            float(physical_top2[
+                                                physical_local_index, 1
+                                            ].item()),
+                                            float(torch.clamp(
+                                                physical_entropy[
+                                                    physical_local_index
+                                                ],
+                                                0.0,
+                                                1.0,
+                                            ).item()),
+                                        )
+                                    raw_probability_frame = (
+                                        complete_raw_probability_frame(
+                                            adaptive_raw_probability_cache,
+                                            active_absolute_start,
+                                            active_absolute_end,
+                                        )
+                                    )
+                                    raw_state_complete = (
+                                        raw_probability_frame is not None
+                                    )
                                     raw_current_state = []
                                     for raw_position, (
                                         absolute_pos,
@@ -2067,31 +2114,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         is_masked = float(
                                             int(x_t[0, absolute_pos].item()) == mask_id
                                         )
-                                        if 0 <= local_index < p_1t.shape[1]:
+                                        cached_summary = (
+                                            None
+                                            if raw_probability_frame is None
+                                            else raw_probability_frame[raw_position]
+                                        )
+                                        if cached_summary is not None:
                                             observed_value = 1.0
-                                            probabilities = p_1t[
-                                                0, local_index, :
-                                            ].float()
-                                            top2 = torch.topk(
-                                                probabilities, k=2, dim=-1
-                                            ).values
-                                            entropy = -torch.sum(
-                                                probabilities
-                                                * torch.log(torch.clamp(
-                                                    probabilities, min=1e-12
-                                                ))
-                                            ) / raw_entropy_scale
-                                            top1_value = float(top2[0].item())
-                                            top2_value = float(top2[1].item())
-                                            entropy_value = float(
-                                                torch.clamp(entropy, 0.0, 1.0).item()
-                                            )
+                                            (
+                                                top1_value,
+                                                top2_value,
+                                                entropy_value,
+                                            ) = cached_summary
                                         else:
-                                            # The logical 8-token frame may straddle a
-                                            # physical Fast-dLLM segment. Zero probability
-                                            # summaries explicitly mark positions not
-                                            # observed by this forward; the mask bit remains
-                                            # factual and keeps the fixed-width state valid.
                                             top1_value = 0.0
                                             top2_value = 0.0
                                             entropy_value = 0.0
@@ -2294,11 +2329,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 )
                                 stop_available = bool(
                                     active_remaining_positions
-                                ) and zero_cost_fill_available
+                                ) and zero_cost_fill_available and (
+                                    not raw_state_requested
+                                    or raw_state_complete
+                                )
                                 if not active_remaining_positions:
                                     stop_availability_reason = "no_active_masks"
                                 elif not zero_cost_fill_available:
                                     stop_availability_reason = "candidate_coverage_unavailable"
+                                elif raw_state_requested and not raw_state_complete:
+                                    stop_availability_reason = "raw_state_incomplete"
                                 else:
                                     stop_availability_reason = "available"
                                 if future_remaining_positions:
@@ -2332,6 +2372,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "unprocessed_future_masks": int(
                                         len(future_remaining_positions)
                                     ),
+                                    "raw_state_complete": bool(
+                                        raw_state_complete
+                                    ),
+                                    "raw_observed_positions": int(
+                                        sum(
+                                            int(absolute_pos)
+                                            in adaptive_raw_probability_cache
+                                            for absolute_pos in range(
+                                                active_absolute_start,
+                                                active_absolute_end,
+                                            )
+                                        )
+                                    ) if raw_state_requested else 0,
                                 }
                                 step_record.update({
                                     f"adaptive_{key}": value
@@ -2651,7 +2704,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         adaptive_pending_stop_extension = None
                                         stop_reason = None
                                 adaptive_previous_proposal = provisional_tokens
-                                if raw_current_state is not None:
+                                if (
+                                    raw_current_state is not None
+                                    and (
+                                        not raw_state_requested
+                                        or raw_state_complete
+                                    )
+                                ):
                                     adaptive_previous_raw_states[
                                         (
                                             int(active_absolute_start),

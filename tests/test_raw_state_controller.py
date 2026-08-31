@@ -14,6 +14,7 @@ def snapshot(masked=1.0, shift=0.0):
     return [
         [
             masked if index >= 4 else 0.0,
+            1.0,
             0.6 + shift,
             0.2,
             0.5,

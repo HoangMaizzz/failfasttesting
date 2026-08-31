@@ -153,6 +153,24 @@ def logical_refinement_span(
     return logical_index, logical_start, logical_end
 
 
+def complete_raw_probability_frame(
+    probability_cache,
+    active_start,
+    active_end,
+    block_size=RAW_STATE_BLOCK_SIZE,
+):
+    """Return one ordered proposal-relative frame once every token was observed."""
+    start = int(active_start)
+    end = int(active_end)
+    if end - start != int(block_size):
+        raise ValueError(
+            f"raw probability frame must span {int(block_size)} positions"
+        )
+    if any(position not in probability_cache for position in range(start, end)):
+        return None
+    return tuple(probability_cache[position] for position in range(start, end))
+
+
 def _clip(value: float, low: float, high: float) -> float:
     value = float(value)
     if math.isnan(value):

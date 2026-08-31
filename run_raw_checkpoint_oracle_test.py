@@ -15,21 +15,21 @@ def parse_args():
         "--online_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_shared_va_math_gsm8k_test25"
+            "outputs_raw_aligned_shared_va_math_gsm8k_test25"
         ),
     )
     parser.add_argument(
         "--oracle_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_state_oracle_math_gsm8k_test10/raw_capacity_dataset"
+            "outputs_raw_state_aligned_oracle_math_gsm8k_test10/raw_capacity_dataset"
         ),
     )
     parser.add_argument(
         "--output_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_checkpoint_oracle_math_gsm8k"
+            "outputs_raw_aligned_checkpoint_oracle_math_gsm8k"
         ),
     )
     return parser.parse_args()

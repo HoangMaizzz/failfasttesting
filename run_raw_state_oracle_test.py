@@ -29,7 +29,7 @@ def parse_args():
         "--output_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_raw_state_oracle_math_gsm8k_test10"
+            "outputs_raw_state_aligned_oracle_math_gsm8k_test10"
         ),
     )
     parser.add_argument("--resume", action="store_true")
