@@ -127,9 +127,23 @@ def load_raw_npz(path: Path, behavior_only: bool = True):
     mask = np.ones(len(payload["X"]), dtype=bool)
     if behavior_only:
         mask &= payload["on_behavior_path"].astype(bool)
-    return {
+    result = {
         name: payload[name][mask]
         for name in (
             "X", "q_stop", "q_continue", "problem_id", "dataset"
         )
     }
+    if result["X"].shape[1] == 85:
+        old = result["X"]
+        upgraded_states = []
+        for offset in (0, 40):
+            state = old[:, offset:offset + 40].reshape(-1, 8, 5)
+            observed = (state[:, :, 1:2] > 0.0).astype(np.float32)
+            upgraded_states.append(
+                np.concatenate((state[:, :, :1], observed, state[:, :, 1:]), axis=2)
+                .reshape(-1, 48)
+            )
+        result["X"] = np.concatenate(
+            (upgraded_states[0], upgraded_states[1], old[:, 80:85]), axis=1
+        ).astype(np.float32)
+    return result

@@ -39,7 +39,8 @@ class RawStateControllerTests(unittest.TestCase):
             factual_tokens_per_verifier_ema=8.0,
         )
         self.assertEqual(len(features), len(RAW_STATE_FEATURE_NAMES))
-        self.assertEqual(len(features), 85)
+        self.assertEqual(len(features), 101)
+        self.assertEqual(features[1], 1.0)
         self.assertEqual(features[-5], 0.25)
         self.assertEqual(features[-4], 0.4)
         self.assertEqual(features[-1], 1.0)

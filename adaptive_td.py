@@ -82,6 +82,7 @@ V23_COMPACT7_FEATURE_NAMES = (
 RAW_STATE_BLOCK_SIZE = 8
 RAW_TOKEN_FIELDS = (
     "mask_indicator",
+    "observed_indicator",
     "top1_probability",
     "top2_probability",
     "normalized_entropy",
@@ -2798,9 +2799,14 @@ def build_raw_state_features(
             )
         values = []
         for row in snapshot:
+            if len(row) == len(RAW_TOKEN_FIELDS) - 1:
+                # Backward compatibility for the 85-dimensional oracle archive:
+                # an exact zero top-1 value was the old unobserved sentinel.
+                row = [row[0], 1.0 if float(row[1]) > 0.0 else 0.0, *row[1:]]
             if len(row) != len(RAW_TOKEN_FIELDS):
                 raise ValueError(
-                    f"{label} rows must contain {len(RAW_TOKEN_FIELDS)} values"
+                    f"{label} rows must contain {len(RAW_TOKEN_FIELDS) - 1} "
+                    f"or {len(RAW_TOKEN_FIELDS)} values"
                 )
             values.extend(float(value) for value in row)
         if len(values) != expected_values or not all(

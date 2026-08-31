@@ -333,8 +333,8 @@ def validate_exact_raw_states(rows):
         current = parse_nested(row.raw_current_state)
         if len(previous) != 8 or len(current) != 8:
             raise RuntimeError("exact raw-state snapshot must contain 8 positions")
-        if any(len(values) != 5 for values in previous + current):
-            raise RuntimeError("exact raw-state positions must contain 5 values")
+        if any(len(values) not in (5, 6) for values in previous + current):
+            raise RuntimeError("exact raw-state positions must contain 5 or 6 values")
         if not bool(int(row.has_previous_state)) and previous != current:
             raise RuntimeError("first exact raw state did not copy current to previous")
         if int(row.active_block_end) - int(row.active_block_start) != 8:

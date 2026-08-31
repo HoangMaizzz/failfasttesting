@@ -106,7 +106,7 @@ def validate_method(directory, model):
     for dataset in DATASETS:
         phase = directory / "raw" / dataset / method
         state = json.loads((phase / "adaptive_td_runtime_state.json").read_text())
-        if state["value_model"] != model or state["feature_dim"] != 85:
+        if state["value_model"] != model or state["feature_dim"] != 101:
             raise RuntimeError(f"invalid raw controller state for {dataset}/{model}")
         nonlinear = state.get("nonlinear_value") or {}
         if not nonlinear or nonlinear.get("update_count", 0) <= 0:

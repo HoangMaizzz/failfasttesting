@@ -2068,6 +2068,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             int(x_t[0, absolute_pos].item()) == mask_id
                                         )
                                         if 0 <= local_index < p_1t.shape[1]:
+                                            observed_value = 1.0
                                             probabilities = p_1t[
                                                 0, local_index, :
                                             ].float()
@@ -2094,8 +2095,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             top1_value = 0.0
                                             top2_value = 0.0
                                             entropy_value = 0.0
+                                            observed_value = 0.0
                                         raw_current_state.append([
                                             is_masked,
+                                            observed_value,
                                             top1_value,
                                             top2_value,
                                             entropy_value,
