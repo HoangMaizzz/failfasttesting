@@ -2040,69 +2040,68 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         != RAW_STATE_BLOCK_SIZE
                                         or len(raw_local_indices)
                                         != RAW_STATE_BLOCK_SIZE
-                                        or min(raw_local_indices, default=-1) < 0
-                                        or max(raw_local_indices, default=-1)
-                                        >= p_1t.shape[1]
                                     ):
                                         raise RuntimeError(
                                             "raw-state controller requires a complete "
                                             f"{RAW_STATE_BLOCK_SIZE}-token active block"
                                         )
-                                    raw_probabilities = p_1t[
-                                        0, raw_local_indices, :
-                                    ].float()
-                                    raw_top2 = torch.topk(
-                                        raw_probabilities, k=2, dim=-1
-                                    ).values
-                                    raw_entropy = -torch.sum(
-                                        raw_probabilities
-                                        * torch.log(
-                                            torch.clamp(
-                                                raw_probabilities, min=1e-12
-                                            )
-                                        ),
-                                        dim=-1,
-                                    ) / max(
+                                    raw_entropy_scale = max(
                                         1.0,
                                         float(torch.log(torch.tensor(
-                                            raw_probabilities.shape[-1],
-                                            device=raw_probabilities.device,
+                                            p_1t.shape[-1],
+                                            device=p_1t.device,
                                             dtype=torch.float32,
                                         )).item()),
                                     )
-                                    raw_post_mask = torch.tensor(
-                                        [
-                                            float(
-                                                int(x_t[0, absolute_pos].item())
-                                                == mask_id
-                                            )
-                                            for absolute_pos in range(
-                                                active_absolute_start,
-                                                active_absolute_end,
-                                            )
-                                        ],
-                                        device=raw_probabilities.device,
-                                    )
-                                    raw_positions = torch.linspace(
-                                        0.0,
-                                        1.0,
-                                        RAW_STATE_BLOCK_SIZE,
-                                        device=raw_probabilities.device,
-                                    )
-                                    raw_snapshot = torch.stack(
-                                        (
-                                            raw_post_mask,
-                                            raw_top2[:, 0],
-                                            raw_top2[:, 1],
-                                            torch.clamp(raw_entropy, 0.0, 1.0),
-                                            raw_positions,
+                                    raw_current_state = []
+                                    for raw_position, (
+                                        absolute_pos,
+                                        local_index,
+                                    ) in enumerate(zip(
+                                        range(
+                                            active_absolute_start,
+                                            active_absolute_end,
                                         ),
-                                        dim=-1,
-                                    ).cpu().tolist()
-                                    raw_current_state = [
-                                        [float(value) for value in row]
-                                        for row in raw_snapshot
-                                    ]
+                                        raw_local_indices,
+                                    )):
+                                        is_masked = float(
+                                            int(x_t[0, absolute_pos].item()) == mask_id
+                                        )
+                                        if 0 <= local_index < p_1t.shape[1]:
+                                            probabilities = p_1t[
+                                                0, local_index, :
+                                            ].float()
+                                            top2 = torch.topk(
+                                                probabilities, k=2, dim=-1
+                                            ).values
+                                            entropy = -torch.sum(
+                                                probabilities
+                                                * torch.log(torch.clamp(
+                                                    probabilities, min=1e-12
+                                                ))
+                                            ) / raw_entropy_scale
+                                            top1_value = float(top2[0].item())
+                                            top2_value = float(top2[1].item())
+                                            entropy_value = float(
+                                                torch.clamp(entropy, 0.0, 1.0).item()
+                                            )
+                                        else:
+                                            # The logical 8-token frame may straddle a
+                                            # physical Fast-dLLM segment. Zero probability
+                                            # summaries explicitly mark positions not
+                                            # observed by this forward; the mask bit remains
+                                            # factual and keeps the fixed-width state valid.
+                                            top1_value = 0.0
+                                            top2_value = 0.0
+                                            entropy_value = 0.0
+                                        raw_current_state.append([
+                                            is_masked,
+                                            top1_value,
+                                            top2_value,
+                                            entropy_value,
+                                            float(raw_position)
+                                            / max(1, RAW_STATE_BLOCK_SIZE - 1),
+                                        ])
                                     raw_state_key = (
                                         int(active_absolute_start),
                                         int(active_absolute_end),
