@@ -123,7 +123,6 @@ def command(args, dataset, output_dir):
         "--adaptive-collect-raw-state",
         "--adaptive-log-decisions",
         "--adaptive-profile-overhead",
-        "--disable_reusing_drafter_kvs",
         "--seed",
         "42",
         "--quiet_generation",
@@ -254,7 +253,8 @@ def main():
                 name: PROBLEM_IDS[name][: args.num_questions] for name in DATASETS
             },
             "method": "online_bayesian_hindsight_block_gain",
-            "label": "delayed committed-greedy LCP, active eight-token block",
+            "label": "delayed committed-greedy LCP, physical 1-8 token span",
+            "drafter_kv_reuse": True,
             "outer_rewards_used": False,
             "counterfactual_model_calls": False,
             "target_quantization": args.target_quantization,
