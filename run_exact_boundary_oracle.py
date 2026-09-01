@@ -198,6 +198,9 @@ def evenly_spaced(values, limit):
 
 
 def build_exact_behavior_policy(decisions, results, boundaries_per_problem):
+    replay_decisions = decisions.copy().sort_values(
+        ["problem_id", "round_id", "decision_id"]
+    )
     decisions = legal_decisions(decisions)
     policies = {}
     selected_rows = []
@@ -215,8 +218,18 @@ def build_exact_behavior_policy(decisions, results, boundaries_per_problem):
             })
         rounds = []
         for round_id in range(int(result.num_speculation_rounds)):
-            current = problem[problem.round_id.astype(int) == round_id]
-            actions = [str(value) for value in current.action.tolist()]
+            replay_problem = replay_decisions[
+                replay_decisions.problem_id.astype(int) == problem_id
+            ]
+            current = replay_problem[
+                replay_problem.round_id.astype(int) == round_id
+            ]
+            action_column = (
+                "executed_action"
+                if "executed_action" in current.columns
+                else "action"
+            )
+            actions = [str(value) for value in current[action_column].tolist()]
             if any(value not in {STOP, CONTINUE} for value in actions):
                 raise ValueError(f"invalid action for problem {problem_id}")
             rounds.append({

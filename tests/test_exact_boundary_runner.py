@@ -33,6 +33,36 @@ class ExactBoundaryRunnerTests(unittest.TestCase):
         self.assertEqual(len(selected_rounds), 5)
         self.assertEqual(rounds[0]["actions"], ["continue"])
 
+    def test_policy_replays_forced_decisions_but_probes_only_legal_rounds(self):
+        rows = pd.DataFrame([
+            {
+                "problem_id": 7,
+                "round_id": 0,
+                "decision_id": 0,
+                "action": "continue",
+                "executed_action": "continue",
+                "stop_available": False,
+            },
+            {
+                "problem_id": 7,
+                "round_id": 0,
+                "decision_id": 1,
+                "action": "stop",
+                "executed_action": "stop",
+                "stop_available": True,
+            },
+        ])
+        policy, selected, selected_rounds = build_exact_behavior_policy(
+            rows,
+            pd.DataFrame([{"problem_id": 7, "num_speculation_rounds": 1}]),
+            1,
+        )
+        round_zero = policy["policies"]["7"][0]
+        self.assertEqual(round_zero["actions"], ["continue", "stop"])
+        self.assertTrue(round_zero["exact_boundary_probe"])
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(len(selected_rounds), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
