@@ -25,7 +25,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Exact STOP/CONTINUE dynamic programming to the next verifier "
-            "boundary on five C6 behavior rounds per problem."
+            "boundary on five raw-state behavior rounds per problem."
         )
     )
     parser.add_argument("--num_questions", type=int, default=10)
@@ -116,7 +116,7 @@ def run_method(args, dataset, problem_ids, directory, *, adaptive):
     if args.resume and complete(directory, problem_ids, expected_adaptive):
         extra = ["adaptive_td_decisions.csv"] if adaptive else ["verifier_calls.csv"]
         if all((directory / name).exists() for name in extra):
-            print(f"SKIP completed {'C6' if adaptive else 'profile'}: {dataset}")
+            print(f"SKIP completed {'raw behavior' if adaptive else 'profile'}: {dataset}")
             return directory
     if directory.exists():
         shutil.rmtree(directory)
@@ -126,18 +126,23 @@ def run_method(args, dataset, problem_ids, directory, *, adaptive):
     )
     command[command.index("--max_new_tokens") + 1] = str(args.max_new_tokens)
     if adaptive:
-        command.extend(adaptive_flags("c6_annealed"))
-        # The exact collector only labels states with a complete raw snapshot.
-        # Apply the same availability gate to the C6 behavior trajectory so
-        # every selected action remains replayable and usable by raw models.
-        command.append("--adaptive-collect-raw-state")
+        flags = adaptive_flags("learned")
+        flags[flags.index("--adaptive-feature-schema") + 1] = "otrc_raw_state_v1"
+        flags.extend([
+            "--adaptive-value-model", "raw_linear",
+            "--adaptive-nonlinear-learning-rate", "0.001",
+            "--adaptive-nonlinear-weight-decay", "0",
+            "--adaptive-nonlinear-grad-clip", "1.0",
+            "--adaptive-nonlinear-device", "cpu",
+        ])
+        command.extend(flags)
         # Exact branches disable KV reuse to keep memory bounded.  Collect the
         # behavior trajectory through the identical drafter path so its action
         # script remains replayable at exact-boundary time.
         command.append("--disable_reusing_drafter_kvs")
     print("\n" + "=" * 96, flush=True)
     print(
-        f"RUN {'C6 BEHAVIOR' if adaptive else 'FROZEN PROFILE'} "
+        f"RUN {'RAW BEHAVIOR' if adaptive else 'FROZEN PROFILE'} "
         f"{dataset.upper()} | questions={len(problem_ids)}",
         flush=True,
     )
@@ -205,7 +210,7 @@ def evenly_spaced(values, limit):
     return [values[position] for position in positions]
 
 
-def build_exact_behavior_policy(decisions, results, boundaries_per_problem):
+def build_exact_raw_behavior_policy(decisions, results, boundaries_per_problem):
     replay_decisions = decisions.copy().sort_values(
         ["problem_id", "round_id", "decision_id"]
     )
@@ -253,7 +258,7 @@ def build_exact_behavior_policy(decisions, results, boundaries_per_problem):
     )
     selected_rounds = pd.DataFrame(selected_round_rows)
     return {
-        "version": "exact_boundary_c6_behavior_v1",
+        "version": "exact_boundary_raw_behavior_v1",
         "policies": policies,
     }, selected, selected_rounds
 
@@ -364,6 +369,21 @@ def validate_exact_raw_states(rows):
             raise RuntimeError("exact raw state crossed an active-block boundary")
 
 
+def validate_raw_behavior_state(state_path, rows):
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("feature_schema") != "otrc_raw_state_v1":
+        raise RuntimeError("oracle behavior did not use the raw-state schema")
+    if int(state.get("feature_dim", 0)) != 101:
+        raise RuntimeError("oracle behavior raw-state dimension is not 101")
+    if not state.get("factual_draft_latency_ema_ms"):
+        raise RuntimeError("oracle behavior did not observe draft latency")
+    validate_exact_raw_states(rows)
+    for row in rows.itertuples(index=False):
+        features = parse_nested(row.features)
+        if len(features) != 101:
+            raise RuntimeError("oracle behavior logged a non-101D raw vector")
+
+
 def summarize_subset(
     root, behavior_dirs, selected_by_dataset, ids_by_dataset, datasets, label
 ):
@@ -421,18 +441,18 @@ def summarize_subset(
             rows,
             on=key,
             how="inner",
-            suffixes=("_c6", "_oracle"),
+            suffixes=("_behavior", "_oracle"),
             validate="one_to_one",
         )
-        alignment["c6_advantage"] = (
+        alignment["behavior_advantage"] = (
             pd.to_numeric(alignment.q_stop_mean)
             - pd.to_numeric(alignment.q_continue_mean)
         )
-        alignment["c6_action"] = np.where(
-            alignment.c6_advantage > 0.0, STOP, CONTINUE
+        alignment["behavior_action"] = np.where(
+            alignment.behavior_advantage > 0.0, STOP, CONTINUE
         )
         alignment["sign_correct"] = (
-            alignment.c6_action == alignment.oracle_action
+            alignment.behavior_action == alignment.oracle_action
         )
         alignment.insert(0, "dataset", dataset)
         alignment.to_csv(report_dir / f"{dataset}_exact_alignment.csv", index=False)
@@ -465,7 +485,7 @@ def summarize_subset(
     summaries = []
     for dataset, frame in non_tie.groupby("dataset"):
         truth_stop = frame.oracle_action.eq(STOP)
-        predicted_stop = frame.c6_action.eq(STOP)
+        predicted_stop = frame.behavior_action.eq(STOP)
         summaries.append({
             "dataset": dataset,
             "problems": int(frame.problem_id.nunique()),
@@ -479,7 +499,7 @@ def summarize_subset(
                 (~predicted_stop[~truth_stop]).mean()
             ) if (~truth_stop).any() else float("nan"),
             "advantage_spearman": float(
-                frame.c6_advantage.rank().corr(
+                frame.behavior_advantage.rank().corr(
                     frame.oracle_advantage_tokens.rank()
                 )
             ),
@@ -540,18 +560,22 @@ def main():
             args,
             dataset,
             ids[dataset],
-            root / "raw" / dataset / "c6_behavior",
+            root / "raw" / dataset / "raw_behavior",
             adaptive=True,
         )
         behavior_dirs[dataset] = behavior_dir
-        policy, selected_states, selected_rounds = build_exact_behavior_policy(
+        policy, selected_states, selected_rounds = build_exact_raw_behavior_policy(
             pd.read_csv(behavior_dir / "adaptive_td_decisions.csv"),
             pd.read_csv(behavior_dir / "benchmark_results.csv"),
             args.boundaries_per_problem,
         )
+        validate_raw_behavior_state(
+            behavior_dir / "adaptive_td_runtime_state.json",
+            selected_states,
+        )
         policy_path = root / dataset / "behavior_policy.json"
         policy_path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
-        selected_states.to_csv(root / dataset / "selected_c6_states.csv", index=False)
+        selected_states.to_csv(root / dataset / "selected_raw_states.csv", index=False)
         selected_rounds.to_csv(root / dataset / "selected_boundary_rounds.csv", index=False)
         policies[dataset] = policy
         selected[dataset] = selected_states

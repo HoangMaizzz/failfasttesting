@@ -3,7 +3,7 @@ import unittest
 import pandas as pd
 
 from run_exact_boundary_oracle import (
-    build_exact_behavior_policy,
+    build_exact_raw_behavior_policy,
     evenly_spaced,
     run_method,
 )
@@ -23,7 +23,7 @@ class ExactBoundaryRunnerTests(unittest.TestCase):
                 "action": "stop" if round_id % 2 else "continue",
                 "stop_available": True,
             })
-        policy, selected, selected_rounds = build_exact_behavior_policy(
+        policy, selected, selected_rounds = build_exact_raw_behavior_policy(
             pd.DataFrame(rows),
             pd.DataFrame([{"problem_id": 7, "num_speculation_rounds": 10}]),
             5,
@@ -53,7 +53,7 @@ class ExactBoundaryRunnerTests(unittest.TestCase):
                 "stop_available": True,
             },
         ])
-        policy, selected, selected_rounds = build_exact_behavior_policy(
+        policy, selected, selected_rounds = build_exact_raw_behavior_policy(
             rows,
             pd.DataFrame([{"problem_id": 7, "num_speculation_rounds": 1}]),
             1,
@@ -67,7 +67,8 @@ class ExactBoundaryRunnerTests(unittest.TestCase):
     def test_behavior_collection_disables_kv_reuse_like_exact_replay(self):
         source = __import__("inspect").getsource(run_method)
         self.assertIn('command.append("--disable_reusing_drafter_kvs")', source)
-        self.assertIn('command.append("--adaptive-collect-raw-state")', source)
+        self.assertIn('"otrc_raw_state_v1"', source)
+        self.assertIn('"raw_linear"', source)
 
 
 if __name__ == "__main__":
