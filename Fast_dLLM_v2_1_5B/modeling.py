@@ -1539,8 +1539,24 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         start_time = torch.cuda.Event(enable_timing=True)
                         start_time.record()
                         adaptive_full_block_logits = None
+                        require_current_hindsight_frame = bool(
+                            adaptive_enabled
+                            and adaptive_controller is not None
+                            and getattr(
+                                adaptive_controller,
+                                "uses_hindsight_block_gain",
+                                False,
+                            )
+                        )
                         if use_block_cache:
-                            if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
+                            if (
+                                require_current_hindsight_frame
+                                or block_past_key_values is None
+                                or (
+                                    x_t[:, -block_size + small_block_start_idx]
+                                    == mask_id
+                                ).any()
+                            ):
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
