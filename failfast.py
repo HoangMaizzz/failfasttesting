@@ -2974,9 +2974,23 @@ def run_strict_greedy_local_oracle_problem(
                 preserve_causal_profile=True,
             )
             if tuple(final_draft["action_script"]) != tuple(action_script):
+                actual_script = tuple(final_draft["action_script"])
+                expected_script = tuple(action_script)
+                mismatch_index = next(
+                    (
+                        index
+                        for index, (expected, actual) in enumerate(
+                            zip(expected_script, actual_script)
+                        )
+                        if expected != actual
+                    ),
+                    min(len(expected_script), len(actual_script)),
+                )
                 raise RuntimeError(
                     f"exact boundary behavior replay diverged at "
-                    f"problem={problem_id}, round={round_id}"
+                    f"problem={problem_id}, round={round_id}, "
+                    f"decision={mismatch_index}, "
+                    f"expected={expected_script}, actual={actual_script}"
                 )
         else:
             action_script = []

@@ -127,6 +127,10 @@ def run_method(args, dataset, problem_ids, directory, *, adaptive):
     command[command.index("--max_new_tokens") + 1] = str(args.max_new_tokens)
     if adaptive:
         command.extend(adaptive_flags("c6_annealed"))
+        # Exact branches disable KV reuse to keep memory bounded.  Collect the
+        # behavior trajectory through the identical drafter path so its action
+        # script remains replayable at exact-boundary time.
+        command.append("--disable_reusing_drafter_kvs")
     print("\n" + "=" * 96, flush=True)
     print(
         f"RUN {'C6 BEHAVIOR' if adaptive else 'FROZEN PROFILE'} "

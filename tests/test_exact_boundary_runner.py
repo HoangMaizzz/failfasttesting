@@ -5,6 +5,7 @@ import pandas as pd
 from run_exact_boundary_oracle import (
     build_exact_behavior_policy,
     evenly_spaced,
+    run_method,
 )
 
 
@@ -62,6 +63,10 @@ class ExactBoundaryRunnerTests(unittest.TestCase):
         self.assertTrue(round_zero["exact_boundary_probe"])
         self.assertEqual(len(selected), 1)
         self.assertEqual(len(selected_rounds), 1)
+
+    def test_behavior_collection_disables_kv_reuse_like_exact_replay(self):
+        source = __import__("inspect").getsource(run_method)
+        self.assertIn('command.append("--disable_reusing_drafter_kvs")', source)
 
 
 if __name__ == "__main__":
