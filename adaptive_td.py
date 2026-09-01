@@ -95,6 +95,18 @@ RAW_GLOBAL_FEATURE_NAMES = (
     "normalized_refinement_step",
     "has_previous_state",
 )
+HINDSIGHT_GAIN_FEATURE_NAMES = (
+    "bias",
+    "active_mask_ratio",
+    "top1_mean",
+    "top1_std",
+    "margin_mean",
+    "margin_std",
+    "entropy_mean",
+    "entropy_std",
+    "accumulated_spec_ratio",
+    "normalized_refinement_step",
+)
 
 
 def _raw_state_feature_names(block_size: int = RAW_STATE_BLOCK_SIZE):
@@ -234,6 +246,11 @@ class AdaptiveTDConfig:
     nonlinear_weight_decay: float = 0.0
     nonlinear_grad_clip: float = 1.0
     nonlinear_device: str = "cpu"
+    hindsight_prior_precision: float = 1.0
+    hindsight_noise_variance: float = 0.25
+    hindsight_confidence_kappa: float = 1.0
+    hindsight_margin_tokens: float = 0.0
+    hindsight_max_uncertainty_tokens: float = 2.0
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -286,10 +303,11 @@ class AdaptiveTDConfig:
             "symmetric",
             "symmetric_annealed",
             "symmetric_greedy",
+            "hindsight_gain",
         }:
             raise ValueError(
                 "policy_mode must be legacy, symmetric, symmetric_annealed, "
-                "or symmetric_greedy"
+                "symmetric_greedy, or hindsight_gain"
             )
         if self.policy_ablation not in {
             "learned",
@@ -307,12 +325,26 @@ class AdaptiveTDConfig:
             "per_step_td",
             "verifier_boundary_factual",
             "verifier_boundary_factual_no_bootstrap",
+            "hindsight_block_gain",
         }:
             raise ValueError(
                 "credit_assignment must be per_step_td, "
                 "verifier_boundary_factual, or "
-                "verifier_boundary_factual_no_bootstrap"
+                "verifier_boundary_factual_no_bootstrap, or hindsight_block_gain"
             )
+        if self.hindsight_prior_precision <= 0.0:
+            raise ValueError("hindsight prior precision must be positive")
+        if self.hindsight_noise_variance <= 0.0:
+            raise ValueError("hindsight noise variance must be positive")
+        if self.hindsight_confidence_kappa < 0.0:
+            raise ValueError("hindsight confidence kappa must be non-negative")
+        if self.hindsight_max_uncertainty_tokens <= 0.0:
+            raise ValueError("hindsight max uncertainty must be positive")
+        if (
+            self.credit_assignment == "hindsight_block_gain"
+            and self.policy_mode != "hindsight_gain"
+        ):
+            raise ValueError("hindsight block gain requires hindsight_gain policy")
         if not 0.0 < self.factual_ema_alpha <= 1.0:
             raise ValueError("factual_ema_alpha must be in (0, 1]")
         if self.rho_warmup_boundaries < 0:
@@ -547,6 +579,68 @@ class _LinearActionValue:
         return raw_residual
 
 
+class _BayesianLinearGain:
+    """Small online Bayesian linear regressor for normalized block gain."""
+
+    def __init__(self, dimension: int, prior_precision: float, noise_variance: float):
+        self.dimension = int(dimension)
+        self.noise_variance = float(noise_variance)
+        prior_variance = 1.0 / float(prior_precision)
+        self.weights = [0.0] * self.dimension
+        self.covariance = [
+            [prior_variance if row == column else 0.0 for column in range(self.dimension)]
+            for row in range(self.dimension)
+        ]
+        self.sample_count = 0
+        self.residual_sum = 0.0
+        self.absolute_residual_sum = 0.0
+        self.squared_residual_sum = 0.0
+
+    def predict(self, features: Sequence[float]) -> tuple[float, float]:
+        mean = _dot(self.weights, features)
+        projected = [_dot(row, features) for row in self.covariance]
+        variance = max(0.0, _dot(features, projected))
+        return mean, math.sqrt(variance)
+
+    def update(self, features: Sequence[float], target: float) -> float:
+        prediction, _ = self.predict(features)
+        residual = float(target) - prediction
+        projected = [_dot(row, features) for row in self.covariance]
+        denominator = max(
+            1e-12,
+            self.noise_variance + _dot(features, projected),
+        )
+        gain = [value / denominator for value in projected]
+        self.weights = [
+            weight + coefficient * residual
+            for weight, coefficient in zip(self.weights, gain)
+        ]
+        self.covariance = [
+            [
+                self.covariance[row][column] - gain[row] * projected[column]
+                for column in range(self.dimension)
+            ]
+            for row in range(self.dimension)
+        ]
+        self.sample_count += 1
+        self.residual_sum += residual
+        self.absolute_residual_sum += abs(residual)
+        self.squared_residual_sum += residual * residual
+        return residual
+
+    def snapshot(self) -> dict:
+        count = max(1, self.sample_count)
+        return {
+            "feature_names": list(HINDSIGHT_GAIN_FEATURE_NAMES),
+            "weights": list(self.weights),
+            "covariance": [list(row) for row in self.covariance],
+            "sample_count": int(self.sample_count),
+            "normalized_bias": self.residual_sum / count,
+            "normalized_mae": self.absolute_residual_sum / count,
+            "normalized_rmse": math.sqrt(self.squared_residual_sum / count),
+        }
+
+
 class OnlineTDRefinementController:
     controller_name = "avg_td"
 
@@ -605,6 +699,23 @@ class OnlineTDRefinementController:
         self.factual_warmup_transition_count = 0
         self.full_stream_transitions: list[dict] = []
         self.weight_snapshots: list[dict] = []
+        self.hindsight_gain_model = _BayesianLinearGain(
+            len(HINDSIGHT_GAIN_FEATURE_NAMES),
+            config.hindsight_prior_precision,
+            config.hindsight_noise_variance,
+        )
+        self.hindsight_problem_id = None
+        self.hindsight_committed_tokens: list[int] = []
+        self.hindsight_snapshot_count = 0
+        self.hindsight_pair_count = 0
+        self.hindsight_resolved_count = 0
+        self.hindsight_censored_count = 0
+        self.hindsight_invalid_count = 0
+        self.hindsight_unavailable_count = 0
+        self.hindsight_current_snapshot = None
+        self.hindsight_pending_sources: dict[tuple, dict] = {}
+        self.hindsight_pending_pairs: list[dict] = []
+        self.hindsight_snapshot_overhead_ema_ms = None
         self.nonlinear_value = (
             None if config.value_model == "linear" else OnlineNonlinearVA(
                 config.value_model,
@@ -744,6 +855,280 @@ class OnlineTDRefinementController:
             self.shared_advantage_theta[index] += advantage_scale * feature
         self._sync_shared_action_means()
         return raw_residual
+
+
+    @property
+    def uses_hindsight_block_gain(self) -> bool:
+        return self.config.credit_assignment == "hindsight_block_gain"
+
+    @staticmethod
+    def _mean_std(values: Sequence[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 0.0
+        mean = sum(float(value) for value in values) / len(values)
+        variance = sum((float(value) - mean) ** 2 for value in values) / len(values)
+        return mean, math.sqrt(max(0.0, variance))
+
+    def _hindsight_features(
+        self,
+        raw_state: Sequence[Sequence[float]],
+        *,
+        proposal_length: int,
+        max_spec_len: int,
+        refinement_step: int,
+    ) -> tuple[float, ...]:
+        if len(raw_state) != RAW_STATE_BLOCK_SIZE:
+            raise ValueError("hindsight gain requires one complete eight-token raw state")
+        if any(len(row) != len(RAW_TOKEN_FIELDS) for row in raw_state):
+            raise ValueError("hindsight raw-state row has an invalid shape")
+        if any(float(row[1]) < 0.5 for row in raw_state):
+            raise ValueError("hindsight gain cannot use an unobserved token slot")
+        top1 = [_clip(row[2], 0.0, 1.0) for row in raw_state]
+        margins = [_clip(row[2] - row[3], 0.0, 1.0) for row in raw_state]
+        entropy = [_clip(row[4], 0.0, 1.0) for row in raw_state]
+        top1_mean, top1_std = self._mean_std(top1)
+        margin_mean, margin_std = self._mean_std(margins)
+        entropy_mean, entropy_std = self._mean_std(entropy)
+        return (
+            1.0,
+            sum(float(row[0]) >= 0.5 for row in raw_state) / RAW_STATE_BLOCK_SIZE,
+            top1_mean,
+            top1_std,
+            margin_mean,
+            margin_std,
+            entropy_mean,
+            entropy_std,
+            _clip(float(proposal_length) / max(1, int(max_spec_len)), 0.0, 1.0),
+            _clip(
+                float(refinement_step) / max(1, self.config.max_refinement_steps),
+                0.0,
+                1.0,
+            ),
+        )
+
+    def begin_hindsight_problem(self, problem_id) -> None:
+        if not self.uses_hindsight_block_gain:
+            return
+        if self.hindsight_pending_pairs or self.hindsight_pending_sources:
+            self.hindsight_censored_count += (
+                len(self.hindsight_pending_pairs)
+                + len(self.hindsight_pending_sources)
+            )
+            self.hindsight_pending_pairs.clear()
+            self.hindsight_pending_sources.clear()
+        self.hindsight_problem_id = int(problem_id)
+        self.hindsight_committed_tokens = []
+        self.hindsight_current_snapshot = None
+
+    def prepare_hindsight_snapshot(
+        self,
+        *,
+        draft_proposal,
+        context_len: int,
+        active_block_start: int,
+        active_block_end: int,
+        raw_current_state,
+        proposal_length: int,
+        max_spec_len: int,
+        refinement_step: int,
+        next_forward_latency_ms: float,
+        forward_pass_index: int,
+        decision_eligible: bool,
+    ) -> dict:
+        if not self.uses_hindsight_block_gain:
+            return {}
+        started = time.perf_counter()
+        for pending in self.hindsight_pending_sources.values():
+            if int(pending["last_forward_pass_index"]) != int(forward_pass_index):
+                pending["latency_ms"] += max(
+                    0.0, float(next_forward_latency_ms)
+                )
+                pending["last_forward_pass_index"] = int(forward_pass_index)
+        relative_start = int(active_block_start) - int(context_len)
+        relative_end = int(active_block_end) - int(context_len)
+        raw_complete = (
+            raw_current_state is not None
+            and len(raw_current_state) == RAW_STATE_BLOCK_SIZE
+            and all(len(row) == len(RAW_TOKEN_FIELDS) for row in raw_current_state)
+            and all(float(row[1]) >= 0.5 for row in raw_current_state)
+        )
+        valid = (
+            raw_complete
+            and relative_start >= 0
+            and relative_end - relative_start == RAW_STATE_BLOCK_SIZE
+            and relative_end <= len(draft_proposal)
+            and all(token is not None for token in draft_proposal[:relative_end])
+        )
+        if not valid:
+            if not raw_complete:
+                self.hindsight_unavailable_count += 1
+                reason = "raw_probability_frame_incomplete"
+            else:
+                self.hindsight_invalid_count += 1
+                reason = "candidate_alignment_invalid"
+            self.hindsight_current_snapshot = None
+            return {
+                "hindsight_snapshot_valid": False,
+                "hindsight_snapshot_skip_reason": reason,
+            }
+        features = self._hindsight_features(
+            raw_current_state,
+            proposal_length=proposal_length,
+            max_spec_len=max_spec_len,
+            refinement_step=refinement_step,
+        )
+        normalized_mean, normalized_sigma = self.hindsight_gain_model.predict(features)
+        snapshot = {
+            "snapshot_id": int(self.hindsight_snapshot_count),
+            "problem_id": int(self.hindsight_problem_id),
+            "output_anchor": len(self.hindsight_committed_tokens),
+            "candidate_prefix": [int(token) for token in draft_proposal[:relative_end]],
+            "active_block_start_relative": int(relative_start),
+            "active_block_end_relative": int(relative_end),
+            "features": list(features),
+            "predicted_gain_tokens": 8.0 * normalized_mean,
+            "predicted_sigma_tokens": 8.0 * normalized_sigma,
+            "rho_at_decision": float(self.rho),
+            "decision_eligible": bool(decision_eligible),
+            "refinement_step": int(refinement_step),
+            "proposal_length": int(proposal_length),
+            "forward_pass_index": int(forward_pass_index),
+        }
+        self.hindsight_snapshot_count += 1
+        key = (
+            snapshot["problem_id"],
+            snapshot["output_anchor"],
+            snapshot["active_block_start_relative"],
+            snapshot["active_block_end_relative"],
+        )
+        pending = self.hindsight_pending_sources.pop(key, None)
+        if pending is not None:
+            self.hindsight_pending_pairs.append({
+                "pair_id": int(self.hindsight_pair_count),
+                "before": pending["snapshot"],
+                "after": snapshot,
+                "next_forward_latency_ms": max(
+                    0.0, float(pending["latency_ms"])
+                ),
+                "created_boundary": int(self.completed_rounds),
+            })
+            self.hindsight_pair_count += 1
+        self.hindsight_current_snapshot = snapshot if decision_eligible else None
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.hindsight_snapshot_overhead_ema_ms = self._update_factual_ema(
+            self.hindsight_snapshot_overhead_ema_ms,
+            elapsed_ms,
+        )
+        return {
+            "hindsight_snapshot_valid": True,
+            "hindsight_snapshot_id": snapshot["snapshot_id"],
+            "hindsight_predicted_gain_tokens": snapshot["predicted_gain_tokens"],
+            "hindsight_predicted_sigma_tokens": snapshot["predicted_sigma_tokens"],
+            "hindsight_training_pairs": self.hindsight_gain_model.sample_count,
+        }
+
+    @staticmethod
+    def _resolve_hindsight_candidate(snapshot: dict, committed: Sequence[int]):
+        anchor = int(snapshot["output_anchor"])
+        candidate = snapshot["candidate_prefix"]
+        available = max(0, len(committed) - anchor)
+        compared = min(len(candidate), available)
+        lcp = 0
+        while lcp < compared and int(candidate[lcp]) == int(committed[anchor + lcp]):
+            lcp += 1
+        if lcp < compared or available >= len(candidate):
+            block_start = int(snapshot["active_block_start_relative"])
+            block_end = int(snapshot["active_block_end_relative"])
+            yield_tokens = min(
+                RAW_STATE_BLOCK_SIZE,
+                max(0, min(lcp, block_end) - block_start),
+            )
+            return int(yield_tokens), int(lcp)
+        return None
+
+    def observe_hindsight_verifier_boundary(
+        self,
+        emitted_tokens: Sequence[int],
+        *,
+        terminal: bool,
+    ) -> None:
+        if not self.uses_hindsight_block_gain:
+            return
+        self.hindsight_committed_tokens.extend(int(token) for token in emitted_tokens)
+        unresolved = []
+        for pair in self.hindsight_pending_pairs:
+            before_result = self._resolve_hindsight_candidate(
+                pair["before"], self.hindsight_committed_tokens
+            )
+            after_result = self._resolve_hindsight_candidate(
+                pair["after"], self.hindsight_committed_tokens
+            )
+            if before_result is None or after_result is None:
+                if terminal:
+                    self.hindsight_censored_count += 1
+                else:
+                    unresolved.append(pair)
+                continue
+            before_yield, before_lcp = before_result
+            after_yield, after_lcp = after_result
+            gain_tokens = int(after_yield - before_yield)
+            features = pair["before"]["features"]
+            predicted_gain = float(pair["before"]["predicted_gain_tokens"])
+            predicted_sigma = float(pair["before"]["predicted_sigma_tokens"])
+            target = gain_tokens / RAW_STATE_BLOCK_SIZE
+            weights_before = list(self.hindsight_gain_model.weights)
+            residual = self.hindsight_gain_model.update(features, target)
+            factual_cost_tokens = (
+                float(pair["before"]["rho_at_decision"])
+                * float(pair["next_forward_latency_ms"])
+            )
+            predicted_continue = (
+                predicted_gain
+                - self.config.hindsight_confidence_kappa * predicted_sigma
+                > factual_cost_tokens + self.config.hindsight_margin_tokens
+            )
+            actual_continue = gain_tokens > factual_cost_tokens
+            row = {
+                "transition_kind": "hindsight_block_gain",
+                "problem_id": pair["before"]["problem_id"],
+                "pair_id": pair["pair_id"],
+                "before_snapshot_id": pair["before"]["snapshot_id"],
+                "after_snapshot_id": pair["after"]["snapshot_id"],
+                "refinement_step": pair["before"]["refinement_step"],
+                "proposal_length": pair["before"]["proposal_length"],
+                "before_lcp": before_lcp,
+                "after_lcp": after_lcp,
+                "before_active_yield": before_yield,
+                "after_active_yield": after_yield,
+                "gain_tokens": gain_tokens,
+                "normalized_target": target,
+                "predicted_gain_tokens_before_update": predicted_gain,
+                "predicted_sigma_tokens_before_update": predicted_sigma,
+                "prediction_error_tokens": gain_tokens - predicted_gain,
+                "normalized_residual": residual,
+                "next_forward_latency_ms": pair["next_forward_latency_ms"],
+                "rho_tokens_per_ms_at_decision": pair["before"]["rho_at_decision"],
+                "factual_cost_tokens": factual_cost_tokens,
+                "predicted_continue": bool(predicted_continue),
+                "actual_continue": bool(actual_continue),
+                "cost_aware_correct": bool(predicted_continue == actual_continue),
+                "resolution_delay_boundaries": (
+                    int(self.completed_rounds) - int(pair["created_boundary"])
+                ),
+                "weights_before": list(weights_before),
+                "weights_after": list(self.hindsight_gain_model.weights),
+            }
+            row.update({
+                name: float(value)
+                for name, value in zip(HINDSIGHT_GAIN_FEATURE_NAMES, features)
+            })
+            self.full_stream_transitions.append(row)
+            self.hindsight_resolved_count += 1
+        self.hindsight_pending_pairs = unresolved
+        if terminal:
+            self.hindsight_censored_count += len(self.hindsight_pending_sources)
+            self.hindsight_pending_sources.clear()
+            self.hindsight_current_snapshot = None
 
     def _policy_theta(self, action: str) -> Sequence[float]:
         if (
@@ -1044,6 +1429,127 @@ class OnlineTDRefinementController:
             ),
         })
 
+    def _choose_hindsight_gain(
+        self,
+        *,
+        allow_stop: bool,
+        refinement_step: int,
+    ) -> AdaptiveDecision:
+        started = time.perf_counter()
+        snapshot = self.hindsight_current_snapshot
+        if snapshot is None:
+            predicted_gain = 0.0
+            predicted_sigma = math.inf
+        else:
+            predicted_gain = float(snapshot["predicted_gain_tokens"])
+            predicted_sigma = float(snapshot["predicted_sigma_tokens"])
+        expected_forward_ms = max(
+            0.0,
+            float(
+                self.factual_draft_latency_ema_ms
+                if self.factual_draft_latency_ema_ms is not None
+                else self.forward_latency_ema_ms or 0.0
+            ),
+        )
+        expected_overhead_ms = max(
+            0.0, float(self.hindsight_snapshot_overhead_ema_ms or 0.0)
+        )
+        break_even_gain = self.rho * (expected_forward_ms + expected_overhead_ms)
+        lower_gain = (
+            predicted_gain
+            - self.config.hindsight_confidence_kappa * predicted_sigma
+        )
+        observations = self.hindsight_gain_model.sample_count
+        cold_start = (
+            observations < self.config.early_stop_min_observations
+            or not math.isfinite(predicted_sigma)
+            or predicted_sigma > self.config.hindsight_max_uncertainty_tokens
+        )
+        if not allow_stop or snapshot is None:
+            action, reason = CONTINUE, "hindsight_candidate_unavailable"
+        elif refinement_step >= self.config.max_refinement_steps:
+            action, reason = STOP, "hindsight_max_refinement_steps"
+        elif cold_start:
+            action, reason = CONTINUE, "hindsight_failfast_fallback"
+        elif lower_gain > break_even_gain + self.config.hindsight_margin_tokens:
+            action, reason = CONTINUE, "hindsight_gain_exceeds_cost"
+        else:
+            action, reason = STOP, "hindsight_gain_not_worth_cost"
+        if snapshot is not None:
+            snapshot["action"] = action
+            snapshot["decision_reason"] = reason
+            snapshot["estimated_break_even_gain_tokens"] = break_even_gain
+            snapshot["predicted_gain_lcb_tokens"] = lower_gain
+        if action == CONTINUE and snapshot is not None:
+            key = (
+                snapshot["problem_id"],
+                snapshot["output_anchor"],
+                snapshot["active_block_start_relative"],
+                snapshot["active_block_end_relative"],
+            )
+            self.hindsight_pending_sources[key] = {
+                "snapshot": snapshot,
+                "latency_ms": 0.0,
+                "last_forward_pass_index": snapshot["forward_pass_index"],
+            }
+        self.hindsight_current_snapshot = None
+        safe_sigma = predicted_sigma if math.isfinite(predicted_sigma) else 1e9
+        stop = ActionEstimate(
+            mean=break_even_gain,
+            risk=0.0,
+            lower=break_even_gain,
+            upper=break_even_gain,
+        )
+        continue_ = ActionEstimate(
+            mean=predicted_gain,
+            risk=safe_sigma,
+            lower=predicted_gain - safe_sigma,
+            upper=predicted_gain + safe_sigma,
+        )
+        advantage_mean = break_even_gain - predicted_gain
+        advantage_risk = safe_sigma
+        stop_probability = self._probability_from_advantage(
+            advantage_mean, advantage_risk
+        )
+        self.decision_count += 1
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        self.record_profile("decision_total", latency_ms)
+        self.advance_algorithm_latency(
+            latency_ms, component="hindsight_controller_decision"
+        )
+        return AdaptiveDecision(
+            action=action,
+            reason=reason,
+            stop=stop,
+            continue_=continue_,
+            rho_tokens_per_ms=self.rho,
+            exploration_used=False,
+            latency_ms=latency_ms,
+            early_stop_observations=observations,
+            calibration_active=cold_start,
+            advantage_mean=advantage_mean,
+            advantage_risk=advantage_risk,
+            stop_probability=stop_probability,
+            behavior_stop_probability=1.0 if action == STOP else 0.0,
+            selected_action_probability=1.0,
+            importance_weight=1.0,
+            diagnostics={
+                "controller_name": "hindsight_block_gain",
+                "hindsight_predicted_gain_tokens": predicted_gain,
+                "hindsight_predicted_sigma_tokens": predicted_sigma,
+                "hindsight_predicted_gain_lcb_tokens": lower_gain,
+                "hindsight_break_even_gain_tokens": break_even_gain,
+                "hindsight_expected_forward_ms": expected_forward_ms,
+                "hindsight_expected_overhead_ms": expected_overhead_ms,
+                "hindsight_observation_count": observations,
+                "hindsight_cold_start": cold_start,
+                "greedy_action": action,
+                "executed_action": action,
+                "raw_advantage": advantage_mean,
+                "raw_stop_probability": stop_probability,
+            },
+        )
+
     def choose(
         self,
         features: Sequence[float],
@@ -1053,6 +1559,11 @@ class OnlineTDRefinementController:
         allow_exploration: bool = True,
         **_unused,
     ) -> AdaptiveDecision:
+        if self.uses_hindsight_block_gain:
+            return self._choose_hindsight_gain(
+                allow_stop=allow_stop,
+                refinement_step=refinement_step,
+            )
         started = time.perf_counter()
         profiling = self.config.profile_overhead
         stop_started = time.perf_counter() if profiling else None
@@ -1781,6 +2292,8 @@ class OnlineTDRefinementController:
         next_stop_available: bool = True,
         action_probability: float = 1.0,
     ) -> float | None:
+        if self.uses_hindsight_block_gain:
+            return None
         latency_ms = max(0.0, float(forward_latency_ms))
         if self.forward_latency_ema_ms is None:
             self.forward_latency_ema_ms = latency_ms
@@ -1851,6 +2364,8 @@ class OnlineTDRefinementController:
         round_latency_ms: float | None = None,
         terminal: bool = False,
     ) -> None:
+        if self.uses_hindsight_block_gain:
+            return
         if self.uses_verifier_boundary_factual:
             self._complete_verifier_boundary_factual(
                 trajectory,
@@ -2133,6 +2648,24 @@ class OnlineTDRefinementController:
             },
             "overhead": self.profile_summary(),
             "weight_snapshots": list(self.weight_snapshots),
+            "hindsight_block_gain": {
+                "enabled": self.uses_hindsight_block_gain,
+                "model": self.hindsight_gain_model.snapshot(),
+                "snapshot_count": int(self.hindsight_snapshot_count),
+                "pair_count": int(self.hindsight_pair_count),
+                "resolved_count": int(self.hindsight_resolved_count),
+                "censored_count": int(self.hindsight_censored_count),
+                "invalid_count": int(self.hindsight_invalid_count),
+                "unavailable_count": int(self.hindsight_unavailable_count),
+                "pending_pair_count": len(self.hindsight_pending_pairs),
+                "pending_source_count": len(self.hindsight_pending_sources),
+                "snapshot_overhead_ema_ms": self.hindsight_snapshot_overhead_ema_ms,
+                "confidence_kappa": self.config.hindsight_confidence_kappa,
+                "margin_tokens": self.config.hindsight_margin_tokens,
+                "max_uncertainty_tokens": (
+                    self.config.hindsight_max_uncertainty_tokens
+                ),
+            },
             "full_stream": {
                 "enabled": self.config.full_stream_bootstrap,
                 "pending": (

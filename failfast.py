@@ -658,6 +658,7 @@ parser.add_argument(
         "per_step_td",
         "verifier_boundary_factual",
         "verifier_boundary_factual_no_bootstrap",
+        "hindsight_block_gain",
     ],
     default="per_step_td",
 )
@@ -699,6 +700,7 @@ parser.add_argument(
         "symmetric",
         "symmetric_annealed",
         "symmetric_greedy",
+        "hindsight_gain",
     ],
     default="legacy",
 )
@@ -747,6 +749,11 @@ parser.add_argument(
 parser.add_argument("--adaptive-profile-overhead", action="store_true")
 parser.add_argument("--adaptive-factual-ema-alpha", type=float, default=0.2)
 parser.add_argument("--adaptive-weight-snapshot-interval", type=int, default=100)
+parser.add_argument("--adaptive-hindsight-prior-precision", type=float, default=1.0)
+parser.add_argument("--adaptive-hindsight-noise-variance", type=float, default=0.25)
+parser.add_argument("--adaptive-hindsight-confidence-kappa", type=float, default=1.0)
+parser.add_argument("--adaptive-hindsight-margin-tokens", type=float, default=0.0)
+parser.add_argument("--adaptive-hindsight-max-uncertainty-tokens", type=float, default=2.0)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -990,6 +997,13 @@ def build_adaptive_controller(args):
             policy_weight_ema_beta=args.adaptive_policy_weight_ema_beta,
             policy_weight_ema_mode=args.adaptive_policy_weight_ema_mode,
             weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
+            hindsight_prior_precision=args.adaptive_hindsight_prior_precision,
+            hindsight_noise_variance=args.adaptive_hindsight_noise_variance,
+            hindsight_confidence_kappa=args.adaptive_hindsight_confidence_kappa,
+            hindsight_margin_tokens=args.adaptive_hindsight_margin_tokens,
+            hindsight_max_uncertainty_tokens=(
+                args.adaptive_hindsight_max_uncertainty_tokens
+            ),
         )
     )
 
@@ -4919,6 +4933,16 @@ for problem_id, is_warmup in tqdm(
             num_speculation_rounds = 0
             total_num_forward_passes = 0
             current_token_ids = []
+            if (
+                draft_type == "dllm"
+                and args.adaptive_td
+                and getattr(
+                    args.adaptive_td_controller,
+                    "uses_hindsight_block_gain",
+                    False,
+                )
+            ):
+                args.adaptive_td_controller.begin_hindsight_problem(problem_id)
             prev_prefill_output = None
             draft_time_total = 0.0
             verify_time_total = 0.0
@@ -5597,6 +5621,18 @@ for problem_id, is_warmup in tqdm(
                                 len(tokens_to_append),
                                 (draft_time + verify_time + post_verify_time) * 1000.0,
                             )
+                            if getattr(
+                                args.adaptive_td_controller,
+                                "uses_hindsight_block_gain",
+                                False,
+                            ):
+                                args.adaptive_td_controller.observe_hindsight_verifier_boundary(
+                                    tokens_to_append,
+                                    terminal=(
+                                        target_tokenizer.eos_token_id in tokens_to_append
+                                        or len(current_token_ids) >= num_target_tokens
+                                    ),
+                                )
                         record_adaptive_td_decisions(
                             args,
                             frontier_stats_this_round,

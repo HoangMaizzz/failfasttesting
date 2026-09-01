@@ -46,6 +46,36 @@ logging.set_verbosity_error()
 logger = logging.get_logger(__name__)
 
 
+def materialize_stop_candidate(
+    current_draft_tokens,
+    *,
+    draft_token_start_idx,
+    active_remaining_positions,
+    current_step_token_ids,
+    mask_id,
+):
+    """Materialize exactly the candidate that production STOP can commit."""
+    active_positions = {int(position) for position in active_remaining_positions}
+    fill_tokens = {}
+    missing_positions = []
+    candidate = []
+    for relative_position, current_token in enumerate(current_draft_tokens):
+        absolute_position = int(draft_token_start_idx) + relative_position
+        if int(current_token) != int(mask_id):
+            candidate.append(int(current_token))
+        elif absolute_position in active_positions:
+            token = current_step_token_ids.get(absolute_position)
+            if token is None:
+                missing_positions.append(absolute_position)
+                candidate.append(None)
+            else:
+                fill_tokens[absolute_position] = int(token)
+                candidate.append(int(token))
+        else:
+            candidate.append(None)
+    return candidate, fill_tokens, missing_positions
+
+
 class Colors:
     YELLOW = '\033[93m'
     CYAN = '\033[96m'
@@ -1934,6 +1964,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             min_steps = int(getattr(args, "bucket_renewal_min_steps", 1)) if args is not None else 1
                             stop_reason = None
                             adaptive_record = None
+                            adaptive_stop_fill_tokens = {}
                             if adaptive_enabled and adaptive_controller is not None:
                                 remaining_relative_positions = [
                                     position
@@ -1995,6 +2026,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 raw_state_requested = bool(
                                     adaptive_controller.config.feature_schema
                                     == "otrc_raw_state_v1"
+                                    or getattr(
+                                        adaptive_controller,
+                                        "uses_hindsight_block_gain",
+                                        False,
+                                    )
                                     or getattr(
                                         args,
                                         "adaptive_collect_raw_state",
@@ -2166,6 +2202,19 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         active_absolute_end,
                                     )
                                 )
+                                (
+                                    production_stop_candidate,
+                                    adaptive_stop_fill_tokens,
+                                    production_stop_missing_positions,
+                                ) = materialize_stop_candidate(
+                                    current_draft_tokens,
+                                    draft_token_start_idx=draft_token_start_idx,
+                                    active_remaining_positions=(
+                                        active_remaining_positions
+                                    ),
+                                    current_step_token_ids=current_step_token_ids,
+                                    mask_id=mask_id,
+                                )
                                 active_remaining_confidences = [
                                     float(current_step_confidences.get(absolute_pos, 0.0))
                                     for absolute_pos in active_remaining_positions
@@ -2314,10 +2363,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_stats["adaptive_last_features"] = list(features)
                                 step_record["adaptive_features"] = list(features)
 
-                                zero_cost_fill_available = all(
-                                    absolute_pos in current_step_token_ids
-                                    and absolute_pos in current_step_confidences
-                                    for absolute_pos in active_remaining_positions
+                                zero_cost_fill_available = (
+                                    not production_stop_missing_positions
+                                    and all(
+                                        absolute_pos in current_step_confidences
+                                        for absolute_pos in active_remaining_positions
+                                    )
                                 )
                                 baseline_would_verify = (
                                     not future_remaining_positions
@@ -2395,6 +2446,36 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     f"adaptive_{key}": value
                                     for key, value in availability_fields.items()
                                 })
+
+                                hindsight_snapshot_fields = {}
+                                if getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_block_gain",
+                                    False,
+                                ):
+                                    hindsight_snapshot_fields = (
+                                        adaptive_controller.prepare_hindsight_snapshot(
+                                            draft_proposal=production_stop_candidate,
+                                            context_len=int(draft_token_start_idx),
+                                            active_block_start=int(active_absolute_start),
+                                            active_block_end=int(active_absolute_end),
+                                            raw_current_state=raw_current_state,
+                                            proposal_length=int(target_len),
+                                            max_spec_len=int(max_spec_len),
+                                            refinement_step=int(adaptive_refinement_step),
+                                            next_forward_latency_ms=float(
+                                                forward_pass_latencies[-1]
+                                            ),
+                                            forward_pass_index=int(
+                                                num_forward_passes
+                                            ),
+                                            decision_eligible=bool(
+                                                active_remaining_positions
+                                                and stop_available
+                                            ),
+                                        )
+                                    )
+                                    step_record.update(hindsight_snapshot_fields)
 
                                 factual_boundary_enabled = bool(
                                     getattr(
@@ -2684,6 +2765,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "next_forward_latency_ms": 0.0,
                                         **availability_fields,
+                                        **hindsight_snapshot_fields,
                                     }
                                     frontier_stats["adaptive_decisions"].append(adaptive_record)
                                     frontier_stats["adaptive_trajectory"].append(adaptive_record)
@@ -2998,7 +3080,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     remaining_absolute_positions = []
                                 for absolute_pos in remaining_absolute_positions:
                                     token_id = torch.tensor(
-                                        [current_step_token_ids[absolute_pos]],
+                                        [adaptive_stop_fill_tokens.get(
+                                            absolute_pos,
+                                            current_step_token_ids[absolute_pos],
+                                        )],
                                         device=x_t.device,
                                         dtype=x_t.dtype,
                                     )
