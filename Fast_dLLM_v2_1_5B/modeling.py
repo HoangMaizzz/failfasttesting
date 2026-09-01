@@ -2096,36 +2096,46 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             dtype=torch.float32,
                                         )).item()),
                                     )
-                                    physical_probabilities = p_1t[0].float()
-                                    physical_top2 = torch.topk(
-                                        physical_probabilities, k=2, dim=-1
+                                    if adaptive_full_block_logits is not None:
+                                        observed_probabilities = torch.softmax(
+                                            adaptive_full_block_logits[0].float(),
+                                            dim=-1,
+                                        )
+                                        observed_absolute_start = int(block_abs_start)
+                                    else:
+                                        observed_probabilities = p_1t[0].float()
+                                        observed_absolute_start = int(
+                                            physical_small_start
+                                        )
+                                    observed_top2 = torch.topk(
+                                        observed_probabilities, k=2, dim=-1
                                     ).values
-                                    physical_entropy = -torch.sum(
-                                        physical_probabilities
+                                    observed_entropy = -torch.sum(
+                                        observed_probabilities
                                         * torch.log(torch.clamp(
-                                            physical_probabilities, min=1e-12
+                                            observed_probabilities, min=1e-12
                                         )),
                                         dim=-1,
                                     ) / raw_entropy_scale
-                                    for physical_local_index in range(
-                                        int(p_1t.shape[1])
+                                    for observed_local_index in range(
+                                        int(observed_probabilities.shape[0])
                                     ):
                                         absolute_pos = (
-                                            physical_small_start
-                                            + physical_local_index
+                                            observed_absolute_start
+                                            + observed_local_index
                                         )
                                         adaptive_raw_probability_cache[
                                             int(absolute_pos)
                                         ] = (
-                                            float(physical_top2[
-                                                physical_local_index, 0
+                                            float(observed_top2[
+                                                observed_local_index, 0
                                             ].item()),
-                                            float(physical_top2[
-                                                physical_local_index, 1
+                                            float(observed_top2[
+                                                observed_local_index, 1
                                             ].item()),
                                             float(torch.clamp(
-                                                physical_entropy[
-                                                    physical_local_index
+                                                observed_entropy[
+                                                    observed_local_index
                                                 ],
                                                 0.0,
                                                 1.0,
