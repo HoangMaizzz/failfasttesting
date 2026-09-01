@@ -97,6 +97,7 @@ RAW_GLOBAL_FEATURE_NAMES = (
 )
 HINDSIGHT_GAIN_FEATURE_NAMES = (
     "bias",
+    "active_span_ratio",
     "active_mask_ratio",
     "top1_mean",
     "top1_std",
@@ -169,12 +170,17 @@ def complete_raw_probability_frame(
     probability_cache,
     active_start,
     active_end,
-    block_size=RAW_STATE_BLOCK_SIZE,
+    block_size=None,
 ):
     """Return one ordered proposal-relative frame once every token was observed."""
     start = int(active_start)
     end = int(active_end)
-    if end - start != int(block_size):
+    span = end - start
+    if span <= 0 or span > RAW_STATE_BLOCK_SIZE:
+        raise ValueError(
+            f"raw probability frame must span 1..{RAW_STATE_BLOCK_SIZE} positions"
+        )
+    if block_size is not None and span != int(block_size):
         raise ValueError(
             f"raw probability frame must span {int(block_size)} positions"
         )
@@ -899,8 +905,9 @@ class OnlineTDRefinementController:
         max_spec_len: int,
         refinement_step: int,
     ) -> tuple[float, ...]:
-        if len(raw_state) != RAW_STATE_BLOCK_SIZE:
-            raise ValueError("hindsight gain requires one complete eight-token raw state")
+        active_span = len(raw_state)
+        if active_span <= 0 or active_span > RAW_STATE_BLOCK_SIZE:
+            raise ValueError("hindsight gain requires a 1..8-token physical state")
         if any(len(row) != len(RAW_TOKEN_FIELDS) for row in raw_state):
             raise ValueError("hindsight raw-state row has an invalid shape")
         if any(float(row[1]) < 0.5 for row in raw_state):
@@ -913,7 +920,8 @@ class OnlineTDRefinementController:
         entropy_mean, entropy_std = self._mean_std(entropy)
         return (
             1.0,
-            sum(float(row[0]) >= 0.5 for row in raw_state) / RAW_STATE_BLOCK_SIZE,
+            active_span / RAW_STATE_BLOCK_SIZE,
+            sum(float(row[0]) >= 0.5 for row in raw_state) / active_span,
             top1_mean,
             top1_std,
             margin_mean,
@@ -969,16 +977,18 @@ class OnlineTDRefinementController:
                 pending["last_forward_pass_index"] = int(forward_pass_index)
         relative_start = int(active_block_start) - int(context_len)
         relative_end = int(active_block_end) - int(context_len)
+        active_span = int(active_block_end) - int(active_block_start)
         raw_complete = (
             raw_current_state is not None
-            and len(raw_current_state) == RAW_STATE_BLOCK_SIZE
+            and len(raw_current_state) == active_span
+            and 0 < active_span <= RAW_STATE_BLOCK_SIZE
             and all(len(row) == len(RAW_TOKEN_FIELDS) for row in raw_current_state)
             and all(float(row[1]) >= 0.5 for row in raw_current_state)
         )
         valid = (
             raw_complete
             and relative_start >= 0
-            and relative_end - relative_start == RAW_STATE_BLOCK_SIZE
+            and relative_end - relative_start == active_span
             and relative_end <= len(draft_proposal)
             and all(token is not None for token in draft_proposal[:relative_end])
         )
@@ -1008,9 +1018,10 @@ class OnlineTDRefinementController:
             "candidate_prefix": [int(token) for token in draft_proposal[:relative_end]],
             "active_block_start_relative": int(relative_start),
             "active_block_end_relative": int(relative_end),
+            "active_span_size": int(active_span),
             "features": list(features),
-            "predicted_gain_tokens": 8.0 * normalized_mean,
-            "predicted_sigma_tokens": 8.0 * normalized_sigma,
+            "predicted_gain_tokens": active_span * normalized_mean,
+            "predicted_sigma_tokens": active_span * normalized_sigma,
             "rho_at_decision": float(self.rho),
             "decision_eligible": bool(decision_eligible),
             "refinement_step": int(refinement_step),
@@ -1064,7 +1075,7 @@ class OnlineTDRefinementController:
             block_start = int(snapshot["active_block_start_relative"])
             block_end = int(snapshot["active_block_end_relative"])
             yield_tokens = min(
-                RAW_STATE_BLOCK_SIZE,
+                int(snapshot["active_span_size"]),
                 max(0, min(lcp, block_end) - block_start),
             )
             return int(yield_tokens), int(lcp)
@@ -1101,7 +1112,8 @@ class OnlineTDRefinementController:
             features = pair["before"]["features"]
             predicted_gain = float(pair["before"]["predicted_gain_tokens"])
             predicted_sigma = float(pair["before"]["predicted_sigma_tokens"])
-            target = gain_tokens / RAW_STATE_BLOCK_SIZE
+            active_span = int(pair["before"]["active_span_size"])
+            target = gain_tokens / max(1, active_span)
             weights_before = list(self.hindsight_gain_model.weights)
             residual = self.hindsight_gain_model.update(features, target)
             factual_cost_tokens = (
@@ -1122,6 +1134,7 @@ class OnlineTDRefinementController:
                 "after_snapshot_id": pair["after"]["snapshot_id"],
                 "refinement_step": pair["before"]["refinement_step"],
                 "proposal_length": pair["before"]["proposal_length"],
+                "active_span_size": active_span,
                 "before_lcp": before_lcp,
                 "after_lcp": after_lcp,
                 "before_active_yield": before_yield,

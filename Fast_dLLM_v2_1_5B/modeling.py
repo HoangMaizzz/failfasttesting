@@ -2037,10 +2037,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 hindsight_frame_eligible = bool(
                                     not hindsight_block_gain
                                     or (
-                                        physical_small_start >= draft_token_start_idx
-                                        and physical_small_end <= draft_end_idx
-                                        and physical_small_end - physical_small_start
-                                        == RAW_STATE_BLOCK_SIZE
+                                        max(physical_small_start, draft_token_start_idx)
+                                        < min(physical_small_end, draft_end_idx)
                                     )
                                 )
                                 raw_state_requested = bool(
@@ -2059,11 +2057,18 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )
                                 )
                                 if hindsight_block_gain and hindsight_frame_eligible:
-                                    logical_span = (
-                                        (physical_small_start - draft_token_start_idx)
-                                        // RAW_STATE_BLOCK_SIZE,
+                                    hindsight_active_start = max(
                                         physical_small_start,
+                                        draft_token_start_idx,
+                                    )
+                                    hindsight_active_end = min(
                                         physical_small_end,
+                                        draft_end_idx,
+                                    )
+                                    logical_span = (
+                                        int(small_block_idx),
+                                        hindsight_active_start,
+                                        hindsight_active_end,
                                     )
                                 elif hindsight_block_gain:
                                     logical_span = None
@@ -2104,15 +2109,20 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )
                                 ]
                                 if raw_state_requested:
-                                    if (
-                                        active_span_length
-                                        != RAW_STATE_BLOCK_SIZE
-                                        or len(raw_local_indices)
-                                        != RAW_STATE_BLOCK_SIZE
-                                    ):
+                                    valid_raw_span = (
+                                        0 < active_span_length <= RAW_STATE_BLOCK_SIZE
+                                        and len(raw_local_indices) == active_span_length
+                                    )
+                                    if not hindsight_block_gain:
+                                        valid_raw_span = bool(
+                                            valid_raw_span
+                                            and active_span_length
+                                            == RAW_STATE_BLOCK_SIZE
+                                        )
+                                    if not valid_raw_span:
                                         raise RuntimeError(
-                                            "raw-state controller requires a complete "
-                                            f"{RAW_STATE_BLOCK_SIZE}-token active block"
+                                            "raw-state controller received an invalid "
+                                            f"active span of {active_span_length} tokens"
                                         )
                                     raw_entropy_scale = max(
                                         1.0,
@@ -2221,7 +2231,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             top1_value,
                                             top2_value,
                                             entropy_value,
-                                            float(raw_position)
+                                            float(local_index)
                                             / max(1, RAW_STATE_BLOCK_SIZE - 1),
                                         ])
                                     raw_state_key = (

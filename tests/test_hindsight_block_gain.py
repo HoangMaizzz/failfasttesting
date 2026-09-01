@@ -3,7 +3,7 @@ import unittest
 from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
 
 
-def raw_state(masked=8, top1=0.6, top2=0.2, entropy=0.5):
+def raw_state(masked=8, top1=0.6, top2=0.2, entropy=0.5, span=8, offset=0):
     return [
         [
             float(index < masked),
@@ -11,9 +11,9 @@ def raw_state(masked=8, top1=0.6, top2=0.2, entropy=0.5):
             float(top1),
             float(top2),
             float(entropy),
-            index / 7.0,
+            (offset + index) / 7.0,
         ]
-        for index in range(8)
+        for index in range(span)
     ]
 
 
@@ -83,6 +83,50 @@ class HindsightBlockGainTest(unittest.TestCase):
         self.assertEqual(row["after_active_yield"], 8)
         self.assertEqual(row["gain_tokens"], 1)
         self.assertEqual(item.hindsight_gain_model.sample_count, 1)
+
+    def test_partial_physical_span_uses_its_own_gain_scale(self):
+        item = controller()
+        item.begin_hindsight_problem(70)
+        before = [1, 2, 3, 4, 9]
+        after = [1, 2, 3, 4, 5]
+
+        item.prepare_hindsight_snapshot(
+            draft_proposal=before,
+            context_len=103,
+            active_block_start=103,
+            active_block_end=108,
+            raw_current_state=raw_state(masked=3, span=5, offset=3),
+            proposal_length=5,
+            max_spec_len=64,
+            refinement_step=1,
+            next_forward_latency_ms=2.0,
+            forward_pass_index=1,
+            decision_eligible=True,
+        )
+        item.choose((1.0,) * 6, allow_stop=True, refinement_step=1)
+        item.prepare_hindsight_snapshot(
+            draft_proposal=after,
+            context_len=103,
+            active_block_start=103,
+            active_block_end=108,
+            raw_current_state=raw_state(masked=1, span=5, offset=3),
+            proposal_length=5,
+            max_spec_len=64,
+            refinement_step=2,
+            next_forward_latency_ms=2.0,
+            forward_pass_index=2,
+            decision_eligible=False,
+        )
+        item.observe_hindsight_verifier_boundary(after, terminal=False)
+
+        row = item.full_stream_transitions[-1]
+        self.assertEqual(row["active_span_size"], 5)
+        self.assertEqual(row["before_active_yield"], 4)
+        self.assertEqual(row["after_active_yield"], 5)
+        self.assertAlmostEqual(row["normalized_target"], 0.2)
+        self.assertAlmostEqual(
+            row["active_span_ratio"], 5 / 8
+        )
 
     def test_equal_full_yield_has_zero_gain(self):
         item = controller()

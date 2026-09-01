@@ -43,9 +43,17 @@ class ActiveBlockRefinementTests(unittest.TestCase):
             [float(position) for position in range(118, 126)],
         )
 
-    def test_raw_frame_rejects_non_eight_token_span(self):
-        with self.assertRaisesRegex(ValueError, "span 8 positions"):
-            complete_raw_probability_frame({}, 118, 125)
+    def test_raw_frame_supports_partial_physical_proposal_span(self):
+        cache = {
+            position: (float(position), 0.0, 0.0)
+            for position in range(115, 120)
+        }
+        frame = complete_raw_probability_frame(cache, 115, 120)
+        self.assertEqual(len(frame), 5)
+
+    def test_raw_frame_rejects_more_than_one_physical_block(self):
+        with self.assertRaisesRegex(ValueError, "span 1..8 positions"):
+            complete_raw_probability_frame({}, 118, 127)
 
     def test_every_verifier_prefix_offset_keeps_relative_eight_token_frames(self):
         for offset in range(8):
@@ -96,10 +104,7 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         source = (ROOT / "Fast_dLLM_v2_1_5B" / "modeling.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            "if active_remaining_positions and stop_available:",
-            source,
-        )
+        self.assertIn("and hindsight_frame_eligible", source)
         self.assertIn(
             "remaining_absolute_positions = list(\n"
             "                                        active_remaining_positions",
@@ -120,6 +125,7 @@ class ActiveBlockRefinementTests(unittest.TestCase):
             source,
         )
         self.assertIn("adaptive_raw_probability_cache", source)
+        self.assertIn("float(local_index)", source)
         self.assertIn("raw_state_incomplete", source)
         self.assertIn(
             "not adaptive_enabled\n"
