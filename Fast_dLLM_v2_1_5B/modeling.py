@@ -3159,6 +3159,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             ),
                                         )
                                     conf_of_unmasked_tokens.append(float(token_confidence))
+                                if (
+                                    adaptive_record is not None
+                                    and adaptive_record.get("action") == "stop"
+                                    and future_remaining_positions
+                                ):
+                                    adaptive_record[
+                                        "realized_post_stop_outer_action"
+                                    ] = "continue_proposal"
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")

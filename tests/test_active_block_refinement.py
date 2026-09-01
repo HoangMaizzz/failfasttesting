@@ -128,6 +128,11 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         self.assertIn("float(local_index)", source)
         self.assertIn("raw_state_incomplete", source)
         self.assertIn(
+            '"realized_post_stop_outer_action"\n'
+            '                                    ] = "continue_proposal"',
+            source,
+        )
+        self.assertIn(
             "not adaptive_enabled\n"
             "                                        and num_salvagable_tokens",
             source,
@@ -138,6 +143,13 @@ class ActiveBlockRefinementTests(unittest.TestCase):
         self.assertIn("orig_model_inputs = None", source)
         self.assertIn("prefill_output = None", source)
         self.assertIn("torch.cuda.empty_cache()", source)
+
+    def test_round_summary_preserves_realized_continue_proposal(self):
+        source = (ROOT / "failfast.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'if realized_action != "continue_proposal":',
+            source,
+        )
 
 
 if __name__ == "__main__":

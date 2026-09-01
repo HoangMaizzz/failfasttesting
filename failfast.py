@@ -1763,9 +1763,11 @@ def record_adaptive_td_decisions(
             ),
         }
         if item.get("action") == "stop":
-            realized_action = (
-                "extend" if high_confidence_extension else "verify"
-            )
+            realized_action = item.get("realized_post_stop_outer_action")
+            if realized_action != "continue_proposal":
+                realized_action = (
+                    "extend" if high_confidence_extension else "verify"
+                )
             finalized_fields["realized_post_stop_outer_action"] = realized_action
             finalized_fields["outer_action_matches_plan"] = (
                 realized_action == item.get("post_stop_outer_action")
