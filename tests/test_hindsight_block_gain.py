@@ -18,13 +18,31 @@ def raw_state(masked=8, top1=0.6, top2=0.2, entropy=0.5):
 
 
 def controller():
-    return OnlineTDRefinementController(
+    item = OnlineTDRefinementController(
         AdaptiveTDConfig(
             feature_dim=6,
             feature_schema="otrc_v2_2_compact_td",
             credit_assignment="hindsight_block_gain",
             policy_mode="hindsight_gain",
             early_stop_min_observations=2,
+            hindsight_confidence_kappa=0.0,
+        )
+    )
+    item.hindsight_gain_model.weights[0] = 1.0
+    return item
+
+
+def probe_controller(probability=1.0):
+    return OnlineTDRefinementController(
+        AdaptiveTDConfig(
+            feature_dim=6,
+            feature_schema="otrc_v2_2_compact_td",
+            credit_assignment="hindsight_block_gain",
+            policy_mode="hindsight_gain",
+            early_stop_min_observations=32,
+            hindsight_probe_initial=probability,
+            hindsight_probe_floor=probability,
+            hindsight_probe_max_fraction=1.0,
         )
     )
 
@@ -125,6 +143,49 @@ class HindsightBlockGainTest(unittest.TestCase):
         prepare_block(8, 2, 4)
         self.assertEqual(len(item.hindsight_pending_pairs), 2)
         self.assertEqual(len(item.hindsight_pending_sources), 0)
+
+    def test_cold_start_no_longer_forces_continue(self):
+        item = probe_controller(probability=0.0)
+        item.begin_hindsight_problem(11)
+        self.prepare(item, list(range(1, 9)), raw_state(masked=4), 1)
+
+        decision = item.choose((1.0,) * 6, allow_stop=True, refinement_step=1)
+
+        self.assertEqual(decision.action, "stop")
+        self.assertEqual(decision.reason, "hindsight_gain_not_worth_cost")
+        self.assertTrue(decision.calibration_active)
+        self.assertFalse(decision.exploration_used)
+
+    def test_uncertain_stop_can_become_forced_continue(self):
+        item = probe_controller(probability=1.0)
+        item.begin_hindsight_problem(12)
+        self.prepare(item, list(range(1, 9)), raw_state(masked=4), 1)
+
+        decision = item.choose((1.0,) * 6, allow_stop=True, refinement_step=1)
+
+        self.assertEqual(decision.action, "continue")
+        self.assertEqual(decision.reason, "hindsight_uncertainty_probe")
+        self.assertTrue(decision.exploration_used)
+        self.assertEqual(decision.diagnostics["greedy_action"], "stop")
+        self.assertEqual(decision.selected_action_probability, 1.0)
+        self.assertEqual(item.hindsight_probe_count, 1)
+        self.assertTrue(item.hindsight_probe_outstanding)
+
+    def test_probe_cannot_repeat_before_feedback(self):
+        item = probe_controller(probability=1.0)
+        item.begin_hindsight_problem(13)
+        proposal = list(range(1, 9))
+        self.prepare(item, proposal, raw_state(masked=4), 1)
+        first = item.choose((1.0,) * 6, allow_stop=True, refinement_step=1)
+        self.assertEqual(first.reason, "hindsight_uncertainty_probe")
+
+        self.prepare(item, proposal, raw_state(masked=2), 2)
+        second = item.choose((1.0,) * 6, allow_stop=True, refinement_step=2)
+
+        self.assertEqual(second.action, "stop")
+        self.assertEqual(second.reason, "hindsight_gain_not_worth_cost")
+        self.assertFalse(second.exploration_used)
+        self.assertEqual(item.hindsight_probe_count, 1)
 
 
 if __name__ == "__main__":

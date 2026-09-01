@@ -251,6 +251,12 @@ class AdaptiveTDConfig:
     hindsight_confidence_kappa: float = 1.0
     hindsight_margin_tokens: float = 0.0
     hindsight_max_uncertainty_tokens: float = 2.0
+    hindsight_probe_initial: float = 0.15
+    hindsight_probe_floor: float = 0.02
+    hindsight_probe_decay_pairs: float = 32.0
+    hindsight_probe_uncertainty_tokens: float = 0.75
+    hindsight_probe_boundary_scale: float = 1.0
+    hindsight_probe_max_fraction: float = 0.08
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -340,6 +346,20 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight confidence kappa must be non-negative")
         if self.hindsight_max_uncertainty_tokens <= 0.0:
             raise ValueError("hindsight max uncertainty must be positive")
+        if not (
+            0.0 <= self.hindsight_probe_floor
+            <= self.hindsight_probe_initial
+            <= 1.0
+        ):
+            raise ValueError("hindsight probe rates must satisfy 0 <= floor <= initial <= 1")
+        if self.hindsight_probe_decay_pairs <= 0.0:
+            raise ValueError("hindsight probe decay pairs must be positive")
+        if self.hindsight_probe_uncertainty_tokens < 0.0:
+            raise ValueError("hindsight probe uncertainty must be non-negative")
+        if self.hindsight_probe_boundary_scale < 0.0:
+            raise ValueError("hindsight probe boundary scale must be non-negative")
+        if not 0.0 <= self.hindsight_probe_max_fraction <= 1.0:
+            raise ValueError("hindsight probe max fraction must be in [0, 1]")
         if (
             self.credit_assignment == "hindsight_block_gain"
             and self.policy_mode != "hindsight_gain"
@@ -716,6 +736,8 @@ class OnlineTDRefinementController:
         self.hindsight_pending_sources: dict[tuple, dict] = {}
         self.hindsight_pending_pairs: list[dict] = []
         self.hindsight_snapshot_overhead_ema_ms = None
+        self.hindsight_probe_count = 0
+        self.hindsight_probe_outstanding = False
         self.nonlinear_value = (
             None if config.value_model == "linear" else OnlineNonlinearVA(
                 config.value_model,
@@ -916,6 +938,7 @@ class OnlineTDRefinementController:
             )
             self.hindsight_pending_pairs.clear()
             self.hindsight_pending_sources.clear()
+        self.hindsight_probe_outstanding = False
         self.hindsight_problem_id = int(problem_id)
         self.hindsight_committed_tokens = []
         self.hindsight_current_snapshot = None
@@ -1011,6 +1034,7 @@ class OnlineTDRefinementController:
                     0.0, float(pending["latency_ms"])
                 ),
                 "created_boundary": int(self.completed_rounds),
+                "forced_probe": bool(pending.get("forced_probe", False)),
             })
             self.hindsight_pair_count += 1
         self.hindsight_current_snapshot = snapshot if decision_eligible else None
@@ -1066,6 +1090,8 @@ class OnlineTDRefinementController:
             if before_result is None or after_result is None:
                 if terminal:
                     self.hindsight_censored_count += 1
+                    if pair.get("forced_probe"):
+                        self.hindsight_probe_outstanding = False
                 else:
                     unresolved.append(pair)
                 continue
@@ -1124,11 +1150,14 @@ class OnlineTDRefinementController:
             })
             self.full_stream_transitions.append(row)
             self.hindsight_resolved_count += 1
+            if pair.get("forced_probe"):
+                self.hindsight_probe_outstanding = False
         self.hindsight_pending_pairs = unresolved
         if terminal:
             self.hindsight_censored_count += len(self.hindsight_pending_sources)
             self.hindsight_pending_sources.clear()
             self.hindsight_current_snapshot = None
+            self.hindsight_probe_outstanding = False
 
     def _policy_theta(self, action: str) -> Sequence[float]:
         if (
@@ -1429,6 +1458,12 @@ class OnlineTDRefinementController:
             ),
         })
 
+    def _hindsight_probe_probability(self, observations: int) -> float:
+        config = self.config
+        return config.hindsight_probe_floor + (
+            config.hindsight_probe_initial - config.hindsight_probe_floor
+        ) * math.exp(-float(observations) / config.hindsight_probe_decay_pairs)
+
     def _choose_hindsight_gain(
         self,
         *,
@@ -1465,16 +1500,50 @@ class OnlineTDRefinementController:
             or not math.isfinite(predicted_sigma)
             or predicted_sigma > self.config.hindsight_max_uncertainty_tokens
         )
+        exploration_used = False
+        probe_probability = 0.0
+        probe_eligible = False
         if not allow_stop or snapshot is None:
             action, reason = CONTINUE, "hindsight_candidate_unavailable"
         elif refinement_step >= self.config.max_refinement_steps:
             action, reason = STOP, "hindsight_max_refinement_steps"
-        elif cold_start:
-            action, reason = CONTINUE, "hindsight_failfast_fallback"
         elif lower_gain > break_even_gain + self.config.hindsight_margin_tokens:
             action, reason = CONTINUE, "hindsight_gain_exceeds_cost"
         else:
             action, reason = STOP, "hindsight_gain_not_worth_cost"
+        greedy_action = action
+        if action == STOP and reason == "hindsight_gain_not_worth_cost":
+            uncertainty_high = (
+                not math.isfinite(predicted_sigma)
+                or predicted_sigma >= self.config.hindsight_probe_uncertainty_tokens
+            )
+            near_boundary = (
+                math.isfinite(predicted_sigma)
+                and abs(predicted_gain - break_even_gain)
+                <= self.config.hindsight_probe_boundary_scale * predicted_sigma
+            )
+            probe_budget = max(
+                1,
+                math.ceil(
+                    self.config.hindsight_probe_max_fraction
+                    * max(1, self.decision_count + 1)
+                ),
+            )
+            probe_eligible = (
+                (uncertainty_high or near_boundary)
+                and not self.hindsight_probe_outstanding
+                and self.hindsight_probe_count < probe_budget
+                and self.config.hindsight_probe_initial > 0.0
+            )
+            if probe_eligible:
+                probe_probability = self._hindsight_probe_probability(observations)
+                if self.rng.random() < probe_probability:
+                    action = CONTINUE
+                    reason = "hindsight_uncertainty_probe"
+                    exploration_used = True
+                    self.exploration_count += 1
+                    self.hindsight_probe_count += 1
+                    self.hindsight_probe_outstanding = True
         if snapshot is not None:
             snapshot["action"] = action
             snapshot["decision_reason"] = reason
@@ -1491,6 +1560,7 @@ class OnlineTDRefinementController:
                 "snapshot": snapshot,
                 "latency_ms": 0.0,
                 "last_forward_pass_index": snapshot["forward_pass_index"],
+                "forced_probe": bool(exploration_used),
             }
         self.hindsight_current_snapshot = None
         safe_sigma = predicted_sigma if math.isfinite(predicted_sigma) else 1e9
@@ -1523,15 +1593,23 @@ class OnlineTDRefinementController:
             stop=stop,
             continue_=continue_,
             rho_tokens_per_ms=self.rho,
-            exploration_used=False,
+            exploration_used=exploration_used,
             latency_ms=latency_ms,
             early_stop_observations=observations,
             calibration_active=cold_start,
             advantage_mean=advantage_mean,
             advantage_risk=advantage_risk,
             stop_probability=stop_probability,
-            behavior_stop_probability=1.0 if action == STOP else 0.0,
-            selected_action_probability=1.0,
+            behavior_stop_probability=(
+                1.0 - probe_probability
+                if probe_eligible
+                else (1.0 if greedy_action == STOP else 0.0)
+            ),
+            selected_action_probability=(
+                probe_probability
+                if exploration_used
+                else (1.0 - probe_probability if probe_eligible else 1.0)
+            ),
             importance_weight=1.0,
             diagnostics={
                 "controller_name": "hindsight_block_gain",
@@ -1543,8 +1621,12 @@ class OnlineTDRefinementController:
                 "hindsight_expected_overhead_ms": expected_overhead_ms,
                 "hindsight_observation_count": observations,
                 "hindsight_cold_start": cold_start,
-                "greedy_action": action,
+                "greedy_action": greedy_action,
                 "executed_action": action,
+                "hindsight_probe_probability": probe_probability,
+                "hindsight_probe_eligible": probe_eligible,
+                "hindsight_probe_count": self.hindsight_probe_count,
+                "hindsight_probe_outstanding": self.hindsight_probe_outstanding,
                 "raw_advantage": advantage_mean,
                 "raw_stop_probability": stop_probability,
             },
@@ -2665,6 +2747,12 @@ class OnlineTDRefinementController:
                 "max_uncertainty_tokens": (
                     self.config.hindsight_max_uncertainty_tokens
                 ),
+                "probe_count": int(self.hindsight_probe_count),
+                "probe_outstanding": bool(self.hindsight_probe_outstanding),
+                "probe_initial": self.config.hindsight_probe_initial,
+                "probe_floor": self.config.hindsight_probe_floor,
+                "probe_decay_pairs": self.config.hindsight_probe_decay_pairs,
+                "probe_max_fraction": self.config.hindsight_probe_max_fraction,
             },
             "full_stream": {
                 "enabled": self.config.full_stream_bootstrap,

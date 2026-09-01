@@ -754,6 +754,12 @@ parser.add_argument("--adaptive-hindsight-noise-variance", type=float, default=0
 parser.add_argument("--adaptive-hindsight-confidence-kappa", type=float, default=1.0)
 parser.add_argument("--adaptive-hindsight-margin-tokens", type=float, default=0.0)
 parser.add_argument("--adaptive-hindsight-max-uncertainty-tokens", type=float, default=2.0)
+parser.add_argument("--adaptive-hindsight-probe-initial", type=float, default=0.15)
+parser.add_argument("--adaptive-hindsight-probe-floor", type=float, default=0.02)
+parser.add_argument("--adaptive-hindsight-probe-decay-pairs", type=float, default=32.0)
+parser.add_argument("--adaptive-hindsight-probe-uncertainty-tokens", type=float, default=0.75)
+parser.add_argument("--adaptive-hindsight-probe-boundary-scale", type=float, default=1.0)
+parser.add_argument("--adaptive-hindsight-probe-max-fraction", type=float, default=0.08)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -1004,6 +1010,16 @@ def build_adaptive_controller(args):
             hindsight_max_uncertainty_tokens=(
                 args.adaptive_hindsight_max_uncertainty_tokens
             ),
+            hindsight_probe_initial=args.adaptive_hindsight_probe_initial,
+            hindsight_probe_floor=args.adaptive_hindsight_probe_floor,
+            hindsight_probe_decay_pairs=args.adaptive_hindsight_probe_decay_pairs,
+            hindsight_probe_uncertainty_tokens=(
+                args.adaptive_hindsight_probe_uncertainty_tokens
+            ),
+            hindsight_probe_boundary_scale=(
+                args.adaptive_hindsight_probe_boundary_scale
+            ),
+            hindsight_probe_max_fraction=args.adaptive_hindsight_probe_max_fraction,
         )
     )
 

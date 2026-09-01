@@ -33,6 +33,10 @@ def parse_args():
         ),
     )
     parser.add_argument("--min_observations", type=int, default=8)
+    parser.add_argument("--probe_initial", type=float, default=0.15)
+    parser.add_argument("--probe_floor", type=float, default=0.02)
+    parser.add_argument("--probe_decay_pairs", type=float, default=32.0)
+    parser.add_argument("--probe_max_fraction", type=float, default=0.08)
     return parser.parse_args()
 
 
@@ -108,6 +112,14 @@ def command(args, dataset, output_dir):
         "hindsight_gain",
         "--adaptive-early-stop-min-observations",
         str(args.min_observations),
+        "--adaptive-hindsight-probe-initial",
+        str(args.probe_initial),
+        "--adaptive-hindsight-probe-floor",
+        str(args.probe_floor),
+        "--adaptive-hindsight-probe-decay-pairs",
+        str(args.probe_decay_pairs),
+        "--adaptive-hindsight-probe-max-fraction",
+        str(args.probe_max_fraction),
         "--adaptive-collect-raw-state",
         "--adaptive-log-decisions",
         "--adaptive-profile-overhead",
@@ -150,6 +162,15 @@ def summarize_dataset(dataset, output_dir):
         ),
         "decisions": len(decisions),
         "stop_rate_percent": 100.0 * (decisions.action == "stop").mean(),
+        "forced_continue_probes": int(
+            (decisions.reason == "hindsight_uncertainty_probe").sum()
+        ),
+        "learned_continue_actions": int(
+            (decisions.reason == "hindsight_gain_exceeds_cost").sum()
+        ),
+        "exploration_rate_percent": 100.0 * float(
+            decisions.exploration_used.fillna(False).astype(bool).mean()
+        ),
         "training_pairs": int(model["sample_count"]),
         "censored_pairs": int(runtime["hindsight_block_gain"]["censored_count"]),
         "invalid_snapshots": int(runtime["hindsight_block_gain"]["invalid_count"]),
