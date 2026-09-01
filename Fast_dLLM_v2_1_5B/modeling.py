@@ -1997,6 +1997,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     == "otrc_raw_state_v1"
                                     or getattr(
                                         args,
+                                        "adaptive_collect_raw_state",
+                                        False,
+                                    )
+                                    or getattr(
+                                        args,
                                         "strict_greedy_capacity_collector",
                                         False,
                                     )

@@ -67,6 +67,7 @@ class ExactBoundaryRunnerTests(unittest.TestCase):
     def test_behavior_collection_disables_kv_reuse_like_exact_replay(self):
         source = __import__("inspect").getsource(run_method)
         self.assertIn('command.append("--disable_reusing_drafter_kvs")', source)
+        self.assertIn('command.append("--adaptive-collect-raw-state")', source)
 
 
 if __name__ == "__main__":

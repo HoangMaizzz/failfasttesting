@@ -127,6 +127,10 @@ def run_method(args, dataset, problem_ids, directory, *, adaptive):
     command[command.index("--max_new_tokens") + 1] = str(args.max_new_tokens)
     if adaptive:
         command.extend(adaptive_flags("c6_annealed"))
+        # The exact collector only labels states with a complete raw snapshot.
+        # Apply the same availability gate to the C6 behavior trajectory so
+        # every selected action remains replayable and usable by raw models.
+        command.append("--adaptive-collect-raw-state")
         # Exact branches disable KV reuse to keep memory bounded.  Collect the
         # behavior trajectory through the identical drafter path so its action
         # script remains replayable at exact-boundary time.

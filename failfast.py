@@ -736,6 +736,14 @@ parser.add_argument("--adaptive-state-path", type=str)
 parser.add_argument("--adaptive-freeze", action="store_true")
 parser.add_argument("--adaptive-counterfactual-replay", action="store_true")
 parser.add_argument("--adaptive-log-decisions", action="store_true")
+parser.add_argument(
+    "--adaptive-collect-raw-state",
+    action="store_true",
+    help=(
+        "Collect complete eight-position raw snapshots while retaining the "
+        "configured behavior policy. Decisions require a complete snapshot."
+    ),
+)
 parser.add_argument("--adaptive-profile-overhead", action="store_true")
 parser.add_argument("--adaptive-factual-ema-alpha", type=float, default=0.2)
 parser.add_argument("--adaptive-weight-snapshot-interval", type=int, default=100)
