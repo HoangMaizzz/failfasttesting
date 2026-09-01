@@ -1539,19 +1539,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         start_time = torch.cuda.Event(enable_timing=True)
                         start_time.record()
                         adaptive_full_block_logits = None
-                        require_current_hindsight_frame = bool(
-                            adaptive_enabled
-                            and adaptive_controller is not None
-                            and getattr(
-                                adaptive_controller,
-                                "uses_hindsight_block_gain",
-                                False,
-                            )
-                        )
                         if use_block_cache:
                             if (
-                                require_current_hindsight_frame
-                                or block_past_key_values is None
+                                block_past_key_values is None
                                 or (
                                     x_t[:, -block_size + small_block_start_idx]
                                     == mask_id
@@ -2039,14 +2029,24 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 physical_small_end = (
                                     block_abs_start + small_block_end_idx
                                 )
+                                hindsight_block_gain = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_block_gain",
+                                    False,
+                                ))
+                                hindsight_frame_eligible = bool(
+                                    not hindsight_block_gain
+                                    or (
+                                        physical_small_start >= draft_token_start_idx
+                                        and physical_small_end <= draft_end_idx
+                                        and physical_small_end - physical_small_start
+                                        == RAW_STATE_BLOCK_SIZE
+                                    )
+                                )
                                 raw_state_requested = bool(
                                     adaptive_controller.config.feature_schema
                                     == "otrc_raw_state_v1"
-                                    or getattr(
-                                        adaptive_controller,
-                                        "uses_hindsight_block_gain",
-                                        False,
-                                    )
+                                    or (hindsight_block_gain and hindsight_frame_eligible)
                                     or getattr(
                                         args,
                                         "adaptive_collect_raw_state",
@@ -2058,13 +2058,23 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         False,
                                     )
                                 )
-                                logical_span = logical_refinement_span(
-                                    draft_token_start_idx,
-                                    draft_end_idx,
-                                    physical_small_start,
-                                    physical_small_end,
-                                    small_block_size,
-                                )
+                                if hindsight_block_gain and hindsight_frame_eligible:
+                                    logical_span = (
+                                        (physical_small_start - draft_token_start_idx)
+                                        // RAW_STATE_BLOCK_SIZE,
+                                        physical_small_start,
+                                        physical_small_end,
+                                    )
+                                elif hindsight_block_gain:
+                                    logical_span = None
+                                else:
+                                    logical_span = logical_refinement_span(
+                                        draft_token_start_idx,
+                                        draft_end_idx,
+                                        physical_small_start,
+                                        physical_small_end,
+                                        small_block_size,
+                                    )
                                 if logical_span is None:
                                     logical_block_idx = -1
                                     active_absolute_start = max(
@@ -2112,7 +2122,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             dtype=torch.float32,
                                         )).item()),
                                     )
-                                    if adaptive_full_block_logits is not None:
+                                    if hindsight_block_gain:
+                                        # Hindsight states must describe exactly this
+                                        # physical eight-token Fast-dLLM forward.
+                                        observed_probabilities = p_1t[0].float()
+                                        observed_absolute_start = int(
+                                            physical_small_start
+                                        )
+                                    elif adaptive_full_block_logits is not None:
                                         observed_probabilities = torch.softmax(
                                             adaptive_full_block_logits[0].float(),
                                             dim=-1,
@@ -2474,11 +2491,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 })
 
                                 hindsight_snapshot_fields = {}
-                                if getattr(
-                                    adaptive_controller,
-                                    "uses_hindsight_block_gain",
-                                    False,
-                                ):
+                                if hindsight_block_gain and hindsight_frame_eligible:
                                     hindsight_snapshot_fields = (
                                         adaptive_controller.prepare_hindsight_snapshot(
                                             draft_proposal=production_stop_candidate,
@@ -2602,7 +2615,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ] = transition_residual is not None
                                     adaptive_pending_stop_extension = None
 
-                                if active_remaining_positions and stop_available:
+                                if (
+                                    active_remaining_positions
+                                    and stop_available
+                                    and hindsight_frame_eligible
+                                ):
                                     adaptive_decision_counts[adaptive_decision_key] = (
                                         adaptive_refinement_step
                                     )
