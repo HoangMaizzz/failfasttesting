@@ -2563,6 +2563,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             active_absolute_end
                                             - draft_token_start_idx
                                         ),
+                                        "active_block_start": int(
+                                            active_absolute_start
+                                        ),
+                                        "active_block_end": int(
+                                            active_absolute_end
+                                        ),
                                         "physical_block_index": int(block_idx),
                                         "physical_small_block_index": int(
                                             small_block_idx
