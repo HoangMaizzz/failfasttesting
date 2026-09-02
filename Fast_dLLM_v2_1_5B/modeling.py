@@ -1,5 +1,6 @@
 from typing import Callable, Optional, Union
 from dataclasses import dataclass
+import math
 import time
 
 import torch

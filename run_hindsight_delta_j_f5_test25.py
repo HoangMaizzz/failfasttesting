@@ -59,7 +59,7 @@ def command(args, dataset, output_dir):
         "--dataset_name", dataset,
         "--num_questions", str(len(ids)),
         "--problem_ids", *map(str, ids),
-        "--warmup_questions", "0",
+        "--warmup_questions", "1",
         "--benchmark_modes", "dllm_ar",
         "--dllm_variant", "failfast",
         "--decoding_strategy", "greedy",
