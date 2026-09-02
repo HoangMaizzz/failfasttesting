@@ -660,6 +660,7 @@ parser.add_argument(
         "verifier_boundary_factual_no_bootstrap",
         "hindsight_block_gain",
         "hindsight_delta_j_f5",
+        "hindsight_delta_j_f2",
     ],
     default="per_step_td",
 )
@@ -703,6 +704,7 @@ parser.add_argument(
         "symmetric_greedy",
         "hindsight_gain",
         "hindsight_delta_j_f5",
+        "hindsight_delta_j_f2",
     ],
     default="legacy",
 )

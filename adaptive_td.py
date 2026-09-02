@@ -116,6 +116,11 @@ HINDSIGHT_DELTA_J_F5_FEATURE_NAMES = (
     "resolved_entropy_max",
     "ema_tokens_per_verifier",
 )
+HINDSIGHT_DELTA_J_F2_FEATURE_NAMES = (
+    "bias",
+    "current_mask_ratio",
+    "first_unresolved_position",
+)
 
 
 def _raw_state_feature_names(block_size: int = RAW_STATE_BLOCK_SIZE):
@@ -333,10 +338,12 @@ class AdaptiveTDConfig:
             "symmetric_greedy",
             "hindsight_gain",
             "hindsight_delta_j_f5",
+            "hindsight_delta_j_f2",
         }:
             raise ValueError(
                 "policy_mode must be legacy, symmetric, symmetric_annealed, "
-                "symmetric_greedy, hindsight_gain, or hindsight_delta_j_f5"
+                "symmetric_greedy, hindsight_gain, hindsight_delta_j_f5, "
+                "or hindsight_delta_j_f2"
             )
         if self.policy_ablation not in {
             "learned",
@@ -356,12 +363,13 @@ class AdaptiveTDConfig:
             "verifier_boundary_factual_no_bootstrap",
             "hindsight_block_gain",
             "hindsight_delta_j_f5",
+            "hindsight_delta_j_f2",
         }:
             raise ValueError(
                 "credit_assignment must be per_step_td, "
                 "verifier_boundary_factual, or "
                 "verifier_boundary_factual_no_bootstrap, hindsight_block_gain, "
-                "or hindsight_delta_j_f5"
+                "hindsight_delta_j_f5, or hindsight_delta_j_f2"
             )
         if self.hindsight_prior_precision <= 0.0:
             raise ValueError("hindsight prior precision must be positive")
@@ -391,10 +399,10 @@ class AdaptiveTDConfig:
         ):
             raise ValueError("hindsight block gain requires hindsight_gain policy")
         if (
-            self.credit_assignment == "hindsight_delta_j_f5"
-            and self.policy_mode != "hindsight_delta_j_f5"
+            self.credit_assignment in {"hindsight_delta_j_f5", "hindsight_delta_j_f2"}
+            and self.policy_mode != self.credit_assignment
         ):
-            raise ValueError("hindsight delta-J F5 requires its matching policy")
+            raise ValueError("hindsight delta-J modes require their matching policy")
         if not 0.5 < self.hindsight_delta_j_p_continue_threshold < 1.0:
             raise ValueError("hindsight delta-J probability threshold must be in (0.5, 1)")
         if self.hindsight_delta_j_class_balance_alpha <= 0.0:
@@ -778,11 +786,12 @@ class OnlineTDRefinementController:
         self.factual_warmup_transition_count = 0
         self.full_stream_transitions: list[dict] = []
         self.weight_snapshots: list[dict] = []
-        hindsight_feature_names = (
-            HINDSIGHT_DELTA_J_F5_FEATURE_NAMES
-            if config.credit_assignment == "hindsight_delta_j_f5"
-            else HINDSIGHT_GAIN_FEATURE_NAMES
-        )
+        if config.credit_assignment == "hindsight_delta_j_f5":
+            hindsight_feature_names = HINDSIGHT_DELTA_J_F5_FEATURE_NAMES
+        elif config.credit_assignment == "hindsight_delta_j_f2":
+            hindsight_feature_names = HINDSIGHT_DELTA_J_F2_FEATURE_NAMES
+        else:
+            hindsight_feature_names = HINDSIGHT_GAIN_FEATURE_NAMES
         self.hindsight_feature_names = hindsight_feature_names
         self.hindsight_gain_model = _BayesianLinearGain(
             len(hindsight_feature_names),
@@ -954,11 +963,23 @@ class OnlineTDRefinementController:
         return self.config.credit_assignment in {
             "hindsight_block_gain",
             "hindsight_delta_j_f5",
+            "hindsight_delta_j_f2",
         }
 
     @property
     def uses_hindsight_delta_j_f5(self) -> bool:
         return self.config.credit_assignment == "hindsight_delta_j_f5"
+
+    @property
+    def uses_hindsight_delta_j_f2(self) -> bool:
+        return self.config.credit_assignment == "hindsight_delta_j_f2"
+
+    @property
+    def uses_hindsight_delta_j(self) -> bool:
+        return self.config.credit_assignment in {
+            "hindsight_delta_j_f5",
+            "hindsight_delta_j_f2",
+        }
 
     @staticmethod
     def _mean_std(values: Sequence[float]) -> tuple[float, float]:
@@ -1021,6 +1042,15 @@ class OnlineTDRefinementController:
             max(0.0, float(self.factual_tokens_per_verifier_ema or 0.0)),
         )
 
+    @staticmethod
+    def _hindsight_delta_j_f2_features(f2_state: dict) -> tuple[float, ...]:
+        active_span = max(1, int(f2_state["active_span_size"]))
+        return (
+            1.0,
+            _clip(float(f2_state["current_mask_count"]) / active_span, 0.0, 1.0),
+            _clip(float(f2_state["first_unresolved_position"]), 0.0, 1.0),
+        )
+
     def begin_hindsight_problem(self, problem_id) -> None:
         if not self.uses_hindsight_block_gain:
             return
@@ -1045,6 +1075,7 @@ class OnlineTDRefinementController:
         active_block_end: int,
         raw_current_state,
         f5_state=None,
+        f2_state=None,
         proposal_length: int,
         max_spec_len: int,
         refinement_step: int,
@@ -1071,11 +1102,12 @@ class OnlineTDRefinementController:
             and all(len(row) == len(RAW_TOKEN_FIELDS) for row in raw_current_state)
             and all(float(row[1]) >= 0.5 for row in raw_current_state)
         )
-        state_complete = bool(
-            f5_state is not None
-            if self.uses_hindsight_delta_j_f5
-            else raw_complete
-        )
+        if self.uses_hindsight_delta_j_f5:
+            state_complete = f5_state is not None
+        elif self.uses_hindsight_delta_j_f2:
+            state_complete = f2_state is not None
+        else:
+            state_complete = raw_complete
         valid = (
             state_complete
             and relative_start >= 0
@@ -1087,8 +1119,8 @@ class OnlineTDRefinementController:
             if not state_complete:
                 self.hindsight_unavailable_count += 1
                 reason = (
-                    "f5_probability_summary_incomplete"
-                    if self.uses_hindsight_delta_j_f5
+                    "compact_delta_j_summary_incomplete"
+                    if self.uses_hindsight_delta_j
                     else "raw_probability_frame_incomplete"
                 )
             else:
@@ -1101,6 +1133,8 @@ class OnlineTDRefinementController:
             }
         if self.uses_hindsight_delta_j_f5:
             features = self._hindsight_delta_j_f5_features(f5_state)
+        elif self.uses_hindsight_delta_j_f2:
+            features = self._hindsight_delta_j_f2_features(f2_state)
         else:
             features = self._hindsight_features(
                 raw_current_state,
@@ -1110,7 +1144,7 @@ class OnlineTDRefinementController:
             )
         normalized_mean, normalized_sigma = self.hindsight_gain_model.predict(
             features,
-            include_observation_noise=self.uses_hindsight_delta_j_f5,
+            include_observation_noise=self.uses_hindsight_delta_j,
         )
         snapshot = {
             "snapshot_id": int(self.hindsight_snapshot_count),
@@ -1122,6 +1156,7 @@ class OnlineTDRefinementController:
             "active_span_size": int(active_span),
             "features": list(features),
             "f5_state": dict(f5_state or {}),
+            "f2_state": dict(f2_state or {}),
             "predicted_gain_tokens": active_span * normalized_mean,
             "predicted_sigma_tokens": active_span * normalized_sigma,
             "predicted_normalized_delta_j": normalized_mean,
@@ -1174,6 +1209,15 @@ class OnlineTDRefinementController:
                 "resolved_entropy_max": float(f5_state["resolved_entropy_max"]),
                 "ema_tokens_per_verifier": float(
                     self.factual_tokens_per_verifier_ema or 0.0
+                ),
+                "mu_raw_normalized_delta_j": normalized_mean,
+                "sigma_normalized_delta_j": normalized_sigma,
+            })
+        elif self.uses_hindsight_delta_j_f2:
+            result.update({
+                "current_mask_count": int(f2_state["current_mask_count"]),
+                "first_unresolved_position": float(
+                    f2_state["first_unresolved_position"]
                 ),
                 "mu_raw_normalized_delta_j": normalized_mean,
                 "sigma_normalized_delta_j": normalized_sigma,
@@ -1339,7 +1383,7 @@ class OnlineTDRefinementController:
                 observation_weight=sample_weight,
             )
             row = {
-                "transition_kind": "hindsight_delta_j_f5",
+                "transition_kind": self.config.credit_assignment,
                 "problem_id": pair["before"]["problem_id"],
                 "pair_id": pair["pair_id"],
                 "before_snapshot_id": pair["before"]["snapshot_id"],
@@ -1401,7 +1445,7 @@ class OnlineTDRefinementController:
         if not self.uses_hindsight_block_gain:
             return
         self.hindsight_committed_tokens.extend(int(token) for token in emitted_tokens)
-        if self.uses_hindsight_delta_j_f5:
+        if self.uses_hindsight_delta_j:
             self._observe_hindsight_delta_j_boundary(
                 terminal=terminal,
                 boundary_cost_ms=(
@@ -1988,7 +2032,12 @@ class OnlineTDRefinementController:
         else:
             mu_raw = float(snapshot["predicted_normalized_delta_j"])
             sigma = float(snapshot["predicted_normalized_delta_j_sigma"])
-            mask_count = int(snapshot.get("f5_state", {}).get("current_mask_count", 0))
+            compact_state = (
+                snapshot.get("f2_state", {})
+                if self.uses_hindsight_delta_j_f2
+                else snapshot.get("f5_state", {})
+            )
+            mask_count = int(compact_state.get("current_mask_count", 0))
         mu_cal = mu_raw + self.hindsight_delta_j_calibration_bias
         p_continue = (
             0.5
@@ -2113,7 +2162,7 @@ class OnlineTDRefinementController:
             ),
             importance_weight=1.0,
             diagnostics={
-                "controller_name": "hindsight_delta_j_f5",
+                "controller_name": self.config.credit_assignment,
                 "mu_raw_normalized_delta_j": mu_raw,
                 "sigma_normalized_delta_j": safe_sigma,
                 "calibration_bias": self.hindsight_delta_j_calibration_bias,
@@ -2152,7 +2201,7 @@ class OnlineTDRefinementController:
         **_unused,
     ) -> AdaptiveDecision:
         if self.uses_hindsight_block_gain:
-            if self.uses_hindsight_delta_j_f5:
+            if self.uses_hindsight_delta_j:
                 return self._choose_hindsight_delta_j_f5(
                     allow_stop=allow_stop,
                     refinement_step=refinement_step,

@@ -2040,8 +2040,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "uses_hindsight_delta_j_f5",
                                     False,
                                 ))
+                                hindsight_delta_j_f2 = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_delta_j_f2",
+                                    False,
+                                ))
+                                hindsight_delta_j = bool(
+                                    hindsight_delta_j_f5 or hindsight_delta_j_f2
+                                )
                                 hindsight_raw_gain = bool(
-                                    hindsight_block_gain and not hindsight_delta_j_f5
+                                    hindsight_block_gain and not hindsight_delta_j
                                 )
                                 hindsight_frame_eligible = bool(
                                     not hindsight_block_gain
@@ -2265,6 +2273,32 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )
                                 )
                                 hindsight_f5_state = None
+                                hindsight_f2_state = None
+                                if hindsight_delta_j_f2 and hindsight_frame_eligible:
+                                    f2_started = time.perf_counter()
+                                    f2_mask = x_t[
+                                        0,
+                                        active_absolute_start:active_absolute_end,
+                                    ].eq(mask_id)
+                                    f2_mask_indices = torch.nonzero(
+                                        f2_mask, as_tuple=False
+                                    ).flatten()
+                                    current_mask_count = int(f2_mask.sum().item())
+                                    first_unresolved = (
+                                        float(f2_mask_indices[0].item())
+                                        / max(1, active_span_length - 1)
+                                        if current_mask_count
+                                        else 1.0
+                                    )
+                                    hindsight_f2_state = {
+                                        "active_span_size": int(active_span_length),
+                                        "current_mask_count": current_mask_count,
+                                        "first_unresolved_position": first_unresolved,
+                                    }
+                                    adaptive_controller.record_profile(
+                                        "hindsight_f2_feature_aggregation",
+                                        (time.perf_counter() - f2_started) * 1000.0,
+                                    )
                                 if hindsight_delta_j_f5 and hindsight_frame_eligible:
                                     f5_started = time.perf_counter()
                                     f5_local_indices = torch.tensor(
@@ -2582,6 +2616,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             active_block_end=int(active_absolute_end),
                                             raw_current_state=raw_current_state,
                                             f5_state=hindsight_f5_state,
+                                            f2_state=hindsight_f2_state,
                                             proposal_length=int(target_len),
                                             max_spec_len=int(max_spec_len),
                                             refinement_step=int(adaptive_refinement_step),

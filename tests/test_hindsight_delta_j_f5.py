@@ -128,6 +128,24 @@ class HindsightDeltaJF5Test(unittest.TestCase):
         self.assertFalse(decision.exploration_used)
         self.assertEqual(item.hindsight_probe_count, 0)
 
+    def test_f2_uses_only_mask_ratio_and_first_unresolved_position(self):
+        item = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=6,
+            feature_schema="otrc_v2_2_compact_td",
+            credit_assignment="hindsight_delta_j_f2",
+            policy_mode="hindsight_delta_j_f2",
+        ))
+        features = item._hindsight_delta_j_f2_features({
+            "active_span_size": 8,
+            "current_mask_count": 4,
+            "first_unresolved_position": 3 / 7,
+        })
+        self.assertEqual(features, (1.0, 0.5, 3 / 7))
+        self.assertEqual(
+            item.hindsight_feature_names,
+            ("bias", "current_mask_ratio", "first_unresolved_position"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

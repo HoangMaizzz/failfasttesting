@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument("--drafter_threshold", type=float, default=0.30)
     parser.add_argument("--lowconf_threshold", type=float, default=0.50)
+    parser.add_argument("--feature_set", choices=("f5", "f2"), default="f5")
     parser.add_argument(
         "--dllm_dir",
         default="/home/maihoang/failfasttesting/Fast_dLLM_v2_1.5B",
@@ -56,6 +57,7 @@ def run(command):
 
 def command(args, dataset, output_dir):
     ids = PROBLEM_IDS[dataset][: args.num_questions]
+    delta_j_mode = f"hindsight_delta_j_{args.feature_set}"
     return [
         sys.executable, "-u", "failfast.py",
         "--dataset_name", dataset,
@@ -80,8 +82,8 @@ def command(args, dataset, output_dir):
         "--sweep_incr_len", "8",
         "--adaptive-td",
         "--adaptive-feature-schema", "otrc_v2_2_compact_td",
-        "--adaptive-credit-assignment", "hindsight_delta_j_f5",
-        "--adaptive-policy-mode", "hindsight_delta_j_f5",
+        "--adaptive-credit-assignment", delta_j_mode,
+        "--adaptive-policy-mode", delta_j_mode,
         "--adaptive-hindsight-delta-j-p-continue-threshold", "0.65",
         "--adaptive-hindsight-delta-j-class-balance-alpha", "5.0",
         "--adaptive-hindsight-delta-j-max-continue-weight", "3.0",
@@ -190,9 +192,13 @@ def main():
     run([sys.executable, "patch_fastdllm_frontier.py", args.dllm_dir])
     summaries, dynamics = [], []
     for dataset in DATASETS:
-        destination = root / "raw" / dataset / "hindsight_delta_j_f5"
+        method = f"hindsight_delta_j_{args.feature_set}"
+        destination = root / "raw" / dataset / method
         destination.mkdir(parents=True)
-        print(f"\n{'=' * 88}\nHINDSIGHT DELTA-J F5 {dataset.upper()}\n{'=' * 88}")
+        print(
+            f"\n{'=' * 88}\nHINDSIGHT DELTA-J "
+            f"{args.feature_set.upper()} {dataset.upper()}\n{'=' * 88}"
+        )
         run(command(args, dataset, destination))
         summary, rows = summarize(dataset, destination, root)
         summaries.append(summary)
@@ -202,7 +208,7 @@ def main():
     summary.to_csv(root / "dataset_summary.csv", index=False)
     learning.to_csv(root / "learning_dynamics.csv", index=False)
     (root / "manifest.json").write_text(json.dumps({
-        "method": "hindsight_delta_j_f5",
+        "method": f"hindsight_delta_j_{args.feature_set}",
         "datasets": list(DATASETS),
         "problem_ids": {
             dataset: PROBLEM_IDS[dataset][: args.num_questions]
