@@ -21,6 +21,8 @@ def parse_args():
     parser.add_argument("--target_quantization", default="int8")
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
+    parser.add_argument("--drafter_threshold", type=float, default=0.30)
+    parser.add_argument("--lowconf_threshold", type=float, default=0.50)
     parser.add_argument(
         "--dllm_dir",
         default="/home/maihoang/failfasttesting/Fast_dLLM_v2_1.5B",
@@ -72,8 +74,8 @@ def command(args, dataset, output_dir):
         "--target_device", str(args.target_device),
         "--drafter_device", str(args.drafter_device),
         "--target_quantization", args.target_quantization,
-        "--drafter_thresholds", "0.30",
-        "--sweep_lowconf_threshold", "0.50",
+        "--drafter_thresholds", str(args.drafter_threshold),
+        "--sweep_lowconf_threshold", str(args.lowconf_threshold),
         "--sweep_max_spec_len", "64",
         "--sweep_incr_len", "8",
         "--adaptive-td",
@@ -177,6 +179,10 @@ def summarize(dataset, destination, root):
 
 def main():
     args = parse_args()
+    if not 0.0 < args.drafter_threshold <= 1.0:
+        raise ValueError("--drafter_threshold must be in (0, 1]")
+    if not 0.0 <= args.lowconf_threshold <= 1.0:
+        raise ValueError("--lowconf_threshold must be in [0, 1]")
     root = Path(args.output_dir)
     if root.exists():
         shutil.rmtree(root)
@@ -204,8 +210,8 @@ def main():
         },
         "target": "normalized local candidate-prefix delta-J",
         "shared_T_B": "first factual verifier latency + post-verify latency",
-        "tau_d": 0.30,
-        "tau_f": 0.50,
+        "tau_d": args.drafter_threshold,
+        "tau_f": args.lowconf_threshold,
         "target_quantization": args.target_quantization,
         "extra_verifier_calls": False,
     }, indent=2), encoding="utf-8")
