@@ -128,6 +128,27 @@ HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES = (
     "global_proposal_position",
 )
 
+HINDSIGHT_TWO_EXPERT_STRUCTURAL_FEATURE_NAMES = (
+    "bias",
+    "proposal_remaining_mask_ratio",
+    "prefix_resolved_ratio",
+    "current_mask_ratio",
+    "global_proposal_position",
+    "newly_unmasked_ratio",
+    "prefix_advance_ratio",
+    "proposal_min_confidence",
+    "failfast_min_confidence",
+)
+HINDSIGHT_TWO_EXPERT_DYNAMICS_FEATURE_NAMES = (
+    "bias",
+    "prefix_advance_ratio",
+    "failfast_margin",
+    "accumulated_spec_ratio",
+    "draft_verify_latency_ratio",
+    "active_remaining_mask_ratio",
+    "normalized_refinement_step",
+)
+
 
 def _raw_state_feature_names(block_size: int = RAW_STATE_BLOCK_SIZE):
     names = []
@@ -291,6 +312,9 @@ class AdaptiveTDConfig:
     hindsight_delta_j_structural_probe_probability: float = 0.08
     hindsight_delta_j_floor_probe_probability: float = 0.02
     hindsight_logistic_learning_rate: float = 0.05
+    # Optimizer for the tiny hindsight logistic learner.
+    # "sgd" preserves the original behavior. "irls" refits the accumulated
+    # weighted logistic objective after every resolved non-tie pair.
     hindsight_logistic_optimizer: str = "sgd"
     hindsight_logistic_l2: float = 0.1
     hindsight_logistic_irls_max_iter: int = 25
@@ -299,6 +323,11 @@ class AdaptiveTDConfig:
     hindsight_logistic_tie_ms_per_token: float = 1.0
     hindsight_logistic_use_class_weight: bool = False
     hindsight_logistic_min_positive_problems: int = 2
+    # Two-expert utility controller. Both experts use accumulated IRLS with
+    # raw |delta J| sample weights; the selector chooses the expert with the
+    # lower rolling realized utility (STOP baseline = 0).
+    hindsight_two_expert_selector_window: int = 20
+    hindsight_two_expert_continue_threshold: float = 0.5
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -355,11 +384,13 @@ class AdaptiveTDConfig:
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
             "hindsight_delta_j_logistic_f2",
+            "hindsight_delta_j_two_expert",
         }:
             raise ValueError(
                 "policy_mode must be legacy, symmetric, symmetric_annealed, "
                 "symmetric_greedy, hindsight_gain, hindsight_delta_j_f5, "
-                "hindsight_delta_j_f2, or hindsight_delta_j_logistic_f2"
+                "hindsight_delta_j_f2, hindsight_delta_j_logistic_f2, or "
+                "hindsight_delta_j_two_expert"
             )
         if self.policy_ablation not in {
             "learned",
@@ -381,6 +412,7 @@ class AdaptiveTDConfig:
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
             "hindsight_delta_j_logistic_f2",
+            "hindsight_delta_j_two_expert",
         }:
             raise ValueError(
                 "credit_assignment must be per_step_td, "
@@ -450,6 +482,10 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight logistic IRLS tolerance must be positive")
         if not 0.0 < self.hindsight_logistic_continue_threshold < 1.0:
             raise ValueError("hindsight logistic threshold must be in (0, 1)")
+        if self.hindsight_two_expert_selector_window < 1:
+            raise ValueError("two-expert selector window must be positive")
+        if not 0.0 < self.hindsight_two_expert_continue_threshold < 1.0:
+            raise ValueError("two-expert continue threshold must be in (0, 1)")
         if self.hindsight_logistic_tie_ms_per_token < 0.0:
             raise ValueError("hindsight logistic tie threshold must be non-negative")
         if self.hindsight_logistic_min_positive_problems < 0:
@@ -766,7 +802,15 @@ class _BayesianLinearGain:
 
 
 class _OnlineWeightedLogistic:
-    """Tiny CPU-only weighted logistic model with SGD or accumulated IRLS."""
+    """Tiny CPU-only weighted logistic classifier.
+
+    ``optimizer="sgd"`` preserves the original one-step online SGD update.
+    ``optimizer="irls"`` stores every resolved non-tie training pair and,
+    after appending the new pair, refits the accumulated weighted logistic
+    objective with damped Newton/IRLS.  This is intentionally CPU-only: the
+    hindsight F2 model has only three parameters, so a full accumulated fit is
+    tiny compared with a drafter/verifier forward.
+    """
 
     def __init__(
         self,
@@ -804,11 +848,13 @@ class _OnlineWeightedLogistic:
     def _objective(self, weights: Sequence[float]) -> float:
         total = 0.0
         for features, label, sample_weight in self.training_buffer:
-            score = self._sigmoid(_dot(weights, features))
+            logit = _dot(weights, features)
+            score = self._sigmoid(logit)
             total -= sample_weight * (
                 float(label) * math.log(max(score, 1e-12))
                 + (1.0 - float(label)) * math.log(max(1.0 - score, 1e-12))
             )
+        # Do not regularize the intercept/bias at index 0.
         total += 0.5 * self.l2 * sum(
             float(value) ** 2 for value in weights[1:]
         )
@@ -816,40 +862,42 @@ class _OnlineWeightedLogistic:
 
     @staticmethod
     def _solve_linear_system(matrix, rhs):
-        dimension = len(rhs)
+        """Solve a tiny dense system with partial-pivot Gaussian elimination."""
+        n = len(rhs)
         augmented = [
-            [float(matrix[row][column]) for column in range(dimension)]
+            [float(matrix[row][column]) for column in range(n)]
             + [float(rhs[row])]
-            for row in range(dimension)
+            for row in range(n)
         ]
-        for column in range(dimension):
+        for column in range(n):
             pivot = max(
-                range(column, dimension),
+                range(column, n),
                 key=lambda row: abs(augmented[row][column]),
             )
             if abs(augmented[pivot][column]) < 1e-12:
                 return None
             if pivot != column:
                 augmented[column], augmented[pivot] = (
-                    augmented[pivot], augmented[column]
+                    augmented[pivot],
+                    augmented[column],
                 )
             pivot_value = augmented[column][column]
-            for row in range(column + 1, dimension):
+            for row in range(column + 1, n):
                 factor = augmented[row][column] / pivot_value
                 if factor == 0.0:
                     continue
-                for index in range(column, dimension + 1):
-                    augmented[row][index] -= factor * augmented[column][index]
-        solution = [0.0] * dimension
-        for row in range(dimension - 1, -1, -1):
+                for k in range(column, n + 1):
+                    augmented[row][k] -= factor * augmented[column][k]
+        solution = [0.0] * n
+        for row in range(n - 1, -1, -1):
             diagonal = augmented[row][row]
             if abs(diagonal) < 1e-12:
                 return None
             remainder = sum(
                 augmented[row][column] * solution[column]
-                for column in range(row + 1, dimension)
+                for column in range(row + 1, n)
             )
-            solution[row] = (augmented[row][dimension] - remainder) / diagonal
+            solution[row] = (augmented[row][n] - remainder) / diagonal
         return solution
 
     def _refit_irls(self) -> None:
@@ -857,15 +905,20 @@ class _OnlineWeightedLogistic:
             return
         weights = list(self.weights)
         dimension = self.dimension
+
         for _ in range(self.irls_max_iter):
             gradient = [0.0] * dimension
-            hessian = [[0.0] * dimension for _ in range(dimension)]
+            hessian = [
+                [0.0] * dimension for _ in range(dimension)
+            ]
+
             for features, label, sample_weight in self.training_buffer:
-                score = self._sigmoid(_dot(weights, features))
+                logit = _dot(weights, features)
+                score = self._sigmoid(logit)
                 error = score - float(label)
-                weighted_curvature = (
-                    sample_weight * max(score * (1.0 - score), 1e-6)
-                )
+                curvature = max(score * (1.0 - score), 1e-6)
+                weighted_curvature = sample_weight * curvature
+
                 for row in range(dimension):
                     x_row = float(features[row])
                     gradient[row] += sample_weight * error * x_row
@@ -875,25 +928,34 @@ class _OnlineWeightedLogistic:
                             * x_row
                             * float(features[column])
                         )
+
+            # Ridge regularization on non-bias coefficients only.
             for index in range(1, dimension):
                 gradient[index] += self.l2 * weights[index]
                 hessian[index][index] += self.l2
+
+            # Tiny numerical damping keeps the Hessian invertible during
+            # early class-imbalanced cold start.
             for index in range(dimension):
                 hessian[index][index] += 1e-9
+
             step = self._solve_linear_system(hessian, gradient)
             if step is None:
+                # Retry with stronger Levenberg-style damping.
                 for index in range(dimension):
                     hessian[index][index] += 1e-5
                 step = self._solve_linear_system(hessian, gradient)
             if step is None:
                 break
+
             step_norm = math.sqrt(sum(float(value) ** 2 for value in step))
             if step_norm <= self.irls_tolerance:
                 break
+
             old_objective = self._objective(weights)
             alpha = 1.0
-            accepted = False
             candidate = list(weights)
+            accepted = False
             for _ in range(20):
                 candidate = [
                     current - alpha * delta
@@ -903,11 +965,14 @@ class _OnlineWeightedLogistic:
                     accepted = True
                     break
                 alpha *= 0.5
+
             if not accepted:
                 break
+
             weights = candidate
             if alpha * step_norm <= self.irls_tolerance:
                 break
+
         self.weights = list(weights)
 
     def update(
@@ -919,11 +984,15 @@ class _OnlineWeightedLogistic:
         features = tuple(float(value) for value in features)
         label = int(label)
         weight = max(0.0, float(sample_weight))
-        _, score = self.predict(features)
+
+        # Keep the logged loss semantics identical to the old code: loss of
+        # the new observation under the PRE-update model.
+        logit, score = self.predict(features)
         loss = -weight * (
             float(label) * math.log(max(score, 1e-12))
             + (1.0 - float(label)) * math.log(max(1.0 - score, 1e-12))
         )
+
         if self.optimizer == "sgd":
             error = score - float(label)
             gradient = [weight * error * float(value) for value in features]
@@ -940,6 +1009,7 @@ class _OnlineWeightedLogistic:
             self._refit_irls()
         else:
             raise ValueError(f"unknown logistic optimizer: {self.optimizer}")
+
         self.sample_count += 1
         self.weight_sum += weight
         self.loss_sum += loss
@@ -1024,6 +1094,10 @@ class OnlineTDRefinementController:
             hindsight_feature_names = HINDSIGHT_DELTA_J_F2_FEATURE_NAMES
         elif config.credit_assignment == "hindsight_delta_j_logistic_f2":
             hindsight_feature_names = HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES
+        elif config.credit_assignment == "hindsight_delta_j_two_expert":
+            # Generic hindsight_feature_names is retained for compatibility;
+            # the two expert-specific schemas are logged separately.
+            hindsight_feature_names = HINDSIGHT_TWO_EXPERT_STRUCTURAL_FEATURE_NAMES
         else:
             hindsight_feature_names = HINDSIGHT_GAIN_FEATURE_NAMES
         self.hindsight_feature_names = hindsight_feature_names
@@ -1040,6 +1114,27 @@ class OnlineTDRefinementController:
             irls_max_iter=config.hindsight_logistic_irls_max_iter,
             irls_tolerance=config.hindsight_logistic_irls_tolerance,
         )
+        self.hindsight_structural_expert = _OnlineWeightedLogistic(
+            len(HINDSIGHT_TWO_EXPERT_STRUCTURAL_FEATURE_NAMES),
+            config.hindsight_logistic_learning_rate,
+            optimizer="irls",
+            l2=config.hindsight_logistic_l2,
+            irls_max_iter=config.hindsight_logistic_irls_max_iter,
+            irls_tolerance=config.hindsight_logistic_irls_tolerance,
+        )
+        self.hindsight_dynamics_expert = _OnlineWeightedLogistic(
+            len(HINDSIGHT_TWO_EXPERT_DYNAMICS_FEATURE_NAMES),
+            config.hindsight_logistic_learning_rate,
+            optimizer="irls",
+            l2=config.hindsight_logistic_l2,
+            irls_max_iter=config.hindsight_logistic_irls_max_iter,
+            irls_tolerance=config.hindsight_logistic_irls_tolerance,
+        )
+        self.hindsight_two_expert_utility_history: list[tuple[float, float]] = []
+        self.hindsight_two_expert_selection_counts = {
+            "structural": 0,
+            "dynamics": 0,
+        }
         self.hindsight_logistic_abs_r: list[float] = []
         self.hindsight_logistic_tie_count = 0
         self.hindsight_logistic_positive_problem_ids: set[int] = set()
@@ -1211,6 +1306,7 @@ class OnlineTDRefinementController:
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
             "hindsight_delta_j_logistic_f2",
+            "hindsight_delta_j_two_expert",
         }
 
     @property
@@ -1226,11 +1322,16 @@ class OnlineTDRefinementController:
         return self.config.credit_assignment == "hindsight_delta_j_logistic_f2"
 
     @property
+    def uses_hindsight_delta_j_two_expert(self) -> bool:
+        return self.config.credit_assignment == "hindsight_delta_j_two_expert"
+
+    @property
     def uses_hindsight_delta_j(self) -> bool:
         return self.config.credit_assignment in {
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
             "hindsight_delta_j_logistic_f2",
+            "hindsight_delta_j_two_expert",
         }
 
     @staticmethod
@@ -1322,6 +1423,80 @@ class OnlineTDRefinementController:
             ),
         )
 
+    def _hindsight_two_expert_features(self, state: dict) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        proposal_length = max(1, int(state["proposal_length"]))
+        max_spec_len = max(proposal_length, int(state["max_spec_len"]))
+        active_span = max(1, int(state["active_span_length"]))
+        active_masks = max(0, int(state["active_remaining_masks"]))
+        proposal_masks = max(0, int(state["proposal_remaining_masks"]))
+        prefix_length = max(0, int(state["prefix_length"]))
+        prefix_advance = max(0, int(state["prefix_advance"]))
+        newly_unmasked = max(0, int(state["active_newly_unmasked"]))
+        active_start = max(0, int(state["active_block_start_relative"]))
+        refinement_step = max(1, int(state["refinement_step"]))
+        proposal_confidences = [
+            _clip(float(v), 0.0, 1.0)
+            for v in state.get("proposal_remaining_confidences", ())
+        ]
+        proposal_min_confidence = (
+            min(proposal_confidences) if proposal_confidences else 1.0
+        )
+        failfast_min_confidence = _clip(
+            float(state.get("failfast_candidate_min_confidence", 0.0)),
+            0.0,
+            1.0,
+        )
+        tau_f = max(float(state.get("failfast_threshold", 1.0)), 1e-9)
+        failfast_margin = _clip(
+            (failfast_min_confidence - tau_f) / tau_f, -1.0, 1.0
+        )
+        if (
+            self.factual_draft_latency_ema_ms is None
+            or self.factual_verifier_latency_ema_ms is None
+            or self.factual_verifier_latency_ema_ms <= 0.0
+        ):
+            draft_verify_ratio = 1.0
+        else:
+            draft_verify_ratio = _clip(
+                float(self.factual_draft_latency_ema_ms)
+                / max(float(self.factual_verifier_latency_ema_ms), 1e-9),
+                0.0,
+                2.0,
+            )
+        structural = (
+            1.0,
+            _clip(proposal_masks / proposal_length, 0.0, 1.0),
+            _clip(prefix_length / proposal_length, 0.0, 1.0),
+            _clip(active_masks / active_span, 0.0, 1.0),
+            _clip(active_start / proposal_length, 0.0, 1.0),
+            _clip(newly_unmasked / active_span, 0.0, 1.0),
+            _clip(prefix_advance / proposal_length, 0.0, 1.0),
+            proposal_min_confidence,
+            failfast_min_confidence,
+        )
+        dynamics = (
+            1.0,
+            _clip(prefix_advance / proposal_length, 0.0, 1.0),
+            failfast_margin,
+            _clip(proposal_length / max_spec_len, 0.0, 1.0),
+            draft_verify_ratio,
+            _clip(active_masks / active_span, 0.0, 1.0),
+            _clip(refinement_step / max(1, self.config.max_refinement_steps), 0.0, 1.0),
+        )
+        return structural, dynamics
+
+    def _hindsight_two_expert_selector_state(self) -> tuple[str, float, float]:
+        window = self.hindsight_two_expert_utility_history[
+            -self.config.hindsight_two_expert_selector_window:
+        ]
+        utility_structural = sum(item[0] for item in window)
+        utility_dynamics = sum(item[1] for item in window)
+        if utility_dynamics < utility_structural:
+            selected = "dynamics"
+        else:
+            selected = "structural"
+        return selected, float(utility_structural), float(utility_dynamics)
+
     def begin_hindsight_problem(self, problem_id) -> None:
         if not self.uses_hindsight_block_gain:
             return
@@ -1354,6 +1529,7 @@ class OnlineTDRefinementController:
         forward_pass_index: int,
         decision_eligible: bool,
         remaining_masks: int | None = None,
+        two_expert_state=None,
     ) -> dict:
         if not self.uses_hindsight_block_gain:
             return {}
@@ -1380,6 +1556,8 @@ class OnlineTDRefinementController:
             state_complete = f2_state is not None
         elif self.uses_hindsight_delta_j_logistic_f2:
             state_complete = remaining_masks is not None
+        elif self.uses_hindsight_delta_j_two_expert:
+            state_complete = two_expert_state is not None
         else:
             state_complete = raw_complete
         valid = (
@@ -1421,6 +1599,16 @@ class OnlineTDRefinementController:
                 "current_mask_count": int(remaining_masks),
                 "global_proposal_position": float(features[2]),
             }
+        elif self.uses_hindsight_delta_j_two_expert:
+            state = dict(two_expert_state or {})
+            state["active_block_start_relative"] = int(relative_start)
+            state["proposal_length"] = int(proposal_length)
+            state["max_spec_len"] = int(max_spec_len)
+            state["refinement_step"] = int(refinement_step)
+            structural_features, dynamics_features = (
+                self._hindsight_two_expert_features(state)
+            )
+            features = structural_features
         else:
             features = self._hindsight_features(
                 raw_current_state,
@@ -1430,6 +1618,21 @@ class OnlineTDRefinementController:
             )
         if self.uses_hindsight_delta_j_logistic_f2:
             logistic_logit, continue_score = self.hindsight_logistic_model.predict(features)
+            normalized_mean, normalized_sigma = 0.0, math.inf
+        elif self.uses_hindsight_delta_j_two_expert:
+            structural_logit, structural_score = (
+                self.hindsight_structural_expert.predict(structural_features)
+            )
+            dynamics_logit, dynamics_score = (
+                self.hindsight_dynamics_expert.predict(dynamics_features)
+            )
+            selected_expert, selector_utility_structural, selector_utility_dynamics = (
+                self._hindsight_two_expert_selector_state()
+            )
+            if selected_expert == "dynamics":
+                logistic_logit, continue_score = dynamics_logit, dynamics_score
+            else:
+                logistic_logit, continue_score = structural_logit, structural_score
             normalized_mean, normalized_sigma = 0.0, math.inf
         else:
             normalized_mean, normalized_sigma = self.hindsight_gain_model.predict(
@@ -1454,6 +1657,16 @@ class OnlineTDRefinementController:
             "predicted_normalized_delta_j_sigma": normalized_sigma,
             "logistic_logit": logistic_logit,
             "continue_score": continue_score,
+            "two_expert_state": dict(two_expert_state or {}),
+            "structural_features": list(structural_features) if self.uses_hindsight_delta_j_two_expert else None,
+            "dynamics_features": list(dynamics_features) if self.uses_hindsight_delta_j_two_expert else None,
+            "structural_logit": float(structural_logit) if self.uses_hindsight_delta_j_two_expert else None,
+            "structural_score": float(structural_score) if self.uses_hindsight_delta_j_two_expert else None,
+            "dynamics_logit": float(dynamics_logit) if self.uses_hindsight_delta_j_two_expert else None,
+            "dynamics_score": float(dynamics_score) if self.uses_hindsight_delta_j_two_expert else None,
+            "selected_expert": selected_expert if self.uses_hindsight_delta_j_two_expert else None,
+            "selector_utility_structural": float(selector_utility_structural) if self.uses_hindsight_delta_j_two_expert else None,
+            "selector_utility_dynamics": float(selector_utility_dynamics) if self.uses_hindsight_delta_j_two_expert else None,
             "rho_at_decision": float(self.rho),
             "decision_eligible": bool(decision_eligible),
             "refinement_step": int(refinement_step),
@@ -1495,7 +1708,11 @@ class OnlineTDRefinementController:
             "hindsight_training_pairs": (
                 self.hindsight_logistic_model.sample_count
                 if self.uses_hindsight_delta_j_logistic_f2
-                else self.hindsight_gain_model.sample_count
+                else (
+                    self.hindsight_structural_expert.sample_count
+                    if self.uses_hindsight_delta_j_two_expert
+                    else self.hindsight_gain_model.sample_count
+                )
             ),
             "hindsight_features": list(features),
             "hindsight_feature_names": list(self.hindsight_feature_names),
@@ -1527,6 +1744,14 @@ class OnlineTDRefinementController:
                 "global_proposal_position": float(features[2]),
                 "logistic_logit": float(logistic_logit),
                 "continue_score": float(continue_score),
+            })
+        elif self.uses_hindsight_delta_j_two_expert:
+            result.update({
+                "selected_expert": selected_expert,
+                "structural_score": float(structural_score),
+                "dynamics_score": float(dynamics_score),
+                "selector_utility_structural": float(selector_utility_structural),
+                "selector_utility_dynamics": float(selector_utility_dynamics),
             })
         return result
 
@@ -1649,6 +1874,155 @@ class OnlineTDRefinementController:
                 self.hindsight_censor_reasons[reason] = (
                     self.hindsight_censor_reasons.get(reason, 0) + 1
                 )
+                if pair.get("forced_probe"):
+                    self.hindsight_probe_outstanding = False
+                continue
+
+            if self.uses_hindsight_delta_j_two_expert:
+                tie_threshold = self.config.hindsight_logistic_tie_ms_per_token
+                is_tie = abs(delta_j) <= tie_threshold
+                actual_continue = delta_j < -tie_threshold
+                structural_features = tuple(pair["before"]["structural_features"])
+                dynamics_features = tuple(pair["before"]["dynamics_features"])
+                structural_score = float(pair["before"]["structural_score"])
+                dynamics_score = float(pair["before"]["dynamics_score"])
+                selected_expert = str(pair["before"].get("selected_expert", "structural"))
+                selected_score = (
+                    dynamics_score if selected_expert == "dynamics" else structural_score
+                )
+                threshold = self.config.hindsight_two_expert_continue_threshold
+                structural_predicted_continue = structural_score > threshold
+                dynamics_predicted_continue = dynamics_score > threshold
+                predicted_continue = selected_score > threshold
+                structural_utility = 0.0
+                dynamics_utility = 0.0
+                sample_weight = 0.0
+                structural_loss = None
+                dynamics_loss = None
+                structural_weights_before = list(self.hindsight_structural_expert.weights)
+                dynamics_weights_before = list(self.hindsight_dynamics_expert.weights)
+                if is_tie:
+                    self.hindsight_logistic_tie_count += 1
+                    true_action = "tie"
+                else:
+                    true_action = CONTINUE if actual_continue else STOP
+                    # STOP is the zero-utility baseline.  A shadow expert that
+                    # predicted CONTINUE receives the factual delta-J; an
+                    # expert that predicted STOP receives zero.
+                    structural_utility = (
+                        float(delta_j) if structural_predicted_continue else 0.0
+                    )
+                    dynamics_utility = (
+                        float(delta_j) if dynamics_predicted_continue else 0.0
+                    )
+                    self.hindsight_two_expert_utility_history.append((
+                        structural_utility, dynamics_utility
+                    ))
+                    max_history = max(
+                        4 * self.config.hindsight_two_expert_selector_window,
+                        self.config.hindsight_two_expert_selector_window,
+                    )
+                    if len(self.hindsight_two_expert_utility_history) > max_history:
+                        del self.hindsight_two_expert_utility_history[:-max_history]
+                    # Raw utility magnitude is deliberate: a rare -40 ms/token
+                    # CONTINUE is allowed to outweigh several +5 mistakes.
+                    sample_weight = max(abs(float(delta_j)), 1e-9)
+                    structural_loss = self.hindsight_structural_expert.update(
+                        structural_features, int(actual_continue), sample_weight
+                    )
+                    dynamics_loss = self.hindsight_dynamics_expert.update(
+                        dynamics_features, int(actual_continue), sample_weight
+                    )
+                    if actual_continue:
+                        self.hindsight_delta_j_continue_count += 1
+                        self.hindsight_logistic_positive_problem_ids.add(
+                            int(pair["before"]["problem_id"])
+                        )
+                    else:
+                        self.hindsight_delta_j_stop_count += 1
+                selector_after, selector_structural_after, selector_dynamics_after = (
+                    self._hindsight_two_expert_selector_state()
+                )
+                row = {
+                    "transition_kind": self.config.credit_assignment,
+                    "problem_id": pair["before"]["problem_id"],
+                    "pair_id": pair["pair_id"],
+                    "before_snapshot_id": pair["before"]["snapshot_id"],
+                    "after_snapshot_id": pair["after"]["snapshot_id"],
+                    "refinement_step": pair["before"]["refinement_step"],
+                    "proposal_length": pair["before"]["proposal_length"],
+                    "active_block_start": pair["before"]["active_block_start_relative"],
+                    "active_block_end": block_end,
+                    "stop_lcp": stop_result["lcp"],
+                    "continue_lcp": continue_result["lcp"],
+                    "stop_passes_active_block": stop_pass,
+                    "continue_passes_active_block": continue_pass,
+                    "before_yield_Y_S": y_stop,
+                    "after_yield_Y_C": y_continue,
+                    "extra_draft_latency_ms_T_D": t_d,
+                    "verifier_boundary_latency_ms_T_B": t_b,
+                    "J_STOP_ms_per_token": j_stop,
+                    "J_CONTINUE_ms_per_token": j_continue,
+                    "delta_J_ms_per_token": delta_j,
+                    "normalized_delta_J": normalized_delta_j,
+                    "is_tie": is_tie,
+                    "update_applied": not is_tie,
+                    "true_action_from_delta_J": true_action,
+                    "binary_label_C": None if is_tie else int(actual_continue),
+                    "label_reason": "tie" if is_tie else label_reason,
+                    "continue_score_before_update": selected_score,
+                    "continue_threshold": threshold,
+                    "predicted_continue": predicted_continue,
+                    "cost_aware_correct": None if is_tie else predicted_continue == actual_continue,
+                    "class_weight": 1.0,
+                    "utility_weight": sample_weight,
+                    "sample_weight": sample_weight,
+                    "weighted_logistic_loss": (
+                        structural_loss if selected_expert == "structural" else dynamics_loss
+                    ),
+                    "N_C": self.hindsight_delta_j_continue_count,
+                    "N_S": self.hindsight_delta_j_stop_count,
+                    "distinct_positive_problem_count": len(self.hindsight_logistic_positive_problem_ids),
+                    "model_action": pair["before"].get("greedy_action", "unknown"),
+                    "executed_action": pair["before"].get("action", "unknown"),
+                    "action_source": pair["before"].get("action_source", "unknown"),
+                    "behavior_continue_probability": pair["before"].get("behavior_continue_probability", 1.0),
+                    "executed_continue": True,
+                    "pair_resolved": True,
+                    "censor_reason": None,
+                    "selected_expert": selected_expert,
+                    "selector_after_update": selector_after,
+                    "selector_utility_structural_before": pair["before"].get("selector_utility_structural", 0.0),
+                    "selector_utility_dynamics_before": pair["before"].get("selector_utility_dynamics", 0.0),
+                    "selector_utility_structural_after": selector_structural_after,
+                    "selector_utility_dynamics_after": selector_dynamics_after,
+                    "structural_score_before_update": structural_score,
+                    "dynamics_score_before_update": dynamics_score,
+                    "structural_predicted_continue": structural_predicted_continue,
+                    "dynamics_predicted_continue": dynamics_predicted_continue,
+                    "structural_shadow_utility": structural_utility,
+                    "dynamics_shadow_utility": dynamics_utility,
+                    "structural_weights_before": structural_weights_before,
+                    "structural_weights_after": list(self.hindsight_structural_expert.weights),
+                    "dynamics_weights_before": dynamics_weights_before,
+                    "dynamics_weights_after": list(self.hindsight_dynamics_expert.weights),
+                }
+                row.update({
+                    f"structural_{name}": float(value)
+                    for name, value in zip(
+                        HINDSIGHT_TWO_EXPERT_STRUCTURAL_FEATURE_NAMES,
+                        structural_features,
+                    )
+                })
+                row.update({
+                    f"dynamics_{name}": float(value)
+                    for name, value in zip(
+                        HINDSIGHT_TWO_EXPERT_DYNAMICS_FEATURE_NAMES,
+                        dynamics_features,
+                    )
+                })
+                self.full_stream_transitions.append(row)
+                self.hindsight_resolved_count += 1
                 if pair.get("forced_probe"):
                     self.hindsight_probe_outstanding = False
                 continue
@@ -2592,6 +2966,143 @@ class OnlineTDRefinementController:
             },
         )
 
+    def _choose_hindsight_delta_j_two_expert(
+        self,
+        *,
+        allow_stop: bool,
+        refinement_step: int,
+        allow_exploration: bool,
+        failfast_fallback_action: str,
+    ) -> AdaptiveDecision:
+        started = time.perf_counter()
+        snapshot = self.hindsight_current_snapshot
+        selected_expert = str((snapshot or {}).get("selected_expert", "structural"))
+        score = 0.5 if snapshot is None else float(snapshot["continue_score"])
+        logit = 0.0 if snapshot is None else float(snapshot["logistic_logit"])
+        observations = self.hindsight_structural_expert.sample_count
+        mask_count = int((snapshot or {}).get("two_expert_state", {}).get("active_remaining_masks", 0))
+        learner_ready = bool(
+            observations >= self.config.hindsight_delta_j_min_pairs
+            and self.hindsight_delta_j_continue_count >= self.config.hindsight_delta_j_min_continue_pairs
+            and len(self.hindsight_logistic_positive_problem_ids) >= self.config.hindsight_logistic_min_positive_problems
+        )
+        exploration_used = False
+        probe_probability = 0.0
+        structural_eligible = mask_count >= 2
+        threshold = self.config.hindsight_two_expert_continue_threshold
+        if not allow_stop or snapshot is None:
+            action, action_source = CONTINUE, "physical_constraint"
+            reason = "hindsight_candidate_unavailable"
+        elif refinement_step >= self.config.max_refinement_steps:
+            action, action_source = STOP, "max_refinement_stop"
+            reason = "hindsight_max_refinement_steps"
+        elif not learner_ready:
+            action = failfast_fallback_action
+            action_source = "cold_start_continue" if action == CONTINUE else "cold_start_stop"
+            reason = "hindsight_failfast_cold_start"
+        elif score > threshold:
+            action, action_source = CONTINUE, "learned_continue"
+            reason = f"hindsight_two_expert_{selected_expert}_continue"
+        else:
+            action, action_source = STOP, "learned_stop"
+            reason = f"hindsight_two_expert_{selected_expert}_stop"
+        model_action = action
+        if (
+            action == STOP
+            and allow_exploration
+            and snapshot is not None
+            and refinement_step < self.config.max_refinement_steps
+            and not self.hindsight_probe_outstanding
+        ):
+            if structural_eligible:
+                probe_probability = self.config.hindsight_delta_j_structural_probe_probability
+                probe_source = "structural_probe"
+            else:
+                probe_probability = self.config.hindsight_delta_j_floor_probe_probability
+                probe_source = "floor_probe"
+            if self.rng.random() < probe_probability:
+                action, action_source = CONTINUE, probe_source
+                reason = f"hindsight_{probe_source}"
+                exploration_used = True
+                self.exploration_count += 1
+                self.hindsight_probe_count += 1
+                self.hindsight_probe_outstanding = True
+                if probe_source == "structural_probe":
+                    self.hindsight_structural_probe_count += 1
+                else:
+                    self.hindsight_floor_probe_count += 1
+        behavior_continue_probability = probe_probability if model_action == STOP else 1.0
+        selected_action_probability = (
+            behavior_continue_probability if action == CONTINUE
+            else 1.0 - behavior_continue_probability
+        )
+        if snapshot is not None:
+            snapshot.update({
+                "action": action,
+                "greedy_action": model_action,
+                "model_action": model_action,
+                "action_source": action_source,
+                "decision_reason": reason,
+                "learner_ready": learner_ready,
+                "behavior_continue_probability": behavior_continue_probability,
+            })
+        if action == CONTINUE and snapshot is not None:
+            key = (
+                snapshot["problem_id"],
+                snapshot["output_anchor"],
+                snapshot["active_block_start_relative"],
+                snapshot["active_block_end_relative"],
+            )
+            self.hindsight_pending_sources[key] = {
+                "snapshot": snapshot,
+                "latency_ms": 0.0,
+                "last_forward_pass_index": snapshot["forward_pass_index"],
+                "forced_probe": bool(exploration_used),
+            }
+        if learner_ready:
+            self.hindsight_two_expert_selection_counts[selected_expert] += 1
+        self.hindsight_current_snapshot = None
+        self.decision_count += 1
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        self.record_profile("decision_total", latency_ms)
+        self.advance_algorithm_latency(latency_ms, component="hindsight_controller_decision")
+        return AdaptiveDecision(
+            action=action,
+            reason=reason,
+            stop=ActionEstimate(mean=1.0-score, risk=0.0, lower=1.0-score, upper=1.0-score),
+            continue_=ActionEstimate(mean=score, risk=0.0, lower=score, upper=score),
+            rho_tokens_per_ms=self.rho,
+            exploration_used=exploration_used,
+            latency_ms=latency_ms,
+            early_stop_observations=observations,
+            calibration_active=learner_ready,
+            advantage_mean=logit,
+            advantage_risk=0.0,
+            stop_probability=1.0-score,
+            behavior_stop_probability=1.0-behavior_continue_probability,
+            selected_action_probability=selected_action_probability,
+            importance_weight=1.0,
+            diagnostics={
+                "controller_name": self.config.credit_assignment,
+                "continue_score": score,
+                "continue_threshold": threshold,
+                "selected_expert": selected_expert,
+                "structural_score": None if snapshot is None else snapshot.get("structural_score"),
+                "dynamics_score": None if snapshot is None else snapshot.get("dynamics_score"),
+                "selector_utility_structural": None if snapshot is None else snapshot.get("selector_utility_structural"),
+                "selector_utility_dynamics": None if snapshot is None else snapshot.get("selector_utility_dynamics"),
+                "model_action": model_action,
+                "executed_action": action,
+                "action_source": action_source,
+                "learner_ready": learner_ready,
+                "N_pairs": observations,
+                "N_C": self.hindsight_delta_j_continue_count,
+                "N_S": self.hindsight_delta_j_stop_count,
+                "behavior_continue_probability": behavior_continue_probability,
+                "probe_probability": probe_probability,
+            },
+        )
+
     def _choose_hindsight_delta_j_f5(
         self,
         *,
@@ -2777,6 +3288,15 @@ class OnlineTDRefinementController:
         **_unused,
     ) -> AdaptiveDecision:
         if self.uses_hindsight_block_gain:
+            if self.uses_hindsight_delta_j_two_expert:
+                return self._choose_hindsight_delta_j_two_expert(
+                    allow_stop=allow_stop,
+                    refinement_step=refinement_step,
+                    allow_exploration=allow_exploration,
+                    failfast_fallback_action=_unused.get(
+                        "failfast_fallback_action", CONTINUE
+                    ),
+                )
             if self.uses_hindsight_delta_j_logistic_f2:
                 return self._choose_hindsight_delta_j_logistic_f2(
                     allow_stop=allow_stop,
@@ -3901,6 +4421,21 @@ class OnlineTDRefinementController:
                 ),
                 "logistic_model": self.hindsight_logistic_model.snapshot(
                     self.hindsight_feature_names
+                ),
+                "structural_expert": self.hindsight_structural_expert.snapshot(
+                    HINDSIGHT_TWO_EXPERT_STRUCTURAL_FEATURE_NAMES
+                ),
+                "dynamics_expert": self.hindsight_dynamics_expert.snapshot(
+                    HINDSIGHT_TWO_EXPERT_DYNAMICS_FEATURE_NAMES
+                ),
+                "two_expert_selector_window": int(
+                    self.config.hindsight_two_expert_selector_window
+                ),
+                "two_expert_selector_history": [
+                    list(item) for item in self.hindsight_two_expert_utility_history
+                ],
+                "two_expert_selection_counts": dict(
+                    self.hindsight_two_expert_selection_counts
                 ),
                 "snapshot_count": int(self.hindsight_snapshot_count),
                 "pair_count": int(self.hindsight_pair_count),

@@ -235,6 +235,57 @@ class HindsightDeltaJF5Test(unittest.TestCase):
         self.assertEqual(model.sample_count, 2)
         self.assertEqual(model.snapshot(("b", "x", "q"))["optimizer"], "irls")
 
+    def test_two_expert_features_have_expected_dimensions_and_values(self):
+        item = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=7,
+            feature_schema="otrc_v2_3_compact7_td",
+            credit_assignment="hindsight_delta_j_two_expert",
+            policy_mode="hindsight_delta_j_two_expert",
+        ))
+        item.factual_draft_latency_ema_ms = 4.0
+        item.factual_verifier_latency_ema_ms = 8.0
+        structural, dynamics = item._hindsight_two_expert_features({
+            "proposal_length": 16,
+            "max_spec_len": 64,
+            "proposal_remaining_masks": 4,
+            "proposal_remaining_confidences": [0.6, 0.8],
+            "prefix_length": 8,
+            "prefix_advance": 2,
+            "active_span_length": 8,
+            "active_remaining_masks": 2,
+            "active_newly_unmasked": 4,
+            "active_block_start_relative": 8,
+            "failfast_candidate_min_confidence": 0.56,
+            "failfast_threshold": 0.7,
+            "refinement_step": 2,
+        })
+        self.assertEqual(len(structural), 9)
+        self.assertEqual(len(dynamics), 7)
+        self.assertEqual(structural[:7], (1.0, 0.25, 0.5, 0.25, 0.5, 0.5, 0.125))
+        self.assertEqual(structural[7:], (0.6, 0.56))
+        self.assertAlmostEqual(dynamics[2], -0.2)
+        self.assertEqual(dynamics[3:6], (0.25, 0.5, 0.25))
+
+    def test_two_expert_selector_uses_lower_recent_shadow_utility(self):
+        item = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=7,
+            feature_schema="otrc_v2_3_compact7_td",
+            credit_assignment="hindsight_delta_j_two_expert",
+            policy_mode="hindsight_delta_j_two_expert",
+            hindsight_two_expert_selector_window=2,
+        ))
+        item.hindsight_two_expert_utility_history = [
+            (5.0, -2.0),
+            (1.0, 0.0),
+            (-100.0, 100.0),
+        ]
+        selected, structural_utility, dynamics_utility = (
+            item._hindsight_two_expert_selector_state()
+        )
+        self.assertEqual(selected, "structural")
+        self.assertEqual(structural_utility, -99.0)
+        self.assertEqual(dynamics_utility, 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

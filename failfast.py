@@ -662,6 +662,7 @@ parser.add_argument(
         "hindsight_delta_j_f5",
         "hindsight_delta_j_f2",
         "hindsight_delta_j_logistic_f2",
+        "hindsight_delta_j_two_expert",
     ],
     default="per_step_td",
 )
@@ -707,6 +708,7 @@ parser.add_argument(
         "hindsight_delta_j_f5",
         "hindsight_delta_j_f2",
         "hindsight_delta_j_logistic_f2",
+        "hindsight_delta_j_two_expert",
     ],
     default="legacy",
 )
@@ -779,6 +781,11 @@ parser.add_argument(
     "--adaptive-hindsight-logistic-optimizer",
     choices=["sgd", "irls"],
     default="sgd",
+    help=(
+        "Optimizer for hindsight logistic F2. 'sgd' preserves the original "
+        "one-step online update; 'irls' refits all accumulated resolved "
+        "non-tie pairs with damped Newton/IRLS."
+    ),
 )
 parser.add_argument("--adaptive-hindsight-logistic-l2", type=float, default=0.1)
 parser.add_argument("--adaptive-hindsight-logistic-irls-max-iter", type=int, default=25)
@@ -791,6 +798,21 @@ parser.add_argument(
     default=False,
 )
 parser.add_argument("--adaptive-hindsight-logistic-min-positive-problems", type=int, default=2)
+parser.add_argument(
+    "--adaptive-hindsight-two-expert-selector-window",
+    type=int,
+    default=20,
+    help="Rolling resolved-pair window used to select the lower-utility expert.",
+)
+parser.add_argument(
+    "--adaptive-hindsight-two-expert-continue-threshold",
+    type=float,
+    default=0.5,
+    help=(
+        "Decision threshold for each raw-|deltaJ|-weighted utility expert. "
+        "At the weighted optimum, 0.5 corresponds to negative expected delta J."
+    ),
+)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -1076,8 +1098,12 @@ def build_adaptive_controller(args):
             hindsight_logistic_learning_rate=(
                 args.adaptive_hindsight_logistic_learning_rate
             ),
-            hindsight_logistic_optimizer=args.adaptive_hindsight_logistic_optimizer,
-            hindsight_logistic_l2=args.adaptive_hindsight_logistic_l2,
+            hindsight_logistic_optimizer=(
+                args.adaptive_hindsight_logistic_optimizer
+            ),
+            hindsight_logistic_l2=(
+                args.adaptive_hindsight_logistic_l2
+            ),
             hindsight_logistic_irls_max_iter=(
                 args.adaptive_hindsight_logistic_irls_max_iter
             ),
@@ -1095,6 +1121,12 @@ def build_adaptive_controller(args):
             ),
             hindsight_logistic_min_positive_problems=(
                 args.adaptive_hindsight_logistic_min_positive_problems
+            ),
+            hindsight_two_expert_selector_window=(
+                args.adaptive_hindsight_two_expert_selector_window
+            ),
+            hindsight_two_expert_continue_threshold=(
+                args.adaptive_hindsight_two_expert_continue_threshold
             ),
         )
     )
