@@ -12,7 +12,7 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 ROOT = Path(__file__).resolve().parent
 DATASETS = ("math", "gsm8k")
-METHODS = ("failfast", "logistic_f2_e1", "logistic_f2_e2")
+METHODS = ("failfast", "logistic_f2_e1", "logistic_f2_e2", "logistic_f2_e2_irls")
 KNOWN_UNRUNNABLE_IDS = {"math": {301}, "gsm8k": set()}
 REPLACEMENT_IDS = {"math": (489,), "gsm8k": ()}
 
@@ -112,6 +112,12 @@ def command(args, dataset, method, destination):
             "--adaptive-credit-assignment", "hindsight_delta_j_logistic_f2",
             "--adaptive-policy-mode", "hindsight_delta_j_logistic_f2",
             "--adaptive-hindsight-logistic-learning-rate", "0.05",
+            "--adaptive-hindsight-logistic-optimizer", (
+                "irls" if method == "logistic_f2_e2_irls" else "sgd"
+            ),
+            "--adaptive-hindsight-logistic-l2", "0.1",
+            "--adaptive-hindsight-logistic-irls-max-iter", "25",
+            "--adaptive-hindsight-logistic-irls-tolerance", "1e-8",
             "--adaptive-hindsight-logistic-continue-threshold", "0.5",
             "--adaptive-hindsight-logistic-tie-ms-per-token", "1.0",
             "--adaptive-hindsight-logistic-min-positive-problems", "2",
@@ -126,7 +132,7 @@ def command(args, dataset, method, destination):
         ])
         result.append(
             "--adaptive-hindsight-logistic-use-class-weight"
-            if method == "logistic_f2_e2"
+            if method in {"logistic_f2_e2", "logistic_f2_e2_irls"}
             else "--no-adaptive-hindsight-logistic-use-class-weight"
         )
     return result
@@ -264,6 +270,10 @@ def main():
         "continue_threshold": 0.5,
         "E1": "utility weighting only",
         "E2": "utility plus moderate CONTINUE class weighting",
+        "E2_IRLS": (
+            "same E2 features, labels, weights, threshold, and probes; "
+            "accumulated damped Newton/IRLS with L2=0.1"
+        ),
         "IPS": "logged only; not used for learner updates",
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

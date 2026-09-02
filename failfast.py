@@ -775,6 +775,14 @@ parser.add_argument("--adaptive-hindsight-delta-j-min-continue-pairs", type=int,
 parser.add_argument("--adaptive-hindsight-delta-j-structural-probe", type=float, default=0.08)
 parser.add_argument("--adaptive-hindsight-delta-j-floor-probe", type=float, default=0.02)
 parser.add_argument("--adaptive-hindsight-logistic-learning-rate", type=float, default=0.05)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-optimizer",
+    choices=["sgd", "irls"],
+    default="sgd",
+)
+parser.add_argument("--adaptive-hindsight-logistic-l2", type=float, default=0.1)
+parser.add_argument("--adaptive-hindsight-logistic-irls-max-iter", type=int, default=25)
+parser.add_argument("--adaptive-hindsight-logistic-irls-tolerance", type=float, default=1e-8)
 parser.add_argument("--adaptive-hindsight-logistic-continue-threshold", type=float, default=0.5)
 parser.add_argument("--adaptive-hindsight-logistic-tie-ms-per-token", type=float, default=1.0)
 parser.add_argument(
@@ -1067,6 +1075,14 @@ def build_adaptive_controller(args):
             ),
             hindsight_logistic_learning_rate=(
                 args.adaptive_hindsight_logistic_learning_rate
+            ),
+            hindsight_logistic_optimizer=args.adaptive_hindsight_logistic_optimizer,
+            hindsight_logistic_l2=args.adaptive_hindsight_logistic_l2,
+            hindsight_logistic_irls_max_iter=(
+                args.adaptive_hindsight_logistic_irls_max_iter
+            ),
+            hindsight_logistic_irls_tolerance=(
+                args.adaptive_hindsight_logistic_irls_tolerance
             ),
             hindsight_logistic_continue_threshold=(
                 args.adaptive_hindsight_logistic_continue_threshold

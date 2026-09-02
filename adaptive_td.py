@@ -291,6 +291,10 @@ class AdaptiveTDConfig:
     hindsight_delta_j_structural_probe_probability: float = 0.08
     hindsight_delta_j_floor_probe_probability: float = 0.02
     hindsight_logistic_learning_rate: float = 0.05
+    hindsight_logistic_optimizer: str = "sgd"
+    hindsight_logistic_l2: float = 0.1
+    hindsight_logistic_irls_max_iter: int = 25
+    hindsight_logistic_irls_tolerance: float = 1e-8
     hindsight_logistic_continue_threshold: float = 0.5
     hindsight_logistic_tie_ms_per_token: float = 1.0
     hindsight_logistic_use_class_weight: bool = False
@@ -436,6 +440,14 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight floor probe probability must be in [0, 1]")
         if self.hindsight_logistic_learning_rate <= 0.0:
             raise ValueError("hindsight logistic learning rate must be positive")
+        if self.hindsight_logistic_optimizer not in {"sgd", "irls"}:
+            raise ValueError("hindsight logistic optimizer must be sgd or irls")
+        if self.hindsight_logistic_l2 < 0.0:
+            raise ValueError("hindsight logistic L2 must be non-negative")
+        if self.hindsight_logistic_irls_max_iter < 1:
+            raise ValueError("hindsight logistic IRLS max_iter must be positive")
+        if self.hindsight_logistic_irls_tolerance <= 0.0:
+            raise ValueError("hindsight logistic IRLS tolerance must be positive")
         if not 0.0 < self.hindsight_logistic_continue_threshold < 1.0:
             raise ValueError("hindsight logistic threshold must be in (0, 1)")
         if self.hindsight_logistic_tie_ms_per_token < 0.0:
@@ -754,24 +766,149 @@ class _BayesianLinearGain:
 
 
 class _OnlineWeightedLogistic:
-    """Tiny CPU-only online logistic classifier."""
+    """Tiny CPU-only weighted logistic model with SGD or accumulated IRLS."""
 
-    def __init__(self, dimension: int, learning_rate: float):
+    def __init__(
+        self,
+        dimension: int,
+        learning_rate: float,
+        *,
+        optimizer: str = "sgd",
+        l2: float = 0.1,
+        irls_max_iter: int = 25,
+        irls_tolerance: float = 1e-8,
+    ):
         self.dimension = int(dimension)
         self.learning_rate = float(learning_rate)
+        self.optimizer = str(optimizer)
+        self.l2 = max(0.0, float(l2))
+        self.irls_max_iter = max(1, int(irls_max_iter))
+        self.irls_tolerance = max(1e-12, float(irls_tolerance))
         self.weights = [0.0] * self.dimension
         self.sample_count = 0
         self.weight_sum = 0.0
         self.loss_sum = 0.0
+        self.training_buffer: list[tuple[tuple[float, ...], int, float]] = []
+
+    @staticmethod
+    def _sigmoid(logit: float) -> float:
+        if logit >= 0.0:
+            return 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
+        exp_logit = math.exp(max(logit, -60.0))
+        return exp_logit / (1.0 + exp_logit)
 
     def predict(self, features: Sequence[float]) -> tuple[float, float]:
         logit = _dot(self.weights, features)
-        if logit >= 0.0:
-            score = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
-        else:
-            exp_logit = math.exp(max(logit, -60.0))
-            score = exp_logit / (1.0 + exp_logit)
-        return logit, score
+        return logit, self._sigmoid(logit)
+
+    def _objective(self, weights: Sequence[float]) -> float:
+        total = 0.0
+        for features, label, sample_weight in self.training_buffer:
+            score = self._sigmoid(_dot(weights, features))
+            total -= sample_weight * (
+                float(label) * math.log(max(score, 1e-12))
+                + (1.0 - float(label)) * math.log(max(1.0 - score, 1e-12))
+            )
+        total += 0.5 * self.l2 * sum(
+            float(value) ** 2 for value in weights[1:]
+        )
+        return total
+
+    @staticmethod
+    def _solve_linear_system(matrix, rhs):
+        dimension = len(rhs)
+        augmented = [
+            [float(matrix[row][column]) for column in range(dimension)]
+            + [float(rhs[row])]
+            for row in range(dimension)
+        ]
+        for column in range(dimension):
+            pivot = max(
+                range(column, dimension),
+                key=lambda row: abs(augmented[row][column]),
+            )
+            if abs(augmented[pivot][column]) < 1e-12:
+                return None
+            if pivot != column:
+                augmented[column], augmented[pivot] = (
+                    augmented[pivot], augmented[column]
+                )
+            pivot_value = augmented[column][column]
+            for row in range(column + 1, dimension):
+                factor = augmented[row][column] / pivot_value
+                if factor == 0.0:
+                    continue
+                for index in range(column, dimension + 1):
+                    augmented[row][index] -= factor * augmented[column][index]
+        solution = [0.0] * dimension
+        for row in range(dimension - 1, -1, -1):
+            diagonal = augmented[row][row]
+            if abs(diagonal) < 1e-12:
+                return None
+            remainder = sum(
+                augmented[row][column] * solution[column]
+                for column in range(row + 1, dimension)
+            )
+            solution[row] = (augmented[row][dimension] - remainder) / diagonal
+        return solution
+
+    def _refit_irls(self) -> None:
+        if not self.training_buffer:
+            return
+        weights = list(self.weights)
+        dimension = self.dimension
+        for _ in range(self.irls_max_iter):
+            gradient = [0.0] * dimension
+            hessian = [[0.0] * dimension for _ in range(dimension)]
+            for features, label, sample_weight in self.training_buffer:
+                score = self._sigmoid(_dot(weights, features))
+                error = score - float(label)
+                weighted_curvature = (
+                    sample_weight * max(score * (1.0 - score), 1e-6)
+                )
+                for row in range(dimension):
+                    x_row = float(features[row])
+                    gradient[row] += sample_weight * error * x_row
+                    for column in range(dimension):
+                        hessian[row][column] += (
+                            weighted_curvature
+                            * x_row
+                            * float(features[column])
+                        )
+            for index in range(1, dimension):
+                gradient[index] += self.l2 * weights[index]
+                hessian[index][index] += self.l2
+            for index in range(dimension):
+                hessian[index][index] += 1e-9
+            step = self._solve_linear_system(hessian, gradient)
+            if step is None:
+                for index in range(dimension):
+                    hessian[index][index] += 1e-5
+                step = self._solve_linear_system(hessian, gradient)
+            if step is None:
+                break
+            step_norm = math.sqrt(sum(float(value) ** 2 for value in step))
+            if step_norm <= self.irls_tolerance:
+                break
+            old_objective = self._objective(weights)
+            alpha = 1.0
+            accepted = False
+            candidate = list(weights)
+            for _ in range(20):
+                candidate = [
+                    current - alpha * delta
+                    for current, delta in zip(weights, step)
+                ]
+                if self._objective(candidate) <= old_objective + 1e-10:
+                    accepted = True
+                    break
+                alpha *= 0.5
+            if not accepted:
+                break
+            weights = candidate
+            if alpha * step_norm <= self.irls_tolerance:
+                break
+        self.weights = list(weights)
 
     def update(
         self,
@@ -779,22 +916,30 @@ class _OnlineWeightedLogistic:
         label: int,
         sample_weight: float,
     ) -> float:
-        logit, score = self.predict(features)
+        features = tuple(float(value) for value in features)
+        label = int(label)
         weight = max(0.0, float(sample_weight))
-        error = score - float(label)
-        gradient = [weight * error * float(value) for value in features]
-        gradient_norm = math.sqrt(sum(value * value for value in gradient))
-        if gradient_norm > 10.0:
-            scale = 10.0 / gradient_norm
-            gradient = [value * scale for value in gradient]
-        self.weights = [
-            current - self.learning_rate * delta
-            for current, delta in zip(self.weights, gradient)
-        ]
+        _, score = self.predict(features)
         loss = -weight * (
             float(label) * math.log(max(score, 1e-12))
             + (1.0 - float(label)) * math.log(max(1.0 - score, 1e-12))
         )
+        if self.optimizer == "sgd":
+            error = score - float(label)
+            gradient = [weight * error * float(value) for value in features]
+            gradient_norm = math.sqrt(sum(value * value for value in gradient))
+            if gradient_norm > 10.0:
+                scale = 10.0 / gradient_norm
+                gradient = [value * scale for value in gradient]
+            self.weights = [
+                current - self.learning_rate * delta
+                for current, delta in zip(self.weights, gradient)
+            ]
+        elif self.optimizer == "irls":
+            self.training_buffer.append((features, label, weight))
+            self._refit_irls()
+        else:
+            raise ValueError(f"unknown logistic optimizer: {self.optimizer}")
         self.sample_count += 1
         self.weight_sum += weight
         self.loss_sum += loss
@@ -807,6 +952,11 @@ class _OnlineWeightedLogistic:
             "sample_count": int(self.sample_count),
             "sample_weight_sum": float(self.weight_sum),
             "mean_weighted_loss": self.loss_sum / max(1, self.sample_count),
+            "optimizer": self.optimizer,
+            "l2": float(self.l2),
+            "irls_max_iter": int(self.irls_max_iter),
+            "irls_tolerance": float(self.irls_tolerance),
+            "training_buffer_size": len(self.training_buffer),
         }
 
 
@@ -885,6 +1035,10 @@ class OnlineTDRefinementController:
         self.hindsight_logistic_model = _OnlineWeightedLogistic(
             len(hindsight_feature_names),
             config.hindsight_logistic_learning_rate,
+            optimizer=config.hindsight_logistic_optimizer,
+            l2=config.hindsight_logistic_l2,
+            irls_max_iter=config.hindsight_logistic_irls_max_iter,
+            irls_tolerance=config.hindsight_logistic_irls_tolerance,
         )
         self.hindsight_logistic_abs_r: list[float] = []
         self.hindsight_logistic_tie_count = 0

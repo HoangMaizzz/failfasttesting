@@ -1,6 +1,10 @@
 import unittest
 
-from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
+from adaptive_td import (
+    AdaptiveTDConfig,
+    OnlineTDRefinementController,
+    _OnlineWeightedLogistic,
+)
 
 
 def make_controller(**overrides):
@@ -218,6 +222,18 @@ class HindsightDeltaJF5Test(unittest.TestCase):
         self.assertTrue(row["is_tie"])
         self.assertFalse(row["update_applied"])
         self.assertEqual(item.hindsight_logistic_model.sample_count, 0)
+
+    def test_irls_refits_accumulated_weighted_samples(self):
+        model = _OnlineWeightedLogistic(
+            3, 0.05, optimizer="irls", l2=0.1,
+            irls_max_iter=25, irls_tolerance=1e-8,
+        )
+        model.update((1.0, 0.9, 0.1), 1, 2.0)
+        model.update((1.0, 0.1, 0.9), 0, 1.0)
+        self.assertGreater(model.predict((1.0, 0.9, 0.1))[1], 0.5)
+        self.assertLess(model.predict((1.0, 0.1, 0.9))[1], 0.5)
+        self.assertEqual(model.sample_count, 2)
+        self.assertEqual(model.snapshot(("b", "x", "q"))["optimizer"], "irls")
 
 
 if __name__ == "__main__":
