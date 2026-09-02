@@ -1151,15 +1151,16 @@ class OnlineTDRefinementController:
 
     @staticmethod
     def _hindsight_delta_j_logistic_f2_features(
-        f2_state: dict,
         *,
+        current_mask_count: int,
+        active_span_size: int,
         active_block_start_relative: int,
         proposal_length: int,
     ) -> tuple[float, ...]:
-        active_span = max(1, int(f2_state["active_span_size"]))
+        active_span = max(1, int(active_span_size))
         return (
             1.0,
-            _clip(float(f2_state["current_mask_count"]) / active_span, 0.0, 1.0),
+            _clip(float(current_mask_count) / active_span, 0.0, 1.0),
             _clip(
                 float(active_block_start_relative) / max(1, int(proposal_length)),
                 0.0,
@@ -1198,6 +1199,7 @@ class OnlineTDRefinementController:
         next_forward_latency_ms: float,
         forward_pass_index: int,
         decision_eligible: bool,
+        remaining_masks: int | None = None,
     ) -> dict:
         if not self.uses_hindsight_block_gain:
             return {}
@@ -1220,8 +1222,10 @@ class OnlineTDRefinementController:
         )
         if self.uses_hindsight_delta_j_f5:
             state_complete = f5_state is not None
-        elif self.uses_hindsight_delta_j_f2 or self.uses_hindsight_delta_j_logistic_f2:
+        elif self.uses_hindsight_delta_j_f2:
             state_complete = f2_state is not None
+        elif self.uses_hindsight_delta_j_logistic_f2:
+            state_complete = remaining_masks is not None
         else:
             state_complete = raw_complete
         valid = (
@@ -1253,10 +1257,16 @@ class OnlineTDRefinementController:
             features = self._hindsight_delta_j_f2_features(f2_state)
         elif self.uses_hindsight_delta_j_logistic_f2:
             features = self._hindsight_delta_j_logistic_f2_features(
-                f2_state,
+                current_mask_count=int(remaining_masks),
+                active_span_size=active_span,
                 active_block_start_relative=relative_start,
                 proposal_length=proposal_length,
             )
+            f2_state = {
+                "active_span_size": int(active_span),
+                "current_mask_count": int(remaining_masks),
+                "global_proposal_position": float(features[2]),
+            }
         else:
             features = self._hindsight_features(
                 raw_current_state,
@@ -1333,6 +1343,8 @@ class OnlineTDRefinementController:
                 if self.uses_hindsight_delta_j_logistic_f2
                 else self.hindsight_gain_model.sample_count
             ),
+            "hindsight_features": list(features),
+            "hindsight_feature_names": list(self.hindsight_feature_names),
         }
         if self.uses_hindsight_delta_j_f5:
             result.update({
@@ -3610,6 +3622,16 @@ class OnlineTDRefinementController:
             "feature_version": self.config.feature_version,
             "feature_dim": self.config.feature_dim,
             "feature_names": list(self.feature_names),
+            "policy_feature_names": list(
+                self.hindsight_feature_names
+                if self.uses_hindsight_delta_j_logistic_f2
+                else self.feature_names
+            ),
+            "policy_feature_dim": len(
+                self.hindsight_feature_names
+                if self.uses_hindsight_delta_j_logistic_f2
+                else self.feature_names
+            ),
             "completed_rounds": self.completed_rounds,
             "decision_count": self.decision_count,
             "annealed_decision_count": self.annealed_decision_count,

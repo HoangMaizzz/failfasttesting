@@ -19,6 +19,8 @@ REPLACEMENT_IDS = {"math": (489,), "gsm8k": ()}
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--num_questions", type=int, default=25)
     parser.add_argument("--id_offset", type=int, default=25)
     parser.add_argument("--target_quantization", default="int8")
@@ -230,26 +232,28 @@ def main():
     (root / "raw").mkdir(parents=True)
     run([sys.executable, "patch_fastdllm_frontier.py", args.dllm_dir])
     rows = []
-    for dataset in DATASETS:
-        for method in METHODS:
+    for dataset in args.datasets:
+        for method in args.methods:
             destination = root / "raw" / dataset / method
             destination.mkdir(parents=True)
             print(f"\n{'=' * 88}\nRUN {dataset.upper()} | {method}\n{'=' * 88}")
             run(command(args, dataset, method, destination))
             rows.append(summarize(dataset, method, destination))
     summary = pd.DataFrame(rows)
-    baseline = summary[summary.method == "failfast"][["dataset", "ms_per_output_token"]].rename(
-        columns={"ms_per_output_token": "failfast_ms_per_output_token"}
-    )
-    summary = summary.merge(baseline, on="dataset", how="left")
-    summary["speedup_vs_failfast"] = (
-        summary.failfast_ms_per_output_token / summary.ms_per_output_token
-    )
+    baseline = summary[summary.method == "failfast"][["dataset", "ms_per_output_token"]]
+    if not baseline.empty:
+        baseline = baseline.rename(
+            columns={"ms_per_output_token": "failfast_ms_per_output_token"}
+        )
+        summary = summary.merge(baseline, on="dataset", how="left")
+        summary["speedup_vs_failfast"] = (
+            summary.failfast_ms_per_output_token / summary.ms_per_output_token
+        )
     summary.to_csv(root / "dataset_method_summary.csv", index=False)
     manifest = {
-        "datasets": list(DATASETS),
-        "methods": list(METHODS),
-        "problem_ids": {dataset: selected_ids(args, dataset) for dataset in DATASETS},
+        "datasets": list(args.datasets),
+        "methods": list(args.methods),
+        "problem_ids": {dataset: selected_ids(args, dataset) for dataset in args.datasets},
         "id_offset": args.id_offset,
         "excluded_known_unrunnable_ids": {
             dataset: sorted(KNOWN_UNRUNNABLE_IDS[dataset]) for dataset in DATASETS

@@ -154,10 +154,8 @@ class HindsightDeltaJF5Test(unittest.TestCase):
             policy_mode="hindsight_delta_j_logistic_f2",
         ))
         features = item._hindsight_delta_j_logistic_f2_features(
-            {
-                "active_span_size": 8,
-                "current_mask_count": 4,
-            },
+            current_mask_count=4,
+            active_span_size=8,
             active_block_start_relative=8,
             proposal_length=32,
         )
@@ -200,6 +198,7 @@ class HindsightDeltaJF5Test(unittest.TestCase):
             proposal_length=8, max_spec_len=64, refinement_step=1,
             next_forward_latency_ms=2.0, forward_pass_index=1,
             decision_eligible=True,
+            remaining_masks=4,
         )
         item.choose((1.0,) * 6, allow_stop=True, refinement_step=1)
         item.prepare_hindsight_snapshot(
@@ -209,6 +208,7 @@ class HindsightDeltaJF5Test(unittest.TestCase):
             proposal_length=8, max_spec_len=64, refinement_step=2,
             next_forward_latency_ms=2.0, forward_pass_index=2,
             decision_eligible=False,
+            remaining_masks=4,
         )
         item.hindsight_pending_pairs[-1]["next_forward_latency_ms"] = 2.0
         item.observe_hindsight_verifier_boundary(

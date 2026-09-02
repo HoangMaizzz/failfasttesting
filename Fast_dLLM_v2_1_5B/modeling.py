@@ -2045,8 +2045,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "uses_hindsight_delta_j_f2",
                                     False,
                                 ))
+                                hindsight_delta_j_logistic_f2 = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_delta_j_logistic_f2",
+                                    False,
+                                ))
                                 hindsight_delta_j = bool(
-                                    hindsight_delta_j_f5 or hindsight_delta_j_f2
+                                    hindsight_delta_j_f5
+                                    or hindsight_delta_j_f2
+                                    or hindsight_delta_j_logistic_f2
                                 )
                                 hindsight_raw_gain = bool(
                                     hindsight_block_gain and not hindsight_delta_j
@@ -2274,7 +2281,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 )
                                 hindsight_f5_state = None
                                 hindsight_f2_state = None
-                                if hindsight_delta_j_f2 and hindsight_frame_eligible:
+                                if (
+                                    hindsight_delta_j_f2
+                                    or hindsight_delta_j_logistic_f2
+                                ) and hindsight_frame_eligible:
                                     f2_started = time.perf_counter()
                                     f2_mask = x_t[
                                         0,
@@ -2630,6 +2640,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 active_remaining_positions
                                                 and stop_available
                                             ),
+                                            remaining_masks=int(
+                                                len(active_remaining_positions)
+                                            ),
                                         )
                                     )
                                     step_record.update(hindsight_snapshot_fields)
@@ -2782,7 +2795,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             None if token_id is None else int(token_id)
                                             for token_id in provisional_tokens
                                         ],
-                                        "features": list(features),
+                                        "features": list(
+                                            hindsight_snapshot_fields.get(
+                                                "hindsight_features", features
+                                            )
+                                        ),
+                                        "feature_names": list(
+                                            hindsight_snapshot_fields.get(
+                                                "hindsight_feature_names",
+                                                adaptive_controller.feature_names,
+                                            )
+                                        ),
                                         "raw_previous_state": raw_previous_state,
                                         "raw_current_state": raw_current_state,
                                         "has_previous_state": bool(

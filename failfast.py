@@ -1833,10 +1833,14 @@ def record_adaptive_td_decisions(
                 realized_action == item.get("post_stop_outer_action")
             )
         item.update(finalized_fields)
+        logged_feature_names = tuple(
+            item.get("feature_names")
+            or getattr(controller, "feature_names", FEATURE_NAMES)
+        )
         feature_values = {
             name: float(value)
             for name, value in zip(
-                getattr(controller, "feature_names", FEATURE_NAMES),
+                logged_feature_names,
                 item.get("features") or [],
             )
         }
@@ -1847,9 +1851,7 @@ def record_adaptive_td_decisions(
             "decision_id": int(decision_id),
             **item,
             "features": json.dumps(item.get("features") or []),
-            "feature_names": json.dumps(list(
-                getattr(controller, "feature_names", FEATURE_NAMES)
-            )),
+            "feature_names": json.dumps(list(logged_feature_names)),
             "draft_proposal": json.dumps(item.get("draft_proposal") or []),
             "draft_length": target_len,
             **feature_values,
