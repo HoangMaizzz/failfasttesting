@@ -661,6 +661,7 @@ parser.add_argument(
         "hindsight_block_gain",
         "hindsight_delta_j_f5",
         "hindsight_delta_j_f2",
+        "hindsight_delta_j_logistic_f2",
     ],
     default="per_step_td",
 )
@@ -705,6 +706,7 @@ parser.add_argument(
         "hindsight_gain",
         "hindsight_delta_j_f5",
         "hindsight_delta_j_f2",
+        "hindsight_delta_j_logistic_f2",
     ],
     default="legacy",
 )
@@ -772,6 +774,15 @@ parser.add_argument("--adaptive-hindsight-delta-j-min-pairs", type=int, default=
 parser.add_argument("--adaptive-hindsight-delta-j-min-continue-pairs", type=int, default=3)
 parser.add_argument("--adaptive-hindsight-delta-j-structural-probe", type=float, default=0.08)
 parser.add_argument("--adaptive-hindsight-delta-j-floor-probe", type=float, default=0.02)
+parser.add_argument("--adaptive-hindsight-logistic-learning-rate", type=float, default=0.05)
+parser.add_argument("--adaptive-hindsight-logistic-continue-threshold", type=float, default=0.5)
+parser.add_argument("--adaptive-hindsight-logistic-tie-ms-per-token", type=float, default=1.0)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-use-class-weight",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+)
+parser.add_argument("--adaptive-hindsight-logistic-min-positive-problems", type=int, default=2)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -1053,6 +1064,21 @@ def build_adaptive_controller(args):
             ),
             hindsight_delta_j_floor_probe_probability=(
                 args.adaptive_hindsight_delta_j_floor_probe
+            ),
+            hindsight_logistic_learning_rate=(
+                args.adaptive_hindsight_logistic_learning_rate
+            ),
+            hindsight_logistic_continue_threshold=(
+                args.adaptive_hindsight_logistic_continue_threshold
+            ),
+            hindsight_logistic_tie_ms_per_token=(
+                args.adaptive_hindsight_logistic_tie_ms_per_token
+            ),
+            hindsight_logistic_use_class_weight=(
+                args.adaptive_hindsight_logistic_use_class_weight
+            ),
+            hindsight_logistic_min_positive_problems=(
+                args.adaptive_hindsight_logistic_min_positive_problems
             ),
         )
     )

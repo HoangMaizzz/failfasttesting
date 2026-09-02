@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from bisect import insort
 from dataclasses import dataclass, field
 from statistics import NormalDist
 from typing import Iterable, Sequence
@@ -120,6 +121,11 @@ HINDSIGHT_DELTA_J_F2_FEATURE_NAMES = (
     "bias",
     "current_mask_ratio",
     "first_unresolved_position",
+)
+HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES = (
+    "bias",
+    "current_mask_ratio",
+    "global_proposal_position",
 )
 
 
@@ -284,6 +290,11 @@ class AdaptiveTDConfig:
     hindsight_delta_j_min_continue_pairs: int = 3
     hindsight_delta_j_structural_probe_probability: float = 0.08
     hindsight_delta_j_floor_probe_probability: float = 0.02
+    hindsight_logistic_learning_rate: float = 0.05
+    hindsight_logistic_continue_threshold: float = 0.5
+    hindsight_logistic_tie_ms_per_token: float = 1.0
+    hindsight_logistic_use_class_weight: bool = False
+    hindsight_logistic_min_positive_problems: int = 2
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -339,11 +350,12 @@ class AdaptiveTDConfig:
             "hindsight_gain",
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
+            "hindsight_delta_j_logistic_f2",
         }:
             raise ValueError(
                 "policy_mode must be legacy, symmetric, symmetric_annealed, "
                 "symmetric_greedy, hindsight_gain, hindsight_delta_j_f5, "
-                "or hindsight_delta_j_f2"
+                "hindsight_delta_j_f2, or hindsight_delta_j_logistic_f2"
             )
         if self.policy_ablation not in {
             "learned",
@@ -364,12 +376,14 @@ class AdaptiveTDConfig:
             "hindsight_block_gain",
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
+            "hindsight_delta_j_logistic_f2",
         }:
             raise ValueError(
                 "credit_assignment must be per_step_td, "
                 "verifier_boundary_factual, or "
                 "verifier_boundary_factual_no_bootstrap, hindsight_block_gain, "
-                "hindsight_delta_j_f5, or hindsight_delta_j_f2"
+                "hindsight_delta_j_f5, hindsight_delta_j_f2, or "
+                "hindsight_delta_j_logistic_f2"
             )
         if self.hindsight_prior_precision <= 0.0:
             raise ValueError("hindsight prior precision must be positive")
@@ -399,7 +413,10 @@ class AdaptiveTDConfig:
         ):
             raise ValueError("hindsight block gain requires hindsight_gain policy")
         if (
-            self.credit_assignment in {"hindsight_delta_j_f5", "hindsight_delta_j_f2"}
+            self.credit_assignment in {
+                "hindsight_delta_j_f5", "hindsight_delta_j_f2",
+                "hindsight_delta_j_logistic_f2",
+            }
             and self.policy_mode != self.credit_assignment
         ):
             raise ValueError("hindsight delta-J modes require their matching policy")
@@ -417,6 +434,14 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight structural probe probability must be in [0, 1]")
         if not 0.0 <= self.hindsight_delta_j_floor_probe_probability <= 1.0:
             raise ValueError("hindsight floor probe probability must be in [0, 1]")
+        if self.hindsight_logistic_learning_rate <= 0.0:
+            raise ValueError("hindsight logistic learning rate must be positive")
+        if not 0.0 < self.hindsight_logistic_continue_threshold < 1.0:
+            raise ValueError("hindsight logistic threshold must be in (0, 1)")
+        if self.hindsight_logistic_tie_ms_per_token < 0.0:
+            raise ValueError("hindsight logistic tie threshold must be non-negative")
+        if self.hindsight_logistic_min_positive_problems < 0:
+            raise ValueError("minimum positive-problem count must be non-negative")
         if not 0.0 < self.factual_ema_alpha <= 1.0:
             raise ValueError("factual_ema_alpha must be in (0, 1]")
         if self.rho_warmup_boundaries < 0:
@@ -728,6 +753,63 @@ class _BayesianLinearGain:
         }
 
 
+class _OnlineWeightedLogistic:
+    """Tiny CPU-only online logistic classifier."""
+
+    def __init__(self, dimension: int, learning_rate: float):
+        self.dimension = int(dimension)
+        self.learning_rate = float(learning_rate)
+        self.weights = [0.0] * self.dimension
+        self.sample_count = 0
+        self.weight_sum = 0.0
+        self.loss_sum = 0.0
+
+    def predict(self, features: Sequence[float]) -> tuple[float, float]:
+        logit = _dot(self.weights, features)
+        if logit >= 0.0:
+            score = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
+        else:
+            exp_logit = math.exp(max(logit, -60.0))
+            score = exp_logit / (1.0 + exp_logit)
+        return logit, score
+
+    def update(
+        self,
+        features: Sequence[float],
+        label: int,
+        sample_weight: float,
+    ) -> float:
+        logit, score = self.predict(features)
+        weight = max(0.0, float(sample_weight))
+        error = score - float(label)
+        gradient = [weight * error * float(value) for value in features]
+        gradient_norm = math.sqrt(sum(value * value for value in gradient))
+        if gradient_norm > 10.0:
+            scale = 10.0 / gradient_norm
+            gradient = [value * scale for value in gradient]
+        self.weights = [
+            current - self.learning_rate * delta
+            for current, delta in zip(self.weights, gradient)
+        ]
+        loss = -weight * (
+            float(label) * math.log(max(score, 1e-12))
+            + (1.0 - float(label)) * math.log(max(1.0 - score, 1e-12))
+        )
+        self.sample_count += 1
+        self.weight_sum += weight
+        self.loss_sum += loss
+        return loss
+
+    def snapshot(self, feature_names) -> dict:
+        return {
+            "feature_names": list(feature_names),
+            "weights": list(self.weights),
+            "sample_count": int(self.sample_count),
+            "sample_weight_sum": float(self.weight_sum),
+            "mean_weighted_loss": self.loss_sum / max(1, self.sample_count),
+        }
+
+
 class OnlineTDRefinementController:
     controller_name = "avg_td"
 
@@ -790,6 +872,8 @@ class OnlineTDRefinementController:
             hindsight_feature_names = HINDSIGHT_DELTA_J_F5_FEATURE_NAMES
         elif config.credit_assignment == "hindsight_delta_j_f2":
             hindsight_feature_names = HINDSIGHT_DELTA_J_F2_FEATURE_NAMES
+        elif config.credit_assignment == "hindsight_delta_j_logistic_f2":
+            hindsight_feature_names = HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES
         else:
             hindsight_feature_names = HINDSIGHT_GAIN_FEATURE_NAMES
         self.hindsight_feature_names = hindsight_feature_names
@@ -798,6 +882,14 @@ class OnlineTDRefinementController:
             config.hindsight_prior_precision,
             config.hindsight_noise_variance,
         )
+        self.hindsight_logistic_model = _OnlineWeightedLogistic(
+            len(hindsight_feature_names),
+            config.hindsight_logistic_learning_rate,
+        )
+        self.hindsight_logistic_abs_r: list[float] = []
+        self.hindsight_logistic_tie_count = 0
+        self.hindsight_logistic_positive_problem_ids: set[int] = set()
+        self.hindsight_censor_reasons: dict[str, int] = {}
         self.hindsight_problem_id = None
         self.hindsight_committed_tokens: list[int] = []
         self.hindsight_snapshot_count = 0
@@ -964,6 +1056,7 @@ class OnlineTDRefinementController:
             "hindsight_block_gain",
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
+            "hindsight_delta_j_logistic_f2",
         }
 
     @property
@@ -975,10 +1068,15 @@ class OnlineTDRefinementController:
         return self.config.credit_assignment == "hindsight_delta_j_f2"
 
     @property
+    def uses_hindsight_delta_j_logistic_f2(self) -> bool:
+        return self.config.credit_assignment == "hindsight_delta_j_logistic_f2"
+
+    @property
     def uses_hindsight_delta_j(self) -> bool:
         return self.config.credit_assignment in {
             "hindsight_delta_j_f5",
             "hindsight_delta_j_f2",
+            "hindsight_delta_j_logistic_f2",
         }
 
     @staticmethod
@@ -1051,6 +1149,24 @@ class OnlineTDRefinementController:
             _clip(float(f2_state["first_unresolved_position"]), 0.0, 1.0),
         )
 
+    @staticmethod
+    def _hindsight_delta_j_logistic_f2_features(
+        f2_state: dict,
+        *,
+        active_block_start_relative: int,
+        proposal_length: int,
+    ) -> tuple[float, ...]:
+        active_span = max(1, int(f2_state["active_span_size"]))
+        return (
+            1.0,
+            _clip(float(f2_state["current_mask_count"]) / active_span, 0.0, 1.0),
+            _clip(
+                float(active_block_start_relative) / max(1, int(proposal_length)),
+                0.0,
+                1.0,
+            ),
+        )
+
     def begin_hindsight_problem(self, problem_id) -> None:
         if not self.uses_hindsight_block_gain:
             return
@@ -1104,7 +1220,7 @@ class OnlineTDRefinementController:
         )
         if self.uses_hindsight_delta_j_f5:
             state_complete = f5_state is not None
-        elif self.uses_hindsight_delta_j_f2:
+        elif self.uses_hindsight_delta_j_f2 or self.uses_hindsight_delta_j_logistic_f2:
             state_complete = f2_state is not None
         else:
             state_complete = raw_complete
@@ -1135,6 +1251,12 @@ class OnlineTDRefinementController:
             features = self._hindsight_delta_j_f5_features(f5_state)
         elif self.uses_hindsight_delta_j_f2:
             features = self._hindsight_delta_j_f2_features(f2_state)
+        elif self.uses_hindsight_delta_j_logistic_f2:
+            features = self._hindsight_delta_j_logistic_f2_features(
+                f2_state,
+                active_block_start_relative=relative_start,
+                proposal_length=proposal_length,
+            )
         else:
             features = self._hindsight_features(
                 raw_current_state,
@@ -1142,10 +1264,15 @@ class OnlineTDRefinementController:
                 max_spec_len=max_spec_len,
                 refinement_step=refinement_step,
             )
-        normalized_mean, normalized_sigma = self.hindsight_gain_model.predict(
-            features,
-            include_observation_noise=self.uses_hindsight_delta_j,
-        )
+        if self.uses_hindsight_delta_j_logistic_f2:
+            logistic_logit, continue_score = self.hindsight_logistic_model.predict(features)
+            normalized_mean, normalized_sigma = 0.0, math.inf
+        else:
+            normalized_mean, normalized_sigma = self.hindsight_gain_model.predict(
+                features,
+                include_observation_noise=self.uses_hindsight_delta_j,
+            )
+            logistic_logit, continue_score = None, None
         snapshot = {
             "snapshot_id": int(self.hindsight_snapshot_count),
             "problem_id": int(self.hindsight_problem_id),
@@ -1161,6 +1288,8 @@ class OnlineTDRefinementController:
             "predicted_sigma_tokens": active_span * normalized_sigma,
             "predicted_normalized_delta_j": normalized_mean,
             "predicted_normalized_delta_j_sigma": normalized_sigma,
+            "logistic_logit": logistic_logit,
+            "continue_score": continue_score,
             "rho_at_decision": float(self.rho),
             "decision_eligible": bool(decision_eligible),
             "refinement_step": int(refinement_step),
@@ -1199,7 +1328,11 @@ class OnlineTDRefinementController:
             "hindsight_snapshot_id": snapshot["snapshot_id"],
             "hindsight_predicted_gain_tokens": snapshot["predicted_gain_tokens"],
             "hindsight_predicted_sigma_tokens": snapshot["predicted_sigma_tokens"],
-            "hindsight_training_pairs": self.hindsight_gain_model.sample_count,
+            "hindsight_training_pairs": (
+                self.hindsight_logistic_model.sample_count
+                if self.uses_hindsight_delta_j_logistic_f2
+                else self.hindsight_gain_model.sample_count
+            ),
         }
         if self.uses_hindsight_delta_j_f5:
             result.update({
@@ -1221,6 +1354,13 @@ class OnlineTDRefinementController:
                 ),
                 "mu_raw_normalized_delta_j": normalized_mean,
                 "sigma_normalized_delta_j": normalized_sigma,
+            })
+        elif self.uses_hindsight_delta_j_logistic_f2:
+            result.update({
+                "current_mask_count": int(f2_state["current_mask_count"]),
+                "global_proposal_position": float(features[2]),
+                "logistic_logit": float(logistic_logit),
+                "continue_score": float(continue_score),
             })
         return result
 
@@ -1293,6 +1433,10 @@ class OnlineTDRefinementController:
             if stop_result is None or continue_result is None:
                 if terminal:
                     self.hindsight_censored_count += 1
+                    reason = "terminal_insufficient_verifier_evidence"
+                    self.hindsight_censor_reasons[reason] = (
+                        self.hindsight_censor_reasons.get(reason, 0) + 1
+                    )
                     if pair.get("forced_probe"):
                         self.hindsight_probe_outstanding = False
                 else:
@@ -1335,6 +1479,136 @@ class OnlineTDRefinementController:
             # yield. Learn it only when that lower bound already proves benefit.
             if not stop_pass and continue_pass and delta_j >= 0.0:
                 self.hindsight_censored_count += 1
+                reason = "continue_pass_lower_bound_not_beneficial"
+                self.hindsight_censor_reasons[reason] = (
+                    self.hindsight_censor_reasons.get(reason, 0) + 1
+                )
+                if pair.get("forced_probe"):
+                    self.hindsight_probe_outstanding = False
+                continue
+
+            if self.uses_hindsight_delta_j_logistic_f2:
+                tie_threshold = self.config.hindsight_logistic_tie_ms_per_token
+                is_tie = abs(delta_j) <= tie_threshold
+                actual_continue = delta_j < -tie_threshold
+                features = pair["before"]["features"]
+                pre_logit = float(pair["before"]["logistic_logit"])
+                pre_score = float(pair["before"]["continue_score"])
+                predicted_continue = (
+                    pre_score > self.config.hindsight_logistic_continue_threshold
+                )
+                counts_before = (
+                    self.hindsight_delta_j_continue_count,
+                    self.hindsight_delta_j_stop_count,
+                )
+                class_weight = 1.0
+                utility_weight = 0.0
+                sample_weight = 0.0
+                loss = None
+                weights_before = list(self.hindsight_logistic_model.weights)
+                if is_tie:
+                    self.hindsight_logistic_tie_count += 1
+                    true_action = "tie"
+                else:
+                    true_action = CONTINUE if actual_continue else STOP
+                    abs_r = abs(normalized_delta_j)
+                    if self.hindsight_logistic_abs_r:
+                        ordered = self.hindsight_logistic_abs_r
+                        middle = len(ordered) // 2
+                        running_median = (
+                            ordered[middle]
+                            if len(ordered) % 2
+                            else 0.5 * (ordered[middle - 1] + ordered[middle])
+                        )
+                        utility_weight = _clip(
+                            abs_r / max(running_median, 1e-9), 0.5, 2.5
+                        )
+                    else:
+                        running_median = None
+                        utility_weight = 1.0
+                    if (
+                        actual_continue
+                        and self.config.hindsight_logistic_use_class_weight
+                    ):
+                        n_c, n_s = counts_before
+                        alpha = self.config.hindsight_delta_j_class_balance_alpha
+                        class_weight = max(1.0, min(
+                            self.config.hindsight_delta_j_max_continue_weight,
+                            math.sqrt((n_s + alpha) / (n_c + alpha)),
+                        ))
+                    sample_weight = class_weight * utility_weight
+                    loss = self.hindsight_logistic_model.update(
+                        features,
+                        int(actual_continue),
+                        sample_weight,
+                    )
+                    insort(self.hindsight_logistic_abs_r, abs_r)
+                    if actual_continue:
+                        self.hindsight_delta_j_continue_count += 1
+                        self.hindsight_logistic_positive_problem_ids.add(
+                            int(pair["before"]["problem_id"])
+                        )
+                    else:
+                        self.hindsight_delta_j_stop_count += 1
+                row = {
+                    "transition_kind": self.config.credit_assignment,
+                    "problem_id": pair["before"]["problem_id"],
+                    "pair_id": pair["pair_id"],
+                    "before_snapshot_id": pair["before"]["snapshot_id"],
+                    "after_snapshot_id": pair["after"]["snapshot_id"],
+                    "refinement_step": pair["before"]["refinement_step"],
+                    "proposal_length": pair["before"]["proposal_length"],
+                    "active_block_start": pair["before"]["active_block_start_relative"],
+                    "active_block_end": block_end,
+                    "stop_lcp": stop_result["lcp"],
+                    "continue_lcp": continue_result["lcp"],
+                    "stop_passes_active_block": stop_pass,
+                    "continue_passes_active_block": continue_pass,
+                    "before_yield_Y_S": y_stop,
+                    "after_yield_Y_C": y_continue,
+                    "extra_draft_latency_ms_T_D": t_d,
+                    "verifier_boundary_latency_ms_T_B": t_b,
+                    "J_STOP_ms_per_token": j_stop,
+                    "J_CONTINUE_ms_per_token": j_continue,
+                    "delta_J_ms_per_token": delta_j,
+                    "normalized_delta_J": normalized_delta_j,
+                    "is_tie": is_tie,
+                    "update_applied": not is_tie,
+                    "true_action_from_delta_J": true_action,
+                    "binary_label_C": None if is_tie else int(actual_continue),
+                    "label_reason": "tie" if is_tie else label_reason,
+                    "logistic_logit_before_update": pre_logit,
+                    "continue_score_before_update": pre_score,
+                    "continue_threshold": self.config.hindsight_logistic_continue_threshold,
+                    "predicted_continue": predicted_continue,
+                    "cost_aware_correct": None if is_tie else predicted_continue == actual_continue,
+                    "class_weight": class_weight,
+                    "utility_weight": utility_weight,
+                    "sample_weight": sample_weight,
+                    "weighted_logistic_loss": loss,
+                    "N_C": self.hindsight_delta_j_continue_count,
+                    "N_S": self.hindsight_delta_j_stop_count,
+                    "distinct_positive_problem_count": len(
+                        self.hindsight_logistic_positive_problem_ids
+                    ),
+                    "model_action": pair["before"].get("greedy_action", "unknown"),
+                    "executed_action": pair["before"].get("action", "unknown"),
+                    "action_source": pair["before"].get("action_source", "unknown"),
+                    "behavior_continue_probability": pair["before"].get(
+                        "behavior_continue_probability", 1.0
+                    ),
+                    "executed_continue": True,
+                    "pair_resolved": True,
+                    "censor_reason": None,
+                    "weights_before": weights_before,
+                    "weights_after": list(self.hindsight_logistic_model.weights),
+                }
+                row.update({
+                    name: float(value)
+                    for name, value in zip(self.hindsight_feature_names, features)
+                })
+                self.full_stream_transitions.append(row)
+                self.hindsight_resolved_count += 1
                 if pair.get("forced_probe"):
                     self.hindsight_probe_outstanding = False
                 continue
@@ -2016,6 +2290,142 @@ class OnlineTDRefinementController:
             },
         )
 
+    def _choose_hindsight_delta_j_logistic_f2(
+        self,
+        *,
+        allow_stop: bool,
+        refinement_step: int,
+        allow_exploration: bool,
+        failfast_fallback_action: str,
+    ) -> AdaptiveDecision:
+        started = time.perf_counter()
+        snapshot = self.hindsight_current_snapshot
+        score = 0.5 if snapshot is None else float(snapshot["continue_score"])
+        logit = 0.0 if snapshot is None else float(snapshot["logistic_logit"])
+        mask_count = int((snapshot or {}).get("f2_state", {}).get("current_mask_count", 0))
+        observations = self.hindsight_logistic_model.sample_count
+        learner_ready = bool(
+            observations >= self.config.hindsight_delta_j_min_pairs
+            and self.hindsight_delta_j_continue_count
+            >= self.config.hindsight_delta_j_min_continue_pairs
+            and len(self.hindsight_logistic_positive_problem_ids)
+            >= self.config.hindsight_logistic_min_positive_problems
+        )
+        exploration_used = False
+        probe_probability = 0.0
+        structural_eligible = mask_count >= 2
+        if not allow_stop or snapshot is None:
+            action, action_source = CONTINUE, "physical_constraint"
+            reason = "hindsight_candidate_unavailable"
+        elif refinement_step >= self.config.max_refinement_steps:
+            action, action_source = STOP, "max_refinement_stop"
+            reason = "hindsight_max_refinement_steps"
+        elif not learner_ready:
+            action = failfast_fallback_action
+            action_source = "cold_start_continue" if action == CONTINUE else "cold_start_stop"
+            reason = "hindsight_failfast_cold_start"
+        elif score > self.config.hindsight_logistic_continue_threshold:
+            action, action_source = CONTINUE, "learned_continue"
+            reason = "hindsight_logistic_continue"
+        else:
+            action, action_source = STOP, "learned_stop"
+            reason = "hindsight_logistic_stop"
+        model_action = action
+        if (
+            action == STOP
+            and allow_exploration
+            and snapshot is not None
+            and refinement_step < self.config.max_refinement_steps
+            and not self.hindsight_probe_outstanding
+        ):
+            if structural_eligible:
+                probe_probability = self.config.hindsight_delta_j_structural_probe_probability
+                probe_source = "structural_probe"
+            else:
+                probe_probability = self.config.hindsight_delta_j_floor_probe_probability
+                probe_source = "floor_probe"
+            if self.rng.random() < probe_probability:
+                action, action_source = CONTINUE, probe_source
+                reason = f"hindsight_{probe_source}"
+                exploration_used = True
+                self.exploration_count += 1
+                self.hindsight_probe_count += 1
+                self.hindsight_probe_outstanding = True
+                if probe_source == "structural_probe":
+                    self.hindsight_structural_probe_count += 1
+                else:
+                    self.hindsight_floor_probe_count += 1
+        behavior_continue_probability = (
+            probe_probability if model_action == STOP else 1.0
+        )
+        selected_action_probability = (
+            behavior_continue_probability
+            if action == CONTINUE
+            else 1.0 - behavior_continue_probability
+        )
+        if snapshot is not None:
+            snapshot.update({
+                "action": action,
+                "greedy_action": model_action,
+                "model_action": model_action,
+                "action_source": action_source,
+                "decision_reason": reason,
+                "learner_ready": learner_ready,
+                "behavior_continue_probability": behavior_continue_probability,
+            })
+        if action == CONTINUE and snapshot is not None:
+            key = (
+                snapshot["problem_id"], snapshot["output_anchor"],
+                snapshot["active_block_start_relative"],
+                snapshot["active_block_end_relative"],
+            )
+            self.hindsight_pending_sources[key] = {
+                "snapshot": snapshot,
+                "latency_ms": 0.0,
+                "last_forward_pass_index": snapshot["forward_pass_index"],
+                "forced_probe": bool(exploration_used),
+            }
+        self.hindsight_current_snapshot = None
+        self.decision_count += 1
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        self.record_profile("decision_total", latency_ms)
+        self.advance_algorithm_latency(latency_ms, component="hindsight_controller_decision")
+        return AdaptiveDecision(
+            action=action,
+            reason=reason,
+            stop=ActionEstimate(mean=1.0 - score, risk=0.0, lower=1.0 - score, upper=1.0 - score),
+            continue_=ActionEstimate(mean=score, risk=0.0, lower=score, upper=score),
+            rho_tokens_per_ms=self.rho,
+            exploration_used=exploration_used,
+            latency_ms=latency_ms,
+            early_stop_observations=observations,
+            calibration_active=learner_ready,
+            advantage_mean=logit,
+            advantage_risk=0.0,
+            stop_probability=1.0 - score,
+            behavior_stop_probability=1.0 - behavior_continue_probability,
+            selected_action_probability=selected_action_probability,
+            importance_weight=1.0,
+            diagnostics={
+                "controller_name": self.config.credit_assignment,
+                "logistic_logit": logit,
+                "continue_score": score,
+                "continue_threshold": self.config.hindsight_logistic_continue_threshold,
+                "model_action": model_action,
+                "executed_action": action,
+                "action_source": action_source,
+                "learner_ready": learner_ready,
+                "N_pairs": observations,
+                "N_C": self.hindsight_delta_j_continue_count,
+                "N_S": self.hindsight_delta_j_stop_count,
+                "distinct_positive_problem_count": len(self.hindsight_logistic_positive_problem_ids),
+                "behavior_continue_probability": behavior_continue_probability,
+                "probe_probability": probe_probability,
+                "structural_probe_eligible": structural_eligible,
+                "failfast_fallback_action": failfast_fallback_action,
+            },
+        )
+
     def _choose_hindsight_delta_j_f5(
         self,
         *,
@@ -2201,6 +2611,15 @@ class OnlineTDRefinementController:
         **_unused,
     ) -> AdaptiveDecision:
         if self.uses_hindsight_block_gain:
+            if self.uses_hindsight_delta_j_logistic_f2:
+                return self._choose_hindsight_delta_j_logistic_f2(
+                    allow_stop=allow_stop,
+                    refinement_step=refinement_step,
+                    allow_exploration=allow_exploration,
+                    failfast_fallback_action=_unused.get(
+                        "failfast_fallback_action", CONTINUE
+                    ),
+                )
             if self.uses_hindsight_delta_j:
                 return self._choose_hindsight_delta_j_f5(
                     allow_stop=allow_stop,
@@ -3304,6 +3723,9 @@ class OnlineTDRefinementController:
                 "model": self.hindsight_gain_model.snapshot(
                     self.hindsight_feature_names
                 ),
+                "logistic_model": self.hindsight_logistic_model.snapshot(
+                    self.hindsight_feature_names
+                ),
                 "snapshot_count": int(self.hindsight_snapshot_count),
                 "pair_count": int(self.hindsight_pair_count),
                 "resolved_count": int(self.hindsight_resolved_count),
@@ -3329,6 +3751,14 @@ class OnlineTDRefinementController:
                     self.hindsight_delta_j_calibration_bias
                 ),
                 "probe_outstanding": bool(self.hindsight_probe_outstanding),
+                "tie_count": int(self.hindsight_logistic_tie_count),
+                "distinct_positive_problem_count": len(
+                    self.hindsight_logistic_positive_problem_ids
+                ),
+                "positive_problem_ids": sorted(
+                    self.hindsight_logistic_positive_problem_ids
+                ),
+                "censor_reasons": dict(self.hindsight_censor_reasons),
                 "probe_initial": self.config.hindsight_probe_initial,
                 "probe_floor": self.config.hindsight_probe_floor,
                 "probe_decay_pairs": self.config.hindsight_probe_decay_pairs,

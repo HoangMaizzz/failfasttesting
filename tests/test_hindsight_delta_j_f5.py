@@ -146,6 +146,79 @@ class HindsightDeltaJF5Test(unittest.TestCase):
             ("bias", "current_mask_ratio", "first_unresolved_position"),
         )
 
+    def test_logistic_f2_uses_global_proposal_position(self):
+        item = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=6,
+            feature_schema="otrc_v2_2_compact_td",
+            credit_assignment="hindsight_delta_j_logistic_f2",
+            policy_mode="hindsight_delta_j_logistic_f2",
+        ))
+        features = item._hindsight_delta_j_logistic_f2_features(
+            {
+                "active_span_size": 8,
+                "current_mask_count": 4,
+            },
+            active_block_start_relative=8,
+            proposal_length=32,
+        )
+        self.assertEqual(features, (1.0, 0.5, 0.25))
+        self.assertEqual(
+            item.hindsight_feature_names,
+            ("bias", "current_mask_ratio", "global_proposal_position"),
+        )
+
+    def test_logistic_update_moves_continue_score_in_label_direction(self):
+        item = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=6,
+            feature_schema="otrc_v2_2_compact_td",
+            credit_assignment="hindsight_delta_j_logistic_f2",
+            policy_mode="hindsight_delta_j_logistic_f2",
+        ))
+        features = (1.0, 0.5, 0.25)
+        before = item.hindsight_logistic_model.predict(features)[1]
+        item.hindsight_logistic_model.update(features, 1, 1.0)
+        after = item.hindsight_logistic_model.predict(features)[1]
+        self.assertGreater(after, before)
+
+    def test_logistic_tie_does_not_update(self):
+        item = OnlineTDRefinementController(AdaptiveTDConfig(
+            feature_dim=6,
+            feature_schema="otrc_v2_2_compact_td",
+            credit_assignment="hindsight_delta_j_logistic_f2",
+            policy_mode="hindsight_delta_j_logistic_f2",
+            hindsight_delta_j_min_pairs=30,
+            hindsight_delta_j_min_continue_pairs=3,
+            hindsight_logistic_tie_ms_per_token=1.0,
+        ))
+        state = {"active_span_size": 8, "current_mask_count": 4}
+        target = list(range(8))
+        item.begin_hindsight_problem(7)
+        item.prepare_hindsight_snapshot(
+            draft_proposal=target, context_len=100,
+            active_block_start=100, active_block_end=108,
+            raw_current_state=None, f2_state=state,
+            proposal_length=8, max_spec_len=64, refinement_step=1,
+            next_forward_latency_ms=2.0, forward_pass_index=1,
+            decision_eligible=True,
+        )
+        item.choose((1.0,) * 6, allow_stop=True, refinement_step=1)
+        item.prepare_hindsight_snapshot(
+            draft_proposal=target, context_len=100,
+            active_block_start=100, active_block_end=108,
+            raw_current_state=None, f2_state=state,
+            proposal_length=8, max_spec_len=64, refinement_step=2,
+            next_forward_latency_ms=2.0, forward_pass_index=2,
+            decision_eligible=False,
+        )
+        item.hindsight_pending_pairs[-1]["next_forward_latency_ms"] = 2.0
+        item.observe_hindsight_verifier_boundary(
+            target, verifier_latency_ms=20.0, terminal=False,
+        )
+        row = item.full_stream_transitions[-1]
+        self.assertTrue(row["is_tie"])
+        self.assertFalse(row["update_applied"])
+        self.assertEqual(item.hindsight_logistic_model.sample_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
