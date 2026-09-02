@@ -659,6 +659,7 @@ parser.add_argument(
         "verifier_boundary_factual",
         "verifier_boundary_factual_no_bootstrap",
         "hindsight_block_gain",
+        "hindsight_delta_j_f5",
     ],
     default="per_step_td",
 )
@@ -701,6 +702,7 @@ parser.add_argument(
         "symmetric_annealed",
         "symmetric_greedy",
         "hindsight_gain",
+        "hindsight_delta_j_f5",
     ],
     default="legacy",
 )
@@ -760,6 +762,14 @@ parser.add_argument("--adaptive-hindsight-probe-decay-pairs", type=float, defaul
 parser.add_argument("--adaptive-hindsight-probe-uncertainty-tokens", type=float, default=0.75)
 parser.add_argument("--adaptive-hindsight-probe-boundary-scale", type=float, default=1.0)
 parser.add_argument("--adaptive-hindsight-probe-max-fraction", type=float, default=0.08)
+parser.add_argument("--adaptive-hindsight-delta-j-p-continue-threshold", type=float, default=0.65)
+parser.add_argument("--adaptive-hindsight-delta-j-class-balance-alpha", type=float, default=5.0)
+parser.add_argument("--adaptive-hindsight-delta-j-max-continue-weight", type=float, default=3.0)
+parser.add_argument("--adaptive-hindsight-delta-j-calibration-beta", type=float, default=0.05)
+parser.add_argument("--adaptive-hindsight-delta-j-min-pairs", type=int, default=30)
+parser.add_argument("--adaptive-hindsight-delta-j-min-continue-pairs", type=int, default=3)
+parser.add_argument("--adaptive-hindsight-delta-j-structural-probe", type=float, default=0.08)
+parser.add_argument("--adaptive-hindsight-delta-j-floor-probe", type=float, default=0.02)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -1020,6 +1030,28 @@ def build_adaptive_controller(args):
                 args.adaptive_hindsight_probe_boundary_scale
             ),
             hindsight_probe_max_fraction=args.adaptive_hindsight_probe_max_fraction,
+            hindsight_delta_j_p_continue_threshold=(
+                args.adaptive_hindsight_delta_j_p_continue_threshold
+            ),
+            hindsight_delta_j_class_balance_alpha=(
+                args.adaptive_hindsight_delta_j_class_balance_alpha
+            ),
+            hindsight_delta_j_max_continue_weight=(
+                args.adaptive_hindsight_delta_j_max_continue_weight
+            ),
+            hindsight_delta_j_calibration_beta=(
+                args.adaptive_hindsight_delta_j_calibration_beta
+            ),
+            hindsight_delta_j_min_pairs=args.adaptive_hindsight_delta_j_min_pairs,
+            hindsight_delta_j_min_continue_pairs=(
+                args.adaptive_hindsight_delta_j_min_continue_pairs
+            ),
+            hindsight_delta_j_structural_probe_probability=(
+                args.adaptive_hindsight_delta_j_structural_probe
+            ),
+            hindsight_delta_j_floor_probe_probability=(
+                args.adaptive_hindsight_delta_j_floor_probe
+            ),
         )
     )
 
@@ -5646,6 +5678,8 @@ for problem_id, is_warmup in tqdm(
                             ):
                                 args.adaptive_td_controller.observe_hindsight_verifier_boundary(
                                     tokens_to_append,
+                                    verifier_latency_ms=verify_time * 1000.0,
+                                    post_verify_latency_ms=post_verify_time * 1000.0,
                                     terminal=(
                                         target_tokenizer.eos_token_id in tokens_to_append
                                         or len(current_token_ids) >= num_target_tokens

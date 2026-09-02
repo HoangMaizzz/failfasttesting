@@ -2034,6 +2034,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "uses_hindsight_block_gain",
                                     False,
                                 ))
+                                hindsight_delta_j_f5 = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_delta_j_f5",
+                                    False,
+                                ))
+                                hindsight_raw_gain = bool(
+                                    hindsight_block_gain and not hindsight_delta_j_f5
+                                )
                                 hindsight_frame_eligible = bool(
                                     not hindsight_block_gain
                                     or (
@@ -2044,7 +2052,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 raw_state_requested = bool(
                                     adaptive_controller.config.feature_schema
                                     == "otrc_raw_state_v1"
-                                    or (hindsight_block_gain and hindsight_frame_eligible)
+                                    or (hindsight_raw_gain and hindsight_frame_eligible)
                                     or getattr(
                                         args,
                                         "adaptive_collect_raw_state",
@@ -2113,7 +2121,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         0 < active_span_length <= RAW_STATE_BLOCK_SIZE
                                         and len(raw_local_indices) == active_span_length
                                     )
-                                    if not hindsight_block_gain:
+                                    if not hindsight_raw_gain:
                                         valid_raw_span = bool(
                                             valid_raw_span
                                             and active_span_length
@@ -2132,7 +2140,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             dtype=torch.float32,
                                         )).item()),
                                     )
-                                    if hindsight_block_gain:
+                                    if hindsight_raw_gain:
                                         # Hindsight states must describe exactly this
                                         # physical eight-token Fast-dLLM forward.
                                         observed_probabilities = p_1t[0].float()
@@ -2255,6 +2263,69 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         active_absolute_end,
                                     )
                                 )
+                                hindsight_f5_state = None
+                                if hindsight_delta_j_f5 and hindsight_frame_eligible:
+                                    f5_started = time.perf_counter()
+                                    f5_local_indices = torch.tensor(
+                                        raw_local_indices,
+                                        device=p_1t.device,
+                                        dtype=torch.long,
+                                    )
+                                    f5_probabilities = p_1t[0].float().index_select(
+                                        0, f5_local_indices
+                                    )
+                                    f5_top2 = torch.topk(
+                                        f5_probabilities, k=2, dim=-1
+                                    ).values
+                                    f5_entropy_scale = max(
+                                        1.0,
+                                        float(math.log(f5_probabilities.shape[-1])),
+                                    )
+                                    f5_entropy = -torch.sum(
+                                        f5_probabilities
+                                        * torch.log(torch.clamp(
+                                            f5_probabilities, min=1e-12
+                                        )),
+                                        dim=-1,
+                                    ) / f5_entropy_scale
+                                    f5_mask = x_t[
+                                        0,
+                                        active_absolute_start:active_absolute_end,
+                                    ].eq(mask_id)
+                                    masked_entropy = f5_entropy[f5_mask]
+                                    resolved_entropy = f5_entropy[~f5_mask]
+                                    resolved_margin = (
+                                        f5_top2[:, 0] - f5_top2[:, 1]
+                                    )[~f5_mask]
+                                    f5_summary = torch.stack([
+                                        f5_mask.sum().float(),
+                                        (
+                                            masked_entropy.std(unbiased=False)
+                                            if masked_entropy.numel() > 1
+                                            else f5_entropy.new_zeros(())
+                                        ),
+                                        (
+                                            resolved_margin.mean()
+                                            if resolved_margin.numel()
+                                            else f5_entropy.new_zeros(())
+                                        ),
+                                        (
+                                            resolved_entropy.max()
+                                            if resolved_entropy.numel()
+                                            else f5_entropy.new_zeros(())
+                                        ),
+                                    ]).detach().cpu().tolist()
+                                    hindsight_f5_state = {
+                                        "active_span_size": int(active_span_length),
+                                        "current_mask_count": int(f5_summary[0]),
+                                        "masked_entropy_std": float(f5_summary[1]),
+                                        "resolved_margin_mean": float(f5_summary[2]),
+                                        "resolved_entropy_max": float(f5_summary[3]),
+                                    }
+                                    adaptive_controller.record_profile(
+                                        "hindsight_f5_feature_aggregation",
+                                        (time.perf_counter() - f5_started) * 1000.0,
+                                    )
                                 (
                                     production_stop_candidate,
                                     adaptive_stop_fill_tokens,
@@ -2509,6 +2580,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             active_block_start=int(active_absolute_start),
                                             active_block_end=int(active_absolute_end),
                                             raw_current_state=raw_current_state,
+                                            f5_state=hindsight_f5_state,
                                             proposal_length=int(target_len),
                                             max_spec_len=int(max_spec_len),
                                             refinement_step=int(adaptive_refinement_step),
@@ -2663,6 +2735,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 False,
                                             )
                                         ),
+                                        failfast_fallback_action="continue",
                                     )
                                     adaptive_record = {
                                         "step": int(adaptive_refinement_step),
