@@ -662,7 +662,6 @@ parser.add_argument(
         "hindsight_delta_j_f5",
         "hindsight_delta_j_f2",
         "hindsight_delta_j_logistic_f2",
-        "hindsight_delta_j_two_expert",
     ],
     default="per_step_td",
 )
@@ -708,7 +707,6 @@ parser.add_argument(
         "hindsight_delta_j_f5",
         "hindsight_delta_j_f2",
         "hindsight_delta_j_logistic_f2",
-        "hindsight_delta_j_two_expert",
     ],
     default="legacy",
 )
@@ -777,19 +775,6 @@ parser.add_argument("--adaptive-hindsight-delta-j-min-continue-pairs", type=int,
 parser.add_argument("--adaptive-hindsight-delta-j-structural-probe", type=float, default=0.08)
 parser.add_argument("--adaptive-hindsight-delta-j-floor-probe", type=float, default=0.02)
 parser.add_argument("--adaptive-hindsight-logistic-learning-rate", type=float, default=0.05)
-parser.add_argument(
-    "--adaptive-hindsight-logistic-optimizer",
-    choices=["sgd", "irls"],
-    default="sgd",
-    help=(
-        "Optimizer for hindsight logistic F2. 'sgd' preserves the original "
-        "one-step online update; 'irls' refits all accumulated resolved "
-        "non-tie pairs with damped Newton/IRLS."
-    ),
-)
-parser.add_argument("--adaptive-hindsight-logistic-l2", type=float, default=0.1)
-parser.add_argument("--adaptive-hindsight-logistic-irls-max-iter", type=int, default=25)
-parser.add_argument("--adaptive-hindsight-logistic-irls-tolerance", type=float, default=1e-8)
 parser.add_argument("--adaptive-hindsight-logistic-continue-threshold", type=float, default=0.5)
 parser.add_argument("--adaptive-hindsight-logistic-tie-ms-per-token", type=float, default=1.0)
 parser.add_argument(
@@ -799,19 +784,27 @@ parser.add_argument(
 )
 parser.add_argument("--adaptive-hindsight-logistic-min-positive-problems", type=int, default=2)
 parser.add_argument(
-    "--adaptive-hindsight-two-expert-selector-window",
-    type=int,
-    default=20,
-    help="Rolling resolved-pair window used to select the lower-utility expert.",
+    "--adaptive-hindsight-logistic-utility-weighting",
+    choices=["legacy", "raw_abs"],
+    default="legacy",
+    help=(
+        "legacy keeps clipped normalized utility/class weighting; raw_abs uses "
+        "sample_weight=abs(delta_J_ms_per_token) with no class weighting."
+    ),
 )
 parser.add_argument(
-    "--adaptive-hindsight-two-expert-continue-threshold",
-    type=float,
-    default=0.5,
+    "--adaptive-hindsight-logistic-replay-batch-size",
+    type=int,
+    default=0,
     help=(
-        "Decision threshold for each raw-|deltaJ|-weighted utility expert. "
-        "At the weighted optimum, 0.5 corresponds to negative expected delta J."
+        "0 disables replay and updates on the current resolved pair only. "
+        "16 enables the tested U1 batch-1x mini-batch update."
     ),
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-replay-buffer-size",
+    type=int,
+    default=100,
 )
 parser.add_argument(
     "--dist-decision-rule",
@@ -1098,18 +1091,6 @@ def build_adaptive_controller(args):
             hindsight_logistic_learning_rate=(
                 args.adaptive_hindsight_logistic_learning_rate
             ),
-            hindsight_logistic_optimizer=(
-                args.adaptive_hindsight_logistic_optimizer
-            ),
-            hindsight_logistic_l2=(
-                args.adaptive_hindsight_logistic_l2
-            ),
-            hindsight_logistic_irls_max_iter=(
-                args.adaptive_hindsight_logistic_irls_max_iter
-            ),
-            hindsight_logistic_irls_tolerance=(
-                args.adaptive_hindsight_logistic_irls_tolerance
-            ),
             hindsight_logistic_continue_threshold=(
                 args.adaptive_hindsight_logistic_continue_threshold
             ),
@@ -1122,11 +1103,14 @@ def build_adaptive_controller(args):
             hindsight_logistic_min_positive_problems=(
                 args.adaptive_hindsight_logistic_min_positive_problems
             ),
-            hindsight_two_expert_selector_window=(
-                args.adaptive_hindsight_two_expert_selector_window
+            hindsight_logistic_utility_weighting=(
+                args.adaptive_hindsight_logistic_utility_weighting
             ),
-            hindsight_two_expert_continue_threshold=(
-                args.adaptive_hindsight_two_expert_continue_threshold
+            hindsight_logistic_replay_batch_size=(
+                args.adaptive_hindsight_logistic_replay_batch_size
+            ),
+            hindsight_logistic_replay_buffer_size=(
+                args.adaptive_hindsight_logistic_replay_buffer_size
             ),
         )
     )

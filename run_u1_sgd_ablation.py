@@ -1,5 +1,6 @@
 import argparse
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -12,16 +13,17 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 ROOT = Path(__file__).resolve().parent
 DATASETS = ("math", "gsm8k")
-METHODS = ("failfast", "logistic_f2_e2", "two_expert_utility")
+METHODS = ("failfast", "logistic_f2_e2", "u1_single", "u1_batch1x")
 KNOWN_UNRUNNABLE_IDS = {"math": {301}, "gsm8k": set()}
 REPLACEMENT_IDS = {"math": (489,), "gsm8k": ()}
+DATASET_SIZES = {"math": 500, "gsm8k": 1319}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
-    parser.add_argument("--num_questions", type=int, default=25)
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=["failfast", "u1_batch1x"])
+    parser.add_argument("--num_questions", type=int, default=100)
     parser.add_argument("--id_offset", type=int, default=25)
     parser.add_argument("--target_quantization", default="int8")
     parser.add_argument("--target_device", type=int, default=0)
@@ -37,7 +39,7 @@ def parse_args():
         "--output_dir",
         default=(
             "/home/maihoang/failfasttesting/"
-            "outputs_two_expert_utility_tauD0p50_tauF0p70_new25"
+            "outputs_u1_batch1x_fixed05_tauD0p50_tauF0p70"
         ),
     )
     return parser.parse_args()
@@ -63,6 +65,14 @@ def run(command):
 def selected_ids(args, dataset):
     start = args.id_offset
     candidates = list(PROBLEM_IDS[dataset][start:]) + list(REPLACEMENT_IDS[dataset])
+    used = set(candidates)
+    supplemental = [
+        problem_id for problem_id in range(DATASET_SIZES[dataset])
+        if problem_id not in used
+        and problem_id not in KNOWN_UNRUNNABLE_IDS[dataset]
+    ]
+    random.Random(42000 + sum(map(ord, dataset))).shuffle(supplemental)
+    candidates.extend(supplemental)
     ids = [
         problem_id for problem_id in candidates
         if problem_id not in KNOWN_UNRUNNABLE_IDS[dataset]
@@ -106,33 +116,15 @@ def command(args, dataset, method, destination):
         "--log_level", "INFO",
     ]
     if method != "failfast":
-        is_two_expert = method == "two_expert_utility"
         result.extend([
             "--adaptive-td",
-            "--adaptive-feature-schema", (
-                "otrc_v2_3_compact7_td" if is_two_expert
-                else "otrc_v2_2_compact_td"
-            ),
-            "--adaptive-credit-assignment", (
-                "hindsight_delta_j_two_expert" if is_two_expert
-                else "hindsight_delta_j_logistic_f2"
-            ),
-            "--adaptive-policy-mode", (
-                "hindsight_delta_j_two_expert" if is_two_expert
-                else "hindsight_delta_j_logistic_f2"
-            ),
+            "--adaptive-feature-schema", "otrc_v2_2_compact_td",
+            "--adaptive-credit-assignment", "hindsight_delta_j_logistic_f2",
+            "--adaptive-policy-mode", "hindsight_delta_j_logistic_f2",
             "--adaptive-hindsight-logistic-learning-rate", "0.05",
-            "--adaptive-hindsight-logistic-optimizer", (
-                "irls" if is_two_expert else "sgd"
-            ),
-            "--adaptive-hindsight-logistic-l2", "0.1",
-            "--adaptive-hindsight-logistic-irls-max-iter", "25",
-            "--adaptive-hindsight-logistic-irls-tolerance", "1e-8",
             "--adaptive-hindsight-logistic-continue-threshold", "0.5",
             "--adaptive-hindsight-logistic-tie-ms-per-token", "1.0",
             "--adaptive-hindsight-logistic-min-positive-problems", "2",
-            "--adaptive-hindsight-two-expert-selector-window", "20",
-            "--adaptive-hindsight-two-expert-continue-threshold", "0.5",
             "--adaptive-hindsight-delta-j-class-balance-alpha", "5.0",
             "--adaptive-hindsight-delta-j-max-continue-weight", "3.0",
             "--adaptive-hindsight-delta-j-min-pairs", "30",
@@ -142,13 +134,25 @@ def command(args, dataset, method, destination):
             "--adaptive-log-decisions",
             "--adaptive-profile-overhead",
         ])
-        # Old E2 keeps its class weighting.  The two-expert utility method
-        # deliberately disables it and uses raw |delta J| inside both experts.
-        result.append(
-            "--adaptive-hindsight-logistic-use-class-weight"
-            if method == "logistic_f2_e2"
-            else "--no-adaptive-hindsight-logistic-use-class-weight"
-        )
+        if method == "logistic_f2_e2":
+            result.extend([
+                "--adaptive-hindsight-logistic-utility-weighting", "legacy",
+                "--adaptive-hindsight-logistic-replay-batch-size", "0",
+                "--adaptive-hindsight-logistic-use-class-weight",
+            ])
+        elif method == "u1_single":
+            result.extend([
+                "--adaptive-hindsight-logistic-utility-weighting", "raw_abs",
+                "--adaptive-hindsight-logistic-replay-batch-size", "0",
+                "--no-adaptive-hindsight-logistic-use-class-weight",
+            ])
+        elif method == "u1_batch1x":
+            result.extend([
+                "--adaptive-hindsight-logistic-utility-weighting", "raw_abs",
+                "--adaptive-hindsight-logistic-replay-batch-size", "16",
+                "--adaptive-hindsight-logistic-replay-buffer-size", "100",
+                "--no-adaptive-hindsight-logistic-use-class-weight",
+            ])
     return result
 
 
@@ -197,10 +201,6 @@ def summarize(dataset, method, destination):
         "tie_pairs": int(runtime["tie_count"]),
         "censored_pairs": int(runtime["censored_count"]),
     })
-    selector_counts = runtime.get("two_expert_selection_counts", {})
-    if selector_counts:
-        row["selected_structural_expert"] = int(selector_counts.get("structural", 0))
-        row["selected_dynamics_expert"] = int(selector_counts.get("dynamics", 0))
     if not transitions.empty:
         update_applied = transitions.update_applied.map(
             lambda value: str(value).strip().lower() in {"1", "true", "yes"}
@@ -242,14 +242,6 @@ def summarize(dataset, method, destination):
             & (labeled.action_source == "learned_continue")
         ]
         row["sum_delta_j_learned_continue"] = float(learned_c.delta_J_ms_per_token.sum())
-        if "structural_shadow_utility" in labeled.columns:
-            row["sum_structural_shadow_utility"] = float(
-                pd.to_numeric(labeled.structural_shadow_utility, errors="coerce").fillna(0.0).sum()
-            )
-        if "dynamics_shadow_utility" in labeled.columns:
-            row["sum_dynamics_shadow_utility"] = float(
-                pd.to_numeric(labeled.dynamics_shadow_utility, errors="coerce").fillna(0.0).sum()
-            )
         row["mean_delta_j_learned_continue"] = (
             float(learned_c.delta_J_ms_per_token.mean()) if len(learned_c) else float("nan")
         )
@@ -294,13 +286,11 @@ def main():
         "tau_f": args.lowconf_threshold,
         "tie_ms_per_token": 1.0,
         "continue_threshold": 0.5,
-        "E2": "F2 SGD with clipped utility weighting plus CONTINUE class weighting",
-        "two_expert_utility": (
-            "Two accumulated IRLS experts: structural/confidence and "
-            "dynamics/cost. Both use raw |delta J| weights and no class "
-            "weight. A rolling realized-utility selector (window=20) chooses "
-            "the expert online without dataset identity."
-        ),
+        "fixed_continue_threshold": 0.5,
+        "E2": "legacy clipped normalized utility plus CONTINUE class weighting",
+        "U1_single": "raw abs(delta_J_ms_per_token), no class weighting, current-pair SGD",
+        "U1_batch1x": "U1 objective + one uniform minibatch SGD update per resolved pair; batch=16, buffer=100",
+        "replay_rng": "dedicated seed+7919 so minibatch sampling does not perturb probe RNG",
         "IPS": "logged only; not used for learner updates",
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

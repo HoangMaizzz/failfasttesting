@@ -2050,16 +2050,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     "uses_hindsight_delta_j_logistic_f2",
                                     False,
                                 ))
-                                hindsight_delta_j_two_expert = bool(getattr(
-                                    adaptive_controller,
-                                    "uses_hindsight_delta_j_two_expert",
-                                    False,
-                                ))
                                 hindsight_delta_j = bool(
                                     hindsight_delta_j_f5
                                     or hindsight_delta_j_f2
                                     or hindsight_delta_j_logistic_f2
-                                    or hindsight_delta_j_two_expert
                                 )
                                 hindsight_raw_gain = bool(
                                     hindsight_block_gain and not hindsight_delta_j
@@ -2538,38 +2532,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_stats["adaptive_last_features"] = list(features)
                                 step_record["adaptive_features"] = list(features)
 
-                                hindsight_two_expert_state = None
-                                if hindsight_delta_j_two_expert and hindsight_frame_eligible:
-                                    hindsight_two_expert_state = {
-                                        "proposal_length": int(target_len),
-                                        "max_spec_len": int(max_spec_len),
-                                        "proposal_remaining_masks": int(masks_remaining),
-                                        "proposal_remaining_confidences": [
-                                            float(value)
-                                            for value in proposal_remaining_confidences
-                                        ],
-                                        "prefix_length": int(prefix_length),
-                                        "prefix_advance": int(max(
-                                            0, prefix_length - prefix_length_before
-                                        )),
-                                        "active_span_length": int(active_span_length),
-                                        "active_remaining_masks": int(
-                                            len(active_remaining_positions)
-                                        ),
-                                        "active_newly_unmasked": int(unmasked_this_step),
-                                        "active_block_start_relative": int(
-                                            logical_relative_start
-                                        ),
-                                        "failfast_candidate_min_confidence": float(
-                                            min(active_candidate_confidences)
-                                            if active_candidate_confidences
-                                            else 0.0
-                                        ),
-                                        "failfast_threshold": float(tau_f),
-                                        "drafter_threshold": float(threshold),
-                                        "refinement_step": int(adaptive_refinement_step),
-                                    }
-
                                 zero_cost_fill_available = (
                                     not production_stop_missing_positions
                                     and all(
@@ -2680,9 +2642,6 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             ),
                                             remaining_masks=int(
                                                 len(active_remaining_positions)
-                                            ),
-                                            two_expert_state=(
-                                                hindsight_two_expert_state
                                             ),
                                         )
                                     )
