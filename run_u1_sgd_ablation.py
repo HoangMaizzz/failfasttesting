@@ -12,11 +12,11 @@ from run_otrc_v2_td_benchmark import PROBLEM_IDS
 
 
 ROOT = Path(__file__).resolve().parent
-DATASETS = ("math", "gsm8k")
+DATASETS = ("math", "gsm8k", "humaneval")
 METHODS = ("failfast", "logistic_f2_e2", "u1_single", "u1_batch1x")
-KNOWN_UNRUNNABLE_IDS = {"math": {301}, "gsm8k": set()}
-REPLACEMENT_IDS = {"math": (489,), "gsm8k": ()}
-DATASET_SIZES = {"math": 500, "gsm8k": 1319}
+KNOWN_UNRUNNABLE_IDS = {"math": {301}, "gsm8k": set(), "humaneval": set()}
+REPLACEMENT_IDS = {"math": (489,), "gsm8k": (), "humaneval": ()}
+DATASET_SIZES = {"math": 500, "gsm8k": 1319, "humaneval": 164}
 
 
 def parse_args():
