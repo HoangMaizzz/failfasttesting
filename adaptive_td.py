@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import csv
-import json
 import math
 import random
 import time
-from pathlib import Path
 from bisect import insort
 from dataclasses import dataclass, field
 from statistics import NormalDist
@@ -130,6 +127,12 @@ HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES = (
     "bias",
     "current_mask_ratio",
     "global_proposal_position",
+)
+HINDSIGHT_DELTA_J_LOGISTIC_F3_PREFIX_FEATURE_NAMES = (
+    "bias",
+    "current_mask_ratio",
+    "global_proposal_position",
+    "normalized_current_prefix_length",
 )
 
 
@@ -299,18 +302,17 @@ class AdaptiveTDConfig:
     hindsight_logistic_continue_threshold: float = 0.5
     hindsight_logistic_tie_ms_per_token: float = 1.0
     hindsight_logistic_use_class_weight: bool = False
+    # Optional third causal feature for the U1 logistic learner:
+    # contiguous current draft prefix length / current proposal length.
+    hindsight_logistic_use_prefix_feature: bool = False
     hindsight_logistic_min_positive_problems: int = 2
     hindsight_logistic_utility_weighting: str = "legacy"
     hindsight_logistic_replay_batch_size: int = 0
     hindsight_logistic_replay_buffer_size: int = 100
-    # Threshold policy for the F2 logistic controller. "fixed" preserves the
-    # original score > continue_threshold rule. "dynamic_utility" re-scores
-    # all resolved history with the current weights and chooses the score
-    # threshold whose historical CONTINUE set minimizes sum(delta_J).
-    hindsight_logistic_threshold_mode: str = "fixed"
-    hindsight_logistic_dynamic_min_support: int = 10
-    hindsight_logistic_dynamic_min_history: int = 100
-    hindsight_logistic_dynamic_history_size: int = 0  # 0 = all history
+    # U1 batch-1x replay class ratio. 3.0 means 3 STOP : 1 Good-C
+    # inside each replay mini-batch. Set <= 0 to recover the original
+    # uniform replay behavior.
+    hindsight_logistic_replay_stop_to_continue_ratio: float = 3.0
 
     def __post_init__(self) -> None:
         if self.feature_dim <= 0:
@@ -464,16 +466,10 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight logistic replay batch size must be non-negative")
         if self.hindsight_logistic_replay_buffer_size <= 0:
             raise ValueError("hindsight logistic replay buffer size must be positive")
-        if self.hindsight_logistic_threshold_mode not in {"fixed", "dynamic_utility"}:
+        if self.hindsight_logistic_replay_stop_to_continue_ratio < 0.0:
             raise ValueError(
-                "hindsight logistic threshold mode must be fixed or dynamic_utility"
+                "hindsight logistic replay STOP:CONTINUE ratio must be non-negative"
             )
-        if self.hindsight_logistic_dynamic_min_support <= 0:
-            raise ValueError("dynamic threshold min support must be positive")
-        if self.hindsight_logistic_dynamic_min_history < 0:
-            raise ValueError("dynamic threshold min history must be non-negative")
-        if self.hindsight_logistic_dynamic_history_size < 0:
-            raise ValueError("dynamic threshold history size must be non-negative")
         if not 0.0 < self.factual_ema_alpha <= 1.0:
             raise ValueError("factual_ema_alpha must be in (0, 1]")
         if self.rho_warmup_boundaries < 0:
@@ -942,7 +938,11 @@ class OnlineTDRefinementController:
         elif config.credit_assignment == "hindsight_delta_j_f2":
             hindsight_feature_names = HINDSIGHT_DELTA_J_F2_FEATURE_NAMES
         elif config.credit_assignment == "hindsight_delta_j_logistic_f2":
-            hindsight_feature_names = HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES
+            hindsight_feature_names = (
+                HINDSIGHT_DELTA_J_LOGISTIC_F3_PREFIX_FEATURE_NAMES
+                if config.hindsight_logistic_use_prefix_feature
+                else HINDSIGHT_DELTA_J_LOGISTIC_F2_FEATURE_NAMES
+            )
         else:
             hindsight_feature_names = HINDSIGHT_GAIN_FEATURE_NAMES
         self.hindsight_feature_names = hindsight_feature_names
@@ -957,16 +957,6 @@ class OnlineTDRefinementController:
         )
         self.hindsight_logistic_abs_r: list[float] = []
         self.hindsight_logistic_replay_buffer: list[tuple[list[float], int, float]] = []
-        # Full causal history used only by the dynamic utility threshold. Each
-        # item stores (features_at_state, realized_delta_J_ms_per_token).
-        self.hindsight_logistic_utility_history: list[tuple[list[float], float]] = []
-        self.hindsight_logistic_dynamic_threshold_dirty = True
-        self.hindsight_logistic_dynamic_threshold_cache = float(
-            config.hindsight_logistic_continue_threshold
-        )
-        self.hindsight_logistic_dynamic_threshold_utility_cache = 0.0
-        self.hindsight_logistic_dynamic_threshold_support_cache = 0
-        self.hindsight_logistic_dynamic_threshold_active_cache = False
         # Dedicated RNG: replay sampling must not perturb probe/exploration randomness.
         self.hindsight_logistic_replay_rng = random.Random(config.seed + 7919)
         self.hindsight_logistic_tie_count = 0
@@ -1231,23 +1221,35 @@ class OnlineTDRefinementController:
             _clip(float(f2_state["first_unresolved_position"]), 0.0, 1.0),
         )
 
-    @staticmethod
     def _hindsight_delta_j_logistic_f2_features(
+        self,
         *,
         current_mask_count: int,
         active_span_size: int,
         active_block_start_relative: int,
         proposal_length: int,
+        prefix_length: int | None = None,
     ) -> tuple[float, ...]:
         active_span = max(1, int(active_span_size))
-        return (
+        proposal_length = max(1, int(proposal_length))
+        base = (
             1.0,
             _clip(float(current_mask_count) / active_span, 0.0, 1.0),
             _clip(
-                float(active_block_start_relative) / max(1, int(proposal_length)),
+                float(active_block_start_relative) / proposal_length,
                 0.0,
                 1.0,
             ),
+        )
+        if not self.config.hindsight_logistic_use_prefix_feature:
+            return base
+        if prefix_length is None:
+            raise ValueError(
+                "prefix_length is required when "
+                "hindsight_logistic_use_prefix_feature=True"
+            )
+        return base + (
+            _clip(float(prefix_length) / proposal_length, 0.0, 1.0),
         )
 
     def begin_hindsight_problem(self, problem_id) -> None:
@@ -1283,6 +1285,7 @@ class OnlineTDRefinementController:
         forward_pass_index: int,
         decision_eligible: bool,
         remaining_masks: int | None = None,
+        prefix_length: int | None = None,
     ) -> dict:
         if not self.uses_hindsight_block_gain:
             return {}
@@ -1312,7 +1315,13 @@ class OnlineTDRefinementController:
         elif self.uses_hindsight_delta_j_f2:
             state_complete = f2_state is not None
         elif self.uses_hindsight_delta_j_logistic_f2:
-            state_complete = remaining_masks is not None
+            state_complete = (
+                remaining_masks is not None
+                and (
+                    not self.config.hindsight_logistic_use_prefix_feature
+                    or prefix_length is not None
+                )
+            )
         else:
             state_complete = raw_complete
         valid = (
@@ -1348,12 +1357,16 @@ class OnlineTDRefinementController:
                 active_span_size=active_span,
                 active_block_start_relative=relative_start,
                 proposal_length=proposal_length,
+                prefix_length=prefix_length,
             )
             f2_state = {
                 "active_span_size": int(active_span),
                 "current_mask_count": int(remaining_masks),
                 "global_proposal_position": float(features[2]),
             }
+            if self.config.hindsight_logistic_use_prefix_feature:
+                f2_state["normalized_current_prefix_length"] = float(features[3])
+                f2_state["current_prefix_length"] = int(prefix_length)
         else:
             features = self._hindsight_features(
                 raw_current_state,
@@ -1462,6 +1475,11 @@ class OnlineTDRefinementController:
                 "logistic_logit": float(logistic_logit),
                 "continue_score": float(continue_score),
             })
+            if self.config.hindsight_logistic_use_prefix_feature:
+                result.update({
+                    "current_prefix_length": int(f2_state["current_prefix_length"]),
+                    "normalized_current_prefix_length": float(features[3]),
+                })
         return result
 
     @staticmethod
@@ -1594,13 +1612,9 @@ class OnlineTDRefinementController:
                 features = pair["before"]["features"]
                 pre_logit = float(pair["before"]["logistic_logit"])
                 pre_score = float(pair["before"]["continue_score"])
-                threshold_used = float(
-                    pair["before"].get(
-                        "continue_threshold_used",
-                        self.config.hindsight_logistic_continue_threshold,
-                    )
+                predicted_continue = (
+                    pre_score > self.config.hindsight_logistic_continue_threshold
                 )
-                predicted_continue = pre_score > threshold_used
                 counts_before = (
                     self.hindsight_delta_j_continue_count,
                     self.hindsight_delta_j_stop_count,
@@ -1611,6 +1625,8 @@ class OnlineTDRefinementController:
                 loss = None
                 running_median = None
                 replay_batch_size_used = 0
+                replay_continue_count_used = 0
+                replay_stop_count_used = 0
                 replay_buffer_size_before = len(self.hindsight_logistic_replay_buffer)
                 weights_before = list(self.hindsight_logistic_model.weights)
                 if is_tie:
@@ -1669,13 +1685,73 @@ class OnlineTDRefinementController:
                             self.config.hindsight_logistic_replay_batch_size,
                             len(self.hindsight_logistic_replay_buffer),
                         )
-                        if replay_batch_size_used == len(self.hindsight_logistic_replay_buffer):
+
+                        # U1 batch-1x 3:1 replay ablation:
+                        # keep the causal labels and raw-|delta J| weights exactly
+                        # as before, but control only which resolved pairs enter
+                        # each SGD mini-batch. With batch_size=16 and ratio=3.0,
+                        # the target composition is 12 STOP + 4 Good-C.
+                        replay_ratio = float(
+                            self.config.hindsight_logistic_replay_stop_to_continue_ratio
+                        )
+                        if replay_ratio > 0.0:
+                            continue_pool = [
+                                item for item in self.hindsight_logistic_replay_buffer
+                                if int(item[1]) == 1
+                            ]
+                            stop_pool = [
+                                item for item in self.hindsight_logistic_replay_buffer
+                                if int(item[1]) == 0
+                            ]
+                        else:
+                            continue_pool = []
+                            stop_pool = []
+
+                        if (
+                            replay_ratio > 0.0
+                            and continue_pool
+                            and stop_pool
+                            and replay_batch_size_used > 1
+                        ):
+                            target_continue = max(
+                                1,
+                                int(round(
+                                    replay_batch_size_used / (1.0 + replay_ratio)
+                                )),
+                            )
+                            target_continue = min(
+                                target_continue, replay_batch_size_used - 1
+                            )
+                            target_stop = replay_batch_size_used - target_continue
+
+                            def _sample_class(pool, count):
+                                if count <= len(pool):
+                                    return self.hindsight_logistic_replay_rng.sample(
+                                        pool, count
+                                    )
+                                # Minority-class oversampling is intentional: it
+                                # enforces the requested replay ratio without
+                                # changing labels, utility weights, LR, or the
+                                # number of SGD updates (still exactly one).
+                                return list(pool) + self.hindsight_logistic_replay_rng.choices(
+                                    pool, k=count - len(pool)
+                                )
+
+                            batch = (
+                                _sample_class(stop_pool, target_stop)
+                                + _sample_class(continue_pool, target_continue)
+                            )
+                            self.hindsight_logistic_replay_rng.shuffle(batch)
+                        elif replay_batch_size_used == len(self.hindsight_logistic_replay_buffer):
                             batch = list(self.hindsight_logistic_replay_buffer)
                         else:
                             batch = self.hindsight_logistic_replay_rng.sample(
                                 self.hindsight_logistic_replay_buffer,
                                 replay_batch_size_used,
                             )
+
+                        replay_continue_count_used = sum(int(item[1]) == 1 for item in batch)
+                        replay_stop_count_used = len(batch) - replay_continue_count_used
                         loss = self.hindsight_logistic_model.update_batch(batch)
                     else:
                         loss = self.hindsight_logistic_model.update(
@@ -1691,21 +1767,6 @@ class OnlineTDRefinementController:
                         )
                     else:
                         self.hindsight_delta_j_stop_count += 1
-                    # The just-resolved pair becomes available only for future
-                    # thresholds. This preserves causal calibration.
-                    self.hindsight_logistic_utility_history.append((
-                        [float(value) for value in features],
-                        float(delta_j),
-                    ))
-                    history_limit = int(
-                        self.config.hindsight_logistic_dynamic_history_size
-                    )
-                    if (
-                        history_limit > 0
-                        and len(self.hindsight_logistic_utility_history) > history_limit
-                    ):
-                        del self.hindsight_logistic_utility_history[:-history_limit]
-                    self.hindsight_logistic_dynamic_threshold_dirty = True
                 row = {
                     "transition_kind": self.config.credit_assignment,
                     "problem_id": pair["before"]["problem_id"],
@@ -1735,26 +1796,15 @@ class OnlineTDRefinementController:
                     "label_reason": "tie" if is_tie else label_reason,
                     "logistic_logit_before_update": pre_logit,
                     "continue_score_before_update": pre_score,
-                    "continue_threshold": threshold_used,
-                    "fixed_continue_threshold": self.config.hindsight_logistic_continue_threshold,
-                    "threshold_mode": pair["before"].get(
-                        "threshold_mode", self.config.hindsight_logistic_threshold_mode
-                    ),
-                    "dynamic_threshold_active": pair["before"].get(
-                        "dynamic_threshold_active", False
-                    ),
-                    "dynamic_threshold_utility": pair["before"].get(
-                        "dynamic_threshold_utility"
-                    ),
-                    "dynamic_threshold_support": pair["before"].get(
-                        "dynamic_threshold_support", 0
-                    ),
-                    "dynamic_threshold_history_count": pair["before"].get(
-                        "dynamic_threshold_history_count", 0
-                    ),
+                    "continue_threshold": self.config.hindsight_logistic_continue_threshold,
                     "utility_weighting_mode": self.config.hindsight_logistic_utility_weighting,
                     "replay_batch_size_config": self.config.hindsight_logistic_replay_batch_size,
                     "replay_buffer_size_config": self.config.hindsight_logistic_replay_buffer_size,
+                    "replay_stop_to_continue_ratio_config": (
+                        self.config.hindsight_logistic_replay_stop_to_continue_ratio
+                    ),
+                    "replay_continue_count_used": replay_continue_count_used,
+                    "replay_stop_count_used": replay_stop_count_used,
                     "replay_buffer_size_before": replay_buffer_size_before,
                     "replay_buffer_size_after": len(self.hindsight_logistic_replay_buffer),
                     "replay_batch_size_used": replay_batch_size_used,
@@ -2468,237 +2518,6 @@ class OnlineTDRefinementController:
             },
         )
 
-    def load_hindsight_logistic_warm_start(self, output_dir: str | Path) -> dict:
-        """Load a previous F2/U1 learner state without importing old timings.
-
-        Expected files are `adaptive_td_runtime_state.json` and
-        `adaptive_full_stream_transitions.csv` from a previous method output
-        directory. Only learner state is restored: final logistic weights,
-        labeled history, replay buffer, C/S counts, positive-problem ids, and
-        replay RNG position. Benchmark/runtime counters for the new run remain
-        fresh, so reported latency covers only the new questions.
-        """
-        root = Path(output_dir)
-        runtime_path = root / "adaptive_td_runtime_state.json"
-        transitions_path = root / "adaptive_full_stream_transitions.csv"
-        if not runtime_path.exists():
-            raise FileNotFoundError(runtime_path)
-        if not transitions_path.exists():
-            raise FileNotFoundError(transitions_path)
-
-        runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-        hindsight = runtime["hindsight_block_gain"]
-        saved = hindsight["logistic_model"]
-        saved_features = list(saved.get("feature_names", []))
-        if saved_features and saved_features != list(self.hindsight_feature_names):
-            raise ValueError(
-                "warm-start logistic feature schema mismatch: "
-                f"saved={saved_features}, current={list(self.hindsight_feature_names)}"
-            )
-        weights = [float(value) for value in saved["weights"]]
-        if len(weights) != self.hindsight_logistic_model.dimension:
-            raise ValueError("warm-start logistic weight dimension mismatch")
-
-        history: list[tuple[list[float], float]] = []
-        replay: list[tuple[list[float], int, float]] = []
-        positive_problem_ids: set[int] = set()
-        n_c = 0
-        n_s = 0
-        abs_r: list[float] = []
-        with transitions_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                applied = str(row.get("update_applied", "")).strip().lower()
-                if applied not in {"1", "true", "yes"}:
-                    continue
-                try:
-                    features = [
-                        float(row[name]) for name in self.hindsight_feature_names
-                    ]
-                    delta_j = float(row["delta_J_ms_per_token"])
-                    label = int(float(row["binary_label_C"]))
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"invalid warm-start transition row in {transitions_path}"
-                    ) from exc
-                sample_weight = abs(delta_j)
-                history.append((features, delta_j))
-                replay.append((features, label, sample_weight))
-                normalized = row.get("normalized_delta_J")
-                if normalized not in {None, ""}:
-                    try:
-                        abs_r.append(abs(float(normalized)))
-                    except ValueError:
-                        pass
-                if label:
-                    n_c += 1
-                    try:
-                        positive_problem_ids.add(int(float(row["problem_id"])))
-                    except (KeyError, TypeError, ValueError):
-                        pass
-                else:
-                    n_s += 1
-
-        self.hindsight_logistic_model.weights = weights
-        self.hindsight_logistic_model.sample_count = int(saved.get("sample_count", len(history)))
-        self.hindsight_logistic_model.weight_sum = float(
-            saved.get("sample_weight_sum", sum(item[2] for item in replay))
-        )
-        mean_loss = float(saved.get("mean_weighted_loss", 0.0))
-        self.hindsight_logistic_model.loss_sum = (
-            mean_loss * self.hindsight_logistic_model.sample_count
-        )
-        self.hindsight_delta_j_continue_count = n_c
-        self.hindsight_delta_j_stop_count = n_s
-        self.hindsight_logistic_positive_problem_ids = positive_problem_ids
-        self.hindsight_logistic_abs_r = sorted(abs_r)
-
-        buffer_limit = int(self.config.hindsight_logistic_replay_buffer_size)
-        self.hindsight_logistic_replay_buffer = replay[-buffer_limit:]
-        history_limit = int(self.config.hindsight_logistic_dynamic_history_size)
-        self.hindsight_logistic_utility_history = (
-            history[-history_limit:] if history_limit > 0 else history
-        )
-        self.hindsight_logistic_dynamic_threshold_dirty = True
-
-        # Advance the dedicated replay RNG exactly as an uninterrupted batch-1x
-        # run would have done. This keeps future replay samples matched when the
-        # previous run used the same seed/batch/buffer settings.
-        self.hindsight_logistic_replay_rng = random.Random(self.config.seed + 7919)
-        batch_size = int(self.config.hindsight_logistic_replay_batch_size)
-        if batch_size > 0:
-            for index in range(1, len(replay) + 1):
-                current_size = min(index, buffer_limit)
-                used = min(batch_size, current_size)
-                if used < current_size:
-                    self.hindsight_logistic_replay_rng.sample(
-                        range(current_size), used
-                    )
-
-        return {
-            "source": str(root),
-            "loaded_pairs": len(history),
-            "loaded_C": n_c,
-            "loaded_S": n_s,
-            "loaded_positive_problems": len(positive_problem_ids),
-            "weights": list(weights),
-        }
-
-    def _hindsight_logistic_effective_threshold(self) -> tuple[float, dict]:
-        """Return the causal fixed/dynamic threshold for the current weights.
-
-        Dynamic mode evaluates every distinct top-score prefix in resolved
-        history. Utility is measured relative to STOP as
-            U(tau) = sum(delta_J_i * 1[score_i > tau]).
-        The all-STOP policy (tau=1) is always a candidate with utility 0. A
-        learned threshold may select a non-empty prefix only when it contains
-        at least `dynamic_min_support` historical states. History is re-scored
-        using the *current* logistic weights, so score-scale drift from online
-        SGD does not invalidate the calibration.
-        """
-        fixed = float(self.config.hindsight_logistic_continue_threshold)
-        mode = self.config.hindsight_logistic_threshold_mode
-        history_total = len(self.hindsight_logistic_utility_history)
-        if mode != "dynamic_utility":
-            return fixed, {
-                "threshold_mode": "fixed",
-                "dynamic_threshold_active": False,
-                "dynamic_threshold_utility": None,
-                "dynamic_threshold_support": 0,
-                "dynamic_threshold_history_count": history_total,
-            }
-
-        if not self.hindsight_logistic_dynamic_threshold_dirty:
-            return self.hindsight_logistic_dynamic_threshold_cache, {
-                "threshold_mode": "dynamic_utility",
-                "dynamic_threshold_active": bool(
-                    self.hindsight_logistic_dynamic_threshold_active_cache
-                ),
-                "dynamic_threshold_utility": float(
-                    self.hindsight_logistic_dynamic_threshold_utility_cache
-                ),
-                "dynamic_threshold_support": int(
-                    self.hindsight_logistic_dynamic_threshold_support_cache
-                ),
-                "dynamic_threshold_history_count": history_total,
-            }
-
-        history = self.hindsight_logistic_utility_history
-        history_size = int(self.config.hindsight_logistic_dynamic_history_size)
-        if history_size > 0 and len(history) > history_size:
-            history = history[-history_size:]
-        history_count = len(history)
-        min_history = int(self.config.hindsight_logistic_dynamic_min_history)
-        min_support = int(self.config.hindsight_logistic_dynamic_min_support)
-
-        # Before enough causal evidence exists, preserve the fixed 0.5 rule.
-        if history_count < max(min_history, min_support):
-            threshold = fixed
-            best_utility = 0.0
-            best_support = 0
-            active = False
-        else:
-            scored = []
-            for features, delta_j in history:
-                _, current_score = self.hindsight_logistic_model.predict(features)
-                scored.append((float(current_score), float(delta_j)))
-            scored.sort(key=lambda item: item[0], reverse=True)
-
-            # All STOP is the safe baseline and has zero relative utility.
-            threshold = 1.0
-            best_utility = 0.0
-            best_support = 0
-            cumulative_utility = 0.0
-            selected_count = 0
-            index = 0
-            n = len(scored)
-            while index < n:
-                group_score = scored[index][0]
-                group_delta = 0.0
-                group_count = 0
-                while index < n and scored[index][0] == group_score:
-                    group_delta += scored[index][1]
-                    group_count += 1
-                    index += 1
-                cumulative_utility += group_delta
-                selected_count += group_count
-                if selected_count < min_support:
-                    continue
-                if index < n:
-                    next_score = scored[index][0]
-                    candidate_threshold = 0.5 * (group_score + next_score)
-                else:
-                    # Logistic scores are in (0,1). nextafter includes the
-                    # lowest-score group without inventing a tuned epsilon.
-                    candidate_threshold = max(
-                        0.0, math.nextafter(group_score, -math.inf)
-                    )
-                if cumulative_utility < best_utility:
-                    best_utility = float(cumulative_utility)
-                    best_support = int(selected_count)
-                    threshold = float(candidate_threshold)
-
-            active = best_support >= min_support and best_utility < 0.0
-            if not active:
-                # No supported historically profitable CONTINUE region: use
-                # all STOP rather than forcing an arbitrary threshold.
-                threshold = 1.0
-                best_utility = 0.0
-                best_support = 0
-
-        self.hindsight_logistic_dynamic_threshold_cache = float(threshold)
-        self.hindsight_logistic_dynamic_threshold_utility_cache = float(best_utility)
-        self.hindsight_logistic_dynamic_threshold_support_cache = int(best_support)
-        self.hindsight_logistic_dynamic_threshold_active_cache = bool(active)
-        self.hindsight_logistic_dynamic_threshold_dirty = False
-        return float(threshold), {
-            "threshold_mode": "dynamic_utility",
-            "dynamic_threshold_active": bool(active),
-            "dynamic_threshold_utility": float(best_utility),
-            "dynamic_threshold_support": int(best_support),
-            "dynamic_threshold_history_count": int(history_count),
-        }
-
     def _choose_hindsight_delta_j_logistic_f2(
         self,
         *,
@@ -2720,9 +2539,6 @@ class OnlineTDRefinementController:
             and len(self.hindsight_logistic_positive_problem_ids)
             >= self.config.hindsight_logistic_min_positive_problems
         )
-        effective_threshold, threshold_info = (
-            self._hindsight_logistic_effective_threshold()
-        )
         exploration_used = False
         probe_probability = 0.0
         structural_eligible = mask_count >= 2
@@ -2736,7 +2552,7 @@ class OnlineTDRefinementController:
             action = failfast_fallback_action
             action_source = "cold_start_continue" if action == CONTINUE else "cold_start_stop"
             reason = "hindsight_failfast_cold_start"
-        elif score > effective_threshold:
+        elif score > self.config.hindsight_logistic_continue_threshold:
             action, action_source = CONTINUE, "learned_continue"
             reason = "hindsight_logistic_continue"
         else:
@@ -2786,14 +2602,6 @@ class OnlineTDRefinementController:
                 "decision_reason": reason,
                 "learner_ready": learner_ready,
                 "behavior_continue_probability": behavior_continue_probability,
-                "continue_threshold_used": float(effective_threshold),
-                "threshold_mode": threshold_info["threshold_mode"],
-                "dynamic_threshold_active": threshold_info["dynamic_threshold_active"],
-                "dynamic_threshold_utility": threshold_info["dynamic_threshold_utility"],
-                "dynamic_threshold_support": threshold_info["dynamic_threshold_support"],
-                "dynamic_threshold_history_count": threshold_info[
-                    "dynamic_threshold_history_count"
-                ],
             })
         if action == CONTINUE and snapshot is not None:
             key = (
@@ -2832,15 +2640,7 @@ class OnlineTDRefinementController:
                 "controller_name": self.config.credit_assignment,
                 "logistic_logit": logit,
                 "continue_score": score,
-                "continue_threshold": float(effective_threshold),
-                "fixed_continue_threshold": self.config.hindsight_logistic_continue_threshold,
-                "threshold_mode": threshold_info["threshold_mode"],
-                "dynamic_threshold_active": threshold_info["dynamic_threshold_active"],
-                "dynamic_threshold_utility": threshold_info["dynamic_threshold_utility"],
-                "dynamic_threshold_support": threshold_info["dynamic_threshold_support"],
-                "dynamic_threshold_history_count": threshold_info[
-                    "dynamic_threshold_history_count"
-                ],
+                "continue_threshold": self.config.hindsight_logistic_continue_threshold,
                 "utility_weighting_mode": self.config.hindsight_logistic_utility_weighting,
                 "replay_batch_size": self.config.hindsight_logistic_replay_batch_size,
                 "replay_buffer_size": len(self.hindsight_logistic_replay_buffer),
@@ -4204,29 +4004,6 @@ class OnlineTDRefinementController:
                 ),
                 "positive_problem_ids": sorted(
                     self.hindsight_logistic_positive_problem_ids
-                ),
-                "threshold_mode": self.config.hindsight_logistic_threshold_mode,
-                "fixed_continue_threshold": self.config.hindsight_logistic_continue_threshold,
-                "dynamic_threshold": float(
-                    self.hindsight_logistic_dynamic_threshold_cache
-                ),
-                "dynamic_threshold_active": bool(
-                    self.hindsight_logistic_dynamic_threshold_active_cache
-                ),
-                "dynamic_threshold_utility": float(
-                    self.hindsight_logistic_dynamic_threshold_utility_cache
-                ),
-                "dynamic_threshold_support": int(
-                    self.hindsight_logistic_dynamic_threshold_support_cache
-                ),
-                "dynamic_threshold_history_count": len(
-                    self.hindsight_logistic_utility_history
-                ),
-                "dynamic_threshold_min_support": int(
-                    self.config.hindsight_logistic_dynamic_min_support
-                ),
-                "dynamic_threshold_min_history": int(
-                    self.config.hindsight_logistic_dynamic_min_history
                 ),
                 "censor_reasons": dict(self.hindsight_censor_reasons),
                 "probe_initial": self.config.hindsight_probe_initial,

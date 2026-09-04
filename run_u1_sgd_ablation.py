@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument("--num_questions", type=int, default=100)
     parser.add_argument("--continue_threshold", type=float, default=0.5)
     parser.add_argument("--soft_probe", action="store_true")
+    parser.add_argument("--replay_stop_to_continue_ratio", type=float, default=0.0)
     parser.add_argument("--id_offset", type=int, default=25)
     parser.add_argument("--target_quantization", default="int8")
     parser.add_argument("--target_device", type=int, default=0)
@@ -118,6 +119,10 @@ def command(args, dataset, method, destination):
         "--log_level", "INFO",
     ]
     if method != "failfast":
+        result.extend([
+            "--adaptive-hindsight-logistic-replay-stop-to-continue-ratio",
+            str(args.replay_stop_to_continue_ratio),
+        ])
         if args.soft_probe:
             result.append("--adaptive-hindsight-soft-probe")
         result.extend([
@@ -291,6 +296,7 @@ def main():
         "tie_ms_per_token": 1.0,
         "continue_threshold": args.continue_threshold,
         "fixed_continue_threshold": args.continue_threshold,
+        "replay_stop_to_continue_ratio": args.replay_stop_to_continue_ratio,
         "soft_probe": args.soft_probe,
         "soft_probe_parameters": {"base": 0.08, "max": 0.24, "tau_k": 1.5, "gamma": 1.5, "floor": 0.02},
         "E2": "legacy clipped normalized utility plus CONTINUE class weighting",

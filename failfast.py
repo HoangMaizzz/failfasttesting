@@ -783,6 +783,15 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=False,
 )
+parser.add_argument(
+    "--adaptive-hindsight-logistic-use-prefix-feature",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "Add normalized current contiguous draft-prefix length "
+        "prefix_length/proposal_length as the third dynamic U1 logistic feature."
+    ),
+)
 parser.add_argument("--adaptive-hindsight-logistic-min-positive-problems", type=int, default=2)
 parser.add_argument(
     "--adaptive-hindsight-logistic-utility-weighting",
@@ -808,35 +817,13 @@ parser.add_argument(
     default=100,
 )
 parser.add_argument(
-    "--adaptive-hindsight-logistic-threshold-mode",
-    choices=["fixed", "dynamic_utility"],
-    default="fixed",
-    help="Use fixed score threshold or causal all-history utility threshold.",
-)
-parser.add_argument(
-    "--adaptive-hindsight-logistic-dynamic-min-support",
-    type=int,
-    default=10,
-    help="Minimum historical states selected by a non-empty dynamic threshold.",
-)
-parser.add_argument(
-    "--adaptive-hindsight-logistic-dynamic-min-history",
-    type=int,
-    default=100,
-    help="Resolved non-tie pairs required before dynamic calibration activates.",
-)
-parser.add_argument(
-    "--adaptive-hindsight-logistic-dynamic-history-size",
-    type=int,
-    default=0,
-    help="0 uses all history; positive values use only the most recent N pairs.",
-)
-parser.add_argument(
-    "--adaptive-hindsight-logistic-warm-start-dir",
-    default=None,
+    "--adaptive-hindsight-logistic-replay-stop-to-continue-ratio",
+    type=float,
+    default=3.0,
     help=(
-        "Optional previous method output directory containing "
-        "adaptive_td_runtime_state.json and adaptive_full_stream_transitions.csv."
+        "Replay mini-batch STOP:Good-C count ratio for U1 batch-1x. "
+        "3.0 gives 12 STOP + 4 Good-C for batch size 16. "
+        "Set 0 to recover the original uniform replay sampler."
     ),
 )
 parser.add_argument(
@@ -1134,6 +1121,9 @@ def build_adaptive_controller(args):
             hindsight_logistic_use_class_weight=(
                 args.adaptive_hindsight_logistic_use_class_weight
             ),
+            hindsight_logistic_use_prefix_feature=(
+                args.adaptive_hindsight_logistic_use_prefix_feature
+            ),
             hindsight_logistic_min_positive_problems=(
                 args.adaptive_hindsight_logistic_min_positive_problems
             ),
@@ -1146,40 +1136,14 @@ def build_adaptive_controller(args):
             hindsight_logistic_replay_buffer_size=(
                 args.adaptive_hindsight_logistic_replay_buffer_size
             ),
-            hindsight_logistic_threshold_mode=(
-                args.adaptive_hindsight_logistic_threshold_mode
-            ),
-            hindsight_logistic_dynamic_min_support=(
-                args.adaptive_hindsight_logistic_dynamic_min_support
-            ),
-            hindsight_logistic_dynamic_min_history=(
-                args.adaptive_hindsight_logistic_dynamic_min_history
-            ),
-            hindsight_logistic_dynamic_history_size=(
-                args.adaptive_hindsight_logistic_dynamic_history_size
+            hindsight_logistic_replay_stop_to_continue_ratio=(
+                args.adaptive_hindsight_logistic_replay_stop_to_continue_ratio
             ),
         )
     )
 
 
 args.adaptive_td_controller = build_adaptive_controller(args)
-args.adaptive_hindsight_warm_start_info = None
-if args.adaptive_hindsight_logistic_warm_start_dir:
-    controller = args.adaptive_td_controller
-    if controller is None or not hasattr(controller, "load_hindsight_logistic_warm_start"):
-        raise ValueError(
-            "--adaptive-hindsight-logistic-warm-start-dir requires the online TD controller"
-        )
-    args.adaptive_hindsight_warm_start_info = (
-        controller.load_hindsight_logistic_warm_start(
-            args.adaptive_hindsight_logistic_warm_start_dir
-        )
-    )
-    print(
-        "[adaptive warm-start] "
-        + json.dumps(args.adaptive_hindsight_warm_start_info, sort_keys=True),
-        flush=True,
-    )
 args.strict_greedy_profile = (
     load_verifier_profile(args.strict_greedy_verifier_profile)
     if args.strict_greedy_local_oracle
