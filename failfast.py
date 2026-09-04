@@ -775,6 +775,7 @@ parser.add_argument("--adaptive-hindsight-delta-j-min-continue-pairs", type=int,
 parser.add_argument("--adaptive-hindsight-delta-j-structural-probe", type=float, default=0.08)
 parser.add_argument("--adaptive-hindsight-delta-j-floor-probe", type=float, default=0.02)
 parser.add_argument("--adaptive-hindsight-logistic-learning-rate", type=float, default=0.05)
+parser.add_argument("--adaptive-hindsight-soft-probe", action="store_true")
 parser.add_argument("--adaptive-hindsight-logistic-continue-threshold", type=float, default=0.5)
 parser.add_argument("--adaptive-hindsight-logistic-tie-ms-per-token", type=float, default=1.0)
 parser.add_argument(
@@ -1123,6 +1124,7 @@ def build_adaptive_controller(args):
             hindsight_logistic_learning_rate=(
                 args.adaptive_hindsight_logistic_learning_rate
             ),
+            hindsight_soft_probe=args.adaptive_hindsight_soft_probe,
             hindsight_logistic_continue_threshold=(
                 args.adaptive_hindsight_logistic_continue_threshold
             ),

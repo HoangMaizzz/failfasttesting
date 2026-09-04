@@ -2643,6 +2643,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             remaining_masks=int(
                                                 len(active_remaining_positions)
                                             ),
+                                            probe_state={
+                                                "prefix_length": int(prefix_length),
+                                                "remaining_masks": sum(
+                                                    int(token == mask_id)
+                                                    for token in current_draft_tokens
+                                                ),
+                                                "proposal_length": len(current_draft_tokens),
+                                            },
                                         )
                                     )
                                     step_record.update(hindsight_snapshot_fields)

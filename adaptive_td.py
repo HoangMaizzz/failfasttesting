@@ -12,6 +12,7 @@ from statistics import NormalDist
 from typing import Iterable, Sequence
 
 from adaptive_nonlinear import OnlineNonlinearVA
+from hindsight_soft_probe import soft_probe_probability
 
 
 STOP = "stop"
@@ -294,6 +295,7 @@ class AdaptiveTDConfig:
     hindsight_delta_j_structural_probe_probability: float = 0.08
     hindsight_delta_j_floor_probe_probability: float = 0.02
     hindsight_logistic_learning_rate: float = 0.05
+    hindsight_soft_probe: bool = False
     hindsight_logistic_continue_threshold: float = 0.5
     hindsight_logistic_tie_ms_per_token: float = 1.0
     hindsight_logistic_use_class_weight: bool = False
@@ -1271,6 +1273,7 @@ class OnlineTDRefinementController:
         active_block_start: int,
         active_block_end: int,
         raw_current_state,
+        probe_state=None,
         f5_state=None,
         f2_state=None,
         proposal_length: int,
@@ -1283,6 +1286,10 @@ class OnlineTDRefinementController:
     ) -> dict:
         if not self.uses_hindsight_block_gain:
             return {}
+        if self.config.hindsight_soft_probe and self.uses_hindsight_delta_j_logistic_f2:
+            if probe_state is None:
+                raise ValueError("soft probe requires post-commit proposal state")
+            soft_probe_probability(**probe_state)
         started = time.perf_counter()
         for pending in self.hindsight_pending_sources.values():
             if int(pending["last_forward_pass_index"]) != int(forward_pass_index):
@@ -1374,6 +1381,7 @@ class OnlineTDRefinementController:
             "features": list(features),
             "f5_state": dict(f5_state or {}),
             "f2_state": dict(f2_state or {}),
+            "probe_state": dict(probe_state or {}),
             "predicted_gain_tokens": active_span * normalized_mean,
             "predicted_sigma_tokens": active_span * normalized_sigma,
             "predicted_normalized_delta_j": normalized_mean,
@@ -2744,6 +2752,8 @@ class OnlineTDRefinementController:
         ):
             if structural_eligible:
                 probe_probability = self.config.hindsight_delta_j_structural_probe_probability
+                if self.config.hindsight_soft_probe:
+                    probe_probability, _ = soft_probe_probability(**snapshot["probe_state"])
                 probe_source = "structural_probe"
             else:
                 probe_probability = self.config.hindsight_delta_j_floor_probe_probability
@@ -2845,6 +2855,10 @@ class OnlineTDRefinementController:
                 "behavior_continue_probability": behavior_continue_probability,
                 "probe_probability": probe_probability,
                 "structural_probe_eligible": structural_eligible,
+                "soft_probe_enabled": self.config.hindsight_soft_probe,
+                "probe_prefix_length": (snapshot or {}).get("probe_state", {}).get("prefix_length"),
+                "probe_remaining_masks": (snapshot or {}).get("probe_state", {}).get("remaining_masks"),
+                "probe_proposal_length": (snapshot or {}).get("probe_state", {}).get("proposal_length"),
                 "failfast_fallback_action": failfast_fallback_action,
             },
         )
