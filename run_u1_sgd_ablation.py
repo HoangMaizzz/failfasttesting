@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=["failfast", "u1_batch1x"])
     parser.add_argument("--num_questions", type=int, default=100)
+    parser.add_argument("--continue_threshold", type=float, default=0.5)
     parser.add_argument("--id_offset", type=int, default=25)
     parser.add_argument("--target_quantization", default="int8")
     parser.add_argument("--target_device", type=int, default=0)
@@ -122,7 +123,7 @@ def command(args, dataset, method, destination):
             "--adaptive-credit-assignment", "hindsight_delta_j_logistic_f2",
             "--adaptive-policy-mode", "hindsight_delta_j_logistic_f2",
             "--adaptive-hindsight-logistic-learning-rate", "0.05",
-            "--adaptive-hindsight-logistic-continue-threshold", "0.5",
+            "--adaptive-hindsight-logistic-continue-threshold", str(args.continue_threshold),
             "--adaptive-hindsight-logistic-tie-ms-per-token", "1.0",
             "--adaptive-hindsight-logistic-min-positive-problems", "2",
             "--adaptive-hindsight-delta-j-class-balance-alpha", "5.0",
@@ -285,8 +286,8 @@ def main():
         "tau_d": args.drafter_threshold,
         "tau_f": args.lowconf_threshold,
         "tie_ms_per_token": 1.0,
-        "continue_threshold": 0.5,
-        "fixed_continue_threshold": 0.5,
+        "continue_threshold": args.continue_threshold,
+        "fixed_continue_threshold": args.continue_threshold,
         "E2": "legacy clipped normalized utility plus CONTINUE class weighting",
         "U1_single": "raw abs(delta_J_ms_per_token), no class weighting, current-pair SGD",
         "U1_batch1x": "U1 objective + one uniform minibatch SGD update per resolved pair; batch=16, buffer=100",
