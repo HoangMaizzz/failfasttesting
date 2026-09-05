@@ -49,7 +49,7 @@ def target_model_load_kwargs(args):
     }
     quantization = getattr(args, "target_quantization", "none")
     if quantization == "none":
-        kwargs["torch_dtype"] = "auto"
+        kwargs["torch_dtype"] = getattr(args, "target_dtype", "auto")
         return kwargs
     if torchao_weight_only:
         try:
@@ -524,6 +524,8 @@ parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--target_device", type=int, default=0)
 parser.add_argument("--drafter_device", type=int, default=0)
+parser.add_argument("--target_dtype", choices=["auto", "float16", "bfloat16"], default="auto")
+parser.add_argument("--drafter_dtype", choices=["auto", "float16", "bfloat16"], default="auto")
 parser.add_argument(
     "--target_quantization",
     choices=[
@@ -1252,6 +1254,8 @@ BENCHMARK_CSV_COLUMNS = [
     "reference_answer",
     "is_correct",
     "target_quantization",
+    "target_dtype",
+    "drafter_dtype",
     "gpu_peak_allocated_gib",
     "gpu_peak_reserved_gib",
     "gpu_memory_used_after_generation_gib",
@@ -2026,6 +2030,8 @@ def build_benchmark_row(
         "reference_answer": reference_answer,
         "is_correct": predicted_answer is not None and predicted_answer == reference_answer,
         "target_quantization": args.target_quantization,
+        "target_dtype": args.target_dtype,
+        "drafter_dtype": args.drafter_dtype,
         **gpu_memory_stats,
     }
 
@@ -4949,7 +4955,7 @@ if not args.read_pickle:
             logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
                 dllm_path,
-                torch_dtype="auto",
+                torch_dtype=args.drafter_dtype,
                 device_map={"": args.drafter_device},
                 trust_remote_code=True,
                 local_files_only=True,
@@ -4975,7 +4981,7 @@ if not args.read_pickle:
         try:
             draft_model = AutoModelForCausalLM.from_pretrained(
                 args.drafter_model_name,
-                torch_dtype="auto",
+                torch_dtype=args.drafter_dtype,
                 device_map={"": args.drafter_device}
             )
         except Exception as e:

@@ -29,6 +29,8 @@ def parse_args():
     parser.add_argument("--replay_stop_to_continue_ratio", type=float, default=0.0)
     parser.add_argument("--id_offset", type=int, default=25)
     parser.add_argument("--target_quantization", default="int8")
+    parser.add_argument("--target_dtype", choices=["auto", "float16", "bfloat16"], default="auto")
+    parser.add_argument("--drafter_dtype", choices=["auto", "float16", "bfloat16"], default="auto")
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=0)
     parser.add_argument("--drafter_threshold", type=float, default=0.50)
@@ -105,6 +107,8 @@ def command(args, dataset, method, destination):
         "--target_device", str(args.target_device),
         "--drafter_device", str(args.drafter_device),
         "--target_quantization", args.target_quantization,
+        "--target_dtype", getattr(args, "target_dtype", "auto"),
+        "--drafter_dtype", getattr(args, "drafter_dtype", "auto"),
         "--drafter_thresholds", str(args.drafter_threshold),
         "--sweep_lowconf_threshold", str(args.lowconf_threshold),
         "--sweep_max_spec_len", "64",
@@ -132,6 +136,7 @@ def command(args, dataset, method, destination):
             "--adaptive-policy-mode", "hindsight_delta_j_logistic_f2",
             "--adaptive-hindsight-logistic-learning-rate", "0.05",
             "--adaptive-hindsight-logistic-continue-threshold", str(args.continue_threshold),
+            "--adaptive-hindsight-logistic-threshold-mode", "fixed",
             "--adaptive-hindsight-logistic-tie-ms-per-token", "1.0",
             "--adaptive-hindsight-logistic-min-positive-problems", "2",
             "--adaptive-hindsight-delta-j-class-balance-alpha", "5.0",
@@ -296,6 +301,9 @@ def main():
         "tie_ms_per_token": 1.0,
         "continue_threshold": args.continue_threshold,
         "fixed_continue_threshold": args.continue_threshold,
+        "target_quantization": args.target_quantization,
+        "target_dtype": args.target_dtype,
+        "drafter_dtype": args.drafter_dtype,
         "replay_stop_to_continue_ratio": args.replay_stop_to_continue_ratio,
         "soft_probe": args.soft_probe,
         "soft_probe_parameters": {"base": 0.08, "max": 0.24, "tau_k": 1.5, "gamma": 1.5, "floor": 0.02},
