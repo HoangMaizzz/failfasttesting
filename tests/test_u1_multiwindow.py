@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController, FEATURE_SCHEMAS
-from run_u1_multiwindow_int8 import parse_args, problem_command
+from run_u1_multiwindow_int8 import parse_args, problem_command, dataset_command
 from run_u1_sgd_ablation import selected_ids
 
 
@@ -25,6 +25,15 @@ def history(delta, n=100):
 
 
 class MultiwindowTest(unittest.TestCase):
+    def test_single_process_keeps_all_ids_in_one_invocation(self):
+        with patch.object(sys, "argv", ["test", "--single_process"]):
+            args = parse_args()
+        ids = selected_ids(args, "gsm8k")
+        cmd = dataset_command(args, "gsm8k", ids, Path("out"))
+        self.assertEqual(cmd[cmd.index("--num_questions") + 1], "100")
+        self.assertEqual(cmd[cmd.index("--problem_ids") + 1:cmd.index("--warmup_questions")], list(map(str, ids)))
+        self.assertNotIn("--adaptive-state-path", cmd)
+
     def test_empty_or_harmful_history_stops(self):
         c = controller()
         self.assertEqual(c._get_dynamic_logistic_threshold()[0], 1.)

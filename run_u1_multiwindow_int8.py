@@ -25,6 +25,8 @@ def parse_args():
     p.add_argument("--output_dir", default=str(ROOT / "outputs_u1_multiwindow_int8_test100"))
     p.add_argument("--soft_probe", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--single_process", action="store_true",
+                   help="Keep models loaded across all questions in each dataset.")
     args = p.parse_args()
     args.target_quantization = "int8"
     args.target_device = args.drafter_device = 0
@@ -81,10 +83,46 @@ def run_logged(cmd, log_path):
             raise
 
 
+def dataset_command(args, dataset, problem_ids, destination):
+    cmd = problem_command(args, dataset, problem_ids[0], destination, None)
+    start = cmd.index("--problem_ids") + 1
+    end = cmd.index("--warmup_questions")
+    cmd[start:end] = list(map(str, problem_ids))
+    cmd[cmd.index("--num_questions") + 1] = str(len(problem_ids))
+    return cmd
+
+
+def run_dataset(args, output, dataset, problem_ids):
+    destination = output / "raw" / dataset / "continuous"
+    marker = destination / "complete.json"
+    if marker.exists():
+        data = pd.read_csv(destination / "benchmark_results.csv")
+        if data.problem_id.tolist() != problem_ids:
+            raise ValueError("Completed dataset has unexpected IDs")
+        return
+    if destination.exists():
+        destination.rename(destination.with_name(f"continuous_incomplete_{time.time_ns()}"))
+        print("Restarting incomplete dataset from its first question; old files preserved.", flush=True)
+    destination.mkdir(parents=True)
+    cmd = dataset_command(args, dataset, problem_ids, destination)
+    (destination / "command.json").write_text(json.dumps(cmd, indent=2))
+    print(f"\n{dataset.upper()} | {len(problem_ids)} questions | load models ONCE", flush=True)
+    run_logged(cmd, destination / "run.log")
+    data = pd.read_csv(destination / "benchmark_results.csv")
+    if data.problem_id.tolist() != problem_ids:
+        raise ValueError("Unexpected output problem IDs")
+    marker.write_text(json.dumps({"problem_ids": problem_ids}))
+
+
 def summarize(output, ids):
     rows = []
     for dataset, problem_ids in ids.items():
         frames = []
+        continuous = output / "raw" / dataset / "continuous" / "benchmark_results.csv"
+        if continuous.exists() and continuous.stat().st_size:
+            frame = pd.read_csv(continuous)
+            frame["dataset"] = dataset
+            frames.append(frame)
         for pid in problem_ids:
             directory = output / "raw" / dataset / f"id_{pid}"
             if (directory / "complete.json").exists():
@@ -118,8 +156,8 @@ def main():
                 "problem_ids": ids, "source_sha256": fingerprint.hexdigest(),
                 "windows": [50, 60, 100], "min_selected": 7, "se_beta": 0.3,
                 "ipw_clip": 50, "unquantized_dtype": "float16",
-                "restart_each_problem": True, "warmup_questions": 0,
-                "timing_note": "Generation timing excludes model loading; fresh process per question; no cross-hardware speedup claim."}
+                "restart_each_problem": not args.single_process, "warmup_questions": 0,
+                "timing_note": "Generation timing excludes model loading; no cross-hardware speedup claim."}
     path = output / "manifest.json"
     if output.exists():
         if not args.resume or not path.exists() or json.loads(path.read_text()) != manifest:
@@ -129,6 +167,11 @@ def main():
     subprocess.run([sys.executable, "patch_fastdllm_frontier.py", args.dllm_dir], cwd=ROOT, check=True)
     try:
         for dataset, problem_ids in ids.items():
+            if args.single_process:
+                run_dataset(args, output, dataset, problem_ids)
+                summarize(output, ids)
+                print("ARCHIVE:", shutil.make_archive(str(output), "zip", output.parent, output.name), flush=True)
+                continue
             checkpoint = None
             for index, pid in enumerate(problem_ids, 1):
                 destination = output / "raw" / dataset / f"id_{pid}"
