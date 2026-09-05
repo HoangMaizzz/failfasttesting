@@ -30,7 +30,7 @@ def main():
     output = root / ("outputs_u1_fixed05_math100_fp16_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     command = [
         sys.executable, "-u", "run_u1_sgd_ablation.py",
-        "--datasets", "math", "--methods", "u1_batch1x",
+        "--datasets", "math", "--methods", "failfast", "u1_batch1x",
         "--num_questions", "100", "--id_offset", "25",
         "--continue_threshold", "0.5",
         "--replay_stop_to_continue_ratio", "0",
@@ -61,21 +61,30 @@ def main():
     print("Checking lossless output against independent FP16 greedy verifier...", flush=True)
     subprocess.run(reference_command, cwd=root, check=True)
     columns = ["problem_id", "output_tokens", "output_token_hash"]
-    adaptive = pd.read_csv(output / "raw/math/u1_batch1x/benchmark_results.csv")[columns]
     reference = pd.read_csv(reference_dir / "benchmark_results.csv")[columns]
-    paired = adaptive.merge(reference, on="problem_id", how="outer",
-                            suffixes=("_u1", "_reference"), validate="one_to_one", indicator=True)
-    paired["exact_match"] = (
-        paired["_merge"].eq("both")
-        & paired.output_tokens_u1.eq(paired.output_tokens_reference)
-        & paired.output_token_hash_u1.eq(paired.output_token_hash_reference)
-    )
-    paired.to_csv(output / "lossless_output_comparison.csv", index=False)
-    passed = len(paired) == 100 and bool(paired.exact_match.all())
+    comparisons = []
+    method_audits = {}
+    for method in ("failfast", "u1_batch1x"):
+        result = pd.read_csv(output / "raw" / "math" / method / "benchmark_results.csv")[columns]
+        paired = result.merge(reference, on="problem_id", how="outer",
+                              suffixes=("_method", "_reference"), validate="one_to_one", indicator=True)
+        paired["method"] = method
+        paired["exact_match"] = (
+            paired["_merge"].eq("both")
+            & paired.output_tokens_method.eq(paired.output_tokens_reference)
+            & paired.output_token_hash_method.eq(paired.output_token_hash_reference)
+        )
+        method_audits[method] = {
+            "passed": len(paired) == 100 and bool(paired.exact_match.all()),
+            "matched": int(paired.exact_match.sum()),
+            "questions": len(paired),
+            "mismatch_ids": paired.loc[~paired.exact_match, "problem_id"].tolist(),
+        }
+        comparisons.append(paired)
+    pd.concat(comparisons, ignore_index=True).to_csv(output / "lossless_output_comparison.csv", index=False)
+    passed = all(item["passed"] for item in method_audits.values())
     audit = {
-        "passed": passed, "matched": int(paired.exact_match.sum()),
-        "questions": len(paired),
-        "mismatch_ids": paired.loc[~paired.exact_match, "problem_id"].tolist(),
+        "passed": passed, "methods": method_audits,
         "comparison": "full generated token sequence SHA256 and length, including EOS",
         "reference_time_included_in_u1_timing": False,
     }
