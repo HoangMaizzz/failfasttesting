@@ -24,7 +24,7 @@ def main():
         raise RuntimeError("This unquantized two-model run requires a 24-GB-class GPU or larger.")
     model_dir = root / "Fast_dLLM_v2_1.5B"
     snapshot_download(
-        "ruipeterpan/Fast_dLLM_v2_1.5B", local_dir=str(model_dir),
+        "Efficient-Large-Model/Fast_dLLM_v2_1.5B", local_dir=str(model_dir),
         ignore_patterns=["*.bin", "*.pt", "*.msgpack", "*.h5"],
     )
     output = root / ("outputs_u1_fixed05_math100_fp16_" + datetime.now().strftime("%Y%m%d_%H%M%S"))

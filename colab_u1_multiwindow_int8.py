@@ -14,7 +14,7 @@ def main():
     root = Path(__file__).resolve().parent
     subprocess.run(["nvidia-smi"], check=True)
     model = root / "Fast_dLLM_v2_1.5B"
-    snapshot_download("ruipeterpan/Fast_dLLM_v2_1.5B", local_dir=str(model),
+    snapshot_download("Efficient-Large-Model/Fast_dLLM_v2_1.5B", local_dir=str(model),
                       ignore_patterns=["*.bin", "*.pt", "*.msgpack", "*.h5"])
     subprocess.run([
         sys.executable, "-u", "run_u1_multiwindow_int8.py",
