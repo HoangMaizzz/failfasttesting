@@ -246,17 +246,16 @@ class HindsightDeltaJF5Test(unittest.TestCase):
             feature_schema="otrc_v2_2_compact_td",
             credit_assignment="hindsight_delta_j_logistic_f2",
             policy_mode="hindsight_delta_j_logistic_f2",
-            hindsight_logistic_threshold_mode="dynamic_utility",
-            hindsight_logistic_dynamic_min_history=3,
-            hindsight_logistic_dynamic_min_support=2,
+            hindsight_logistic_dynamic_threshold=True,
+            hindsight_logistic_dynamic_min_selected=3,
         ))
-        item.hindsight_logistic_utility_history = [
-            ([1.0, 0.8, 0.1], -4.0),
-            ([1.0, 0.7, 0.2], -3.0),
+        item.hindsight_logistic_calibration_history = [
+            {"features": [1.0, 0.8, 0.1], "delta_j": -4.0},
+            {"features": [1.0, 0.7, 0.2], "delta_j": -3.0},
         ]
-        threshold, info = item._hindsight_logistic_effective_threshold()
-        self.assertEqual(threshold, 0.5)
-        self.assertFalse(info["dynamic_threshold_active"])
+        threshold, info = item._get_dynamic_logistic_threshold()
+        self.assertEqual(threshold, 1.0)
+        self.assertEqual(info["dynamic_threshold_w50_reason"], "insufficient_history")
 
     def test_dynamic_threshold_keeps_all_stop_as_safe_candidate(self):
         item = OnlineTDRefinementController(AdaptiveTDConfig(
@@ -264,19 +263,17 @@ class HindsightDeltaJF5Test(unittest.TestCase):
             feature_schema="otrc_v2_2_compact_td",
             credit_assignment="hindsight_delta_j_logistic_f2",
             policy_mode="hindsight_delta_j_logistic_f2",
-            hindsight_logistic_threshold_mode="dynamic_utility",
-            hindsight_logistic_dynamic_min_history=2,
-            hindsight_logistic_dynamic_min_support=2,
+            hindsight_logistic_dynamic_threshold=True,
+            hindsight_logistic_dynamic_min_selected=2,
         ))
         item.hindsight_logistic_model.weights = [0.0, 2.0, 0.0]
-        item.hindsight_logistic_utility_history = [
-            ([1.0, 0.8, 0.1], 4.0),
-            ([1.0, 0.7, 0.2], 3.0),
+        item.hindsight_logistic_calibration_history = [
+            {"features": [1.0, 0.8, 0.1], "delta_j": 4.0},
+            {"features": [1.0, 0.7, 0.2], "delta_j": 3.0},
         ]
-        threshold, info = item._hindsight_logistic_effective_threshold()
+        threshold, info = item._get_dynamic_logistic_threshold()
         self.assertEqual(threshold, 1.0)
-        self.assertFalse(info["dynamic_threshold_active"])
-        self.assertEqual(info["dynamic_threshold_utility"], 0.0)
+        self.assertEqual(info["dynamic_threshold_w50_reason"], "no_profitable_tail")
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ def target_model_load_kwargs(args):
     }
     quantization = getattr(args, "target_quantization", "none")
     if quantization == "none":
-        kwargs["torch_dtype"] = getattr(args, "target_dtype", "auto")
+        kwargs["torch_dtype"] = getattr(args, "unquantized_dtype", "auto")
         return kwargs
     if torchao_weight_only:
         try:
@@ -524,8 +524,8 @@ parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--target_device", type=int, default=0)
 parser.add_argument("--drafter_device", type=int, default=0)
-parser.add_argument("--target_dtype", choices=["auto", "float16", "bfloat16"], default="auto")
-parser.add_argument("--drafter_dtype", choices=["auto", "float16", "bfloat16"], default="auto")
+parser.add_argument("--unquantized_dtype", choices=["auto", "float16", "bfloat16"], default="auto",
+                    help="Dtype for the dLLM and any unquantized target; use float16 on T4.")
 parser.add_argument(
     "--target_quantization",
     choices=[
@@ -817,6 +817,43 @@ parser.add_argument(
     "--adaptive-hindsight-logistic-replay-buffer-size",
     type=int,
     default=100,
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-dynamic-threshold",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Enable recent multi-window utility calibration of the logistic CONTINUE "
+        "threshold. Historical states are re-scored with the current learner."
+    ),
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-dynamic-windows",
+    type=str,
+    default="50,60,100",
+    help="Comma-separated recent causal-pair windows used by dynamic calibration.",
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-dynamic-min-selected",
+    type=int,
+    default=7,
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-dynamic-se-beta",
+    type=float,
+    default=0.30,
+    help="Require mean(delta_J) + beta*SE < 0 for a CONTINUE tail.",
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-dynamic-use-ipw",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use inverse behavior-probability weights for probed STOP states.",
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-dynamic-ipw-clip",
+    type=float,
+    default=50.0,
 )
 parser.add_argument(
     "--adaptive-hindsight-logistic-replay-stop-to-continue-ratio",
@@ -1138,6 +1175,26 @@ def build_adaptive_controller(args):
             hindsight_logistic_replay_buffer_size=(
                 args.adaptive_hindsight_logistic_replay_buffer_size
             ),
+            hindsight_logistic_dynamic_threshold=(
+                args.adaptive_hindsight_logistic_dynamic_threshold
+            ),
+            hindsight_logistic_dynamic_windows=tuple(
+                int(part.strip())
+                for part in args.adaptive_hindsight_logistic_dynamic_windows.split(",")
+                if part.strip()
+            ),
+            hindsight_logistic_dynamic_min_selected=(
+                args.adaptive_hindsight_logistic_dynamic_min_selected
+            ),
+            hindsight_logistic_dynamic_se_beta=(
+                args.adaptive_hindsight_logistic_dynamic_se_beta
+            ),
+            hindsight_logistic_dynamic_use_ipw=(
+                args.adaptive_hindsight_logistic_dynamic_use_ipw
+            ),
+            hindsight_logistic_dynamic_ipw_clip=(
+                args.adaptive_hindsight_logistic_dynamic_ipw_clip
+            ),
             hindsight_logistic_replay_stop_to_continue_ratio=(
                 args.adaptive_hindsight_logistic_replay_stop_to_continue_ratio
             ),
@@ -1254,8 +1311,6 @@ BENCHMARK_CSV_COLUMNS = [
     "reference_answer",
     "is_correct",
     "target_quantization",
-    "target_dtype",
-    "drafter_dtype",
     "gpu_peak_allocated_gib",
     "gpu_peak_reserved_gib",
     "gpu_memory_used_after_generation_gib",
@@ -2030,8 +2085,6 @@ def build_benchmark_row(
         "reference_answer": reference_answer,
         "is_correct": predicted_answer is not None and predicted_answer == reference_answer,
         "target_quantization": args.target_quantization,
-        "target_dtype": args.target_dtype,
-        "drafter_dtype": args.drafter_dtype,
         **gpu_memory_stats,
     }
 
@@ -4955,7 +5008,7 @@ if not args.read_pickle:
             logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
                 dllm_path,
-                torch_dtype=args.drafter_dtype,
+                torch_dtype=args.unquantized_dtype,
                 device_map={"": args.drafter_device},
                 trust_remote_code=True,
                 local_files_only=True,
@@ -4981,7 +5034,7 @@ if not args.read_pickle:
         try:
             draft_model = AutoModelForCausalLM.from_pretrained(
                 args.drafter_model_name,
-                torch_dtype=args.drafter_dtype,
+                torch_dtype=args.unquantized_dtype,
                 device_map={"": args.drafter_device}
             )
         except Exception as e:
@@ -6111,7 +6164,12 @@ if args.adaptive_td:
         "w",
         encoding="utf-8",
     ) as handle:
-        json.dump(args.adaptive_td_controller.snapshot(), handle, indent=2)
+        runtime_snapshot = args.adaptive_td_controller.snapshot()
+        if args.adaptive_td_controller.uses_hindsight_delta_j_logistic_f2:
+            runtime_snapshot["logistic_boundary_checkpoint"] = (
+                args.adaptive_td_controller.save_logistic_boundary_checkpoint()
+            )
+        json.dump(runtime_snapshot, handle, indent=2)
     decision_rows = getattr(args, "adaptive_decision_rows", [])
     if decision_rows:
         decision_columns = sorted(

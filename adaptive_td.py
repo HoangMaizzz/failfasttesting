@@ -309,6 +309,18 @@ class AdaptiveTDConfig:
     hindsight_logistic_utility_weighting: str = "legacy"
     hindsight_logistic_replay_batch_size: int = 0
     hindsight_logistic_replay_buffer_size: int = 100
+
+    # Dynamic utility-calibrated threshold for the U1 logistic controller.
+    # Historical causal states are re-scored with the CURRENT logistic weights,
+    # then multiple recent windows independently estimate a safe profitable
+    # CONTINUE tail.  The final threshold is the most conservative proposal.
+    hindsight_logistic_dynamic_threshold: bool = True
+    hindsight_logistic_dynamic_windows: tuple[int, ...] = (50, 60, 100)
+    hindsight_logistic_dynamic_min_selected: int = 7
+    hindsight_logistic_dynamic_se_beta: float = 0.30
+    hindsight_logistic_dynamic_use_ipw: bool = True
+    hindsight_logistic_dynamic_ipw_clip: float = 50.0
+
     # U1 batch-1x replay class ratio. 3.0 means 3 STOP : 1 Good-C
     # inside each replay mini-batch. Set <= 0 to recover the original
     # uniform replay behavior.
@@ -466,6 +478,16 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight logistic replay batch size must be non-negative")
         if self.hindsight_logistic_replay_buffer_size <= 0:
             raise ValueError("hindsight logistic replay buffer size must be positive")
+        if not self.hindsight_logistic_dynamic_windows:
+            raise ValueError("hindsight logistic dynamic windows must be non-empty")
+        if any(int(window) <= 0 for window in self.hindsight_logistic_dynamic_windows):
+            raise ValueError("hindsight logistic dynamic windows must be positive")
+        if self.hindsight_logistic_dynamic_min_selected <= 0:
+            raise ValueError("hindsight logistic dynamic min-selected must be positive")
+        if self.hindsight_logistic_dynamic_se_beta < 0.0:
+            raise ValueError("hindsight logistic dynamic SE beta must be non-negative")
+        if self.hindsight_logistic_dynamic_ipw_clip < 1.0:
+            raise ValueError("hindsight logistic dynamic IPW clip must be at least 1")
         if self.hindsight_logistic_replay_stop_to_continue_ratio < 0.0:
             raise ValueError(
                 "hindsight logistic replay STOP:CONTINUE ratio must be non-negative"
@@ -957,6 +979,14 @@ class OnlineTDRefinementController:
         )
         self.hindsight_logistic_abs_r: list[float] = []
         self.hindsight_logistic_replay_buffer: list[tuple[list[float], int, float]] = []
+        # Separate history for dynamic score-to-action calibration.  This stores
+        # raw causal utility rather than SGD labels/weights so every historical
+        # state can be re-scored under the CURRENT logistic parameters.
+        self.hindsight_logistic_calibration_history: list[dict] = []
+        self.hindsight_logistic_dynamic_threshold_value = float(
+            config.hindsight_logistic_continue_threshold
+        )
+        self.hindsight_logistic_dynamic_threshold_diagnostics: dict = {}
         # Dedicated RNG: replay sampling must not perturb probe/exploration randomness.
         self.hindsight_logistic_replay_rng = random.Random(config.seed + 7919)
         self.hindsight_logistic_tie_count = 0
@@ -1612,9 +1642,13 @@ class OnlineTDRefinementController:
                 features = pair["before"]["features"]
                 pre_logit = float(pair["before"]["logistic_logit"])
                 pre_score = float(pair["before"]["continue_score"])
-                predicted_continue = (
-                    pre_score > self.config.hindsight_logistic_continue_threshold
+                threshold_at_decision = float(
+                    pair["before"].get(
+                        "continue_threshold_at_decision",
+                        self.config.hindsight_logistic_continue_threshold,
+                    )
                 )
+                predicted_continue = pre_score > threshold_at_decision
                 counts_before = (
                     self.hindsight_delta_j_continue_count,
                     self.hindsight_delta_j_stop_count,
@@ -1767,6 +1801,27 @@ class OnlineTDRefinementController:
                         )
                     else:
                         self.hindsight_delta_j_stop_count += 1
+
+                    # Keep a dedicated causal calibration stream.  Only resolved
+                    # non-tie pairs enter this history; old scores are not stored
+                    # because they are re-computed from these features at each
+                    # future decision using the current logistic weights.
+                    self.hindsight_logistic_calibration_history.append({
+                        "features": [float(value) for value in features],
+                        "delta_j": float(delta_j),
+                        "behavior_continue_probability": float(
+                            pair["before"].get("behavior_continue_probability", 1.0)
+                        ),
+                        "problem_id": int(pair["before"]["problem_id"]),
+                        "refinement_step": int(pair["before"]["refinement_step"]),
+                        "action_source": pair["before"].get("action_source", "unknown"),
+                    })
+                    max_window = max(
+                        int(window)
+                        for window in self.config.hindsight_logistic_dynamic_windows
+                    )
+                    if len(self.hindsight_logistic_calibration_history) > max_window:
+                        del self.hindsight_logistic_calibration_history[:-max_window]
                 row = {
                     "transition_kind": self.config.credit_assignment,
                     "problem_id": pair["before"]["problem_id"],
@@ -1796,7 +1851,16 @@ class OnlineTDRefinementController:
                     "label_reason": "tie" if is_tie else label_reason,
                     "logistic_logit_before_update": pre_logit,
                     "continue_score_before_update": pre_score,
-                    "continue_threshold": self.config.hindsight_logistic_continue_threshold,
+                    "continue_threshold": float(threshold_at_decision),
+                    "fixed_continue_threshold": float(
+                        self.config.hindsight_logistic_continue_threshold
+                    ),
+                    "dynamic_threshold_active": bool(
+                        pair["before"].get("dynamic_threshold_active", False)
+                    ),
+                    "dynamic_threshold_history_size": int(
+                        pair["before"].get("dynamic_threshold_history_size", 0)
+                    ),
                     "utility_weighting_mode": self.config.hindsight_logistic_utility_weighting,
                     "replay_batch_size_config": self.config.hindsight_logistic_replay_batch_size,
                     "replay_buffer_size_config": self.config.hindsight_logistic_replay_buffer_size,
@@ -2518,6 +2582,185 @@ class OnlineTDRefinementController:
             },
         )
 
+    def _estimate_dynamic_logistic_threshold_window(
+        self,
+        history: Sequence[dict],
+    ) -> tuple[float, dict]:
+        """Estimate a safe CONTINUE threshold from one recent causal window.
+
+        Historical decision-time scores are intentionally ignored.  Every stored
+        state is re-scored with the CURRENT logistic model, because the online
+        learner changes its score scale over time.  ``delta_j < 0`` means that
+        CONTINUE is locally beneficial.  A return threshold of 1.0 is the
+        all-STOP fallback.
+        """
+        min_selected = int(self.config.hindsight_logistic_dynamic_min_selected)
+        beta = float(self.config.hindsight_logistic_dynamic_se_beta)
+        use_ipw = bool(self.config.hindsight_logistic_dynamic_use_ipw)
+        ipw_clip = float(self.config.hindsight_logistic_dynamic_ipw_clip)
+
+        if len(history) < min_selected:
+            return 1.0, {
+                "valid": False,
+                "reason": "insufficient_history",
+                "history_size": int(len(history)),
+            }
+
+        rescored = []
+        for row in history:
+            _, current_score = self.hindsight_logistic_model.predict(row["features"])
+            delta_j = float(row["delta_j"])
+            behavior_p = max(
+                1e-6,
+                min(1.0, float(row.get("behavior_continue_probability", 1.0))),
+            )
+            weight = min(ipw_clip, 1.0 / behavior_p) if use_ipw else 1.0
+            rescored.append((float(current_score), delta_j, float(weight)))
+
+        rescored.sort(key=lambda item: item[0], reverse=True)
+        total_weight = sum(item[2] for item in rescored)
+        if total_weight <= 0.0:
+            return 1.0, {
+                "valid": False,
+                "reason": "zero_weight",
+                "history_size": int(len(history)),
+            }
+
+        best = None
+        n = 0
+        sum_w = 0.0
+        sum_w2 = 0.0
+        sum_w_delta = 0.0
+        sum_w_delta2 = 0.0
+        i = 0
+        total = len(rescored)
+
+        while i < total:
+            score_here = rescored[i][0]
+            j = i
+            # Add the whole equal-score group so a strict score > threshold rule
+            # never arbitrarily splits numerically identical scores.
+            while j < total and abs(rescored[j][0] - score_here) <= 1e-12:
+                _, delta_j, weight = rescored[j]
+                n += 1
+                sum_w += weight
+                sum_w2 += weight * weight
+                sum_w_delta += weight * delta_j
+                sum_w_delta2 += weight * delta_j * delta_j
+                j += 1
+
+            if n >= min_selected and sum_w > 0.0:
+                mean = sum_w_delta / sum_w
+                variance = max(0.0, sum_w_delta2 / sum_w - mean * mean)
+                # Kish effective sample size handles unequal IPW weights.
+                n_eff = (sum_w * sum_w) / max(sum_w2, 1e-12)
+                se = math.sqrt(variance / max(n_eff, 1.0))
+                upper_utility = mean + beta * se
+
+                if j < total:
+                    next_score = rescored[j][0]
+                    threshold = 0.5 * (score_here + next_score)
+                else:
+                    # Logistic scores are strictly positive, so threshold 0 selects all.
+                    threshold = 0.0
+
+                # Only open a CONTINUE tail when its conservative utility estimate
+                # is beneficial.  Among safe candidates choose the one with the
+                # smallest estimated population incremental utility vs all-STOP.
+                if upper_utility < 0.0:
+                    utility_estimate = sum_w_delta / total_weight
+                    candidate = {
+                        "threshold": float(threshold),
+                        "selected_count": int(n),
+                        "effective_n": float(n_eff),
+                        "mean_delta_j": float(mean),
+                        "se_delta_j": float(se),
+                        "upper_delta_j": float(upper_utility),
+                        "utility_estimate": float(utility_estimate),
+                    }
+                    if best is None or (
+                        candidate["utility_estimate"] < best["utility_estimate"]
+                    ):
+                        best = candidate
+
+            i = j
+
+        if best is None:
+            return 1.0, {
+                "valid": False,
+                "reason": "no_profitable_tail",
+                "history_size": int(len(history)),
+            }
+
+        best = dict(best)
+        best.update({"valid": True, "history_size": int(len(history))})
+        return float(best["threshold"]), best
+
+    def _get_dynamic_logistic_threshold(self) -> tuple[float, dict]:
+        """Return conservative multi-scale dynamic threshold and flat diagnostics."""
+        fixed_threshold = float(self.config.hindsight_logistic_continue_threshold)
+        if not self.config.hindsight_logistic_dynamic_threshold:
+            return fixed_threshold, {
+                "dynamic_threshold_active": False,
+                "dynamic_threshold": fixed_threshold,
+                "dynamic_threshold_history_size": int(
+                    len(self.hindsight_logistic_calibration_history)
+                ),
+            }
+
+        history = self.hindsight_logistic_calibration_history
+        windows = tuple(int(w) for w in self.config.hindsight_logistic_dynamic_windows)
+        proposed = []
+        diagnostics = {
+            "dynamic_threshold_active": True,
+            "dynamic_threshold_history_size": int(len(history)),
+        }
+
+        for window_size in windows:
+            recent = history[-window_size:]
+            threshold, window_diag = self._estimate_dynamic_logistic_threshold_window(
+                recent
+            )
+            proposed.append(float(threshold))
+            prefix = f"dynamic_threshold_w{window_size}"
+            diagnostics[f"{prefix}_threshold"] = float(threshold)
+            diagnostics[f"{prefix}_valid"] = bool(window_diag.get("valid", False))
+            diagnostics[f"{prefix}_history_size"] = int(
+                window_diag.get("history_size", len(recent))
+            )
+            diagnostics[f"{prefix}_selected_count"] = int(
+                window_diag.get("selected_count", 0)
+            )
+            diagnostics[f"{prefix}_effective_n"] = float(
+                window_diag.get("effective_n", 0.0)
+            )
+            diagnostics[f"{prefix}_mean_delta_j"] = float(
+                window_diag.get("mean_delta_j", 0.0)
+            )
+            diagnostics[f"{prefix}_se_delta_j"] = float(
+                window_diag.get("se_delta_j", 0.0)
+            )
+            diagnostics[f"{prefix}_upper_delta_j"] = float(
+                window_diag.get("upper_delta_j", 0.0)
+            )
+            diagnostics[f"{prefix}_utility_estimate"] = float(
+                window_diag.get("utility_estimate", 0.0)
+            )
+            diagnostics[f"{prefix}_reason"] = str(
+                window_diag.get("reason", "ok" if window_diag.get("valid") else "unknown")
+            )
+
+        # Conservative consensus: if any horizon says all-STOP (=1.0), the
+        # combined policy also stays all-STOP.  Otherwise use the largest
+        # threshold proposed by the recent horizons.
+        threshold = max(proposed) if proposed else 1.0
+        threshold = max(0.0, min(1.0, float(threshold)))
+        diagnostics["dynamic_threshold"] = threshold
+
+        self.hindsight_logistic_dynamic_threshold_value = threshold
+        self.hindsight_logistic_dynamic_threshold_diagnostics = dict(diagnostics)
+        return threshold, diagnostics
+
     def _choose_hindsight_delta_j_logistic_f2(
         self,
         *,
@@ -2542,6 +2785,20 @@ class OnlineTDRefinementController:
         exploration_used = False
         probe_probability = 0.0
         structural_eligible = mask_count >= 2
+
+        dynamic_threshold = float(self.config.hindsight_logistic_continue_threshold)
+        dynamic_threshold_diag = {
+            "dynamic_threshold_active": False,
+            "dynamic_threshold": dynamic_threshold,
+            "dynamic_threshold_history_size": int(
+                len(self.hindsight_logistic_calibration_history)
+            ),
+        }
+        if learner_ready:
+            dynamic_threshold, dynamic_threshold_diag = (
+                self._get_dynamic_logistic_threshold()
+            )
+
         if not allow_stop or snapshot is None:
             action, action_source = CONTINUE, "physical_constraint"
             reason = "hindsight_candidate_unavailable"
@@ -2552,12 +2809,12 @@ class OnlineTDRefinementController:
             action = failfast_fallback_action
             action_source = "cold_start_continue" if action == CONTINUE else "cold_start_stop"
             reason = "hindsight_failfast_cold_start"
-        elif score > self.config.hindsight_logistic_continue_threshold:
+        elif score > dynamic_threshold:
             action, action_source = CONTINUE, "learned_continue"
-            reason = "hindsight_logistic_continue"
+            reason = "hindsight_dynamic_logistic_continue"
         else:
             action, action_source = STOP, "learned_stop"
-            reason = "hindsight_logistic_stop"
+            reason = "hindsight_dynamic_logistic_stop"
         model_action = action
         if (
             action == STOP
@@ -2602,6 +2859,13 @@ class OnlineTDRefinementController:
                 "decision_reason": reason,
                 "learner_ready": learner_ready,
                 "behavior_continue_probability": behavior_continue_probability,
+                "continue_threshold_at_decision": float(dynamic_threshold),
+                "dynamic_threshold_active": bool(
+                    dynamic_threshold_diag.get("dynamic_threshold_active", False)
+                ),
+                "dynamic_threshold_history_size": int(
+                    dynamic_threshold_diag.get("dynamic_threshold_history_size", 0)
+                ),
             })
         if action == CONTINUE and snapshot is not None:
             key = (
@@ -2640,7 +2904,11 @@ class OnlineTDRefinementController:
                 "controller_name": self.config.credit_assignment,
                 "logistic_logit": logit,
                 "continue_score": score,
-                "continue_threshold": self.config.hindsight_logistic_continue_threshold,
+                "continue_threshold": float(dynamic_threshold),
+                "fixed_continue_threshold": float(
+                    self.config.hindsight_logistic_continue_threshold
+                ),
+                **dynamic_threshold_diag,
                 "utility_weighting_mode": self.config.hindsight_logistic_utility_weighting,
                 "replay_batch_size": self.config.hindsight_logistic_replay_batch_size,
                 "replay_buffer_size": len(self.hindsight_logistic_replay_buffer),
@@ -4030,6 +4298,32 @@ class OnlineTDRefinementController:
             },
         }
 
+    def save_logistic_boundary_checkpoint(self) -> dict:
+        if self.hindsight_pending_pairs or self.hindsight_pending_sources:
+            raise ValueError("Finish the current problem before saving a U1 checkpoint")
+        names = (
+            "hindsight_logistic_abs_r", "hindsight_logistic_replay_buffer",
+            "hindsight_logistic_calibration_history",
+            "hindsight_logistic_dynamic_threshold_value",
+            "hindsight_logistic_dynamic_threshold_diagnostics",
+            "hindsight_logistic_tie_count", "hindsight_censor_reasons",
+            "hindsight_snapshot_count", "hindsight_pair_count",
+            "hindsight_resolved_count", "hindsight_censored_count",
+            "hindsight_invalid_count", "hindsight_unavailable_count",
+            "hindsight_snapshot_overhead_ema_ms", "hindsight_probe_count",
+            "hindsight_delta_j_calibration_bias", "hindsight_delta_j_continue_count",
+            "hindsight_delta_j_stop_count", "hindsight_structural_probe_count",
+            "hindsight_floor_probe_count",
+        )
+        return {
+            "version": 1,
+            "config": {k: v for k, v in vars(self.config).items() if k.startswith("hindsight_")},
+            "model": dict(vars(self.hindsight_logistic_model)),
+            "state": {name: getattr(self, name) for name in names},
+            "positive_problem_ids": sorted(self.hindsight_logistic_positive_problem_ids),
+            "replay_rng": self.hindsight_logistic_replay_rng.getstate(),
+        }
+
     def load_snapshot(self, snapshot: dict) -> None:
         snapshot_schema = snapshot.get("feature_schema", "otrc_v1_td")
         snapshot_version = int(snapshot.get("feature_version", 1))
@@ -4310,6 +4604,28 @@ class OnlineTDRefinementController:
             snapshot.get("factual_warmup_transition_count", 0)
         )
         self.weight_snapshots = list(snapshot.get("weight_snapshots") or [])
+        if self.uses_hindsight_delta_j_logistic_f2:
+            checkpoint = snapshot.get("logistic_boundary_checkpoint")
+            if not checkpoint or checkpoint.get("version") != 1:
+                raise ValueError("U1 resume requires a complete logistic boundary checkpoint")
+            for name, value in checkpoint["config"].items():
+                current = getattr(self.config, name)
+                if isinstance(current, tuple):
+                    value = tuple(value)
+                if current != value:
+                    raise ValueError(f"U1 checkpoint configuration differs: {name}")
+            model = checkpoint["model"]
+            if model["dimension"] != self.hindsight_logistic_model.dimension:
+                raise ValueError("U1 checkpoint feature dimension differs")
+            for name in vars(self.hindsight_logistic_model):
+                setattr(self.hindsight_logistic_model, name, model[name])
+            allowed = self.save_logistic_boundary_checkpoint()["state"]
+            for name in allowed:
+                setattr(self, name, checkpoint["state"][name])
+            self.hindsight_logistic_positive_problem_ids = set(checkpoint["positive_problem_ids"])
+            def replay_tuple(value):
+                return tuple(replay_tuple(x) for x in value) if isinstance(value, list) else value
+            self.hindsight_logistic_replay_rng.setstate(replay_tuple(checkpoint["replay_rng"]))
 
 
 def build_state_features(
