@@ -1,0 +1,16 @@
+MATH-30 C-rich positive-control protocol
+
+Frozen IDs (run order):
+308,315,332,348,396,413,441,457,459,139,442,355,217,126,431,51,366,474,491,238,208,221,100,300,114,26,470,283,483,454
+
+Adaptation prefix (first 10):
+308,315,332,348,396,413,441,457,459,139
+
+Primary evaluation (last 20):
+442,355,217,126,431,51,366,474,491,238,208,221,100,300,114,26,470,283,483,454
+
+Discovery-only statistics from old INT8/full-prefix MATH U1-fixed0.5 run:
+114 resolved non-tie pairs; 39 Good-C; Good-C rate 34.21%; sum(delta_J_all)=-168.43.
+
+Selection did NOT use tau=.65 runtime or Always-STOP-vs-U1 runtime wins.
+Current deployed test method is original/current U1: no utility-mass balance, fixed tau=.5.
