@@ -472,8 +472,8 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight structural probe probability must be in [0, 1]")
         if not 0.0 <= self.hindsight_delta_j_floor_probe_probability <= 1.0:
             raise ValueError("hindsight floor probe probability must be in [0, 1]")
-        if self.hindsight_logistic_learning_rate <= 0.0:
-            raise ValueError("hindsight logistic learning rate must be positive")
+        if not math.isfinite(self.hindsight_logistic_learning_rate) or self.hindsight_logistic_learning_rate < 0.0:
+            raise ValueError("hindsight logistic learning rate must be finite and non-negative")
         if not 0.0 < self.hindsight_logistic_continue_threshold < 1.0:
             raise ValueError("hindsight logistic threshold must be in (0, 1)")
         if self.hindsight_logistic_tie_ms_per_token < 0.0:
