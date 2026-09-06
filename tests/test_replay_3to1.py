@@ -4,7 +4,7 @@ from adaptive_td import AdaptiveTDConfig, OnlineTDRefinementController
 
 
 class ReplayRatioTest(unittest.TestCase):
-    def resolve(self, ratio, initial_labels):
+    def resolve(self, ratio, initial_labels, balance=False):
         controller = OnlineTDRefinementController(AdaptiveTDConfig(
             feature_dim=6, feature_schema="otrc_v2_2_compact_td",
             credit_assignment="hindsight_delta_j_logistic_f2",
@@ -13,6 +13,7 @@ class ReplayRatioTest(unittest.TestCase):
             hindsight_logistic_replay_batch_size=16,
             hindsight_logistic_replay_buffer_size=100,
             hindsight_logistic_replay_stop_to_continue_ratio=ratio,
+            hindsight_logistic_balance_utility_mass=balance,
         ))
         controller.hindsight_logistic_replay_buffer = [
             ([1.0, 0.5, 0.0], label, 2.0) for label in initial_labels
@@ -53,6 +54,30 @@ class ReplayRatioTest(unittest.TestCase):
         _, row = self.resolve(0.0, [0] * 20)
         self.assertLessEqual(row["replay_continue_count_used"], 1)
         self.assertEqual(row["replay_batch_size_used"], 16)
+
+    def test_balance_preserves_total_mass_and_single_update(self):
+        controller, row = self.resolve(0.0, [0, 1] * 5, balance=True)
+        self.assertTrue(row["utility_balance_applied"])
+        self.assertAlmostEqual(row["utility_balance_continue_mass_after"],
+                               row["utility_balance_stop_mass_after"])
+        self.assertAlmostEqual(
+            row["utility_balance_continue_mass_before"] + row["utility_balance_stop_mass_before"],
+            row["utility_balance_continue_mass_after"] + row["utility_balance_stop_mass_after"])
+        self.assertEqual(controller.hindsight_logistic_model.sample_count, 1)
+
+    def test_balance_single_class_keeps_weights(self):
+        _, row = self.resolve(0.0, [1] * 20, balance=True)
+        self.assertFalse(row["utility_balance_applied"])
+        self.assertEqual(row["utility_balance_continue_scale"], 1.0)
+
+    def test_heldout_ids_exclude_previous_u1_100(self):
+        from types import SimpleNamespace
+        from run_u1_sgd_ablation import selected_ids
+        from run_gsm8k100_int8_tau065_vs_alwaysstop import selected_problem_ids
+        old = selected_ids(SimpleNamespace(id_offset=25, num_questions=100), "gsm8k")
+        new = selected_problem_ids(SimpleNamespace(id_offset=125, num_questions=100))
+        self.assertEqual(len(set(new)), 100)
+        self.assertFalse(set(old) & set(new))
 
 
 if __name__ == "__main__":

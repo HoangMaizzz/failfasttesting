@@ -147,6 +147,9 @@ def get_output_dir(args, problem_id, drafter_config):
 
 
 def populate_dataset(args):
+    if getattr(args, "dataset_dir", None):
+        args.dataset = load_from_disk(args.dataset_dir)
+        return
     if args.dataset_name == "aime":
         dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
     elif args.dataset_name == "math":

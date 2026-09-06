@@ -1,5 +1,7 @@
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
 
 import sys
 import copy
@@ -20,12 +22,21 @@ from pathlib import Path
 from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from local_run_reports import save_controller_reports
+from fp16_two_gpu import qwen2_device_map, synchronize_devices
+from verifier_kv_cache import VerifierKVCache
+from verifier_diagnostic import trace_verifier, append_record, install_replay
+
+
+def _benchmark_synchronize(device):
+    synchronize_devices(torch.cuda, device,
+                        getattr(globals().get("args"), "target_two_gpu_fp16", False))
 
 
 def _synchronize_device(device):
     device = torch.device(device)
     if device.type == "cuda":
-        torch.cuda.synchronize(device)
+        _benchmark_synchronize(device)
 
 
 def _record_transfer(args, elapsed):
@@ -50,7 +61,15 @@ def target_model_load_kwargs(args):
     quantization = getattr(args, "target_quantization", "none")
     if quantization == "none":
         kwargs["torch_dtype"] = getattr(args, "unquantized_dtype", "auto")
+        if getattr(args, "target_two_gpu_fp16", False):
+            if args.unquantized_dtype != "float16" or args.target_device != 0 or args.drafter_device != 1:
+                raise ValueError("Two-GPU FP16 requires target=0, drafter=1, dtype=float16.")
+            if torch.cuda.device_count() < 2:
+                raise RuntimeError("Two-GPU FP16 requires two visible CUDA GPUs.")
+            kwargs["device_map"] = qwen2_device_map(args.target_model_name)
         return kwargs
+    if getattr(args, "target_two_gpu_fp16", False):
+        raise ValueError("Two-GPU FP16 does not permit quantization.")
     if torchao_weight_only:
         try:
             from transformers import TorchAoConfig
@@ -519,10 +538,16 @@ parser.add_argument("--benchmark_modes", type=str, nargs="+", choices=["verifier
 parser.add_argument("--dllm_variant", type=str, choices=["failfast", "fixed"], default="failfast")
 parser.add_argument("--decoding_strategy", type=str, choices=["greedy", "sampling"], default="greedy")
 parser.add_argument("--target_model_name", type=str, default=None)
+parser.add_argument("--target_model_label", type=str, default=None)
+parser.add_argument("--dataset_dir", type=str, default=None)
 parser.add_argument("--verifier_model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
 parser.add_argument("--drafter_model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
 parser.add_argument("--dllm_dir", type=str, default=None)
 parser.add_argument("--target_device", type=int, default=0)
+parser.add_argument("--target_two_gpu_fp16", action="store_true")
+parser.add_argument("--verifier_kv_cache", action="store_true")
+parser.add_argument("--verifier_diagnostic", action="store_true")
+parser.add_argument("--diagnostic_action_replay", type=str)
 parser.add_argument("--drafter_device", type=int, default=0)
 parser.add_argument("--unquantized_dtype", choices=["auto", "float16", "bfloat16"], default="auto",
                     help="Dtype for the dLLM and any unquantized target; use float16 on T4.")
@@ -817,6 +842,22 @@ parser.add_argument(
     "--adaptive-hindsight-logistic-replay-buffer-size",
     type=int,
     default=100,
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-balance-utility-mass",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "For raw-|delta_J| U1 replay, rescale C/S weights inside each sampled "
+        "mini-batch so both classes carry equal total utility mass while "
+        "preserving relative |delta_J| magnitudes within each class."
+    ),
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-balance-min-per-class",
+    type=int,
+    default=1,
+    help="Minimum C and S samples required in a mini-batch before utility balancing.",
 )
 parser.add_argument(
     "--adaptive-hindsight-logistic-dynamic-threshold",
@@ -1174,6 +1215,12 @@ def build_adaptive_controller(args):
             ),
             hindsight_logistic_replay_buffer_size=(
                 args.adaptive_hindsight_logistic_replay_buffer_size
+            ),
+            hindsight_logistic_balance_utility_mass=(
+                args.adaptive_hindsight_logistic_balance_utility_mass
+            ),
+            hindsight_logistic_balance_min_per_class=(
+                args.adaptive_hindsight_logistic_balance_min_per_class
             ),
             hindsight_logistic_dynamic_threshold=(
                 args.adaptive_hindsight_logistic_dynamic_threshold
@@ -1997,11 +2044,13 @@ def build_benchmark_drafter_configs(args):
             args.sweep_incr_len[0],
         )
     )
-    return {
+    configs = {
         "verifier_ar": ("verifier_ar", None, "none", None, None, None),
         "ar_ar": ("ar", None, "sf", None, None, None),
         "dllm_ar": dllm_config,
     }
+    # Model loading must follow requested modes, not the full mode catalog.
+    return {mode: configs[mode] for mode in args.benchmark_modes}
 
 def build_benchmark_row(
     args,
@@ -2273,7 +2322,7 @@ def evaluate_oracle_proposal_tokens(
         dim=1,
     )
     if proposal_tensor.is_cuda:
-        torch.cuda.synchronize(proposal_tensor.device)
+        _benchmark_synchronize(proposal_tensor.device)
     verify_start = time.perf_counter()
     with torch.inference_mode():
         oracle_outputs = target_model(
@@ -2283,7 +2332,7 @@ def evaluate_oracle_proposal_tokens(
             logits_to_keep=len(draft_proposal) + 1,
         )
     if proposal_tensor.is_cuda:
-        torch.cuda.synchronize(proposal_tensor.device)
+        _benchmark_synchronize(proposal_tensor.device)
     verify_latency_ms = (time.perf_counter() - verify_start) * 1000.0
 
     post_verify_start = time.perf_counter()
@@ -2435,7 +2484,7 @@ def enumerate_global_oracle_round_edges(
         args.last_frontier_stats = None
         transformers.set_seed(args.seed)
         if orig_model_inputs["input_ids"].is_cuda:
-            torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+            _benchmark_synchronize(orig_model_inputs["input_ids"].device)
         draft_started = time.perf_counter()
         try:
             (
@@ -2471,7 +2520,7 @@ def enumerate_global_oracle_round_edges(
             pending_scripts.append(script + (CONTINUE,))
             continue
         if orig_model_inputs["input_ids"].is_cuda:
-            torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+            _benchmark_synchronize(orig_model_inputs["input_ids"].device)
         draft_replay_wall_time_ms = (time.perf_counter() - draft_started) * 1000.0
         if controller.script_position != len(script):
             raise RuntimeError("oracle replay completed without consuming its script")
@@ -2679,7 +2728,7 @@ def run_oracle_draft_trajectory(
     args.last_frontier_stats = None
     transformers.set_seed(args.seed)
     if orig_model_inputs["input_ids"].is_cuda:
-        torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+        _benchmark_synchronize(orig_model_inputs["input_ids"].device)
     started = time.perf_counter()
     draft_result = get_next_tokens_dllm(
         dllm,
@@ -2714,7 +2763,7 @@ def run_oracle_draft_trajectory(
             forward_pass_latencies,
         ) = draft_result
     if orig_model_inputs["input_ids"].is_cuda:
-        torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+        _benchmark_synchronize(orig_model_inputs["input_ids"].device)
     return {
         "proposal": [int(token_id) for token_id in proposal],
         "proposal_len": int(actual_spec_len),
@@ -4922,7 +4971,18 @@ def append_bucket_oracle_rows(
     )
 
 apply_mode_settings(args)
-args.target_model_name_clean = args.target_model_name.split("/", 1)[1]
+if args.verifier_diagnostic and not args.verifier_kv_cache:
+    raise ValueError("Diagnostic tracing requires verifier KV cache.")
+if args.diagnostic_action_replay:
+    if not args.verifier_diagnostic or not args.adaptive_td:
+        raise ValueError("Action replay is diagnostic-only and requires adaptive mode.")
+    diagnostic_replay, diagnostic_offsets = install_replay(args.adaptive_td_controller, args.diagnostic_action_replay)
+if args.verifier_kv_cache and (
+    args.benchmark_modes != ["dllm_ar"] or args.decoding_strategy != "greedy"
+    or args.global_oracle_graph or args.strict_greedy_local_oracle
+):
+    raise ValueError("Verifier cache currently supports greedy dllm_ar without oracle only.")
+args.target_model_name_clean = args.target_model_label or args.target_model_name.rstrip("/").rsplit("/", 1)[-1]
 logging.basicConfig(
     level=getattr(logging, args.log_level),
     format="[%(asctime)s %(levelname)s] %(message)s",
@@ -4968,6 +5028,7 @@ if not args.read_pickle:
             args.target_quantization,
             target_model.get_memory_footprint() / (1024 ** 3),
         )
+        logging.info("Target dtype=%s; device map=%s", target_model.dtype, target_model.hf_device_map)
     except Exception as e:
         msg = str(e).lower()
         if isinstance(e, RuntimeError) and ("out of memory" in msg or 'cuda' in msg) or isinstance(e, torch.cuda.OutOfMemoryError):
@@ -4999,9 +5060,6 @@ if not args.read_pickle:
 
         try:
             import shutil, os
-            hf_cache_dir = "/root/.cache/huggingface/modules"
-            if os.path.exists(hf_cache_dir):
-                shutil.rmtree(hf_cache_dir)
             
             dllm_path = args.dllm_dir or "/content/failfasttesting/Fast_dLLM_v2_1_5B"
             
@@ -5016,6 +5074,7 @@ if not args.read_pickle:
             )
             
             dllm.lm_head.weight = dllm.model.embed_tokens.weight
+            logging.info("Drafter dtype=%s; device map=%s", dllm.dtype, dllm.hf_device_map)
 
         except Exception as e:
             msg = str(e).lower()
@@ -5131,6 +5190,7 @@ for problem_id, is_warmup in tqdm(
             num_speculation_rounds = 0
             total_num_forward_passes = 0
             current_token_ids = []
+            verifier_cache = VerifierKVCache() if args.verifier_kv_cache else None
             if (
                 draft_type == "dllm"
                 and args.adaptive_td
@@ -5161,7 +5221,7 @@ for problem_id, is_warmup in tqdm(
                 )
 
             if orig_model_inputs["input_ids"].is_cuda:
-                torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                _benchmark_synchronize(orig_model_inputs["input_ids"].device)
             generation_start = time.perf_counter()
 
             inner_bar = None
@@ -5178,7 +5238,7 @@ for problem_id, is_warmup in tqdm(
                 generation_print(args, f"\n⏳ BẮT ĐẦU AR-ONLY GENERATION (Live Stream):", flush=True)
 
                 if orig_model_inputs["input_ids"].is_cuda:
-                    torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                    _benchmark_synchronize(orig_model_inputs["input_ids"].device)
                 verify_start = time.perf_counter()
                 generated_ids = target_model.generate(
                     **orig_model_inputs,
@@ -5189,7 +5249,7 @@ for problem_id, is_warmup in tqdm(
                     streamer=streamer
                 )
                 if orig_model_inputs["input_ids"].is_cuda:
-                    torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                    _benchmark_synchronize(orig_model_inputs["input_ids"].device)
                 verify_time_total = time.perf_counter() - verify_start
                 current_token_ids = generated_ids[0][orig_model_inputs['input_ids'].shape[1]:].tolist()
                 accepted_tokens = len(current_token_ids)
@@ -5253,7 +5313,7 @@ for problem_id, is_warmup in tqdm(
                     logging.debug(f"--- [{drafter_name}_{freq_scheme}] Speculation round {num_speculation_rounds} ---")
 
                     if orig_model_inputs["input_ids"].is_cuda:
-                        torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                        _benchmark_synchronize(orig_model_inputs["input_ids"].device)
                     if (
                         draft_type == "dllm"
                         and args.adaptive_td
@@ -5384,7 +5444,7 @@ for problem_id, is_warmup in tqdm(
                             generation_print(args, f"\n[VÒNG {num_speculation_rounds}] ⚡ DLLM NHÁP: {draft_text!r}", flush=True)
 
                     if orig_model_inputs["input_ids"].is_cuda:
-                        torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                        _benchmark_synchronize(orig_model_inputs["input_ids"].device)
                     physical_draft_time = time.perf_counter() - draft_start
                     draft_time = physical_draft_time
                     if (
@@ -5540,19 +5600,34 @@ for problem_id, is_warmup in tqdm(
                     full_attention_mask = torch.cat([orig_model_inputs['attention_mask'], verify_mask_tensor], dim=1)
 
                     if verify_input_tensor.is_cuda:
-                        torch.cuda.synchronize(verify_input_tensor.device)
+                        _benchmark_synchronize(verify_input_tensor.device)
+                    # Release the previous round's logits and their views before
+                    # allocating verifier activations for the next full prefix.
+                    outputs = verify_logits = final_token_logits = None
+                    target_probs = final_probs = None
                     verify_start = time.perf_counter()
                     with torch.inference_mode():
-                        outputs = target_model(
-                            input_ids=full_input_ids,
-                            attention_mask=full_attention_mask,
-                            use_cache=False,
-                            logits_to_keep=len(draft_proposal) + 1,
-                        )
+                        if verifier_cache is not None:
+                            outputs = verifier_cache.verify(
+                                target_model, full_input_ids, full_attention_mask, len(draft_proposal)
+                            )
+                        else:
+                            outputs = target_model(
+                                input_ids=full_input_ids,
+                                attention_mask=full_attention_mask,
+                                use_cache=False,
+                                logits_to_keep=len(draft_proposal) + 1,
+                            )
                     if verify_input_tensor.is_cuda:
-                        torch.cuda.synchronize(verify_input_tensor.device)
+                        _benchmark_synchronize(verify_input_tensor.device)
                     verify_time = time.perf_counter() - verify_start
                     verify_time_total += verify_time
+                    if args.verifier_diagnostic:
+                        trace_verifier(
+                            target_model, full_input_ids, full_attention_mask, outputs.logits,
+                            draft_proposal, os.path.join(args.output_dir, "verifier_trace.jsonl"),
+                            problem_id, num_speculation_rounds,
+                        )
                     
                     verify_logits = outputs.logits[0, :len(draft_proposal)]
                     post_verify_start = time.perf_counter()
@@ -5668,6 +5743,16 @@ for problem_id, is_warmup in tqdm(
                     tokens_to_append = tokens_to_append[:remaining_tokens]
                     oracle_prefix_token_ids = list(current_token_ids)
                     current_token_ids.extend(tokens_to_append)
+                    if args.verifier_diagnostic:
+                        append_record(os.path.join(args.output_dir, "committed_trace.jsonl"), {
+                            "problem_id": int(problem_id), "round_id": int(num_speculation_rounds),
+                            "accepted_len": int(accepted_len), "appended_tokens": tokens_to_append,
+                            "output_token_ids": list(current_token_ids),
+                        })
+                    if verifier_cache is not None:
+                        verifier_cache.commit(
+                            orig_model_inputs['input_ids'].shape[1] + len(current_token_ids)
+                        )
                     
                     accepted_tokens += accepted_len
                     rejected_tokens += len(draft_proposal) - accepted_len
@@ -5715,7 +5800,7 @@ for problem_id, is_warmup in tqdm(
                         observed_post_verify_time = time.perf_counter() - post_verify_start
                         update_frontier_controller_cost(args, observed_post_verify_time)
                     if verify_input_tensor.is_cuda:
-                        torch.cuda.synchronize(verify_input_tensor.device)
+                        _benchmark_synchronize(verify_input_tensor.device)
                     post_verify_time = time.perf_counter() - post_verify_start
                     post_verify_time_total += post_verify_time
                     if (
@@ -5941,7 +6026,7 @@ for problem_id, is_warmup in tqdm(
                         break
 
             if orig_model_inputs["input_ids"].is_cuda:
-                torch.cuda.synchronize(orig_model_inputs["input_ids"].device)
+                _benchmark_synchronize(orig_model_inputs["input_ids"].device)
             if args.global_oracle_graph or args.strict_greedy_local_oracle:
                 actual_e2e_time = (
                     global_oracle_result["global"]["total_latency_ms"] / 1000.0
@@ -6078,9 +6163,24 @@ for problem_id, is_warmup in tqdm(
             "gpu_peak_reserved_gib": None,
             "gpu_memory_used_after_generation_gib": None,
         }
+        if args.verifier_diagnostic and not args.read_pickle:
+            replay_count = diagnostic_offsets.get(str(problem_id), 0) if args.diagnostic_action_replay else None
+            append_record(os.path.join(args.output_dir, "diagnostic_outputs.jsonl"), {
+                "problem_id": int(problem_id), "output_token_ids": list(current_token_ids),
+                "replayed_decisions": replay_count,
+                "expected_replay_decisions": len(diagnostic_replay["problems"][str(problem_id)]["decisions"]) if args.diagnostic_action_replay else None,
+                "timing_valid_for_benchmark": False,
+            })
+        if not args.read_pickle and args.verifier_kv_cache:
+            if not is_warmup:
+                cache_row = {"problem_id": problem_id, "mode": benchmark_mode, **verifier_cache.stats()}
+                append_csv_rows(os.path.join(args.output_dir, "verifier_cache_stats.csv"),
+                                list(cache_row), [cache_row])
+            verifier_cache = None
+            outputs = verify_logits = final_token_logits = None
         if not args.read_pickle and orig_model_inputs["input_ids"].is_cuda:
             memory_device = orig_model_inputs["input_ids"].device
-            torch.cuda.synchronize(memory_device)
+            _benchmark_synchronize(memory_device)
             free_bytes, total_bytes = torch.cuda.mem_get_info(memory_device)
             gpu_memory_stats = {
                 "gpu_peak_allocated_gib": (
@@ -6128,12 +6228,15 @@ for problem_id, is_warmup in tqdm(
             row["theo_speedup_vs_AR"] = safe_div(baseline_row["theo_total_time"], row["theo_total_time"])
     if not is_warmup:
         append_benchmark_rows(args, problem_benchmark_rows)
+        save_controller_reports(args)
 
     # Long benchmark processes keep both models resident, but per-problem
     # inputs and drafter KV state must not survive into the next question.
     orig_model_inputs = None
     prefill_output = None
     draft_proposal = None
+    outputs = verify_logits = final_token_logits = None
+    target_probs = final_probs = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

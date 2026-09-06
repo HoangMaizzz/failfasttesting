@@ -310,6 +310,14 @@ class AdaptiveTDConfig:
     hindsight_logistic_replay_batch_size: int = 0
     hindsight_logistic_replay_buffer_size: int = 100
 
+    # Optional utility-mass balancing for the U1 replay update.
+    # When enabled and both classes occur in the sampled mini-batch, raw
+    # |delta_J| weights are rescaled so the total CONTINUE and STOP utility
+    # mass in that mini-batch is equal. Relative |delta_J| magnitudes within
+    # each class are preserved.
+    hindsight_logistic_balance_utility_mass: bool = False
+    hindsight_logistic_balance_min_per_class: int = 1
+
     # Dynamic utility-calibrated threshold for the U1 logistic controller.
     # Historical causal states are re-scored with the CURRENT logistic weights,
     # then multiple recent windows independently estimate a safe profitable
@@ -478,6 +486,8 @@ class AdaptiveTDConfig:
             raise ValueError("hindsight logistic replay batch size must be non-negative")
         if self.hindsight_logistic_replay_buffer_size <= 0:
             raise ValueError("hindsight logistic replay buffer size must be positive")
+        if self.hindsight_logistic_balance_min_per_class <= 0:
+            raise ValueError("hindsight logistic balance min-per-class must be positive")
         if not self.hindsight_logistic_dynamic_windows:
             raise ValueError("hindsight logistic dynamic windows must be non-empty")
         if any(int(window) <= 0 for window in self.hindsight_logistic_dynamic_windows):
@@ -1661,6 +1671,13 @@ class OnlineTDRefinementController:
                 replay_batch_size_used = 0
                 replay_continue_count_used = 0
                 replay_stop_count_used = 0
+                utility_balance_applied = False
+                utility_balance_continue_scale = 1.0
+                utility_balance_stop_scale = 1.0
+                utility_balance_continue_mass_before = 0.0
+                utility_balance_stop_mass_before = 0.0
+                utility_balance_continue_mass_after = 0.0
+                utility_balance_stop_mass_after = 0.0
                 replay_buffer_size_before = len(self.hindsight_logistic_replay_buffer)
                 weights_before = list(self.hindsight_logistic_model.weights)
                 if is_tie:
@@ -1786,6 +1803,68 @@ class OnlineTDRefinementController:
 
                         replay_continue_count_used = sum(int(item[1]) == 1 for item in batch)
                         replay_stop_count_used = len(batch) - replay_continue_count_used
+
+                        # Optional utility-mass balancing. This is deliberately
+                        # applied AFTER sampling so the base replay trajectory,
+                        # update count, buffer, and labels are unchanged. Only
+                        # the relative training mass assigned to C vs S changes.
+                        if self.config.hindsight_logistic_balance_utility_mass:
+                            min_per_class = int(
+                                self.config.hindsight_logistic_balance_min_per_class
+                            )
+                            c_count = replay_continue_count_used
+                            s_count = replay_stop_count_used
+                            if c_count >= min_per_class and s_count >= min_per_class:
+                                utility_balance_continue_mass_before = sum(
+                                    max(0.0, float(item[2]))
+                                    for item in batch
+                                    if int(item[1]) == 1
+                                )
+                                utility_balance_stop_mass_before = sum(
+                                    max(0.0, float(item[2]))
+                                    for item in batch
+                                    if int(item[1]) == 0
+                                )
+                                if (
+                                    utility_balance_continue_mass_before > 0.0
+                                    and utility_balance_stop_mass_before > 0.0
+                                ):
+                                    target_mass = 0.5 * (
+                                        utility_balance_continue_mass_before
+                                        + utility_balance_stop_mass_before
+                                    )
+                                    utility_balance_continue_scale = (
+                                        target_mass
+                                        / utility_balance_continue_mass_before
+                                    )
+                                    utility_balance_stop_scale = (
+                                        target_mass
+                                        / utility_balance_stop_mass_before
+                                    )
+                                    batch = [
+                                        (
+                                            item[0],
+                                            item[1],
+                                            float(item[2]) * (
+                                                utility_balance_continue_scale
+                                                if int(item[1]) == 1
+                                                else utility_balance_stop_scale
+                                            ),
+                                        )
+                                        for item in batch
+                                    ]
+                                    utility_balance_applied = True
+                                    utility_balance_continue_mass_after = sum(
+                                        max(0.0, float(item[2]))
+                                        for item in batch
+                                        if int(item[1]) == 1
+                                    )
+                                    utility_balance_stop_mass_after = sum(
+                                        max(0.0, float(item[2]))
+                                        for item in batch
+                                        if int(item[1]) == 0
+                                    )
+
                         loss = self.hindsight_logistic_model.update_batch(batch)
                     else:
                         loss = self.hindsight_logistic_model.update(
@@ -1872,6 +1951,20 @@ class OnlineTDRefinementController:
                     "replay_buffer_size_before": replay_buffer_size_before,
                     "replay_buffer_size_after": len(self.hindsight_logistic_replay_buffer),
                     "replay_batch_size_used": replay_batch_size_used,
+                    "utility_balance_enabled": bool(
+                        self.config.hindsight_logistic_balance_utility_mass
+                    ),
+                    "utility_balance_applied": utility_balance_applied,
+                    "utility_balance_continue_scale": utility_balance_continue_scale,
+                    "utility_balance_stop_scale": utility_balance_stop_scale,
+                    "utility_balance_continue_mass_before": (
+                        utility_balance_continue_mass_before
+                    ),
+                    "utility_balance_stop_mass_before": utility_balance_stop_mass_before,
+                    "utility_balance_continue_mass_after": (
+                        utility_balance_continue_mass_after
+                    ),
+                    "utility_balance_stop_mass_after": utility_balance_stop_mass_after,
                     "predicted_continue": predicted_continue,
                     "cost_aware_correct": None if is_tie else predicted_continue == actual_continue,
                     "class_weight": class_weight,
@@ -2805,6 +2898,11 @@ class OnlineTDRefinementController:
         elif refinement_step >= self.config.max_refinement_steps:
             action, action_source = STOP, "max_refinement_stop"
             reason = "hindsight_max_refinement_steps"
+        elif self.config.policy_ablation == "frozen_stop":
+            # Matched Always-STOP baseline for the hindsight-logistic path:
+            # stop at every state where STOP is physically legal.
+            action, action_source = STOP, "frozen_stop_control"
+            reason = "hindsight_frozen_stop_control"
         elif not learner_ready:
             action = failfast_fallback_action
             action_source = "cold_start_continue" if action == CONTINUE else "cold_start_stop"
@@ -2822,6 +2920,7 @@ class OnlineTDRefinementController:
             and snapshot is not None
             and refinement_step < self.config.max_refinement_steps
             and not self.hindsight_probe_outstanding
+            and self.config.policy_ablation == "learned"
         ):
             if structural_eligible:
                 probe_probability = self.config.hindsight_delta_j_structural_probe_probability
@@ -2912,6 +3011,9 @@ class OnlineTDRefinementController:
                 "utility_weighting_mode": self.config.hindsight_logistic_utility_weighting,
                 "replay_batch_size": self.config.hindsight_logistic_replay_batch_size,
                 "replay_buffer_size": len(self.hindsight_logistic_replay_buffer),
+                "utility_balance_enabled": bool(
+                    self.config.hindsight_logistic_balance_utility_mass
+                ),
                 "model_action": model_action,
                 "executed_action": action,
                 "action_source": action_source,
