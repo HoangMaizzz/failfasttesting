@@ -805,6 +805,9 @@ parser.add_argument("--adaptive-hindsight-logistic-learning-rate", type=float, d
 parser.add_argument("--adaptive-hindsight-soft-probe", action="store_true")
 parser.add_argument("--adaptive-hindsight-logistic-continue-threshold", type=float, default=0.5)
 parser.add_argument("--adaptive-hindsight-logistic-probe-only", action="store_true")
+parser.add_argument("--adaptive-hindsight-probe-tape", type=str)
+parser.add_argument("--adaptive-hindsight-probe-trace", type=str)
+parser.add_argument("--adaptive-hindsight-state-fingerprint", action="store_true")
 parser.add_argument("--adaptive-hindsight-logistic-tie-ms-per-token", type=float, default=1.0)
 parser.add_argument(
     "--adaptive-hindsight-logistic-use-class-weight",
@@ -1194,6 +1197,9 @@ def build_adaptive_controller(args):
             ),
             hindsight_soft_probe=args.adaptive_hindsight_soft_probe,
             hindsight_logistic_probe_only=args.adaptive_hindsight_logistic_probe_only,
+            hindsight_probe_tape_path=args.adaptive_hindsight_probe_tape,
+            hindsight_probe_trace_path=args.adaptive_hindsight_probe_trace,
+            hindsight_state_fingerprint=args.adaptive_hindsight_state_fingerprint,
             hindsight_logistic_continue_threshold=(
                 args.adaptive_hindsight_logistic_continue_threshold
             ),

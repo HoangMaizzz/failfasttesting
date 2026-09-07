@@ -301,6 +301,9 @@ class AdaptiveTDConfig:
     hindsight_soft_probe: bool = False
     hindsight_logistic_continue_threshold: float = 0.5
     hindsight_logistic_probe_only: bool = False
+    hindsight_probe_tape_path: str | None = None
+    hindsight_probe_trace_path: str | None = None
+    hindsight_state_fingerprint: bool = False
     hindsight_logistic_tie_ms_per_token: float = 1.0
     hindsight_logistic_use_class_weight: bool = False
     # Optional third causal feature for the U1 logistic learner:
@@ -1022,6 +1025,13 @@ class OnlineTDRefinementController:
         self.hindsight_delta_j_stop_count = 0
         self.hindsight_structural_probe_count = 0
         self.hindsight_floor_probe_count = 0
+        self.hindsight_probe_tape = None
+        if self.config.hindsight_probe_tape_path:
+            from oracle_probe_schedule import ProbeTape
+            if not self.config.hindsight_probe_trace_path:
+                raise ValueError('Probe tape requires a trace output path')
+            self.hindsight_probe_tape = ProbeTape(
+                self.config.hindsight_probe_tape_path, self.config.hindsight_probe_trace_path)
         self.nonlinear_value = (
             None if config.value_model == "linear" else OnlineNonlinearVA(
                 config.value_model,
@@ -2881,6 +2891,21 @@ class OnlineTDRefinementController:
         structural_eligible = mask_count >= 2
 
         dynamic_threshold = float(self.config.hindsight_logistic_continue_threshold)
+        tape_event = None
+        state_fingerprint = None
+        probe_gate_open = bool(
+            allow_exploration and snapshot is not None
+            and refinement_step < self.config.max_refinement_steps
+            and not self.hindsight_probe_outstanding
+            and self.config.policy_ablation == 'learned')
+        if self.config.hindsight_state_fingerprint:
+            from oracle_probe_schedule import ProbeTape
+            state_fingerprint = ProbeTape.fingerprint(
+                snapshot, self.hindsight_committed_tokens, refinement_step)
+        if self.hindsight_probe_tape is not None:
+            tape_event = self.hindsight_probe_tape.begin(
+                int(self.hindsight_problem_id), snapshot,
+                self.hindsight_committed_tokens, refinement_step)
         dynamic_threshold_diag = {
             "dynamic_threshold_active": False,
             "dynamic_threshold": dynamic_threshold,
@@ -2933,7 +2958,8 @@ class OnlineTDRefinementController:
             else:
                 probe_probability = self.config.hindsight_delta_j_floor_probe_probability
                 probe_source = "floor_probe"
-            if self.rng.random() < probe_probability:
+            if (self.hindsight_probe_tape.select(tape_event, probe_probability)
+                if tape_event is not None else self.rng.random() < probe_probability):
                 action, action_source = CONTINUE, probe_source
                 reason = f"hindsight_{probe_source}"
                 exploration_used = True
@@ -2952,6 +2978,10 @@ class OnlineTDRefinementController:
             if action == CONTINUE
             else 1.0 - behavior_continue_probability
         )
+        if tape_event is not None:
+            self.hindsight_probe_tape.finish(tape_event, action, action_source)
+            behavior_continue_probability = float(action == CONTINUE)
+            selected_action_probability = 1.0
         if snapshot is not None:
             snapshot.update({
                 "action": action,
@@ -3005,6 +3035,8 @@ class OnlineTDRefinementController:
             diagnostics={
                 "controller_name": self.config.credit_assignment,
                 "logistic_logit": logit,
+                "hindsight_state_hash": state_fingerprint,
+                "hindsight_probe_gate_open": probe_gate_open,
                 "continue_score": score,
                 "continue_threshold": float(dynamic_threshold),
                 "fixed_continue_threshold": float(
