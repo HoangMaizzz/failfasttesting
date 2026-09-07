@@ -571,6 +571,8 @@ def screen_until_candidates(args: argparse.Namespace, root: Path, needed: int) -
         if not cand.empty:
             cand.to_csv(root / "screen_candidates.csv", index=False)
         json_dump(root / "screen_f2_diagnostic.json", {
+            "good_c_pairs": int(tr.binary_label_C.eq(1).sum()) if not tr.empty else 0,
+            "problems_with_good_c": int(tr.loc[tr.binary_label_C.eq(1), "problem_id"].nunique()) if not tr.empty else 0,
             "beta": beta.tolist(),
             "pooled_auc": auc_binary(tr.binary_label_C, add_f2_offline_score(tr, beta).offline_f2_score) if (not tr.empty and tr.binary_label_C.nunique() == 2) else float("nan"),
             "screened_problem_count": len(screened),
@@ -660,6 +662,13 @@ def screen_until_candidates(args: argparse.Namespace, root: Path, needed: int) -
         screened_in_window = {pid for pid in screened if args.screen_start_id <= pid < hard_end_id}
         tr, cand = refresh()
         after_ids = set(cand.problem_id.astype(int).tolist()) if not cand.empty else set()
+        good_c = tr[tr.binary_label_C.eq(1)] if not tr.empty else tr
+        print(
+            f"[GOOD-C] pairs={len(good_c)} | problems_with_good_c="
+            f"{good_c.problem_id.nunique() if not good_c.empty else 0} | "
+            f"qualified_candidates={len(cand)}/{needed} | "
+            f"still_needed={max(0, needed-len(cand))}", flush=True,
+        )
         new_ids = sorted(after_ids - before_ids)
         remaining = max(0, needed - len(cand))
         yield_rate = len(cand) / max(1, len(screened_in_window))
