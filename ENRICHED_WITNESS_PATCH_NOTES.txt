@@ -1,0 +1,7 @@
+Frozen enriched-good-probe witness test.
+- No discovery/search phase.
+- Exact 50-problem trajectory frozen.
+- Exact 214-probe schedule frozen and mapped from oracle transition rows to physical decision ordinals using before_snapshot_id -> hindsight_snapshot_id.
+- INT8 verifier / FP16 compute; verifier KV off; drafter FP16; drafter reusable KV off.
+- Strong schedule completeness check added: all frozen keys must be encountered and selected-or-shadowed.
+- Final claim uses ACTUAL rerun learned-C delta-J only.

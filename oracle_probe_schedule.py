@@ -20,13 +20,18 @@ class ProbeTape:
     def __init__(self, path, trace_path):
         self.rows = {}
         with Path(path).open(encoding='utf-8', newline='') as stream:
-            for row in csv.DictReader(stream):
+            reader = csv.DictReader(stream)
+            fields = set(reader.fieldnames or [])
+            sparse = 'probe' not in fields
+            for row in reader:
                 key = (int(row['problem_id']), int(row['decision_ordinal']))
                 if key in self.rows:
                     raise ValueError(f'Duplicate probe tape key: {key}')
-                row['probe'] = row['probe'].lower() in ('1', 'true')
+                row['probe'] = True if sparse else row['probe'].lower() in ('1', 'true')
+                aliases = {'mask': 'expected_mask', 'pos': 'expected_pos'}
                 for name in ('mask', 'pos'):
-                    row[name] = float(row[name])
+                    value = row.get(name, row.get(aliases[name]))
+                    row[name] = float(value)
                     if not math.isfinite(row[name]):
                         raise ValueError('Tape features must be finite')
                 self.rows[key] = row
@@ -67,6 +72,7 @@ class ProbeTape:
 
     def finish(self, event, action, source):
         event.update(action=action, action_source=source)
-        event['action_match'] = event['expected_action'] == action
+        event['action_match'] = (event['expected_action'] in (None, '')
+                                 or event['expected_action'] == action)
         with self.trace_path.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(event, allow_nan=False) + '\n')
