@@ -25,6 +25,7 @@ class PoolTest(unittest.TestCase):
             self.assertNotIn('--verifier_kv_cache',cmd)
             self.assertEqual(cmd[cmd.index('--unquantized_dtype')+1],'float16')
             self.assertEqual(cmd[cmd.index('--target_quantization')+1],'none')
+            self.assertEqual(cmd[cmd.index('--target_model_label')+1],'Qwen2.5-7B-Instruct')
 
     def test_pool_and_completion(self):
         a=SimpleNamespace(pool_size=180,candidate_id_min=1,candidate_id_max=499,

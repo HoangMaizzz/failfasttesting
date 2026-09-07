@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WORK = Path('/kaggle/working')
-OUTPUT = WORK / 'math50_fp16_nokv_pool_results'
+OUTPUT = Path(os.environ.get('MATH50_POOL_OUTPUT', str(WORK / 'math50_fp16_nokv_pool_label_fix')))
 MODELS = WORK / 'math50_fp16_models'
 POOL_SIZE = 180
 MAX_CANDIDATES = 5

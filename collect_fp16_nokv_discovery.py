@@ -122,6 +122,7 @@ def cmd_for(a, ids, dest):
         '--max_new_tokens', str(a.max_new_tokens),
         '--spec_len', '8', '--block_size', '32', '--small_block_size', '8',
         '--target_model_name', str(a.target_model_name),
+        '--target_model_label', 'Qwen2.5-7B-Instruct',
         '--dllm_dir', str(a.dllm_dir),
         '--target_device', str(a.target_device),
         '--drafter_device', str(a.drafter_device),
