@@ -69,8 +69,10 @@ def bools(s):
 
 
 def base_cmd(a, ids, dest):
-    if a.target_quantization != 'none' or a.target_dtype != 'fp16' or a.drafter_dtype != 'fp16':
-        raise ValueError('This experiment requires FP16 target and drafter, without quantization')
+    if a.target_quantization not in ('none','int8') or a.target_dtype != 'fp16' or a.drafter_dtype != 'fp16':
+        raise ValueError('Use FP16 compute with an FP16 or INT8 target and FP16 drafter')
+    if a.two_gpu and a.target_quantization != 'none':
+        raise ValueError('Two-GPU FP16 placement cannot be combined with INT8')
     return [
         sys.executable, '-u', 'failfast.py',
         '--dataset_name', 'math',

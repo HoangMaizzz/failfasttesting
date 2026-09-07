@@ -28,6 +28,7 @@ def parse_args():
     p.add_argument('--drafter_device', type=int, default=1)
     p.add_argument('--target_model_name', default='Qwen/Qwen2.5-7B-Instruct')
     p.add_argument('--two_gpu', action='store_true')
+    p.add_argument('--target_quantization', choices=['none','int8'], default='none')
     p.add_argument('--pool_size', type=int, default=180,
                    help='Number of unique MATH problems in the single discovery stream; recommended 150-200.')
     p.add_argument('--candidate_id_min', type=int, default=1)
@@ -110,6 +111,9 @@ def run(cmd, log_path):
 
 
 def cmd_for(a, ids, dest):
+    quantization = getattr(a, 'target_quantization', 'none')
+    if a.two_gpu and quantization != 'none':
+        raise ValueError('Two-GPU FP16 placement cannot be combined with INT8')
     return [
         sys.executable, '-u', 'failfast.py',
         '--dataset_name', 'math',
@@ -126,7 +130,7 @@ def cmd_for(a, ids, dest):
         '--dllm_dir', str(a.dllm_dir),
         '--target_device', str(a.target_device),
         '--drafter_device', str(a.drafter_device),
-        '--target_quantization', 'none',
+        '--target_quantization', quantization,
         '--unquantized_dtype', 'float16',
         *(['--target_two_gpu_fp16'] if a.two_gpu else []),
         '--disable_reusing_drafter_kvs',
@@ -174,7 +178,7 @@ def main():
     manifest = {
         'discovery_design': 'single_broad_stream',
         'setting': {
-            'target_quantization': 'none',
+            'target_quantization': a.target_quantization,
             'target_dtype': 'fp16',
             'drafter_dtype': 'fp16',
             'verifier_use_cache': False,

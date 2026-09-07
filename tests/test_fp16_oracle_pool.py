@@ -38,6 +38,20 @@ class PoolTest(unittest.TestCase):
             self.assertTrue(complete(p,[2,1]))
             self.assertFalse(complete(p,[1,2]))
 
+    def test_int8_single_gpu_commands(self):
+        a=SimpleNamespace(dllm_dir='draft',target_model_name='target',target_device=0,
+            drafter_device=0,target_quantization='int8',target_dtype='fp16',drafter_dtype='fp16',
+            two_gpu=False,seed=42,max_new_tokens=1024,drafter_threshold=.5,
+            lowconf_threshold=.7,log_level='INFO',probe_schedule_csv='tape.csv')
+        for cmd in (cmd_for(a,[1,2],Path('out')),u1_cmd(a,[1,2],Path('out'))):
+            self.assertEqual(cmd[cmd.index('--target_quantization')+1],'int8')
+            self.assertEqual(cmd[cmd.index('--drafter_device')+1],'0')
+            self.assertIn('--disable_reusing_drafter_kvs',cmd)
+            self.assertNotIn('--target_two_gpu_fp16',cmd)
+            self.assertNotIn('--verifier_kv_cache',cmd)
+        a.two_gpu=True
+        with self.assertRaises(ValueError):u1_cmd(a,[1,2],Path('out'))
+
     def test_tape_never_overrides_learned(self):
         t=WitnessTest()
         with tempfile.TemporaryDirectory() as td:

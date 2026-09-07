@@ -30,3 +30,15 @@ This is a selected positive control, NOT an exhaustive or globally optimal oracl
 CPU replay generates candidates only: actual execution is authoritative. An empty
 search result is a valid negative outcome. This implementation cannot promise a
 beneficial witness, speedup, bitwise determinism, or absence of GPU OOM.
+
+## Single-GPU INT8 server variant
+
+`run_int8_nokv_pool_server.py` executes the same discovery/search/witness protocol
+with bitsandbytes INT8 target weights and an FP16 drafter, both on GPU 0. FP16
+Kaggle defaults remain unchanged. The INT8 variant collects its own fresh data;
+it does not reuse FP16 discovery labels. The default pool IDs/order match the
+Kaggle selection seed, but model outputs and trajectories may differ.
+
+Use `--dllm_dir <local drafter> --resume`; reports default to
+`outputs_int8_nokv_math_pool` and the adjacent `.zip`. No Always-STOP run or
+speedup gate is added. No GPU run starts during deployment or `--dry_run`.

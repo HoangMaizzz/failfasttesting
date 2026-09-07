@@ -116,8 +116,16 @@ def main():
         raise ValueError('Search budgets and learned-C minimum must be positive')
     if not 0 < a.min_total_learned_benefit < float('inf'):
         raise ValueError('Benefit margin must be finite and positive')
-    if a.target_quantization != 'none' or a.target_dtype != 'fp16' or a.drafter_dtype != 'fp16':
-        raise ValueError('FP16/no-quantization experiment only')
+    if a.target_quantization not in ('none','int8') or a.target_dtype != 'fp16' or a.drafter_dtype != 'fp16':
+        raise ValueError('Use FP16 compute, an FP16 or INT8 target and FP16 drafter')
+    if a.two_gpu and a.target_quantization != 'none':
+        raise ValueError('Two-GPU FP16 placement cannot be combined with INT8')
+    for source in source_paths:
+        manifest = source/'DISCOVERY_MANIFEST.json'
+        if source.is_dir() and manifest.exists():
+            settings = json.loads(manifest.read_text())['setting']
+            if settings['target_quantization'] != a.target_quantization:
+                raise ValueError('Discovery and witness target quantization must match')
     source_hashes = {}
     for source in source_paths:
         files = [source] if source.is_file() else sorted(source.rglob('benchmark_results.csv'))
@@ -283,7 +291,7 @@ def main():
                 "definition": "delta_J = J_CONTINUE - J_STOP; aggregate benefit = -sum(delta_J_learned_continue)",
                 "always_stop_speed_required": False,
                 "individual_learned_continue_must_all_be_beneficial": False,
-                "precision_setting": "FP16 verifier + FP16 drafter; verifier use_cache=False; reusable drafter KVs disabled",
+                "precision_setting": f"target_quantization={a.target_quantization}, FP16 compute/drafter; verifier use_cache=False; reusable drafter KVs disabled",
                 "probe_ratio_hard_required": False,
                 "probe_ratio_soft_preference": True,
                 "actual_total_learned_benefit_ms_per_token": total_benefit,
