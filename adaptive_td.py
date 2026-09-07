@@ -300,6 +300,7 @@ class AdaptiveTDConfig:
     hindsight_logistic_learning_rate: float = 0.05
     hindsight_soft_probe: bool = False
     hindsight_logistic_continue_threshold: float = 0.5
+    hindsight_logistic_probe_only: bool = False
     hindsight_logistic_tie_ms_per_token: float = 1.0
     hindsight_logistic_use_class_weight: bool = False
     # Optional third causal feature for the U1 logistic learner:
@@ -2907,12 +2908,14 @@ class OnlineTDRefinementController:
             action = failfast_fallback_action
             action_source = "cold_start_continue" if action == CONTINUE else "cold_start_stop"
             reason = "hindsight_failfast_cold_start"
-        elif score > dynamic_threshold:
+        elif score > dynamic_threshold and not self.config.hindsight_logistic_probe_only:
             action, action_source = CONTINUE, "learned_continue"
             reason = "hindsight_dynamic_logistic_continue"
         else:
             action, action_source = STOP, "learned_stop"
             reason = "hindsight_dynamic_logistic_stop"
+            if self.config.hindsight_logistic_probe_only:
+                action_source = "probe_only_stop"
         model_action = action
         if (
             action == STOP
