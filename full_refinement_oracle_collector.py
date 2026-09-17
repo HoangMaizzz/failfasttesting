@@ -17,6 +17,7 @@ import argparse
 import csv
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -35,13 +36,14 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--problem_ids_file", type=Path)
     p.add_argument("--output_dir", type=Path)
     p.add_argument("--target_model_name", default="Qwen/Qwen2.5-7B-Instruct")
-    p.add_argument("--dllm_dir", default=str(ROOT / "Fast_dLLM_v2_1.5B"))
-    p.add_argument("--target_quantization", default="int8")
+    p.add_argument("--dllm_dir", default=str(ROOT / "Fast_dLLM_v2_1_5B"))
+    p.add_argument("--target_quantization", default="none")
     p.add_argument("--target_device", default="0")
-    p.add_argument("--drafter_device", default="0")
+    p.add_argument("--drafter_device", default="1")
     p.add_argument("--shard_rows", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--drop_staging", action="store_true", help="remove large CSV staging after successful conversion")
     return p.parse_args()
 
 
@@ -90,7 +92,7 @@ def run_staging(args: argparse.Namespace, dataset: str, destination: Path) -> No
     ]
     ids = problem_ids(args.problem_ids_file, dataset, args.num_questions)
     if ids:
-        command += ["--problem_ids", *map(str, ids)]
+        command += ["--num_questions", str(len(ids)), "--problem_ids", *map(str, ids)]
     else:
         command += ["--num_questions", str(args.num_questions)]
     print(">>>", " ".join(map(str, command)), flush=True)
@@ -116,7 +118,6 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
     if not source.exists():
         raise FileNotFoundError(f"collector produced no {source}")
     csv.field_size_limit(sys.maxsize)
-    rows = list(csv.DictReader(source.open(encoding="utf-8", newline="")))
     dataset_out = output / dataset
     dataset_out.mkdir(parents=True, exist_ok=True)
     metadata_path = dataset_out / "index.jsonl"
@@ -157,31 +158,27 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
         shard_index += 1
 
     previous_by_block: dict[tuple[str, str], str] = {}
-    ids = [state_id(dataset, row) for row in rows]
-    next_ids = {}
-    for index, row in enumerate(rows[:-1]):
-        if (row.get("problem_id"), row.get("round_id")) == (
-            rows[index + 1].get("problem_id"), rows[index + 1].get("round_id")
-        ):
-            next_ids[index] = ids[index + 1]
-    for index, row in enumerate(rows):
-        proposal = [int(x) for x in parse_json(row.get("draft_proposal"))]
-        probabilities = [float(x) for x in parse_json(row.get("accept_probabilities"))]
-        probabilities = (probabilities + [0.0] * len(proposal))[:len(proposal)]
-        block = (row.get("problem_id", ""), row.get("round_id", ""))
-        sid = ids[index]
-        previous = previous_by_block.get(block)
-        previous_by_block[block] = sid
-        hidden = parse_json(row.get("hidden_states"))
-        layers = [int(x) for x in parse_json(row.get("hidden_layer_indices"))]
-        top_ids = parse_json(row.get("topk_token_ids"))
-        top_logits = parse_json(row.get("topk_logits"))
-        if not hidden or not layers or not top_ids or not top_logits:
-            raise RuntimeError("full raw collection row is missing hidden/top-K tensors")
-        metadata_chunks.append({
+    state_count = 0
+    with source.open(encoding="utf-8", newline="") as source_file:
+        rows = csv.DictReader(source_file)
+        for row in rows:
+            proposal = [int(x) for x in parse_json(row.get("draft_proposal"))]
+            probabilities = [float(x) for x in parse_json(row.get("accept_probabilities"))]
+            probabilities = (probabilities + [0.0] * len(proposal))[:len(proposal)]
+            block = (row.get("problem_id", ""), row.get("round_id", ""))
+            sid = state_id(dataset, row)
+            previous = previous_by_block.get(block)
+            previous_by_block[block] = sid
+            hidden = parse_json(row.get("hidden_states"))
+            layers = [int(x) for x in parse_json(row.get("hidden_layer_indices"))]
+            top_ids = parse_json(row.get("topk_token_ids"))
+            top_logits = parse_json(row.get("topk_logits"))
+            if not hidden or not layers or not top_ids or not top_logits:
+                raise RuntimeError("full raw collection row is missing hidden/top-K tensors")
+            metadata_chunks.append({
             "state_id": sid,
             "previous_state_id": previous,
-            "next_state_id": next_ids.get(index),
+            "next_state_id": None,
             "dataset": dataset,
             "problem_id": int(row["problem_id"]),
             "round_id": int(row["round_id"]),
@@ -192,18 +189,27 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             "first_mismatch": int(row.get("accepted_len_if_stop") or 0),
             "verifier_latency_ms": float(row.get("actual_verify_latency_ms") or 0),
             "source_csv": str(source),
-        })
-        token_chunks.append(proposal)
-        prob_chunks.append(probabilities)
-        mask_chunks.append([token == MASK_ID for token in proposal])
-        hidden_chunks.append(hidden)
-        layer_chunks.append(layers)
-        top_id_chunks.append(top_ids)
-        top_logit_chunks.append(top_logits)
-        if len(token_chunks) >= shard_rows:
-            flush()
+            })
+            token_chunks.append(proposal)
+            prob_chunks.append(probabilities)
+            mask_chunks.append([token == MASK_ID for token in proposal])
+            hidden_chunks.append(hidden)
+            layer_chunks.append(layers)
+            top_id_chunks.append(top_ids)
+            top_logit_chunks.append(top_logits)
+            state_count += 1
+            if len(token_chunks) >= shard_rows:
+                flush()
     flush(); metadata_file.close()
-    return {"states": len(rows), "shards": shard_index, "source": str(source)}
+    # Restore trajectory links without retaining the multi-GB CSV in memory.
+    metadata = [json.loads(line) for line in metadata_path.read_text(encoding="utf-8").splitlines()]
+    for left, right in zip(metadata, metadata[1:]):
+        if (left.get("problem_id"), left.get("round_id")) == (right.get("problem_id"), right.get("round_id")):
+            left["next_state_id"] = right["state_id"]
+    metadata_path.write_text(
+        "".join(json.dumps(item) + "\n" for item in metadata), encoding="utf-8"
+    )
+    return {"states": state_count, "shards": shard_index, "source": str(source)}
 
 
 def main() -> None:
@@ -229,6 +235,8 @@ def main() -> None:
             run_staging(args, dataset, staging)
         manifest["datasets"][dataset] = convert_dataset(
             dataset, staging, output / "raw", args.shard_rows)
+        if args.drop_staging:
+            shutil.rmtree(staging)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2), flush=True)
 

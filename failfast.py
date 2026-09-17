@@ -49,7 +49,9 @@ def target_model_load_kwargs(args):
     }
     quantization = getattr(args, "target_quantization", "none")
     if quantization == "none":
-        kwargs["torch_dtype"] = "auto"
+        # Kaggle T4 does not support bfloat16 efficiently; keep the explicit
+        # full-precision path in FP16 while placing the verifier on GPU 0.
+        kwargs["torch_dtype"] = torch.float16
         return kwargs
     if torchao_weight_only:
         try:
@@ -4965,7 +4967,7 @@ if not args.read_pickle:
             logging.info(f"{Colors.BOLD}=== Loading dLLM model from: {dllm_path} ==={Colors.RESET}")
             dllm = AutoModelForCausalLM.from_pretrained(
                 dllm_path,
-                torch_dtype="auto",
+                torch_dtype=torch.float16,
                 device_map={"": args.drafter_device},
                 trust_remote_code=True,
                 local_files_only=True,

@@ -582,6 +582,7 @@ class Fast_dLLM_QwenModel(Fast_dLLM_QwenPreTrainedModel):
         replace_position: Optional[int] = None,
         **kwargs
     ) -> BaseModelOutputWithPast:
+        collect_hidden_states = bool(kwargs.pop("output_hidden_states", False))
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -623,11 +624,14 @@ class Fast_dLLM_QwenModel(Fast_dLLM_QwenPreTrainedModel):
                 attention_mask = self.eval_mask(input_ids.shape[1], block_size, past_key_values.get_seq_length() if past_key_values is not None else 0).to(device=inputs_embeds.device)
 
         hidden_states = inputs_embeds
+        all_hidden_states = [] if collect_hidden_states else None
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if all_hidden_states is not None:
+                all_hidden_states.append(hidden_states)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -644,10 +648,13 @@ class Fast_dLLM_QwenModel(Fast_dLLM_QwenPreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
+        if all_hidden_states is not None:
+            all_hidden_states.append(hidden_states)
         return BaseModelOutputWithPastAndBlockCache(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             block_past_key_values=block_past_key_values if use_block_cache else None,
+            hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
         )
 
 
@@ -793,6 +800,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         **kwargs
     ):
         """Vanilla generate of Fast-dLLM"""
+        collect_raw = bool(kwargs.get("full_refinement_oracle", False))
         num_blocks = max_new_tokens // block_size
         original_input_length = input_ids.shape[1]
 
@@ -852,10 +860,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 logits = logits[:, start:end]
                             else:
-                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+                                output = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx, output_hidden_states=collect_raw)
+                                logits = output.logits
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         else:
-                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, output_hidden_states=collect_raw)
+                            logits = output.logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
 
@@ -905,6 +915,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         **kwargs
     ):
         """Generate n draft tokens"""
+        collect_raw = bool(getattr(args, "full_refinement_oracle", False))
         num_blocks = max_new_tokens // block_size
         # if num_blocks == 1:
         #     logger.debug(f"{Colors.RED}Warning: <{max_new_tokens} tokens might be generated if only 1 block is needed. {Colors.RESET}")
@@ -935,7 +946,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 E.g., if seqlen is 40, blk size is 32, only process first 32 tokens.
                 This makes sure the KVs are attended to correctly (on complete blocks).
                 """
-                output = self.forward(input_ids=input_ids[:, :(input_ids.shape[1] // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+                output = self.forward(input_ids=input_ids[:, :(input_ids.shape[1] // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size, output_hidden_states=collect_raw)
                 end_time = torch.cuda.Event(enable_timing=True)
                 end_time.record()
                 torch.cuda.synchronize()
@@ -1207,6 +1218,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 "total": 0,
             },
         }
+        collect_raw = bool(getattr(args, "full_refinement_oracle", False))
+        raw_top_k = max(1, int(getattr(args, "raw_top_k", 32)))
         committed_confidences = {}
         committed_margins = {}
         committed_accept_probabilities = {}
@@ -1423,7 +1436,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 ##################Start of timer##################
                 start_time = torch.cuda.Event(enable_timing=True)
                 start_time.record()
-                output = self.forward(input_ids=input_ids[:, :(input_ids.shape[1] // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+                output = self.forward(input_ids=input_ids[:, :(input_ids.shape[1] // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size, output_hidden_states=collect_raw)
                 end_time = torch.cuda.Event(enable_timing=True)
                 end_time.record()
                 torch.cuda.synchronize()
@@ -1483,7 +1496,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                     ##################Start of timer##################
                     start_time = torch.cuda.Event(enable_timing=True)
                     start_time.record()
-                    output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
+                    output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size, output_hidden_states=collect_raw)
                     end_time = torch.cuda.Event(enable_timing=True)
                     end_time.record()
                     torch.cuda.synchronize()
@@ -1540,6 +1553,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         start_time = torch.cuda.Event(enable_timing=True)
                         start_time.record()
                         adaptive_full_block_logits = None
+                        raw_logits_offset = 0
+                        raw_hidden_offset = 0
                         if use_block_cache:
                             if (
                                 block_past_key_values is None
@@ -1548,25 +1563,32 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     == mask_id
                                 ).any()
                             ):
-                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
+                                output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, output_hidden_states=collect_raw)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 adaptive_full_block_logits = (
                                     logits
                                     if adaptive_enabled
+                                    or collect_raw
                                     or bool(getattr(args, "collect_bucket_oracle", False))
                                     else None
                                 )
                                 logits = logits[:, start:end]
                             else:
-                                logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+                                output = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx, output_hidden_states=collect_raw)
+                                logits = output.logits
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+                                adaptive_full_block_logits = logits
+                                raw_logits_offset = int(small_block_start_idx)
+                                raw_hidden_offset = int(small_block_start_idx)
                         else:
-                            logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, output_hidden_states=collect_raw)
+                            logits = output.logits
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             adaptive_full_block_logits = (
                                 logits
                                 if adaptive_enabled
+                                or collect_raw
                                 or bool(getattr(args, "collect_bucket_oracle", False))
                                 else None
                             )
@@ -3134,6 +3156,39 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         for item in frontier_stats["adaptive_decisions"]
                                         if item.get("stop_available")
                                     ]
+                                    raw_snapshot_fields = {}
+                                    if collect_raw:
+                                        local_start = max(0, int(draft_token_start_idx - block_abs_start))
+                                        local_end = min(int(target_len), int(block_size - local_start))
+                                        hidden = getattr(locals().get("output"), "hidden_states", None)
+                                        if hidden:
+                                            depth = len(hidden)
+                                            selected = sorted(set([
+                                                0,
+                                                max(0, (depth - 1) // 4),
+                                                max(0, (depth - 1) // 2),
+                                                max(0, 3 * (depth - 1) // 4),
+                                                depth - 1,
+                                            ]))
+                                            local_end = min(int(hidden[-1].shape[1]), local_start + int(target_len))
+                                            raw_snapshot_fields["hidden_layer_indices"] = selected
+                                            hidden_start = max(0, local_start - raw_hidden_offset)
+                                            hidden_end = min(int(hidden[-1].shape[1]), hidden_start + int(target_len))
+                                            raw_snapshot_fields["hidden_states"] = [
+                                                hidden[index][0, hidden_start:hidden_end].detach().to(torch.float16).cpu().tolist()
+                                                for index in selected
+                                            ]
+                                        if adaptive_full_block_logits is not None:
+                                            k = min(raw_top_k, int(adaptive_full_block_logits.shape[-1]))
+                                            logit_start = max(0, local_start - raw_logits_offset)
+                                            logit_end = min(int(adaptive_full_block_logits.shape[1]), logit_start + int(target_len))
+                                            values, indices = torch.topk(
+                                                adaptive_full_block_logits[0, logit_start:logit_end].float(),
+                                                k=k,
+                                                dim=-1,
+                                            )
+                                            raw_snapshot_fields["topk_token_ids"] = indices.detach().cpu().tolist()
+                                            raw_snapshot_fields["topk_logits"] = values.detach().to(torch.float16).cpu().tolist()
                                     frontier_stats["oracle_refinement_snapshots"].append({
                                         "step": current_step,
                                         "target_len": int(target_len),
@@ -3186,6 +3241,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "calibration_tokens": int(bucket_calibration_tokens),
                                         "accept_probabilities": list(accept_probabilities),
+                                        **raw_snapshot_fields,
                                         "adaptive_policy_action": (
                                             None
                                             if adaptive_record is None
