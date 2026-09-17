@@ -18,7 +18,7 @@ from huggingface_hub import snapshot_download
 snapshot_download(
     "Efficient-Large-Model/Fast_dLLM_v2_1.5B",
     local_dir="/kaggle/working/failfasttesting/Fast_dLLM_v2_1_5B",
-    allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja"],
+    allow_patterns=["configuration.py", "*.json", "*.safetensors", "*.txt", "*.jinja"],
 )
 ```
 
