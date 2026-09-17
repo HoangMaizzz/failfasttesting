@@ -1,5 +1,6 @@
 from typing import Callable, Optional, Union
 from dataclasses import dataclass
+import math
 import time
 
 import torch
@@ -44,6 +45,36 @@ logging.set_verbosity_error()
 # logging.set_verbosity_debug()
 
 logger = logging.get_logger(__name__)
+
+
+def materialize_stop_candidate(
+    current_draft_tokens,
+    *,
+    draft_token_start_idx,
+    active_remaining_positions,
+    current_step_token_ids,
+    mask_id,
+):
+    """Materialize exactly the candidate that production STOP can commit."""
+    active_positions = {int(position) for position in active_remaining_positions}
+    fill_tokens = {}
+    missing_positions = []
+    candidate = []
+    for relative_position, current_token in enumerate(current_draft_tokens):
+        absolute_position = int(draft_token_start_idx) + relative_position
+        if int(current_token) != int(mask_id):
+            candidate.append(int(current_token))
+        elif absolute_position in active_positions:
+            token = current_step_token_ids.get(absolute_position)
+            if token is None:
+                missing_positions.append(absolute_position)
+                candidate.append(None)
+            else:
+                fill_tokens[absolute_position] = int(token)
+                candidate.append(int(token))
+        else:
+            candidate.append(None)
+    return candidate, fill_tokens, missing_positions
 
 
 class Colors:
@@ -1510,7 +1541,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         start_time.record()
                         adaptive_full_block_logits = None
                         if use_block_cache:
-                            if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
+                            if (
+                                block_past_key_values is None
+                                or (
+                                    x_t[:, -block_size + small_block_start_idx]
+                                    == mask_id
+                                ).any()
+                            ):
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
@@ -1934,6 +1971,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             min_steps = int(getattr(args, "bucket_renewal_min_steps", 1)) if args is not None else 1
                             stop_reason = None
                             adaptive_record = None
+                            adaptive_stop_fill_tokens = {}
                             if adaptive_enabled and adaptive_controller is not None:
                                 remaining_relative_positions = [
                                     position
@@ -1992,9 +2030,45 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 physical_small_end = (
                                     block_abs_start + small_block_end_idx
                                 )
+                                hindsight_block_gain = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_block_gain",
+                                    False,
+                                ))
+                                hindsight_delta_j_f5 = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_delta_j_f5",
+                                    False,
+                                ))
+                                hindsight_delta_j_f2 = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_delta_j_f2",
+                                    False,
+                                ))
+                                hindsight_delta_j_logistic_f2 = bool(getattr(
+                                    adaptive_controller,
+                                    "uses_hindsight_delta_j_logistic_f2",
+                                    False,
+                                ))
+                                hindsight_delta_j = bool(
+                                    hindsight_delta_j_f5
+                                    or hindsight_delta_j_f2
+                                    or hindsight_delta_j_logistic_f2
+                                )
+                                hindsight_raw_gain = bool(
+                                    hindsight_block_gain and not hindsight_delta_j
+                                )
+                                hindsight_frame_eligible = bool(
+                                    not hindsight_block_gain
+                                    or (
+                                        max(physical_small_start, draft_token_start_idx)
+                                        < min(physical_small_end, draft_end_idx)
+                                    )
+                                )
                                 raw_state_requested = bool(
                                     adaptive_controller.config.feature_schema
                                     == "otrc_raw_state_v1"
+                                    or (hindsight_raw_gain and hindsight_frame_eligible)
                                     or getattr(
                                         args,
                                         "adaptive_collect_raw_state",
@@ -2006,13 +2080,30 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         False,
                                     )
                                 )
-                                logical_span = logical_refinement_span(
-                                    draft_token_start_idx,
-                                    draft_end_idx,
-                                    physical_small_start,
-                                    physical_small_end,
-                                    small_block_size,
-                                )
+                                if hindsight_block_gain and hindsight_frame_eligible:
+                                    hindsight_active_start = max(
+                                        physical_small_start,
+                                        draft_token_start_idx,
+                                    )
+                                    hindsight_active_end = min(
+                                        physical_small_end,
+                                        draft_end_idx,
+                                    )
+                                    logical_span = (
+                                        int(small_block_idx),
+                                        hindsight_active_start,
+                                        hindsight_active_end,
+                                    )
+                                elif hindsight_block_gain:
+                                    logical_span = None
+                                else:
+                                    logical_span = logical_refinement_span(
+                                        draft_token_start_idx,
+                                        draft_end_idx,
+                                        physical_small_start,
+                                        physical_small_end,
+                                        small_block_size,
+                                    )
                                 if logical_span is None:
                                     logical_block_idx = -1
                                     active_absolute_start = max(
@@ -2042,15 +2133,20 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     )
                                 ]
                                 if raw_state_requested:
-                                    if (
-                                        active_span_length
-                                        != RAW_STATE_BLOCK_SIZE
-                                        or len(raw_local_indices)
-                                        != RAW_STATE_BLOCK_SIZE
-                                    ):
+                                    valid_raw_span = (
+                                        0 < active_span_length <= RAW_STATE_BLOCK_SIZE
+                                        and len(raw_local_indices) == active_span_length
+                                    )
+                                    if not hindsight_raw_gain:
+                                        valid_raw_span = bool(
+                                            valid_raw_span
+                                            and active_span_length
+                                            == RAW_STATE_BLOCK_SIZE
+                                        )
+                                    if not valid_raw_span:
                                         raise RuntimeError(
-                                            "raw-state controller requires a complete "
-                                            f"{RAW_STATE_BLOCK_SIZE}-token active block"
+                                            "raw-state controller received an invalid "
+                                            f"active span of {active_span_length} tokens"
                                         )
                                     raw_entropy_scale = max(
                                         1.0,
@@ -2060,36 +2156,53 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             dtype=torch.float32,
                                         )).item()),
                                     )
-                                    physical_probabilities = p_1t[0].float()
-                                    physical_top2 = torch.topk(
-                                        physical_probabilities, k=2, dim=-1
+                                    if hindsight_raw_gain:
+                                        # Hindsight states must describe exactly this
+                                        # physical eight-token Fast-dLLM forward.
+                                        observed_probabilities = p_1t[0].float()
+                                        observed_absolute_start = int(
+                                            physical_small_start
+                                        )
+                                    elif adaptive_full_block_logits is not None:
+                                        observed_probabilities = torch.softmax(
+                                            adaptive_full_block_logits[0].float(),
+                                            dim=-1,
+                                        )
+                                        observed_absolute_start = int(block_abs_start)
+                                    else:
+                                        observed_probabilities = p_1t[0].float()
+                                        observed_absolute_start = int(
+                                            physical_small_start
+                                        )
+                                    observed_top2 = torch.topk(
+                                        observed_probabilities, k=2, dim=-1
                                     ).values
-                                    physical_entropy = -torch.sum(
-                                        physical_probabilities
+                                    observed_entropy = -torch.sum(
+                                        observed_probabilities
                                         * torch.log(torch.clamp(
-                                            physical_probabilities, min=1e-12
+                                            observed_probabilities, min=1e-12
                                         )),
                                         dim=-1,
                                     ) / raw_entropy_scale
-                                    for physical_local_index in range(
-                                        int(p_1t.shape[1])
+                                    for observed_local_index in range(
+                                        int(observed_probabilities.shape[0])
                                     ):
                                         absolute_pos = (
-                                            physical_small_start
-                                            + physical_local_index
+                                            observed_absolute_start
+                                            + observed_local_index
                                         )
                                         adaptive_raw_probability_cache[
                                             int(absolute_pos)
                                         ] = (
-                                            float(physical_top2[
-                                                physical_local_index, 0
+                                            float(observed_top2[
+                                                observed_local_index, 0
                                             ].item()),
-                                            float(physical_top2[
-                                                physical_local_index, 1
+                                            float(observed_top2[
+                                                observed_local_index, 1
                                             ].item()),
                                             float(torch.clamp(
-                                                physical_entropy[
-                                                    physical_local_index
+                                                observed_entropy[
+                                                    observed_local_index
                                                 ],
                                                 0.0,
                                                 1.0,
@@ -2142,7 +2255,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             top1_value,
                                             top2_value,
                                             entropy_value,
-                                            float(raw_position)
+                                            float(local_index)
                                             / max(1, RAW_STATE_BLOCK_SIZE - 1),
                                         ])
                                     raw_state_key = (
@@ -2165,6 +2278,111 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         active_absolute_start,
                                         active_absolute_end,
                                     )
+                                )
+                                hindsight_f5_state = None
+                                hindsight_f2_state = None
+                                if (
+                                    hindsight_delta_j_f2
+                                    or hindsight_delta_j_logistic_f2
+                                ) and hindsight_frame_eligible:
+                                    f2_started = time.perf_counter()
+                                    f2_mask = x_t[
+                                        0,
+                                        active_absolute_start:active_absolute_end,
+                                    ].eq(mask_id)
+                                    f2_mask_indices = torch.nonzero(
+                                        f2_mask, as_tuple=False
+                                    ).flatten()
+                                    current_mask_count = int(f2_mask.sum().item())
+                                    first_unresolved = (
+                                        float(f2_mask_indices[0].item())
+                                        / max(1, active_span_length - 1)
+                                        if current_mask_count
+                                        else 1.0
+                                    )
+                                    hindsight_f2_state = {
+                                        "active_span_size": int(active_span_length),
+                                        "current_mask_count": current_mask_count,
+                                        "first_unresolved_position": first_unresolved,
+                                    }
+                                    adaptive_controller.record_profile(
+                                        "hindsight_f2_feature_aggregation",
+                                        (time.perf_counter() - f2_started) * 1000.0,
+                                    )
+                                if hindsight_delta_j_f5 and hindsight_frame_eligible:
+                                    f5_started = time.perf_counter()
+                                    f5_local_indices = torch.tensor(
+                                        raw_local_indices,
+                                        device=p_1t.device,
+                                        dtype=torch.long,
+                                    )
+                                    f5_probabilities = p_1t[0].float().index_select(
+                                        0, f5_local_indices
+                                    )
+                                    f5_top2 = torch.topk(
+                                        f5_probabilities, k=2, dim=-1
+                                    ).values
+                                    f5_entropy_scale = max(
+                                        1.0,
+                                        float(math.log(f5_probabilities.shape[-1])),
+                                    )
+                                    f5_entropy = -torch.sum(
+                                        f5_probabilities
+                                        * torch.log(torch.clamp(
+                                            f5_probabilities, min=1e-12
+                                        )),
+                                        dim=-1,
+                                    ) / f5_entropy_scale
+                                    f5_mask = x_t[
+                                        0,
+                                        active_absolute_start:active_absolute_end,
+                                    ].eq(mask_id)
+                                    masked_entropy = f5_entropy[f5_mask]
+                                    resolved_entropy = f5_entropy[~f5_mask]
+                                    resolved_margin = (
+                                        f5_top2[:, 0] - f5_top2[:, 1]
+                                    )[~f5_mask]
+                                    f5_summary = torch.stack([
+                                        f5_mask.sum().float(),
+                                        (
+                                            masked_entropy.std(unbiased=False)
+                                            if masked_entropy.numel() > 1
+                                            else f5_entropy.new_zeros(())
+                                        ),
+                                        (
+                                            resolved_margin.mean()
+                                            if resolved_margin.numel()
+                                            else f5_entropy.new_zeros(())
+                                        ),
+                                        (
+                                            resolved_entropy.max()
+                                            if resolved_entropy.numel()
+                                            else f5_entropy.new_zeros(())
+                                        ),
+                                    ]).detach().cpu().tolist()
+                                    hindsight_f5_state = {
+                                        "active_span_size": int(active_span_length),
+                                        "current_mask_count": int(f5_summary[0]),
+                                        "masked_entropy_std": float(f5_summary[1]),
+                                        "resolved_margin_mean": float(f5_summary[2]),
+                                        "resolved_entropy_max": float(f5_summary[3]),
+                                    }
+                                    adaptive_controller.record_profile(
+                                        "hindsight_f5_feature_aggregation",
+                                        (time.perf_counter() - f5_started) * 1000.0,
+                                    )
+                                (
+                                    production_stop_candidate,
+                                    adaptive_stop_fill_tokens,
+                                    production_stop_missing_positions,
+                                ) = materialize_stop_candidate(
+                                    current_draft_tokens,
+                                    draft_token_start_idx=draft_token_start_idx,
+                                    active_remaining_positions=(
+                                        active_remaining_positions
+                                    ),
+                                    current_step_token_ids=current_step_token_ids,
+                                    mask_id=mask_id,
                                 )
                                 active_remaining_confidences = [
                                     float(current_step_confidences.get(absolute_pos, 0.0))
@@ -2314,10 +2532,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 frontier_stats["adaptive_last_features"] = list(features)
                                 step_record["adaptive_features"] = list(features)
 
-                                zero_cost_fill_available = all(
-                                    absolute_pos in current_step_token_ids
-                                    and absolute_pos in current_step_confidences
-                                    for absolute_pos in active_remaining_positions
+                                zero_cost_fill_available = (
+                                    not production_stop_missing_positions
+                                    and all(
+                                        absolute_pos in current_step_confidences
+                                        for absolute_pos in active_remaining_positions
+                                    )
                                 )
                                 baseline_would_verify = (
                                     not future_remaining_positions
@@ -2395,6 +2615,45 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     f"adaptive_{key}": value
                                     for key, value in availability_fields.items()
                                 })
+
+                                hindsight_snapshot_fields = {}
+                                if hindsight_block_gain and hindsight_frame_eligible:
+                                    hindsight_snapshot_fields = (
+                                        adaptive_controller.prepare_hindsight_snapshot(
+                                            draft_proposal=production_stop_candidate,
+                                            context_len=int(draft_token_start_idx),
+                                            active_block_start=int(active_absolute_start),
+                                            active_block_end=int(active_absolute_end),
+                                            raw_current_state=raw_current_state,
+                                            f5_state=hindsight_f5_state,
+                                            f2_state=hindsight_f2_state,
+                                            proposal_length=int(target_len),
+                                            max_spec_len=int(max_spec_len),
+                                            refinement_step=int(adaptive_refinement_step),
+                                            next_forward_latency_ms=float(
+                                                forward_pass_latencies[-1]
+                                            ),
+                                            forward_pass_index=int(
+                                                num_forward_passes
+                                            ),
+                                            decision_eligible=bool(
+                                                active_remaining_positions
+                                                and stop_available
+                                            ),
+                                            remaining_masks=int(
+                                                len(active_remaining_positions)
+                                            ),
+                                            probe_state={
+                                                "prefix_length": int(prefix_length),
+                                                "remaining_masks": sum(
+                                                    int(token == mask_id)
+                                                    for token in current_draft_tokens
+                                                ),
+                                                "proposal_length": len(current_draft_tokens),
+                                            },
+                                        )
+                                    )
+                                    step_record.update(hindsight_snapshot_fields)
 
                                 factual_boundary_enabled = bool(
                                     getattr(
@@ -2495,7 +2754,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     ] = transition_residual is not None
                                     adaptive_pending_stop_extension = None
 
-                                if active_remaining_positions and stop_available:
+                                if (
+                                    active_remaining_positions
+                                    and stop_available
+                                    and hindsight_frame_eligible
+                                ):
                                     adaptive_decision_counts[adaptive_decision_key] = (
                                         adaptive_refinement_step
                                     )
@@ -2529,6 +2792,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 False,
                                             )
                                         ),
+                                        failfast_fallback_action="continue",
                                     )
                                     adaptive_record = {
                                         "step": int(adaptive_refinement_step),
@@ -2539,7 +2803,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             None if token_id is None else int(token_id)
                                             for token_id in provisional_tokens
                                         ],
-                                        "features": list(features),
+                                        "features": list(
+                                            hindsight_snapshot_fields.get(
+                                                "hindsight_features", features
+                                            )
+                                        ),
+                                        "feature_names": list(
+                                            hindsight_snapshot_fields.get(
+                                                "hindsight_feature_names",
+                                                adaptive_controller.feature_names,
+                                            )
+                                        ),
                                         "raw_previous_state": raw_previous_state,
                                         "raw_current_state": raw_current_state,
                                         "has_previous_state": bool(
@@ -2684,6 +2958,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         ),
                                         "next_forward_latency_ms": 0.0,
                                         **availability_fields,
+                                        **hindsight_snapshot_fields,
                                     }
                                     frontier_stats["adaptive_decisions"].append(adaptive_record)
                                     frontier_stats["adaptive_trajectory"].append(adaptive_record)
@@ -2998,7 +3273,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     remaining_absolute_positions = []
                                 for absolute_pos in remaining_absolute_positions:
                                     token_id = torch.tensor(
-                                        [current_step_token_ids[absolute_pos]],
+                                        [adaptive_stop_fill_tokens.get(
+                                            absolute_pos,
+                                            current_step_token_ids[absolute_pos],
+                                        )],
                                         device=x_t.device,
                                         dtype=x_t.dtype,
                                     )
@@ -3021,6 +3299,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             ),
                                         )
                                     conf_of_unmasked_tokens.append(float(token_confidence))
+                                if (
+                                    adaptive_record is not None
+                                    and adaptive_record.get("action") == "stop"
+                                    and future_remaining_positions
+                                ):
+                                    adaptive_record[
+                                        "realized_post_stop_outer_action"
+                                    ] = "continue_proposal"
                         
                         # logger.debug(f"{Colors.CYAN}x1_p {x1_p.tolist()[0]}{Colors.RESET}")
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")

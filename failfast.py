@@ -557,6 +557,12 @@ parser.add_argument("--bucket_min_observations", type=int, default=8)
 parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--collect_bucket_oracle", action="store_true")
+parser.add_argument(
+    "--full_refinement_oracle",
+    action="store_true",
+    help="Export raw drafter hidden states and top-K logits at oracle boundaries.",
+)
+parser.add_argument("--raw_top_k", type=int, default=32)
 parser.add_argument("--causal_oracle", action="store_true")
 parser.add_argument("--causal_oracle_future_cost_profile", type=str)
 parser.add_argument("--global_oracle_graph", action="store_true")
@@ -658,6 +664,10 @@ parser.add_argument(
         "per_step_td",
         "verifier_boundary_factual",
         "verifier_boundary_factual_no_bootstrap",
+        "hindsight_block_gain",
+        "hindsight_delta_j_f5",
+        "hindsight_delta_j_f2",
+        "hindsight_delta_j_logistic_f2",
     ],
     default="per_step_td",
 )
@@ -699,6 +709,10 @@ parser.add_argument(
         "symmetric",
         "symmetric_annealed",
         "symmetric_greedy",
+        "hindsight_gain",
+        "hindsight_delta_j_f5",
+        "hindsight_delta_j_f2",
+        "hindsight_delta_j_logistic_f2",
     ],
     default="legacy",
 )
@@ -747,6 +761,77 @@ parser.add_argument(
 parser.add_argument("--adaptive-profile-overhead", action="store_true")
 parser.add_argument("--adaptive-factual-ema-alpha", type=float, default=0.2)
 parser.add_argument("--adaptive-weight-snapshot-interval", type=int, default=100)
+parser.add_argument("--adaptive-hindsight-prior-precision", type=float, default=1.0)
+parser.add_argument("--adaptive-hindsight-noise-variance", type=float, default=0.25)
+parser.add_argument("--adaptive-hindsight-confidence-kappa", type=float, default=1.0)
+parser.add_argument("--adaptive-hindsight-margin-tokens", type=float, default=0.0)
+parser.add_argument("--adaptive-hindsight-max-uncertainty-tokens", type=float, default=2.0)
+parser.add_argument("--adaptive-hindsight-probe-initial", type=float, default=0.15)
+parser.add_argument("--adaptive-hindsight-probe-floor", type=float, default=0.02)
+parser.add_argument("--adaptive-hindsight-probe-decay-pairs", type=float, default=32.0)
+parser.add_argument("--adaptive-hindsight-probe-uncertainty-tokens", type=float, default=0.75)
+parser.add_argument("--adaptive-hindsight-probe-boundary-scale", type=float, default=1.0)
+parser.add_argument("--adaptive-hindsight-probe-max-fraction", type=float, default=0.08)
+parser.add_argument("--adaptive-hindsight-delta-j-p-continue-threshold", type=float, default=0.65)
+parser.add_argument("--adaptive-hindsight-delta-j-class-balance-alpha", type=float, default=5.0)
+parser.add_argument("--adaptive-hindsight-delta-j-max-continue-weight", type=float, default=3.0)
+parser.add_argument("--adaptive-hindsight-delta-j-calibration-beta", type=float, default=0.05)
+parser.add_argument("--adaptive-hindsight-delta-j-min-pairs", type=int, default=30)
+parser.add_argument("--adaptive-hindsight-delta-j-min-continue-pairs", type=int, default=3)
+parser.add_argument("--adaptive-hindsight-delta-j-structural-probe", type=float, default=0.08)
+parser.add_argument("--adaptive-hindsight-delta-j-floor-probe", type=float, default=0.02)
+parser.add_argument("--adaptive-hindsight-logistic-learning-rate", type=float, default=0.05)
+parser.add_argument("--adaptive-hindsight-soft-probe", action="store_true")
+parser.add_argument("--adaptive-hindsight-logistic-continue-threshold", type=float, default=0.5)
+parser.add_argument("--adaptive-hindsight-logistic-tie-ms-per-token", type=float, default=1.0)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-use-class-weight",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-use-prefix-feature",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "Add normalized current contiguous draft-prefix length "
+        "prefix_length/proposal_length as the third dynamic U1 logistic feature."
+    ),
+)
+parser.add_argument("--adaptive-hindsight-logistic-min-positive-problems", type=int, default=2)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-utility-weighting",
+    choices=["legacy", "raw_abs"],
+    default="legacy",
+    help=(
+        "legacy keeps clipped normalized utility/class weighting; raw_abs uses "
+        "sample_weight=abs(delta_J_ms_per_token) with no class weighting."
+    ),
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-replay-batch-size",
+    type=int,
+    default=0,
+    help=(
+        "0 disables replay and updates on the current resolved pair only. "
+        "16 enables the tested U1 batch-1x mini-batch update."
+    ),
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-replay-buffer-size",
+    type=int,
+    default=100,
+)
+parser.add_argument(
+    "--adaptive-hindsight-logistic-replay-stop-to-continue-ratio",
+    type=float,
+    default=3.0,
+    help=(
+        "Replay mini-batch STOP:Good-C count ratio for U1 batch-1x. "
+        "3.0 gives 12 STOP + 4 Good-C for batch size 16. "
+        "Set 0 to recover the original uniform replay sampler."
+    ),
+)
 parser.add_argument(
     "--dist-decision-rule",
     choices=["expected_regret", "probability"],
@@ -990,6 +1075,76 @@ def build_adaptive_controller(args):
             policy_weight_ema_beta=args.adaptive_policy_weight_ema_beta,
             policy_weight_ema_mode=args.adaptive_policy_weight_ema_mode,
             weight_snapshot_interval=args.adaptive_weight_snapshot_interval,
+            hindsight_prior_precision=args.adaptive_hindsight_prior_precision,
+            hindsight_noise_variance=args.adaptive_hindsight_noise_variance,
+            hindsight_confidence_kappa=args.adaptive_hindsight_confidence_kappa,
+            hindsight_margin_tokens=args.adaptive_hindsight_margin_tokens,
+            hindsight_max_uncertainty_tokens=(
+                args.adaptive_hindsight_max_uncertainty_tokens
+            ),
+            hindsight_probe_initial=args.adaptive_hindsight_probe_initial,
+            hindsight_probe_floor=args.adaptive_hindsight_probe_floor,
+            hindsight_probe_decay_pairs=args.adaptive_hindsight_probe_decay_pairs,
+            hindsight_probe_uncertainty_tokens=(
+                args.adaptive_hindsight_probe_uncertainty_tokens
+            ),
+            hindsight_probe_boundary_scale=(
+                args.adaptive_hindsight_probe_boundary_scale
+            ),
+            hindsight_probe_max_fraction=args.adaptive_hindsight_probe_max_fraction,
+            hindsight_delta_j_p_continue_threshold=(
+                args.adaptive_hindsight_delta_j_p_continue_threshold
+            ),
+            hindsight_delta_j_class_balance_alpha=(
+                args.adaptive_hindsight_delta_j_class_balance_alpha
+            ),
+            hindsight_delta_j_max_continue_weight=(
+                args.adaptive_hindsight_delta_j_max_continue_weight
+            ),
+            hindsight_delta_j_calibration_beta=(
+                args.adaptive_hindsight_delta_j_calibration_beta
+            ),
+            hindsight_delta_j_min_pairs=args.adaptive_hindsight_delta_j_min_pairs,
+            hindsight_delta_j_min_continue_pairs=(
+                args.adaptive_hindsight_delta_j_min_continue_pairs
+            ),
+            hindsight_delta_j_structural_probe_probability=(
+                args.adaptive_hindsight_delta_j_structural_probe
+            ),
+            hindsight_delta_j_floor_probe_probability=(
+                args.adaptive_hindsight_delta_j_floor_probe
+            ),
+            hindsight_logistic_learning_rate=(
+                args.adaptive_hindsight_logistic_learning_rate
+            ),
+            hindsight_soft_probe=args.adaptive_hindsight_soft_probe,
+            hindsight_logistic_continue_threshold=(
+                args.adaptive_hindsight_logistic_continue_threshold
+            ),
+            hindsight_logistic_tie_ms_per_token=(
+                args.adaptive_hindsight_logistic_tie_ms_per_token
+            ),
+            hindsight_logistic_use_class_weight=(
+                args.adaptive_hindsight_logistic_use_class_weight
+            ),
+            hindsight_logistic_use_prefix_feature=(
+                args.adaptive_hindsight_logistic_use_prefix_feature
+            ),
+            hindsight_logistic_min_positive_problems=(
+                args.adaptive_hindsight_logistic_min_positive_problems
+            ),
+            hindsight_logistic_utility_weighting=(
+                args.adaptive_hindsight_logistic_utility_weighting
+            ),
+            hindsight_logistic_replay_batch_size=(
+                args.adaptive_hindsight_logistic_replay_batch_size
+            ),
+            hindsight_logistic_replay_buffer_size=(
+                args.adaptive_hindsight_logistic_replay_buffer_size
+            ),
+            hindsight_logistic_replay_stop_to_continue_ratio=(
+                args.adaptive_hindsight_logistic_replay_stop_to_continue_ratio
+            ),
         )
     )
 
@@ -1206,6 +1361,10 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "actual_accept_check_latency_ms",
     "actual_shared_post_verify_overhead_ms",
     "actual_post_verify_latency_ms",
+    "hidden_layer_indices",
+    "hidden_states",
+    "topk_token_ids",
+    "topk_logits",
 ]
 
 CAUSAL_ORACLE_CANDIDATE_COLUMNS = [
@@ -1733,18 +1892,24 @@ def record_adaptive_td_decisions(
             ),
         }
         if item.get("action") == "stop":
-            realized_action = (
-                "extend" if high_confidence_extension else "verify"
-            )
+            realized_action = item.get("realized_post_stop_outer_action")
+            if realized_action != "continue_proposal":
+                realized_action = (
+                    "extend" if high_confidence_extension else "verify"
+                )
             finalized_fields["realized_post_stop_outer_action"] = realized_action
             finalized_fields["outer_action_matches_plan"] = (
                 realized_action == item.get("post_stop_outer_action")
             )
         item.update(finalized_fields)
+        logged_feature_names = tuple(
+            item.get("feature_names")
+            or getattr(controller, "feature_names", FEATURE_NAMES)
+        )
         feature_values = {
             name: float(value)
             for name, value in zip(
-                getattr(controller, "feature_names", FEATURE_NAMES),
+                logged_feature_names,
                 item.get("features") or [],
             )
         }
@@ -1755,9 +1920,7 @@ def record_adaptive_td_decisions(
             "decision_id": int(decision_id),
             **item,
             "features": json.dumps(item.get("features") or []),
-            "feature_names": json.dumps(list(
-                getattr(controller, "feature_names", FEATURE_NAMES)
-            )),
+            "feature_names": json.dumps(list(logged_feature_names)),
             "draft_proposal": json.dumps(item.get("draft_proposal") or []),
             "draft_length": target_len,
             **feature_values,
@@ -4702,6 +4865,12 @@ def append_bucket_oracle_rows(
             "actual_post_verify_latency_ms": (
                 accept_check_ms + shared_post_verify_overhead_ms
             ),
+            "hidden_layer_indices": json.dumps(
+                snapshot.get("hidden_layer_indices") or []
+            ),
+            "hidden_states": json.dumps(snapshot.get("hidden_states") or []),
+            "topk_token_ids": json.dumps(snapshot.get("topk_token_ids") or []),
+            "topk_logits": json.dumps(snapshot.get("topk_logits") or []),
         })
     append_csv_rows(
         os.path.join(args.output_dir, "bucket_oracle_snapshots.csv"),
@@ -4919,6 +5088,16 @@ for problem_id, is_warmup in tqdm(
             num_speculation_rounds = 0
             total_num_forward_passes = 0
             current_token_ids = []
+            if (
+                draft_type == "dllm"
+                and args.adaptive_td
+                and getattr(
+                    args.adaptive_td_controller,
+                    "uses_hindsight_block_gain",
+                    False,
+                )
+            ):
+                args.adaptive_td_controller.begin_hindsight_problem(problem_id)
             prev_prefill_output = None
             draft_time_total = 0.0
             verify_time_total = 0.0
@@ -5597,6 +5776,20 @@ for problem_id, is_warmup in tqdm(
                                 len(tokens_to_append),
                                 (draft_time + verify_time + post_verify_time) * 1000.0,
                             )
+                            if getattr(
+                                args.adaptive_td_controller,
+                                "uses_hindsight_block_gain",
+                                False,
+                            ):
+                                args.adaptive_td_controller.observe_hindsight_verifier_boundary(
+                                    tokens_to_append,
+                                    verifier_latency_ms=verify_time * 1000.0,
+                                    post_verify_latency_ms=post_verify_time * 1000.0,
+                                    terminal=(
+                                        target_tokenizer.eos_token_id in tokens_to_append
+                                        or len(current_token_ids) >= num_target_tokens
+                                    ),
+                                )
                         record_adaptive_td_decisions(
                             args,
                             frontier_stats_this_round,

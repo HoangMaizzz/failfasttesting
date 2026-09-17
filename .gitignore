@@ -6,5 +6,16 @@ figures/
 .DS_Store
 .venv/
 /Fast_dLLM_v2_1.5B/
+/Fast_dLLM_v2_1_5B/checkpoint-*/
+/backups/
+*.log
+*.logcd
+*.zip
+*.tar.gz
+*.pdf
+*.pickle
+*.pt
+*.safetensors
+/lossless_audit/
 /outputs_*/
 /outputs_*.zip
