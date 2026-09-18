@@ -18,6 +18,7 @@ import csv
 import hashlib
 import json
 import shutil
+import zipfile
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -45,6 +46,8 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--drop_staging", action="store_true", help="remove large CSV staging after successful conversion")
     p.add_argument("--stream_raw", action="store_true", help="write compressed raw shards during inference")
+    p.add_argument("--archive_each_dataset", action="store_true", help="archive each dataset immediately after inference")
+    p.add_argument("--remove_raw_after_archive", action="store_true", help="remove unpacked raw shards after archiving")
     return p.parse_args()
 
 
@@ -218,6 +221,24 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
     return {"states": state_count, "shards": shard_index, "source": str(source)}
 
 
+def archive_dataset(dataset: str, output: Path, staging: Path) -> dict:
+    dataset_out = output / "raw" / dataset
+    archive_path = output / f"{dataset}_raw.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path in dataset_out.rglob("*"):
+            if path.is_file():
+                archive.write(path, path.relative_to(output))
+        benchmark = staging / "benchmark_results.csv"
+        if benchmark.exists():
+            archive.write(benchmark, benchmark.relative_to(output))
+    return {
+        "archive": str(archive_path),
+        "archive_bytes": archive_path.stat().st_size,
+        "states": sum(1 for _ in (dataset_out / "index.jsonl").open(encoding="utf-8")),
+        "shards": len(list(dataset_out.glob("shard_*.npz"))),
+    }
+
+
 def main() -> None:
     args = args_parser()
     output = args.output_dir or ROOT / (
@@ -251,6 +272,13 @@ def main() -> None:
         else:
             manifest["datasets"][dataset] = convert_dataset(
                 dataset, staging, output / "raw", args.shard_rows)
+        if args.archive_each_dataset:
+            manifest["datasets"][dataset] = archive_dataset(dataset, output, staging)
+            (output / "manifest_partial.json").write_text(
+                json.dumps(manifest, indent=2, default=str), encoding="utf-8"
+            )
+            if args.remove_raw_after_archive:
+                shutil.rmtree(output / "raw" / dataset)
         if args.drop_staging:
             shutil.rmtree(staging)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
