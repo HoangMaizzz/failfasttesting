@@ -32,6 +32,7 @@ snapshot_download(
     --drafter_device 1 \
     --dllm_dir /kaggle/working/failfasttesting/Fast_dLLM_v2_1_5B \
     --shard_rows 128 \
+    --stream_raw \
     --drop_staging \
     --output_dir /kaggle/working/world_model_raw_fp16_t4x2 \
     2>&1 | tee /kaggle/working/world_model_raw_fp16_t4x2.log

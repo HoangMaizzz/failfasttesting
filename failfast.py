@@ -560,6 +560,12 @@ parser.add_argument("--bucket_latency_ema_alpha", type=float, default=0.2)
 parser.add_argument("--collect_draft_diagnostics", action="store_true")
 parser.add_argument("--collect_bucket_oracle", action="store_true")
 parser.add_argument(
+    "--raw_stream_dir",
+    type=str,
+    help="write raw hidden/top-k states directly to compressed NPZ shards",
+)
+parser.add_argument("--raw_stream_shard_rows", type=int, default=128)
+parser.add_argument(
     "--full_refinement_oracle",
     action="store_true",
     help="Export raw drafter hidden states and top-K logits at oracle boundaries.",
@@ -4878,7 +4884,55 @@ def append_bucket_oracle_rows(
         os.path.join(args.output_dir, "bucket_oracle_snapshots.csv"),
         BUCKET_ORACLE_SNAPSHOT_COLUMNS,
         rows,
-    )
+    ) if not getattr(args, "raw_stream_dir", None) else None
+    if getattr(args, "raw_stream_dir", None):
+        from raw_stream_writer import RawShardWriter
+
+        writer = getattr(args, "_raw_stream_writer", None)
+        if writer is None:
+            writer = RawShardWriter(
+                args.raw_stream_dir,
+                args.dataset_name,
+                args.raw_stream_shard_rows,
+            )
+            args._raw_stream_writer = writer
+        for row in rows:
+            proposal = json.loads(row["draft_proposal"])
+            hidden = json.loads(row["hidden_states"])
+            layers = json.loads(row["hidden_layer_indices"])
+            top_ids = json.loads(row["topk_token_ids"])
+            top_logits = json.loads(row["topk_logits"])
+            if not hidden or not layers or not top_ids or not top_logits:
+                raise RuntimeError("raw stream row is missing hidden/top-K tensors")
+            sid_raw = (
+                f"{args.dataset_name}|{row.get('problem_id')}|"
+                f"{row.get('round_id')}|{row.get('step')}"
+            )
+            metadata = {
+                "state_id": hashlib.sha1(sid_raw.encode()).hexdigest()[:20],
+                "previous_state_id": None,
+                "next_state_id": None,
+                "dataset": args.dataset_name,
+                "problem_id": int(row["problem_id"]),
+                "round_id": int(row["round_id"]),
+                "boundary_index": int(row.get("step") or 0),
+                "context_len": int(row.get("context_len") or 0),
+                "proposal_length": len(proposal),
+                "accepted_len": int(row.get("accepted_len_if_stop") or 0),
+                "first_mismatch": int(row.get("accepted_len_if_stop") or 0),
+                "verifier_latency_ms": float(row.get("actual_verify_latency_ms") or 0),
+                "source_csv": None,
+            }
+            writer.append({
+                "proposal_token_ids": proposal,
+                "drafter_observed_prob": json.loads(row["accept_probabilities"]),
+                "proposal_mask": [token == 151665 for token in proposal],
+                "hidden_states": hidden,
+                "hidden_layer_indices": layers,
+                "topk_token_ids": top_ids,
+                "topk_logits": top_logits,
+                "metadata": metadata,
+            })
 
 apply_mode_settings(args)
 args.target_model_name_clean = args.target_model_name.split("/", 1)[1]

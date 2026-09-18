@@ -44,6 +44,7 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--drop_staging", action="store_true", help="remove large CSV staging after successful conversion")
+    p.add_argument("--stream_raw", action="store_true", help="write compressed raw shards during inference")
     return p.parse_args()
 
 
@@ -95,6 +96,11 @@ def run_staging(args: argparse.Namespace, dataset: str, destination: Path) -> No
         command += ["--num_questions", str(len(ids)), "--problem_ids", *map(str, ids)]
     else:
         command += ["--num_questions", str(args.num_questions)]
+    if args.stream_raw:
+        command += [
+            "--raw_stream_dir", str(destination.parent.parent / "raw"),
+            "--raw_stream_shard_rows", str(args.shard_rows),
+        ]
     print(">>>", " ".join(map(str, command)), flush=True)
     subprocess.run(command, cwd=ROOT, check=True)
 
@@ -233,8 +239,18 @@ def main() -> None:
         if not (args.resume and (staging / "bucket_oracle_snapshots.csv").exists()):
             staging.mkdir(parents=True, exist_ok=True)
             run_staging(args, dataset, staging)
-        manifest["datasets"][dataset] = convert_dataset(
-            dataset, staging, output / "raw", args.shard_rows)
+        if args.stream_raw:
+            dataset_out = output / "raw" / dataset
+            index_path = dataset_out / "index.jsonl"
+            manifest["datasets"][dataset] = {
+                "states": sum(1 for _ in index_path.open(encoding="utf-8"))
+                if index_path.exists() else 0,
+                "shards": len(list(dataset_out.glob("shard_*.npz"))),
+                "source": "streamed during inference",
+            }
+        else:
+            manifest["datasets"][dataset] = convert_dataset(
+                dataset, staging, output / "raw", args.shard_rows)
         if args.drop_staging:
             shutil.rmtree(staging)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
