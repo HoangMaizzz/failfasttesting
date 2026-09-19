@@ -58,7 +58,8 @@ def command(args, ids, n, max_spec_len, destination):
         "--benchmark_modes", "dllm_ar", "--dllm_variant", "failfast",
         "--decoding_strategy", "greedy", "--max_new_tokens", str(args.max_new_tokens),
         "--spec_len", str(n), "--block_size", "32", "--small_block_size", "8",
-        "--target_model_name", "Qwen/Qwen2.5-7B-Instruct",
+        # Use the downloaded local model because benchmark execution is offline.
+        "--target_model_name", str(args.assets / "target"),
         "--target_model_label", "Qwen2.5-7B-Instruct",
         "--dllm_dir", str(args.assets / "drafter"),
         "--dataset_dir", str(args.assets / "datasets" / "math"),
