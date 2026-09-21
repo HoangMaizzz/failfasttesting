@@ -1197,6 +1197,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             "lowconf_threshold": None if lowconf_threshold is None else float(lowconf_threshold),
             "steps": [],
             "stop_reason": None,
+            "native_termination_reason": None,
             "final_frontier_score": None,
             "actual_spec_len": None,
             "draft_token_stats": [],
@@ -3200,6 +3201,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 hidden[index][0, hidden_start:hidden_end].detach().to(torch.float16).cpu().tolist()
                                                 for index in selected
                                             ]
+                                            raw_snapshot_fields["hidden_state_stage"] = (
+                                                "native_pre_counterfactual_fill"
+                                            )
+                                            raw_snapshot_fields["hidden_state_source"] = (
+                                                "native_refinement_forward_output"
+                                            )
+                                            raw_snapshot_fields["hidden_state_forward_pass"] = int(
+                                                num_forward_passes
+                                            )
                                         if adaptive_full_block_logits is not None:
                                             k = min(raw_top_k, int(adaptive_full_block_logits.shape[-1]))
                                             logit_start = max(0, local_start - raw_logits_offset)
@@ -3469,6 +3479,24 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             
             if is_drafter and draft_tokens_unmasked:
                 break
+        if is_drafter and return_frontier_stats:
+            draft_end_for_reason = min(
+                draft_token_start_idx + int(spec_len), input_ids.shape[1]
+            )
+            draft_span_for_reason = input_ids[
+                0, draft_token_start_idx:draft_end_for_reason
+            ]
+            stop_seen = bool(stop_token in input_ids[:, original_input_length:])
+            masks_left = bool((draft_span_for_reason == mask_id).any())
+            if stop_seen:
+                frontier_stats["native_termination_reason"] = "eos"
+            elif masks_left and int(spec_len) >= int(max_spec_len):
+                frontier_stats["native_termination_reason"] = "max_refinement_steps"
+            elif masks_left:
+                frontier_stats["native_termination_reason"] = "native_stop"
+            else:
+                frontier_stats["native_termination_reason"] = "all_masks_resolved"
+
         # Truncate stop_token
         if stop_token in input_ids[:, original_input_length:]:
             stop_token_idx = (input_ids[:, original_input_length:] == stop_token).nonzero()[0][1]

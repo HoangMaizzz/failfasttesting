@@ -44,6 +44,13 @@ class RawShardWriter:
         def pad(values, fill):
             return list(values) + [fill] * (width - len(values))
 
+        prefix_offsets = [0]
+        prefix_flat = []
+        for row in rows:
+            prefix = [int(value) for value in row.get("prefix_token_ids", [])]
+            prefix_flat.extend(prefix)
+            prefix_offsets.append(len(prefix_flat))
+
         name = f"shard_{self.shard_index:05d}.npz"
         np.savez_compressed(
             self.out / name,
@@ -71,6 +78,8 @@ class RawShardWriter:
                 [pad(row.get("proposal_token_ids_after_fill", row["proposal_token_ids"]), 0)
                  for row in rows], dtype=np.int64
             ),
+            prefix_token_ids_flat=np.asarray(prefix_flat, dtype=np.int32),
+            prefix_token_ids_offsets=np.asarray(prefix_offsets, dtype=np.int64),
             hidden_states=np.asarray([row["hidden_states"] for row in rows], dtype=np.float16),
             hidden_layer_indices=np.asarray(
                 [row["hidden_layer_indices"] for row in rows], dtype=np.int64

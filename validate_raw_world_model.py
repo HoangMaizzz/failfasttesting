@@ -40,6 +40,8 @@ def validate_dataset(root: Path, dataset: str) -> dict:
                 "proposal_mask_before_fill",
                 "proposal_token_ids_before_fill",
                 "proposal_token_ids_after_fill",
+                "prefix_token_ids_flat",
+                "prefix_token_ids_offsets",
                 "hidden_states",
                 "topk_token_ids",
                 "topk_logits",
@@ -52,6 +54,9 @@ def validate_dataset(root: Path, dataset: str) -> dict:
                 count = int(mask.sum())
                 masked_positions += count
                 masked_states += int(count > 0)
+                offset = int(item["row"])
+                offsets = arrays["prefix_token_ids_offsets"]
+                assert offsets[offset + 1] >= offsets[offset]
 
     return {
         "dataset": dataset,
@@ -60,6 +65,16 @@ def validate_dataset(root: Path, dataset: str) -> dict:
         "masked_positions": masked_positions,
         "continue_available_states": continue_available,
         "one_step_latency_continue_labels": continue_labels,
+        "terminal_states_with_masks": sum(
+            int(
+                item.get("continue_available") is False
+                and int(item.get("masks_remaining") or 0) > 0
+            )
+            for item in items
+        ),
+        "hidden_state_stages": sorted(
+            {item.get("hidden_state_stage") for item in items}
+        ),
     }
 
 

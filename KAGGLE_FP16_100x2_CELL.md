@@ -45,6 +45,7 @@ The final files are:
 ```
 
 The new ZIP schema includes `proposal_mask_before_fill`, the proposal before
-and after counterfactual fill, refinement counters, and the one-step
-latency-per-output-token fields. `actual_action_taken` remains null because the
-collection trajectory is intentionally forced to continue.
+and after counterfactual fill, refinement counters, prefix token IDs, explicit
+`hidden_state_stage="native_pre_counterfactual_fill"`, terminal reasons, and
+the one-step latency-per-output-token fields. `actual_action_taken` remains null
+because the collection trajectory is intentionally forced to continue.

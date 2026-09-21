@@ -1351,6 +1351,8 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "committed_position_mask",
     "proposal_token_ids_after_fill",
     "draft_proposal",
+    "prefix_token_ids",
+    "termination_reason",
     "outer_action_if_stop",
     "accept_probabilities",
     "predicted_expected_output",
@@ -1377,6 +1379,9 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "actual_accept_check_latency_ms",
     "actual_shared_post_verify_overhead_ms",
     "actual_post_verify_latency_ms",
+    "hidden_state_stage",
+    "hidden_state_source",
+    "hidden_state_forward_pass",
     "stop_total_latency_ms",
     "stop_latency_per_output_token",
     "stop_yield_tokens_per_ms",
@@ -4864,6 +4869,7 @@ def annotate_one_step_latency_oracle(rows):
     if not rows:
         return
     ordered = sorted(rows, key=lambda item: _row_int(item, "step"))
+    terminal_reason = ordered[-1].get("termination_reason")
     emitted = [_row_int(row, "emitted_len_if_stop") for row in ordered]
     stop_total = []
     for row in ordered:
@@ -4893,6 +4899,9 @@ def annotate_one_step_latency_oracle(rows):
         row["one_step_latency_continue_label"] = None
         row["one_step_latency_oracle_action"] = None
         row["actual_action_taken"] = None
+        row["termination_reason"] = (
+            terminal_reason if index == len(ordered) - 1 else None
+        )
 
         row["future_yield_opportunity_label"] = int(
             any(future > current_emitted for future in emitted[index + 1:])
@@ -4938,6 +4947,13 @@ def append_bucket_oracle_rows(
         return
     snapshots = (frontier_stats or {}).get("oracle_refinement_snapshots") or []
     rows = []
+    prefix_token_ids = [
+        int(token_id)
+        for token_id in orig_model_inputs["input_ids"][0].detach().cpu().tolist()
+    ] + [int(token_id) for token_id in current_token_ids]
+    native_termination_reason = (frontier_stats or {}).get(
+        "native_termination_reason"
+    )
     for snapshot in snapshots:
         draft_proposal = [int(token_id) for token_id in snapshot["draft_proposal"]]
         accepted_len, emitted_len, verify_ms, accept_check_ms = evaluate_oracle_proposal(
@@ -4978,6 +4994,8 @@ def append_bucket_oracle_rows(
                 snapshot.get("proposal_token_ids_after_fill") or draft_proposal
             ),
             "draft_proposal": json.dumps(draft_proposal),
+            "prefix_token_ids": json.dumps(prefix_token_ids),
+            "termination_reason": native_termination_reason,
             "outer_action_if_stop": snapshot.get("outer_action_if_stop"),
             "accept_probabilities": json.dumps(
                 snapshot.get("accept_probabilities") or []
@@ -5016,6 +5034,9 @@ def append_bucket_oracle_rows(
             "actual_post_verify_latency_ms": (
                 accept_check_ms + shared_post_verify_overhead_ms
             ),
+            "hidden_state_stage": snapshot.get("hidden_state_stage"),
+            "hidden_state_source": snapshot.get("hidden_state_source"),
+            "hidden_state_forward_pass": snapshot.get("hidden_state_forward_pass"),
             "hidden_layer_indices": json.dumps(
                 snapshot.get("hidden_layer_indices") or []
             ),
@@ -5080,6 +5101,7 @@ def append_bucket_oracle_rows(
                 "round_id": int(row["round_id"]),
                 "boundary_index": int(row.get("step") or 0),
                 "context_len": int(row.get("context_len") or 0),
+                "prefix_length": len(json.loads(row.get("prefix_token_ids") or "[]")),
                 "proposal_length": len(proposal),
                 "accepted_len": int(row.get("accepted_len_if_stop") or 0),
                 "emitted_len_if_stop": int(row.get("emitted_len_if_stop") or 0),
@@ -5090,6 +5112,12 @@ def append_bucket_oracle_rows(
                 "post_verify_latency_ms": float(
                     row.get("actual_post_verify_latency_ms") or 0
                 ),
+                "hidden_state_stage": row.get("hidden_state_stage"),
+                "hidden_state_source": row.get("hidden_state_source"),
+                "hidden_state_forward_pass": _row_int(
+                    row, "hidden_state_forward_pass"
+                ),
+                "termination_reason": row.get("termination_reason"),
                 "first_mismatch_convention": "accepted_prefix_length_for_greedy_verifier",
                 "draft_passes_elapsed": _row_int(row, "draft_passes_elapsed"),
                 "draft_latency_elapsed_ms": _row_float(row, "draft_latency_elapsed_ms"),
@@ -5155,6 +5183,9 @@ def append_bucket_oracle_rows(
             }
             writer.append({
                 "proposal_token_ids": proposal,
+                "prefix_token_ids": json.loads(
+                    row.get("prefix_token_ids") or "[]"
+                ),
                 "proposal_token_ids_before_fill": json.loads(
                     row.get("proposal_token_ids_before_fill") or "[]"
                 ),

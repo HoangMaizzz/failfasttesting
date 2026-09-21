@@ -132,6 +132,7 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
     metadata_path = dataset_out / "index.jsonl"
     token_chunks: list[list[int]] = []
     before_token_chunks: list[list[int]] = []
+    prefix_chunks: list[list[int]] = []
     prob_chunks: list[list[float]] = []
     mask_chunks: list[list[bool]] = []
     committed_mask_chunks: list[list[bool]] = []
@@ -151,6 +152,10 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
         name = f"shard_{shard_index:05d}.npz"
         width = max(map(len, token_chunks))
         pad = lambda values, fill: values + [fill] * (width - len(values))
+        prefix_flat = [token for prefix in prefix_chunks for token in prefix]
+        prefix_offsets = [0]
+        for prefix in prefix_chunks:
+            prefix_offsets.append(prefix_offsets[-1] + len(prefix))
         np.savez_compressed(
             dataset_out / name,
             proposal_token_ids=np.asarray([pad(x, 0) for x in token_chunks], dtype=np.int64),
@@ -168,6 +173,8 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             proposal_token_ids_after_fill=np.asarray(
                 [pad(x, 0) for x in after_token_chunks], dtype=np.int64
             ),
+            prefix_token_ids_flat=np.asarray(prefix_flat, dtype=np.int32),
+            prefix_token_ids_offsets=np.asarray(prefix_offsets, dtype=np.int64),
             hidden_states=np.asarray(hidden_chunks, dtype=np.float16),
             hidden_layer_indices=np.asarray(layer_chunks, dtype=np.int64),
             topk_token_ids=np.asarray(top_id_chunks, dtype=np.int64),
@@ -176,7 +183,8 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
         for offset, item in enumerate(metadata_chunks):
             item.update({"shard": name, "row": offset})
             metadata_file.write(json.dumps(item) + "\n")
-        token_chunks.clear(); before_token_chunks.clear(); prob_chunks.clear()
+        token_chunks.clear(); before_token_chunks.clear(); prefix_chunks.clear()
+        prob_chunks.clear()
         mask_chunks.clear(); committed_mask_chunks.clear(); after_token_chunks.clear()
         hidden_chunks.clear(); layer_chunks.clear(); top_id_chunks.clear(); top_logit_chunks.clear()
         metadata_chunks.clear()
@@ -203,6 +211,9 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             proposal_after_fill = [
                 int(x) for x in parse_json(row.get("proposal_token_ids_after_fill"))
             ] or proposal
+            prefix_token_ids = [
+                int(x) for x in parse_json(row.get("prefix_token_ids"))
+            ]
             probabilities = [float(x) for x in parse_json(row.get("accept_probabilities"))]
             probabilities = (probabilities + [0.0] * len(proposal))[:len(proposal)]
             block = (row.get("problem_id", ""), row.get("round_id", ""))
@@ -224,6 +235,7 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             "round_id": int(row["round_id"]),
             "boundary_index": int(row.get("step") or 0),
             "context_len": int(row.get("context_len") or 0),
+            "prefix_length": len(prefix_token_ids),
             "proposal_length": len(proposal),
             "accepted_len": int(row.get("accepted_len_if_stop") or 0),
             "emitted_len_if_stop": int(row.get("emitted_len_if_stop") or 0),
@@ -235,6 +247,12 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             "post_verify_latency_ms": float(
                 row.get("actual_post_verify_latency_ms") or 0
             ),
+            "hidden_state_stage": row.get("hidden_state_stage") or None,
+            "hidden_state_source": row.get("hidden_state_source") or None,
+            "hidden_state_forward_pass": int(
+                row.get("hidden_state_forward_pass") or 0
+            ),
+            "termination_reason": row.get("termination_reason") or None,
             "draft_passes_elapsed": int(row.get("draft_passes_elapsed") or 0),
             "draft_latency_elapsed_ms": float(row.get("draft_latency_elapsed_ms") or 0),
             "masks_remaining": int(row.get("masks_remaining") or sum(proposal_mask_before)),
@@ -297,6 +315,7 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             })
             token_chunks.append(proposal)
             before_token_chunks.append(proposal_before_fill)
+            prefix_chunks.append(prefix_token_ids)
             prob_chunks.append(probabilities)
             mask_chunks.append(proposal_mask_before)
             committed_mask_chunks.append(committed_position_mask)
@@ -351,6 +370,8 @@ def main() -> None:
         "lowconf_threshold": 0.0,
         "oracle": "real greedy verifier at every recorded refinement boundary",
         "mask_semantics": "proposal_mask_before_fill is the live pre-stop refinement mask",
+        "prefix_storage": "prefix_token_ids_flat + prefix_token_ids_offsets per shard",
+        "hidden_state_stage": "native_pre_counterfactual_fill",
         "verifier_target": "accepted_len; first_mismatch is the same greedy-prefix index",
         "latency_oracle": (
             "one-step stop-vs-next-boundary comparison using cumulative "

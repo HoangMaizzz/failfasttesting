@@ -4,7 +4,9 @@ This collector keeps the verifier on GPU 0 and the Fast-dLLM drafter on GPU 1.
 It uses FP16 (`target_quantization=none`) and preserves the raw-state NPZ schema
 used by the existing MATH/GSM8K collection: live pre-fill proposal IDs and mask,
 post-fill verifier proposal, refinement counters, latency-per-output-token
-counterfactuals, five hidden-state layers, and top-32 token IDs/logits.
+counterfactuals, prefix token IDs stored as flat values plus offsets, explicit
+hidden-state stage metadata, terminal reasons, five hidden-state layers, and
+top-32 token IDs/logits.
 
 ```python
 !pip install -q --no-cache-dir "transformers==4.53.1" "bitsandbytes>=0.46.1" datasets accelerate einops tqdm numpy pandas matplotlib sentencepiece scipy
