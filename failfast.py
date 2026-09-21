@@ -1343,7 +1343,15 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "masks_remaining",
     "committed_tokens",
     "filled_tokens",
+    "counterfactual_fill_tokens",
+    "newly_unmasked",
+    "newly_unmasked_positions",
+    "proposal_token_ids_before_fill",
+    "proposal_mask_before_fill",
+    "committed_position_mask",
+    "proposal_token_ids_after_fill",
     "draft_proposal",
+    "outer_action_if_stop",
     "accept_probabilities",
     "predicted_expected_output",
     "predicted_next_gain",
@@ -1369,6 +1377,20 @@ BUCKET_ORACLE_SNAPSHOT_COLUMNS = [
     "actual_accept_check_latency_ms",
     "actual_shared_post_verify_overhead_ms",
     "actual_post_verify_latency_ms",
+    "stop_total_latency_ms",
+    "stop_latency_per_output_token",
+    "stop_yield_tokens_per_ms",
+    "continue_available",
+    "continue_next_step",
+    "continue_draft_delta_passes",
+    "continue_draft_delta_latency_ms",
+    "continue_total_latency_ms",
+    "continue_latency_per_output_token",
+    "continue_yield_tokens_per_ms",
+    "future_yield_opportunity_label",
+    "one_step_latency_continue_label",
+    "one_step_latency_oracle_action",
+    "actual_action_taken",
     "hidden_layer_indices",
     "hidden_states",
     "topk_token_ids",
@@ -4798,6 +4820,109 @@ def append_causal_oracle_decision(args, row):
     )
 
 
+def _row_float(row, key):
+    value = row.get(key)
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _row_int(row, key):
+    value = row.get(key)
+    if value in (None, ""):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _row_bool(row, key):
+    value = row.get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def _latency_per_output(total_ms, emitted_len):
+    return float(total_ms) / max(1, int(emitted_len))
+
+
+def annotate_one_step_latency_oracle(rows):
+    """Add yield/latency labels without pretending to observe a policy action.
+
+    The collection trajectory is forcibly continued, so ``actual_action_taken``
+    is deliberately left null.  For every non-terminal state, the one-step
+    counterfactual compares stopping at the current boundary with stopping at
+    the next recorded native boundary.  Both costs are measured from the start
+    of the current speculative block, which makes the comparison an explicit
+    latency-per-output-token objective and includes the extra draft work.
+    """
+    if not rows:
+        return
+    ordered = sorted(rows, key=lambda item: _row_int(item, "step"))
+    emitted = [_row_int(row, "emitted_len_if_stop") for row in ordered]
+    stop_total = []
+    for row in ordered:
+        total = (
+            _row_float(row, "draft_latency_elapsed_ms")
+            + _row_float(row, "actual_verify_latency_ms")
+            + _row_float(row, "actual_post_verify_latency_ms")
+        )
+        stop_total.append(total)
+
+    for index, row in enumerate(ordered):
+        current_emitted = emitted[index]
+        row["stop_total_latency_ms"] = stop_total[index]
+        row["stop_latency_per_output_token"] = _latency_per_output(
+            stop_total[index], current_emitted
+        )
+        row["stop_yield_tokens_per_ms"] = current_emitted / max(
+            1e-9, stop_total[index]
+        )
+        row["continue_available"] = bool(index + 1 < len(ordered))
+        row["continue_next_step"] = None
+        row["continue_draft_delta_passes"] = None
+        row["continue_draft_delta_latency_ms"] = None
+        row["continue_total_latency_ms"] = None
+        row["continue_latency_per_output_token"] = None
+        row["continue_yield_tokens_per_ms"] = None
+        row["one_step_latency_continue_label"] = None
+        row["one_step_latency_oracle_action"] = None
+        row["actual_action_taken"] = None
+
+        row["future_yield_opportunity_label"] = int(
+            any(future > current_emitted for future in emitted[index + 1:])
+        )
+        if index + 1 >= len(ordered):
+            continue
+
+        next_row = ordered[index + 1]
+        next_total = stop_total[index + 1]
+        next_emitted = emitted[index + 1]
+        stop_lpo = _latency_per_output(stop_total[index], current_emitted)
+        continue_lpo = _latency_per_output(next_total, next_emitted)
+        row["continue_next_step"] = _row_int(next_row, "step")
+        row["continue_draft_delta_passes"] = (
+            _row_int(next_row, "draft_passes_elapsed")
+            - _row_int(row, "draft_passes_elapsed")
+        )
+        row["continue_draft_delta_latency_ms"] = (
+            _row_float(next_row, "draft_latency_elapsed_ms")
+            - _row_float(row, "draft_latency_elapsed_ms")
+        )
+        row["continue_total_latency_ms"] = next_total
+        row["continue_latency_per_output_token"] = continue_lpo
+        row["continue_yield_tokens_per_ms"] = next_emitted / max(1e-9, next_total)
+        row["one_step_latency_continue_label"] = int(continue_lpo < stop_lpo)
+        row["one_step_latency_oracle_action"] = (
+            "continue" if continue_lpo < stop_lpo else "stop"
+        )
+
+
 def append_bucket_oracle_rows(
     args,
     problem_id,
@@ -4835,7 +4960,25 @@ def append_bucket_oracle_rows(
             "masks_remaining": snapshot.get("masks_remaining"),
             "committed_tokens": snapshot.get("committed_tokens"),
             "filled_tokens": snapshot.get("filled_tokens"),
+            "counterfactual_fill_tokens": snapshot.get("counterfactual_fill_tokens"),
+            "newly_unmasked": snapshot.get("newly_committed"),
+            "newly_unmasked_positions": json.dumps(
+                snapshot.get("newly_unmasked_positions") or []
+            ),
+            "proposal_token_ids_before_fill": json.dumps(
+                snapshot.get("proposal_token_ids_before_fill") or []
+            ),
+            "proposal_mask_before_fill": json.dumps(
+                snapshot.get("proposal_mask_before_fill") or []
+            ),
+            "committed_position_mask": json.dumps(
+                snapshot.get("committed_position_mask") or []
+            ),
+            "proposal_token_ids_after_fill": json.dumps(
+                snapshot.get("proposal_token_ids_after_fill") or draft_proposal
+            ),
             "draft_proposal": json.dumps(draft_proposal),
+            "outer_action_if_stop": snapshot.get("outer_action_if_stop"),
             "accept_probabilities": json.dumps(
                 snapshot.get("accept_probabilities") or []
             ),
@@ -4880,6 +5023,7 @@ def append_bucket_oracle_rows(
             "topk_token_ids": json.dumps(snapshot.get("topk_token_ids") or []),
             "topk_logits": json.dumps(snapshot.get("topk_logits") or []),
         })
+    annotate_one_step_latency_oracle(rows)
     append_csv_rows(
         os.path.join(args.output_dir, "bucket_oracle_snapshots.csv"),
         BUCKET_ORACLE_SNAPSHOT_COLUMNS,
@@ -4896,7 +5040,14 @@ def append_bucket_oracle_rows(
                 args.raw_stream_shard_rows,
             )
             args._raw_stream_writer = writer
+        state_ids = []
         for row in rows:
+            sid_raw = (
+                f"{args.dataset_name}|{row.get('problem_id')}|"
+                f"{row.get('round_id')}|{row.get('step')}"
+            )
+            state_ids.append(hashlib.sha1(sid_raw.encode()).hexdigest()[:20])
+        for row_index, row in enumerate(rows):
             proposal = json.loads(row["draft_proposal"])
             hidden = json.loads(row["hidden_states"])
             layers = json.loads(row["hidden_layer_indices"])
@@ -4904,14 +5055,26 @@ def append_bucket_oracle_rows(
             top_logits = json.loads(row["topk_logits"])
             if not hidden or not layers or not top_ids or not top_logits:
                 raise RuntimeError("raw stream row is missing hidden/top-K tensors")
-            sid_raw = (
-                f"{args.dataset_name}|{row.get('problem_id')}|"
-                f"{row.get('round_id')}|{row.get('step')}"
-            )
+            previous_state_id = None
+            next_state_id = None
+            if row_index > 0:
+                previous_row = rows[row_index - 1]
+                if (
+                    previous_row.get("problem_id") == row.get("problem_id")
+                    and previous_row.get("round_id") == row.get("round_id")
+                ):
+                    previous_state_id = state_ids[row_index - 1]
+            if row_index + 1 < len(rows):
+                next_row = rows[row_index + 1]
+                if (
+                    next_row.get("problem_id") == row.get("problem_id")
+                    and next_row.get("round_id") == row.get("round_id")
+                ):
+                    next_state_id = state_ids[row_index + 1]
             metadata = {
-                "state_id": hashlib.sha1(sid_raw.encode()).hexdigest()[:20],
-                "previous_state_id": None,
-                "next_state_id": None,
+                "state_id": state_ids[row_index],
+                "previous_state_id": previous_state_id,
+                "next_state_id": next_state_id,
                 "dataset": args.dataset_name,
                 "problem_id": int(row["problem_id"]),
                 "round_id": int(row["round_id"]),
@@ -4919,14 +5082,95 @@ def append_bucket_oracle_rows(
                 "context_len": int(row.get("context_len") or 0),
                 "proposal_length": len(proposal),
                 "accepted_len": int(row.get("accepted_len_if_stop") or 0),
-                "first_mismatch": int(row.get("accepted_len_if_stop") or 0),
+                "emitted_len_if_stop": int(row.get("emitted_len_if_stop") or 0),
                 "verifier_latency_ms": float(row.get("actual_verify_latency_ms") or 0),
+                "accept_check_latency_ms": float(
+                    row.get("actual_accept_check_latency_ms") or 0
+                ),
+                "post_verify_latency_ms": float(
+                    row.get("actual_post_verify_latency_ms") or 0
+                ),
+                "first_mismatch_convention": "accepted_prefix_length_for_greedy_verifier",
+                "draft_passes_elapsed": _row_int(row, "draft_passes_elapsed"),
+                "draft_latency_elapsed_ms": _row_float(row, "draft_latency_elapsed_ms"),
+                "masks_remaining": _row_int(row, "masks_remaining"),
+                "committed_tokens": _row_int(row, "committed_tokens"),
+                "filled_tokens": _row_int(row, "filled_tokens"),
+                "counterfactual_fill_tokens": _row_int(row, "counterfactual_fill_tokens"),
+                "newly_unmasked": _row_int(row, "newly_unmasked"),
+                "newly_unmasked_positions": json.loads(
+                    row.get("newly_unmasked_positions") or "[]"
+                ),
+                "outer_action_if_stop": row.get("outer_action_if_stop"),
+                "stop_total_latency_ms": _row_float(row, "stop_total_latency_ms"),
+                "stop_latency_per_output_token": _row_float(
+                    row, "stop_latency_per_output_token"
+                ),
+                "stop_yield_tokens_per_ms": _row_float(row, "stop_yield_tokens_per_ms"),
+                "continue_available": _row_bool(row, "continue_available"),
+                "continue_next_step": (
+                    _row_int(row, "continue_next_step")
+                    if row.get("continue_next_step") not in (None, "")
+                    else None
+                ),
+                "continue_draft_delta_passes": (
+                    _row_int(row, "continue_draft_delta_passes")
+                    if row.get("continue_draft_delta_passes") not in (None, "")
+                    else None
+                ),
+                "continue_draft_delta_latency_ms": (
+                    _row_float(row, "continue_draft_delta_latency_ms")
+                    if row.get("continue_draft_delta_latency_ms") not in (None, "")
+                    else None
+                ),
+                "continue_total_latency_ms": (
+                    _row_float(row, "continue_total_latency_ms")
+                    if row.get("continue_total_latency_ms") not in (None, "")
+                    else None
+                ),
+                "continue_latency_per_output_token": (
+                    _row_float(row, "continue_latency_per_output_token")
+                    if row.get("continue_latency_per_output_token") not in (None, "")
+                    else None
+                ),
+                "continue_yield_tokens_per_ms": (
+                    _row_float(row, "continue_yield_tokens_per_ms")
+                    if row.get("continue_yield_tokens_per_ms") not in (None, "")
+                    else None
+                ),
+                "future_yield_opportunity_label": _row_int(
+                    row, "future_yield_opportunity_label"
+                ),
+                "one_step_latency_continue_label": (
+                    _row_int(row, "one_step_latency_continue_label")
+                    if row.get("one_step_latency_continue_label") not in (None, "")
+                    else None
+                ),
+                "one_step_latency_oracle_action": row.get(
+                    "one_step_latency_oracle_action"
+                ),
+                "actual_action_taken": None,
+                "trajectory_policy": "policy_independent_force_continue",
                 "source_csv": None,
             }
             writer.append({
                 "proposal_token_ids": proposal,
+                "proposal_token_ids_before_fill": json.loads(
+                    row.get("proposal_token_ids_before_fill") or "[]"
+                ),
+                "proposal_token_ids_after_fill": json.loads(
+                    row.get("proposal_token_ids_after_fill") or row["draft_proposal"]
+                ),
                 "drafter_observed_prob": json.loads(row["accept_probabilities"]),
-                "proposal_mask": [token == 151665 for token in proposal],
+                "proposal_mask": json.loads(
+                    row.get("proposal_mask_before_fill") or "[]"
+                ),
+                "proposal_mask_before_fill": json.loads(
+                    row.get("proposal_mask_before_fill") or "[]"
+                ),
+                "committed_position_mask": json.loads(
+                    row.get("committed_position_mask") or "[]"
+                ),
                 "hidden_states": hidden,
                 "hidden_layer_indices": layers,
                 "topk_token_ids": top_ids,

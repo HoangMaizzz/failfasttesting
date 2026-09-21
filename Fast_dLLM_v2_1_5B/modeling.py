@@ -3133,9 +3133,31 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     if absolute_pos not in current_step_token_ids
                                 ]
                                 if not missing_fill_positions:
+                                    # Preserve the actual refinement state before the
+                                    # counterfactual stop candidate is materialized.
+                                    # ``oracle_x`` below is deliberately filled so the
+                                    # greedy verifier can evaluate a stop-now action;
+                                    # it must not be used as the refinement mask state.
+                                    proposal_before_fill = x_t[
+                                        0,
+                                        draft_token_start_idx:draft_end_idx,
+                                    ].detach().clone()
+                                    proposal_mask_before_fill = proposal_before_fill.eq(
+                                        mask_id
+                                    )
+                                    committed_position_mask = ~proposal_mask_before_fill
+                                    newly_unmasked_relative_positions = [
+                                        int(position - draft_token_start_idx)
+                                        for position in newly_unmasked_absolute_positions
+                                        if draft_token_start_idx <= position < draft_end_idx
+                                    ]
                                     oracle_x = x_t.clone()
                                     for absolute_pos in remaining_absolute_positions:
                                         oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
+                                    proposal_after_fill = oracle_x[
+                                        0,
+                                        draft_token_start_idx:draft_end_idx,
+                                    ].detach().clone()
                                     oracle_outer_action = (
                                         post_stop_outer_action
                                         if adaptive_enabled
@@ -3197,11 +3219,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "masks_remaining": int(masks_remaining),
                                         "newly_committed": int(unmasked_this_step),
                                         "committed_tokens": int(target_len - masks_remaining),
-                                        "filled_tokens": int(masks_remaining),
-                                        "draft_proposal": oracle_x[
-                                            0,
-                                            draft_token_start_idx:draft_end_idx,
-                                        ].tolist(),
+                                        "filled_tokens": int(target_len - masks_remaining),
+                                        "counterfactual_fill_tokens": int(masks_remaining),
+                                        "newly_unmasked_positions": newly_unmasked_relative_positions,
+                                        "proposal_token_ids_before_fill": proposal_before_fill.tolist(),
+                                        "proposal_mask_before_fill": proposal_mask_before_fill.tolist(),
+                                        "committed_position_mask": committed_position_mask.tolist(),
+                                        "proposal_token_ids_after_fill": proposal_after_fill.tolist(),
+                                        # Kept for compatibility: draft_proposal is
+                                        # the verifier-ready, fully materialized copy.
+                                        "draft_proposal": proposal_after_fill.tolist(),
                                         "confidences": [float(value) for value in confidences],
                                         "margins": [float(value) for value in margins],
                                         "outer_action_if_stop": oracle_outer_action,

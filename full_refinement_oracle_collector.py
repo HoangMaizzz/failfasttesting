@@ -131,8 +131,11 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
     dataset_out.mkdir(parents=True, exist_ok=True)
     metadata_path = dataset_out / "index.jsonl"
     token_chunks: list[list[int]] = []
+    before_token_chunks: list[list[int]] = []
     prob_chunks: list[list[float]] = []
     mask_chunks: list[list[bool]] = []
+    committed_mask_chunks: list[list[bool]] = []
+    after_token_chunks: list[list[int]] = []
     hidden_chunks: list[list] = []
     layer_chunks: list[list[int]] = []
     top_id_chunks: list[list] = []
@@ -151,8 +154,20 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
         np.savez_compressed(
             dataset_out / name,
             proposal_token_ids=np.asarray([pad(x, 0) for x in token_chunks], dtype=np.int64),
+            proposal_token_ids_before_fill=np.asarray(
+                [pad(x, MASK_ID) for x in before_token_chunks], dtype=np.int64
+            ),
             drafter_observed_prob=np.asarray([pad(x, 0.0) for x in prob_chunks], dtype=np.float16),
             proposal_mask=np.asarray([pad(x, False) for x in mask_chunks], dtype=np.bool_),
+            proposal_mask_before_fill=np.asarray(
+                [pad(x, False) for x in mask_chunks], dtype=np.bool_
+            ),
+            committed_position_mask=np.asarray(
+                [pad(x, False) for x in committed_mask_chunks], dtype=np.bool_
+            ),
+            proposal_token_ids_after_fill=np.asarray(
+                [pad(x, 0) for x in after_token_chunks], dtype=np.int64
+            ),
             hidden_states=np.asarray(hidden_chunks, dtype=np.float16),
             hidden_layer_indices=np.asarray(layer_chunks, dtype=np.int64),
             topk_token_ids=np.asarray(top_id_chunks, dtype=np.int64),
@@ -161,7 +176,8 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
         for offset, item in enumerate(metadata_chunks):
             item.update({"shard": name, "row": offset})
             metadata_file.write(json.dumps(item) + "\n")
-        token_chunks.clear(); prob_chunks.clear(); mask_chunks.clear()
+        token_chunks.clear(); before_token_chunks.clear(); prob_chunks.clear()
+        mask_chunks.clear(); committed_mask_chunks.clear(); after_token_chunks.clear()
         hidden_chunks.clear(); layer_chunks.clear(); top_id_chunks.clear(); top_logit_chunks.clear()
         metadata_chunks.clear()
         shard_index += 1
@@ -172,6 +188,21 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
         rows = csv.DictReader(source_file)
         for row in rows:
             proposal = [int(x) for x in parse_json(row.get("draft_proposal"))]
+            proposal_before_fill = [
+                int(x) for x in parse_json(row.get("proposal_token_ids_before_fill"))
+            ] or proposal
+            proposal_mask_before = [
+                bool(x) for x in parse_json(row.get("proposal_mask_before_fill"))
+            ]
+            if not proposal_mask_before:
+                proposal_mask_before = [token == MASK_ID for token in proposal_before_fill]
+            proposal_mask_before = (proposal_mask_before + [False] * len(proposal_before_fill))[
+                :len(proposal_before_fill)
+            ]
+            committed_position_mask = [not value for value in proposal_mask_before]
+            proposal_after_fill = [
+                int(x) for x in parse_json(row.get("proposal_token_ids_after_fill"))
+            ] or proposal
             probabilities = [float(x) for x in parse_json(row.get("accept_probabilities"))]
             probabilities = (probabilities + [0.0] * len(proposal))[:len(proposal)]
             block = (row.get("problem_id", ""), row.get("round_id", ""))
@@ -195,13 +226,81 @@ def convert_dataset(dataset: str, staging: Path, output: Path, shard_rows: int) 
             "context_len": int(row.get("context_len") or 0),
             "proposal_length": len(proposal),
             "accepted_len": int(row.get("accepted_len_if_stop") or 0),
-            "first_mismatch": int(row.get("accepted_len_if_stop") or 0),
+            "emitted_len_if_stop": int(row.get("emitted_len_if_stop") or 0),
+            "first_mismatch_convention": "accepted_prefix_length_for_greedy_verifier",
             "verifier_latency_ms": float(row.get("actual_verify_latency_ms") or 0),
+            "accept_check_latency_ms": float(
+                row.get("actual_accept_check_latency_ms") or 0
+            ),
+            "post_verify_latency_ms": float(
+                row.get("actual_post_verify_latency_ms") or 0
+            ),
+            "draft_passes_elapsed": int(row.get("draft_passes_elapsed") or 0),
+            "draft_latency_elapsed_ms": float(row.get("draft_latency_elapsed_ms") or 0),
+            "masks_remaining": int(row.get("masks_remaining") or sum(proposal_mask_before)),
+            "committed_tokens": int(row.get("committed_tokens") or sum(committed_position_mask)),
+            "filled_tokens": int(row.get("filled_tokens") or sum(committed_position_mask)),
+            "counterfactual_fill_tokens": int(
+                row.get("counterfactual_fill_tokens") or sum(proposal_mask_before)
+            ),
+            "newly_unmasked": int(row.get("newly_unmasked") or 0),
+            "newly_unmasked_positions": parse_json(row.get("newly_unmasked_positions")),
+            "outer_action_if_stop": row.get("outer_action_if_stop") or None,
+            "stop_total_latency_ms": float(row.get("stop_total_latency_ms") or 0),
+            "stop_latency_per_output_token": float(
+                row.get("stop_latency_per_output_token") or 0
+            ),
+            "stop_yield_tokens_per_ms": float(row.get("stop_yield_tokens_per_ms") or 0),
+            "continue_available": row.get("continue_available") == "True",
+            "continue_next_step": (
+                int(row["continue_next_step"])
+                if row.get("continue_next_step") not in (None, "")
+                else None
+            ),
+            "continue_draft_delta_passes": (
+                int(row["continue_draft_delta_passes"])
+                if row.get("continue_draft_delta_passes") not in (None, "")
+                else None
+            ),
+            "continue_draft_delta_latency_ms": (
+                float(row["continue_draft_delta_latency_ms"])
+                if row.get("continue_draft_delta_latency_ms") not in (None, "")
+                else None
+            ),
+            "continue_total_latency_ms": (
+                float(row["continue_total_latency_ms"])
+                if row.get("continue_total_latency_ms") not in (None, "")
+                else None
+            ),
+            "continue_latency_per_output_token": (
+                float(row["continue_latency_per_output_token"])
+                if row.get("continue_latency_per_output_token") not in (None, "")
+                else None
+            ),
+            "continue_yield_tokens_per_ms": (
+                float(row["continue_yield_tokens_per_ms"])
+                if row.get("continue_yield_tokens_per_ms") not in (None, "")
+                else None
+            ),
+            "future_yield_opportunity_label": int(
+                row.get("future_yield_opportunity_label") or 0
+            ),
+            "one_step_latency_continue_label": (
+                int(row["one_step_latency_continue_label"])
+                if row.get("one_step_latency_continue_label") not in (None, "")
+                else None
+            ),
+            "one_step_latency_oracle_action": row.get("one_step_latency_oracle_action") or None,
+            "actual_action_taken": None,
+            "trajectory_policy": "policy_independent_force_continue",
             "source_csv": str(source),
             })
             token_chunks.append(proposal)
+            before_token_chunks.append(proposal_before_fill)
             prob_chunks.append(probabilities)
-            mask_chunks.append([token == MASK_ID for token in proposal])
+            mask_chunks.append(proposal_mask_before)
+            committed_mask_chunks.append(committed_position_mask)
+            after_token_chunks.append(proposal_after_fill)
             hidden_chunks.append(hidden)
             layer_chunks.append(layers)
             top_id_chunks.append(top_ids)
@@ -251,6 +350,13 @@ def main() -> None:
         "native_hard_cap": 8,
         "lowconf_threshold": 0.0,
         "oracle": "real greedy verifier at every recorded refinement boundary",
+        "mask_semantics": "proposal_mask_before_fill is the live pre-stop refinement mask",
+        "verifier_target": "accepted_len; first_mismatch is the same greedy-prefix index",
+        "latency_oracle": (
+            "one-step stop-vs-next-boundary comparison using cumulative "
+            "latency per emitted output token"
+        ),
+        "actual_action_taken": "not available; trajectory is forcibly continued",
         "created_utc": datetime.now(timezone.utc).isoformat(),
     })
     (output / "config.json").write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")

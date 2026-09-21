@@ -50,11 +50,26 @@ class RawShardWriter:
             proposal_token_ids=np.asarray(
                 [pad(row["proposal_token_ids"], 0) for row in rows], dtype=np.int64
             ),
+            proposal_token_ids_before_fill=np.asarray(
+                [pad(row.get("proposal_token_ids_before_fill", row["proposal_token_ids"]), 151665)
+                 for row in rows], dtype=np.int64
+            ),
             drafter_observed_prob=np.asarray(
                 [pad(row["drafter_observed_prob"], 0.0) for row in rows], dtype=np.float16
             ),
             proposal_mask=np.asarray(
-                [pad(row["proposal_mask"], False) for row in rows], dtype=np.bool_
+                [pad(row.get("proposal_mask", []), False) for row in rows], dtype=np.bool_
+            ),
+            proposal_mask_before_fill=np.asarray(
+                [pad(row.get("proposal_mask_before_fill", row.get("proposal_mask", [])), False)
+                 for row in rows], dtype=np.bool_
+            ),
+            committed_position_mask=np.asarray(
+                [pad(row.get("committed_position_mask", []), False) for row in rows], dtype=np.bool_
+            ),
+            proposal_token_ids_after_fill=np.asarray(
+                [pad(row.get("proposal_token_ids_after_fill", row["proposal_token_ids"]), 0)
+                 for row in rows], dtype=np.int64
             ),
             hidden_states=np.asarray([row["hidden_states"] for row in rows], dtype=np.float16),
             hidden_layer_indices=np.asarray(
