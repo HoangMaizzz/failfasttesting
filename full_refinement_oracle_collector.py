@@ -48,6 +48,12 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--sweep_incr_len", type=int, default=8)
     p.add_argument("--drafter_threshold", type=float, default=0.3)
     p.add_argument("--sweep_lowconf_threshold", type=float, default=0.0)
+    p.add_argument("--log_level", default="INFO")
+    p.add_argument(
+        "--show_progress",
+        action="store_true",
+        help="keep generation text and progress bars visible for diagnostics",
+    )
     p.add_argument("--shard_rows", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", action="store_true")
@@ -97,10 +103,11 @@ def run_staging(args: argparse.Namespace, dataset: str, destination: Path) -> No
         "--collect_bucket_oracle",
         "--full_refinement_oracle",
         "--bucket_oracle_force_continue",
-        "--quiet_generation", "--disable_progress",
         "--skip_artifacts", "--skip_plots", "--overwrite",
-        "--output_dir", str(destination), "--log_level", "INFO",
+        "--output_dir", str(destination), "--log_level", str(args.log_level),
     ]
+    if not args.show_progress:
+        command += ["--quiet_generation", "--disable_progress"]
     ids = problem_ids(args.problem_ids_file, dataset, args.num_questions)
     if ids:
         command += ["--num_questions", str(len(ids)), "--problem_ids", *map(str, ids)]
