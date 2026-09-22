@@ -41,6 +41,13 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--target_quantization", default="none")
     p.add_argument("--target_device", default="0")
     p.add_argument("--drafter_device", default="1")
+    p.add_argument("--block_size", type=int, default=32)
+    p.add_argument("--small_block_size", type=int, default=8)
+    p.add_argument("--spec_len", type=int, default=8)
+    p.add_argument("--sweep_max_spec_len", type=int, default=8)
+    p.add_argument("--sweep_incr_len", type=int, default=8)
+    p.add_argument("--drafter_threshold", type=float, default=0.3)
+    p.add_argument("--sweep_lowconf_threshold", type=float, default=0.0)
     p.add_argument("--shard_rows", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", action="store_true")
@@ -72,13 +79,13 @@ def run_staging(args: argparse.Namespace, dataset: str, destination: Path) -> No
         "--benchmark_modes", "dllm_ar",
         "--dllm_variant", "failfast",
         "--decoding_strategy", "greedy",
-        "--block_size", "32",
-        "--small_block_size", "8",
-        "--spec_len", "8",
-        "--drafter_thresholds", "0.3",
-        "--sweep_lowconf_threshold", "0.0",
-        "--sweep_max_spec_len", "8",
-        "--sweep_incr_len", "8",
+        "--block_size", str(args.block_size),
+        "--small_block_size", str(args.small_block_size),
+        "--spec_len", str(args.spec_len),
+        "--drafter_thresholds", str(args.drafter_threshold),
+        "--sweep_lowconf_threshold", str(args.sweep_lowconf_threshold),
+        "--sweep_max_spec_len", str(args.sweep_max_spec_len),
+        "--sweep_incr_len", str(args.sweep_incr_len),
         "--max_new_tokens", "1024",
         "--target_model_name", args.target_model_name,
         "--dllm_dir", args.dllm_dir,
