@@ -46,6 +46,7 @@ def args_parser() -> argparse.Namespace:
     p.add_argument("--spec_len", type=int, default=8)
     p.add_argument("--sweep_max_spec_len", type=int, default=8)
     p.add_argument("--sweep_incr_len", type=int, default=8)
+    p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--drafter_threshold", type=float, default=0.3)
     p.add_argument("--sweep_lowconf_threshold", type=float, default=0.0)
     p.add_argument("--log_level", default="INFO")
@@ -92,7 +93,7 @@ def run_staging(args: argparse.Namespace, dataset: str, destination: Path) -> No
         "--sweep_lowconf_threshold", str(args.sweep_lowconf_threshold),
         "--sweep_max_spec_len", str(args.sweep_max_spec_len),
         "--sweep_incr_len", str(args.sweep_incr_len),
-        "--max_new_tokens", "1024",
+        "--max_new_tokens", str(args.max_new_tokens),
         "--target_model_name", args.target_model_name,
         "--dllm_dir", args.dllm_dir,
         "--target_device", str(args.target_device),
