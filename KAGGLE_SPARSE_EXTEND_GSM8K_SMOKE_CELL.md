@@ -13,11 +13,13 @@ from huggingface_hub import snapshot_download
 
 repo = Path("/kaggle/working/sparse_extend_world_model_repo")
 data_dir = Path("/kaggle/input/datasets/ainzkhail/specworld/gsm8k_raw")
+if not data_dir.exists():
+    raise FileNotFoundError(f"Kaggle input folder not found: {data_dir}")
 archives = [p for p in data_dir.rglob("*.zip") if zipfile.is_zipfile(p)]
-if len(archives) != 1:
-    raise RuntimeError(f"Expected one GSM8K ZIP under {data_dir}; found {archives}")
-gsm8k_zip = archives[0]
-print("Using archive:", gsm8k_zip)
+if len(archives) > 1:
+    raise RuntimeError(f"Expected at most one GSM8K ZIP under {data_dir}; found {archives}")
+backbone_input = archives[0] if archives else data_dir
+print("Using backbone input:", backbone_input)
 
 dllm_dir = repo / "Fast_dLLM_v2_1_5B"
 snapshot_download(
@@ -28,7 +30,7 @@ snapshot_download(
 
 cmd = [
     sys.executable, str(repo / "sparse_extend_world_model_collector.py"),
-    "--backbone_zip", str(gsm8k_zip), "--dataset", "gsm8k",
+    "--backbone_zip", str(backbone_input), "--dataset", "gsm8k",
     "--num_questions", "3", "--max_rounds_per_question", "1",
     "--root_boundaries", "4", "--extend_size", "8",
     "--max_proposal_tokens", "64", "--max_unmask_passes", "4",

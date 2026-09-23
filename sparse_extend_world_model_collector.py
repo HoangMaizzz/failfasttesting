@@ -33,7 +33,10 @@ MASK_ID = 151665
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--backbone_zip", type=Path, required=True)
+    p.add_argument(
+        "--backbone_zip", type=Path, required=True,
+        help="raw-state ZIP or directory containing its extracted index/shards",
+    )
     p.add_argument("--dataset", choices=("math", "gsm8k"), default="gsm8k")
     p.add_argument("--num_questions", type=int, default=3)
     p.add_argument("--max_rounds_per_question", type=int, default=1,
@@ -66,71 +69,130 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_backbone_rows(zip_path: Path, dataset: str, num_questions: int,
+def _find_unpacked_index(folder: Path, dataset: str) -> Path:
+    candidates = list(folder.rglob("index.jsonl"))
+    raw_candidates = [
+        p for p in candidates
+        if p.parent.name.lower() == dataset.lower()
+        and p.parent.parent.name.lower() == "raw"
+    ]
+    if raw_candidates:
+        candidates = raw_candidates
+    else:
+        dataset_candidates = [p for p in candidates if p.parent.name.lower() == dataset.lower()]
+        if dataset_candidates:
+            candidates = dataset_candidates
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            f"Expected one {dataset} raw index.jsonl under {folder}; found: "
+            f"{[str(p) for p in candidates]}"
+        )
+    return candidates[0]
+
+
+def _select_backbone_rows(rows: list[dict], num_questions: int,
+                          max_rounds: int, root_boundaries: int) -> list[dict]:
+    by_question: dict[int, list[dict]] = defaultdict(list)
+    for row in rows:
+        problem_id = int(row["problem_id"])
+        if problem_id < num_questions and int(row.get("proposal_length", 0)) == 8:
+            by_question[problem_id].append(row)
+    selected = []
+    for problem_id in range(num_questions):
+        rounds: dict[int, list[dict]] = defaultdict(list)
+        for row in by_question.get(problem_id, []):
+            rounds[int(row["round_id"])].append(row)
+        round_ids = sorted(rounds)
+        if max_rounds > 0:
+            round_ids = round_ids[:max_rounds]
+        for round_id in round_ids:
+            candidates = sorted(
+                rounds[round_id],
+                key=lambda row: (int(row.get("boundary_index", 0)), row["state_id"]),
+            )
+            selected.extend(candidates[:root_boundaries])
+    return selected
+
+
+def _hydrate_backbone_rows(selected: list[dict], dataset: str,
+                           shard_loader) -> list[dict]:
+    shard_cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
+    result = []
+    for row in selected:
+        shard_key = str(row["shard"])
+        if shard_key not in shard_cache:
+            shard_cache[shard_key] = shard_loader(row["shard"])
+            while len(shard_cache) > 3:
+                shard_cache.popitem(last=False)
+        else:
+            shard_cache.move_to_end(shard_key)
+        arrays = shard_cache[shard_key]
+        i = int(row["row"])
+        offsets = arrays["prefix_token_ids_offsets"]
+        lo, hi = int(offsets[i]), int(offsets[i + 1])
+        record = dict(row)
+        record["prefix_token_ids"] = arrays["prefix_token_ids_flat"][lo:hi].astype(np.int64).tolist()
+        for name in (
+            "proposal_token_ids", "proposal_token_ids_before_fill",
+            "proposal_token_ids_after_fill", "proposal_mask_before_fill",
+            "committed_position_mask", "drafter_observed_prob",
+            "hidden_states", "hidden_layer_indices", "topk_token_ids", "topk_logits",
+        ):
+            if name in arrays:
+                record[name] = arrays[name][i].tolist()
+        width = int(record["proposal_length"])
+        for name in (
+            "proposal_token_ids", "proposal_token_ids_before_fill",
+            "proposal_token_ids_after_fill", "proposal_mask_before_fill",
+            "committed_position_mask", "drafter_observed_prob",
+        ):
+            if name in record:
+                record[name] = record[name][:width]
+        result.append(record)
+    if not result:
+        raise RuntimeError("No 8-token backbone states selected; check dataset/problem IDs")
+    return result
+
+
+def _load_backbone_rows(backbone_path: Path, dataset: str, num_questions: int,
                         max_rounds: int, root_boundaries: int) -> list[dict]:
-    """Read only selected rows/shards; never extract the full multi-GB ZIP."""
-    with zipfile.ZipFile(zip_path) as archive:
+    """Load selected states directly from either the ZIP or its extracted folder."""
+    if backbone_path.is_dir():
+        index_path = _find_unpacked_index(backbone_path, dataset)
+        rows = [json.loads(line) for line in index_path.read_text(encoding="utf-8").splitlines()]
+        selected = _select_backbone_rows(rows, num_questions, max_rounds, root_boundaries)
+
+        def load_shard(shard):
+            shard_path = Path(shard)
+            candidates = [
+                shard_path if shard_path.is_absolute() else index_path.parent / shard_path,
+                backbone_path / shard_path,
+                backbone_path / "raw" / dataset / shard_path.name,
+            ]
+            actual = next((p for p in candidates if p.is_file()), None)
+            if actual is None:
+                raise FileNotFoundError(f"Shard {shard!r} not found under {backbone_path}")
+            with np.load(actual, allow_pickle=False) as data:
+                return {name: data[name] for name in data.files}
+
+        return _hydrate_backbone_rows(selected, dataset, load_shard)
+
+    if not zipfile.is_zipfile(backbone_path):
+        raise ValueError(f"Backbone input is neither a ZIP nor a directory: {backbone_path}")
+    with zipfile.ZipFile(backbone_path) as archive:
         index_name = f"raw/{dataset}/index.jsonl"
         if index_name not in archive.namelist():
-            raise FileNotFoundError(f"{index_name} missing from {zip_path}")
+            raise FileNotFoundError(f"{index_name} missing from {backbone_path}")
         rows = [json.loads(line) for line in archive.read(index_name).splitlines()]
-        by_question: dict[int, list[dict]] = defaultdict(list)
-        for row in rows:
-            problem_id = int(row["problem_id"])
-            if problem_id < num_questions and int(row.get("proposal_length", 0)) == 8:
-                by_question[problem_id].append(row)
+        selected = _select_backbone_rows(rows, num_questions, max_rounds, root_boundaries)
 
-        selected: list[dict] = []
-        for problem_id in range(num_questions):
-            question_rows = by_question.get(problem_id, [])
-            rounds: dict[int, list[dict]] = defaultdict(list)
-            for row in question_rows:
-                rounds[int(row["round_id"])].append(row)
-            round_ids = sorted(rounds)
-            if max_rounds > 0:
-                round_ids = round_ids[:max_rounds]
-            for round_id in round_ids:
-                candidates = sorted(
-                    rounds[round_id],
-                    key=lambda row: (int(row.get("boundary_index", 0)), row["state_id"]),
-                )
-                selected.extend(candidates[:root_boundaries])
+        def load_shard(shard):
+            member = f"raw/{dataset}/{Path(shard).name}"
+            with archive.open(member) as handle:
+                with np.load(handle, allow_pickle=False) as data:
+                    return {name: data[name] for name in data.files}
 
-        shard_cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
-        result = []
-        for row in selected:
-            shard_name = f"raw/{dataset}/{row['shard']}"
-            if shard_name not in shard_cache:
-                with archive.open(shard_name) as handle:
-                    shard_cache[row["shard"]] = dict(np.load(handle, allow_pickle=False))
-                while len(shard_cache) > 3:
-                    shard_cache.popitem(last=False)
-            else:
-                shard_cache.move_to_end(row["shard"])
-            arrays = shard_cache[row["shard"]]
-            i = int(row["row"])
-            offsets = arrays["prefix_token_ids_offsets"]
-            lo, hi = int(offsets[i]), int(offsets[i + 1])
-            record = dict(row)
-            record["prefix_token_ids"] = arrays["prefix_token_ids_flat"][lo:hi].astype(np.int64).tolist()
-            for name in (
-                "proposal_token_ids", "proposal_token_ids_before_fill",
-                "proposal_token_ids_after_fill", "proposal_mask_before_fill",
-                "committed_position_mask", "drafter_observed_prob",
-                "hidden_states", "hidden_layer_indices", "topk_token_ids", "topk_logits",
-            ):
-                if name in arrays:
-                    record[name] = arrays[name][i].tolist()
-            width = int(record["proposal_length"])
-            for name in ("proposal_token_ids", "proposal_token_ids_before_fill",
-                         "proposal_token_ids_after_fill", "proposal_mask_before_fill",
-                         "committed_position_mask", "drafter_observed_prob"):
-                if name in record:
-                    record[name] = record[name][:width]
-            result.append(record)
-        if not result:
-            raise RuntimeError("No 8-token backbone states selected; check dataset/problem IDs")
-        return result
+        return _hydrate_backbone_rows(selected, dataset, load_shard)
 
 
 def _load_models(args):
@@ -208,15 +270,25 @@ def _score_greedy(proposal: list[int], reference: list[int], eos_id: int | None,
     return min(accepted, len(emitted)), len(emitted), emitted
 
 
-def _load_verifier_profile(zip_path: Path, dataset: str) -> list[dict]:
-    """Load measured L=8 verifier timings once; the ZIP is multi-GB."""
-    with zipfile.ZipFile(zip_path) as archive:
-        selected = []
-        for line in archive.open(f"raw/{dataset}/index.jsonl"):
-            row = json.loads(line)
-            if int(row.get("proposal_length", 0)) == 8:
-                selected.append(row)
-        return selected
+def _load_verifier_profile(backbone_path: Path, dataset: str) -> list[dict]:
+    """Load measured L=8 verifier timings from the ZIP index or extracted index."""
+    if backbone_path.is_dir():
+        index_path = _find_unpacked_index(backbone_path, dataset)
+        index_lines = index_path.read_text(encoding="utf-8").splitlines()
+    else:
+        archive = zipfile.ZipFile(backbone_path)
+        index_name = f"raw/{dataset}/index.jsonl"
+        if index_name not in archive.namelist():
+            archive.close()
+            raise FileNotFoundError(f"{index_name} missing from {backbone_path}")
+        index_lines = archive.read(index_name).decode("utf-8").splitlines()
+        archive.close()
+    selected = []
+    for line in index_lines:
+        row = json.loads(line)
+        if int(row.get("proposal_length", 0)) == 8:
+            selected.append(row)
+    return selected
 
 
 def _verifier_profile(rows: list[dict], context_len: int) -> tuple[float, float]:
@@ -647,8 +719,12 @@ def collect(args) -> dict:
         del reference
     writer.flush()
     graph_summary["child_states"] = step_counter[0]
-    graph_summary["backbone_zip_sha256"] = sha256_file(args.backbone_zip)
-    graph_summary["backbone_zip"] = args.backbone_zip.name
+    if args.backbone_zip.is_dir():
+        source_index = _find_unpacked_index(args.backbone_zip, args.dataset)
+        graph_summary["backbone_source_index_sha256"] = sha256_file(source_index)
+    else:
+        graph_summary["backbone_source_sha256"] = sha256_file(args.backbone_zip)
+    graph_summary["backbone_source"] = str(args.backbone_zip)
     graph_summary["submit_label_source"] = "cached_greedy_reference_lcp"
     graph_summary["verifier_latency_note"] = (
         "L=8 latency measured in backbone ZIP; longer proposals are scaled estimates, not per-node verifier measurements"
