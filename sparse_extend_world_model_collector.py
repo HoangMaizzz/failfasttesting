@@ -494,8 +494,9 @@ def _extend_one(args, drafter, tokenizer, prefix: list[int], parent: dict,
             feature_merge_fallback_reason = "full-state feature snapshot missing"
 
         if feature_merge_mode == "append_extension_fallback":
-            hidden_states = list(parent["hidden_states"]) + list(
-                snap.get("hidden_states") or []
+            hidden_states = _merge_layer_features(
+                parent["hidden_states"], snap.get("hidden_states") or [],
+                len(full_native), len(native),
             )
             topk_token_ids = list(parent["topk_token_ids"]) + list(
                 snap.get("topk_token_ids") or []
