@@ -1,0 +1,59 @@
+"""Exercise the repository's real dLLM forward with tiny random weights.
+
+This validates the adapter/position contract, not pretrained model quality.
+"""
+import importlib.util
+from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+if (ROOT / '.test-deps').exists():
+    sys.path.insert(0, str(ROOT / '.test-deps'))
+
+import torch
+from transformers import Qwen2Config
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from structured_sparse_collector import ExplicitDrafter, MASK_ID
+
+
+class NativeForwardTest(unittest.TestCase):
+    def test_full_state_adapter_on_real_forward(self):
+        package = ModuleType('tiny_dllm_test')
+        package.__path__ = []
+        sys.modules[package.__name__] = package
+        configuration = ModuleType('tiny_dllm_test.configuration')
+        configuration.Fast_dLLM_QwenConfig = Qwen2Config
+        sys.modules[configuration.__name__] = configuration
+        spec = importlib.util.spec_from_file_location('tiny_dllm_test.modeling', ROOT / 'Fast_dLLM_v2_1_5B/modeling.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        if 'default' not in ROPE_INIT_FUNCTIONS:
+            def rope(config, device, **kwargs):
+                dim = config.hidden_size // config.num_attention_heads
+                return 1 / (config.rope_theta ** (torch.arange(0, dim, 2, device=device).float() / dim)), 1.0
+            ROPE_INIT_FUNCTIONS['default'] = rope
+        config = Qwen2Config(vocab_size=151680, hidden_size=16, intermediate_size=32,
+                             num_hidden_layers=4, num_attention_heads=2,
+                             num_key_value_heads=2, max_position_embeddings=512)
+        config.bd_size = 32
+        config._attn_implementation = 'sdpa'
+        model = module.Fast_dLLM_QwenForCausalLM(config).eval()
+        devices = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+        for device in devices:
+            model = model.to(device=device, dtype=torch.float16 if device == 'cuda' else torch.float32)
+            engine = ExplicitDrafter(model, SimpleNamespace(physical_block_size=32, raw_top_k=32))
+            for prefix_length, length in [(7, 8), (8, 24), (8, 32), (8, 64)]:
+                with self.subTest(device=device, prefix=prefix_length, length=length):
+                    obs = engine.observe([1] * prefix_length, [MASK_ID] * length)
+                    self.assertEqual(len(obs['hidden_states']), 5)
+                    self.assertTrue(all(len(layer) == length for layer in obs['hidden_states']))
+                    self.assertEqual(len(obs['filled']), length)
+                    self.assertEqual(len(obs['topk_logits']), length)
+
+
+if __name__ == '__main__':
+    unittest.main()

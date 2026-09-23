@@ -797,8 +797,10 @@ def collect(args) -> dict:
 
 
 def main() -> None:
-    args = parse_args()
-    collect(args)
+    # Keep the old filename as a CLI entry point, but use explicit one-step
+    # S/R/E collection. Legacy helpers above remain for archive compatibility.
+    from structured_sparse_collector import collect as collect_structured, parse_args as parse_structured
+    collect_structured(parse_structured())
 
 
 if __name__ == "__main__":

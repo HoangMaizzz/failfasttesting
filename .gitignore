@@ -5,6 +5,7 @@ slurm_logs/
 figures/
 .DS_Store
 .venv/
+.test-deps/
 /Fast_dLLM_v2_1.5B/
 /Fast_dLLM_v2_1_5B/checkpoint-*/
 /backups/
