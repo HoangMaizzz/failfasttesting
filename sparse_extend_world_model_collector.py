@@ -469,17 +469,31 @@ def _extend_one(args, drafter, tokenizer, prefix: list[int], parent: dict,
         full_hidden = snap.get("collector_full_hidden_states")
         full_topk_ids = snap.get("collector_full_topk_token_ids")
         full_topk_logits = snap.get("collector_full_topk_logits")
+        feature_merge_mode = "full_state_overlay"
+        feature_merge_fallback_reason = None
         if full_hidden and full_topk_ids and full_topk_logits:
-            hidden_states = _merge_layer_features(
-                parent["hidden_states"], full_hidden, feature_offset, len(native)
-            )
-            topk_token_ids = _merge_feature_rows(
-                parent["topk_token_ids"], full_topk_ids, feature_offset, len(native)
-            )
-            topk_logits = _merge_feature_rows(
-                parent["topk_logits"], full_topk_logits, feature_offset, len(native)
-            )
+            try:
+                hidden_states = _merge_layer_features(
+                    parent["hidden_states"], full_hidden, feature_offset, len(native)
+                )
+                topk_token_ids = _merge_feature_rows(
+                    parent["topk_token_ids"], full_topk_ids, feature_offset, len(native)
+                )
+                topk_logits = _merge_feature_rows(
+                    parent["topk_logits"], full_topk_logits, feature_offset, len(native)
+                )
+            except RuntimeError as exc:
+                # Some dLLM snapshots start their refreshed feature window one
+                # position after the inherited state ends. The extension-only
+                # tensors below are position-aligned and preserve all parent
+                # features without inventing a value for the missing slot.
+                feature_merge_mode = "append_extension_fallback"
+                feature_merge_fallback_reason = str(exc)
         else:
+            feature_merge_mode = "append_extension_fallback"
+            feature_merge_fallback_reason = "full-state feature snapshot missing"
+
+        if feature_merge_mode == "append_extension_fallback":
             hidden_states = list(parent["hidden_states"]) + list(
                 snap.get("hidden_states") or []
             )
@@ -563,6 +577,31 @@ def _extend_one(args, drafter, tokenizer, prefix: list[int], parent: dict,
         }
         if not child["hidden_states"] or not child["topk_token_ids"] or not child["topk_logits"]:
             raise RuntimeError("dLLM extension snapshot omitted raw hidden/top-K features")
+        expected_feature_length = len(native)
+        feature_lengths = [
+            len(child["topk_token_ids"]),
+            len(child["topk_logits"]),
+            *(len(layer) for layer in child["hidden_states"]),
+        ]
+        if any(length != expected_feature_length for length in feature_lengths):
+            raise RuntimeError(
+                "composed raw feature lengths do not match proposal length: "
+                f"expected={expected_feature_length}, got={feature_lengths}, "
+                f"merge_mode={feature_merge_mode}"
+            )
+        child["metadata"]["feature_merge_mode"] = feature_merge_mode
+        child["metadata"]["feature_merge_fallback_reason"] = feature_merge_fallback_reason
+        child["metadata"]["feature_scope"] = (
+            "parent_features_plus_current_extension_features"
+            if feature_merge_mode == "append_extension_fallback"
+            else "full_proposal_parent_plus_current_native_block_refresh"
+        )
+        if feature_merge_mode == "append_extension_fallback":
+            extension_hidden = snap.get("hidden_states") or []
+            child["metadata"]["feature_update_start_offset"] = len(full_native)
+            child["metadata"]["feature_update_token_count"] = (
+                len(extension_hidden[0]) if extension_hidden else 0
+            )
         children.append(child)
     return children
 
