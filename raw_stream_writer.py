@@ -44,6 +44,27 @@ class RawShardWriter:
         def pad(values, fill):
             return list(values) + [fill] * (width - len(values))
 
+        max_feature_tokens = max(
+            max(len(layer) for layer in row["hidden_states"])
+            for row in rows
+        )
+
+        def pad_layered_features(layers, target_tokens, fill):
+            padded = []
+            for layer in layers:
+                layer = [list(token_values) for token_values in layer]
+                if layer:
+                    feature_width = len(layer[0])
+                else:
+                    feature_width = 0
+                layer.extend(
+                    [[fill] * feature_width] * (target_tokens - len(layer))
+                )
+                padded.append(layer)
+            return padded
+
+        max_topk_tokens = max(len(row["topk_token_ids"]) for row in rows)
+
         prefix_offsets = [0]
         prefix_flat = []
         for row in rows:
@@ -80,16 +101,21 @@ class RawShardWriter:
             ),
             prefix_token_ids_flat=np.asarray(prefix_flat, dtype=np.int32),
             prefix_token_ids_offsets=np.asarray(prefix_offsets, dtype=np.int64),
-            hidden_states=np.asarray([row["hidden_states"] for row in rows], dtype=np.float16),
+            hidden_states=np.asarray([
+                pad_layered_features(row["hidden_states"], max_feature_tokens, 0.0)
+                for row in rows
+            ], dtype=np.float16),
             hidden_layer_indices=np.asarray(
                 [row["hidden_layer_indices"] for row in rows], dtype=np.int64
             ),
-            topk_token_ids=np.asarray(
-                [row["topk_token_ids"] for row in rows], dtype=np.int64
-            ),
-            topk_logits=np.asarray(
-                [row["topk_logits"] for row in rows], dtype=np.float16
-            ),
+            topk_token_ids=np.asarray([
+                pad_layered_features([row["topk_token_ids"]], max_topk_tokens, 0)[0]
+                for row in rows
+            ], dtype=np.int64),
+            topk_logits=np.asarray([
+                pad_layered_features([row["topk_logits"]], max_topk_tokens, 0.0)[0]
+                for row in rows
+            ], dtype=np.float16),
         )
         with self.metadata_path.open("a", encoding="utf-8") as handle:
             for offset, row in enumerate(rows):

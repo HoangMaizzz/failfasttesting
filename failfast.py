@@ -452,6 +452,12 @@ def get_next_tokens_dllm(dllm, args, orig_model_inputs, token_ids_so_far, spec_l
             new_model_inputs["input_ids"],
             max_new_tokens=output_seqlen,
             small_block_size=small_block_size,
+            # Keep the arbitrary-length generator on the same block geometry
+            # as the active experiment.  Omitting this argument makes the
+            # function fall back to block_size=32; for an all8 run
+            # output_seqlen=24 then gives num_blocks=0 and returns only the
+            # prompt, triggering the assertion below.
+            block_size=args.block_size,
             threshold=threshold,
             do_sample=False,
             temperature=0.0,

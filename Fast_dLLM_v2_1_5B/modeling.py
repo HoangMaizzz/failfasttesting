@@ -1151,6 +1151,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         incr_len=None,
         last_round_rejected=None,  # rejected tokens from the last round (that might be reusable)
         return_frontier_stats=False,
+        max_denoising_passes=None,
         **kwargs
     ):
         """Generate n draft tokens, where n is dynamically determined"""
@@ -1163,6 +1164,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
             draft_token_end_idx = draft_token_start_idx + spec_len  # exclusive
         
         num_forward_passes = 0
+        denoising_forward_passes = 0
         forward_pass_latencies = []  # ms
         draft_tokens_unmasked = False
         prefill_output = None
@@ -1616,6 +1618,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                             )
                         ##################End of timer##################
                         num_forward_passes += 1
+                        denoising_forward_passes += 1
                         frontier_stats["forward_pass_breakdown"]["denoising"] += 1
                         if (
                             adaptive_enabled
@@ -3155,6 +3158,26 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                     oracle_x = x_t.clone()
                                     for absolute_pos in remaining_absolute_positions:
                                         oracle_x[:, absolute_pos] = current_step_token_ids[absolute_pos]
+                                    collector_parent_native_length = int(
+                                        getattr(args, "collector_parent_native_length", 0)
+                                    ) if args is not None else 0
+                                    collector_parent_fill_tokens = list(
+                                        getattr(args, "collector_parent_fill_tokens", [])
+                                    ) if args is not None else []
+                                    collector_state_start = (
+                                        draft_token_start_idx - collector_parent_native_length
+                                    )
+                                    for relative_pos in range(collector_parent_native_length):
+                                        absolute_pos = collector_state_start + relative_pos
+                                        if (
+                                            absolute_pos >= 0
+                                            and absolute_pos < oracle_x.shape[1]
+                                            and int(oracle_x[0, absolute_pos].item()) == mask_id
+                                            and relative_pos < len(collector_parent_fill_tokens)
+                                        ):
+                                            oracle_x[:, absolute_pos] = int(
+                                                collector_parent_fill_tokens[relative_pos]
+                                            )
                                     proposal_after_fill = oracle_x[
                                         0,
                                         draft_token_start_idx:draft_end_idx,
@@ -3221,11 +3244,63 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             )
                                             raw_snapshot_fields["topk_token_ids"] = indices.detach().cpu().tolist()
                                             raw_snapshot_fields["topk_logits"] = values.detach().to(torch.float16).cpu().tolist()
+                                            if collector_parent_native_length > 0 and hidden:
+                                                full_state_end = draft_token_end_idx
+                                                full_abs_start = max(
+                                                    collector_state_start,
+                                                    block_abs_start,
+                                                )
+                                                full_abs_end = min(
+                                                    full_state_end,
+                                                    block_abs_start + block_size,
+                                                )
+                                                if full_abs_end > full_abs_start:
+                                                    full_local_start = max(
+                                                        0,
+                                                        full_abs_start - block_abs_start - raw_hidden_offset,
+                                                    )
+                                                    full_local_end = min(
+                                                        int(hidden[-1].shape[1]),
+                                                        full_abs_end - block_abs_start - raw_hidden_offset,
+                                                    )
+                                                    full_logit_start = max(
+                                                        0,
+                                                        full_abs_start - block_abs_start - raw_logits_offset,
+                                                    )
+                                                    full_logit_end = min(
+                                                        int(adaptive_full_block_logits.shape[1]),
+                                                        full_abs_end - block_abs_start - raw_logits_offset,
+                                                    )
+                                                    raw_snapshot_fields["collector_full_feature_start_offset"] = int(
+                                                        full_abs_start - collector_state_start
+                                                    )
+                                                    raw_snapshot_fields["collector_full_hidden_states"] = [
+                                                        hidden[index][0, full_local_start:full_local_end]
+                                                        .detach().to(torch.float16).cpu().tolist()
+                                                        for index in selected
+                                                    ]
+                                                    full_values, full_indices = torch.topk(
+                                                        adaptive_full_block_logits[
+                                                            0,
+                                                            full_logit_start:full_logit_end,
+                                                        ].float(),
+                                                        k=k,
+                                                        dim=-1,
+                                                    )
+                                                    raw_snapshot_fields["collector_full_topk_token_ids"] = full_indices.detach().cpu().tolist()
+                                                    raw_snapshot_fields["collector_full_topk_logits"] = full_values.detach().to(torch.float16).cpu().tolist()
                                     frontier_stats["oracle_refinement_snapshots"].append({
                                         "step": current_step,
                                         "target_len": int(target_len),
                                         "draft_passes_elapsed": int(num_forward_passes),
                                         "draft_latency_elapsed_ms": float(sum(forward_pass_latencies)),
+                                        "unmask_forward_index": int(denoising_forward_passes),
+                                        "unmask_forward_latency_ms": float(forward_pass_latencies[-1]) if forward_pass_latencies else 0.0,
+                                        "denoising_latency_elapsed_ms": float(sum(
+                                            forward_pass_latencies[
+                                                max(0, len(forward_pass_latencies) - denoising_forward_passes):
+                                            ]
+                                        )),
                                         "masks_remaining": int(masks_remaining),
                                         "newly_committed": int(unmasked_this_step),
                                         "committed_tokens": int(target_len - masks_remaining),
@@ -3236,6 +3311,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         "proposal_mask_before_fill": proposal_mask_before_fill.tolist(),
                                         "committed_position_mask": committed_position_mask.tolist(),
                                         "proposal_token_ids_after_fill": proposal_after_fill.tolist(),
+                                        "collector_full_proposal_token_ids_before_fill": (
+                                            x_t[0, collector_state_start:draft_token_end_idx].detach().tolist()
+                                            if collector_parent_native_length > 0
+                                            else None
+                                        ),
+                                        "collector_full_proposal_token_ids_after_fill": (
+                                            oracle_x[0, collector_state_start:draft_token_end_idx].detach().tolist()
+                                            if collector_parent_native_length > 0
+                                            else None
+                                        ),
                                         # Kept for compatibility: draft_proposal is
                                         # the verifier-ready, fully materialized copy.
                                         "draft_proposal": proposal_after_fill.tolist(),
@@ -3405,6 +3490,16 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")
                         small_block_tokens = args.target_tokenizer.decode(x_1[0], skip_special_tokens=False)
                         # logger.debug(f"{Colors.CYAN}Small_block_tokens: {small_block_tokens}{Colors.RESET}")
+
+                        if (
+                            is_drafter
+                            and max_denoising_passes is not None
+                            and denoising_forward_passes >= int(max_denoising_passes)
+                        ):
+                            frontier_stats["collector_pass_limit_reached"] = True
+                            frontier_stats["collector_pass_limit"] = int(max_denoising_passes)
+                            frontier_stats["stop_reason"] = "collector_pass_limit"
+                            draft_tokens_unmasked = True
 
                         if is_drafter and draft_token_end_idx <= x_t.shape[1] \
                             and x_t[:, draft_token_start_idx:draft_token_end_idx].ne(mask_id).all():
