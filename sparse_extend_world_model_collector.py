@@ -384,7 +384,16 @@ def _extend_one(args, drafter, tokenizer, prefix: list[int], parent: dict,
         bucket_acceptance_calibration={},
         bucket_min_observations=8,
         bucket_prior_strength=8.0,
-        bucket_gain_calibration=None,
+        # The dLLM gain estimator expects a mapping even when there is no
+        # precomputed calibration. Keep per-call tables local to this branch.
+        bucket_gain_calibration={
+            "length_score_masks": {},
+            "score_masks": {},
+            "length_score": {},
+            "score": {},
+            "step": {},
+            "global": [0.0, 0],
+        },
         bucket_current_context_len=len(prompt_ids),
         collector_parent_native_length=len(full_native),
         collector_parent_fill_tokens=list(parent["filled_tokens"]),
