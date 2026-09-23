@@ -215,6 +215,7 @@ class PackagingTests(unittest.TestCase):
                 args.seed = 42
                 args.backbone_zip = Path(folder) / 'unused.zip'
                 args.target_model_name = 'fake-target'
+                args.target_gpu_memory_gib = 9
                 args.num_questions = 1
                 args.anchors_per_question = 1
                 args.max_rounds_per_question = 0

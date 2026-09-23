@@ -472,7 +472,7 @@ def collect(args):
         raise ValueError("Invalid acceptance threshold or refinement budget")
     if args.remaining_output_budget is not None and args.remaining_output_budget < 1:
         raise ValueError("Remaining output budget must be positive")
-    if args.target_gpu_memory_gib < 1:
+    if getattr(args, "target_gpu_memory_gib", 9) < 1:
         raise ValueError("Target GPU memory budget must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Use a new output directory; existing data will not be overwritten")
