@@ -453,6 +453,7 @@ def parse_args():
     p.add_argument("--dllm_dir", required=True)
     p.add_argument("--target_device", type=int, default=0)
     p.add_argument("--drafter_device", type=int, default=1)
+    p.add_argument("--target_gpu_memory_gib", type=int, default=9)
     p.add_argument("--output_dir", type=Path, required=True)
     p.add_argument("--shard_rows", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
@@ -471,6 +472,8 @@ def collect(args):
         raise ValueError("Invalid acceptance threshold or refinement budget")
     if args.remaining_output_budget is not None and args.remaining_output_budget < 1:
         raise ValueError("Remaining output budget must be positive")
+    if args.target_gpu_memory_gib < 1:
+        raise ValueError("Target GPU memory budget must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Use a new output directory; existing data will not be overwritten")
     args.output_dir.mkdir(parents=True, exist_ok=True)

@@ -31,3 +31,5 @@ The v2 dataset has exact one-step R/E edges and Submit labels on every node.
 See `STRUCTURED_SPARSE_PROTOCOL.md` for collection policy, calibrated verifier
 cost versus measured node cost, and the full-context replay timing limitation.
 Old ZIPs are unchanged; v2 features must not be silently mixed with legacy ones.
+The FP16 target is sharded over both GPUs to make room for verifier KV
+calibration; startup prints the device map.

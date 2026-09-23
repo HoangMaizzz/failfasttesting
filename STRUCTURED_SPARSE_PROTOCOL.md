@@ -89,6 +89,10 @@ query tokens). One warm-up is discarded and three repetitions are stored. Each
 probe gets an isolated prefix cache. Per-node latency is explicitly a calibrated
 estimate, not a per-node measurement or final deployment reward ground truth.
 No linear L8 scaling is used.
+The FP16 target verifier is automatically sharded across both selected GPUs,
+with a default 9 GiB weight budget per GPU, leaving memory for the drafter on
+GPU 1 and verifier KV calibration. Target weights remain FP16, preserving the
+verifier's greedy-label definition. The shard map is printed at startup.
 
 Drafter edge cost measures its full-context replay forward. R reuses the exact
 source observation's measured forward; E measures the appended-mask input

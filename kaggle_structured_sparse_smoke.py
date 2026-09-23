@@ -64,6 +64,7 @@ for dataset in DATASETS:
         "--bad_refinement_steps", "2", "--physical_block_size", "32",
         "--small_block_size", "8", "--drafter_threshold", "0.3",
         "--target_device", "0", "--drafter_device", "1",
+        "--target_gpu_memory_gib", "9",
         "--dllm_dir", str(dllm), "--output_dir", str(out),
         "--reference_cache_dir", "/kaggle/temp/structured_reference_cache"]
     print("Running:", " ".join(cmd), flush=True)

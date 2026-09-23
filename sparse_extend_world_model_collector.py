@@ -200,9 +200,15 @@ def _load_models(args):
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model_name,
         torch_dtype=torch.float16,
-        device_map={"": args.target_device},
+        device_map="auto",
+        max_memory={
+            **{gpu: f"{getattr(args, 'target_gpu_memory_gib', 9)}GiB"
+               for gpu in range(torch.cuda.device_count())},
+            "cpu": "32GiB",
+        },
         attn_implementation="sdpa",
     )
+    print(f"[models] target FP16 device map: {getattr(target, 'hf_device_map', {})}", flush=True)
     # Compatibility hooks used by the repository's own failfast loader.
     import transformers.modeling_rope_utils as rope_utils
     import transformers.modeling_utils as modeling_utils
