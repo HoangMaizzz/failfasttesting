@@ -66,7 +66,8 @@ for dataset in DATASETS:
         "--target_device", "0", "--drafter_device", "1",
         "--target_gpu_memory_gib", "9",
         "--dllm_dir", str(dllm), "--output_dir", str(out),
-        "--reference_cache_dir", "/kaggle/temp/structured_reference_cache"]
+        "--reference_cache_dir", str(Path("/kaggle/temp") /
+            f"structured_reference_cache_{run_dir.name}")]
     print("Running:", " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=repo, env=env, check=True)
     print("DOWNLOAD:", out / f"{dataset}_structured_graph.zip", flush=True)

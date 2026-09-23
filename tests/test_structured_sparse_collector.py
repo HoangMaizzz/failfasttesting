@@ -12,7 +12,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from structured_sparse_collector import (
-    MASK_ID, CachedVerifier, ExplicitDrafter, GraphCollector, collect, commit_one, identity, select_anchors,
+    MASK_ID, CachedVerifier, ExplicitDrafter, GraphCollector, annotate_verifier_acceptance,
+    collect, commit_one, identity, select_anchors,
 )
 
 
@@ -41,6 +42,15 @@ def args_for(path):
 
 
 class StructuredGraphTests(unittest.TestCase):
+    def test_verifier_mismatch_is_retained_and_recomputed_label_is_authoritative(self):
+        source = dict(state_id="anchor", accepted_len=6, proposal_token_ids_after_fill=[1] * 8)
+        checked = annotate_verifier_acceptance(source, 4)
+        self.assertEqual(checked["accepted_len"], 4)
+        self.assertEqual(checked["backbone_recorded_accepted_len"], 6)
+        self.assertEqual(checked["verifier_recomputed_accepted_len"], 4)
+        self.assertFalse(checked["verifier_acceptance_matches_backbone"])
+        self.assertEqual(source["accepted_len"], 6)
+
     def run_graph(self, folder, bad=False):
         args = args_for(folder)
         graph = GraphCollector(args, FakeEngine(bad), eos_id=100)

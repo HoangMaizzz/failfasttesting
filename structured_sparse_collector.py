@@ -41,6 +41,20 @@ def regime(accepted, length):
     return "mid"
 
 
+def annotate_verifier_acceptance(row, recomputed_accepted):
+    """Keep the archive label, but make the active label match this verifier run."""
+    checked = dict(row)
+    recorded = int(row["accepted_len"])
+    recomputed = int(recomputed_accepted)
+    checked["backbone_recorded_accepted_len"] = recorded
+    checked["verifier_recomputed_accepted_len"] = recomputed
+    checked["verifier_acceptance_matches_backbone"] = recorded == recomputed
+    # All newly collected labels must use the verifier/reference generated in
+    # this run. Preserve the source value explicitly for auditing.
+    checked["accepted_len"] = recomputed
+    return checked
+
+
 def select_anchors(rows, num_questions, anchors_per_question, max_rounds=0):
     """Deterministic round-robin across acceptance regimes, not first rounds."""
     questions = sorted({int(r["problem_id"]) for r in rows})[:num_questions]
@@ -194,6 +208,9 @@ class CachedVerifier:
             "tokenizer_revision": self.tokenizer.init_kwargs.get("_commit_hash"),
             "dtype": str(self.model.dtype), "greedy": True,
             "max_tokens": args.max_proposal_tokens + 1,
+            # Greedy token IDs can differ at near-ties under different sharding.
+            "device_map": sorted((str(k), str(v)) for k, v in
+                                  getattr(self.model, "hf_device_map", {}).items()),
         }
         key = identity(prefix, model_key)
         cache_dir = getattr(args, "reference_cache_dir", None) or args.output_dir / "reference_cache"
@@ -384,8 +401,13 @@ class GraphCollector:
         self.prefix, self.source, self.anchor_id = row["prefix_token_ids"], row, row["state_id"]
         native = row["proposal_token_ids_before_fill"][:8]
         root = self.node(self.prefix, native, self.engine.observe(self.prefix, native), 0, 0.0, row)
-        root["meta"]["backbone_accepted_len"] = row["accepted_len"]
-        root["meta"]["backbone_acceptance_regime"] = regime(row["accepted_len"], 8)
+        recorded_acceptance = row.get("backbone_recorded_accepted_len", row["accepted_len"])
+        root["meta"]["backbone_accepted_len"] = recorded_acceptance
+        root["meta"]["backbone_recomputed_accepted_len"] = row.get(
+            "verifier_recomputed_accepted_len", row["accepted_len"])
+        root["meta"]["backbone_verifier_mismatch"] = not row.get(
+            "verifier_acceptance_matches_backbone", True)
+        root["meta"]["backbone_acceptance_regime"] = regime(recorded_acceptance, 8)
         root["meta"]["backbone_boundary_index"] = row.get("boundary_index")
         root["meta"]["refinement_budget_origin"] = "reset_at_sampled_anchor"
         active = [root]
@@ -484,6 +506,7 @@ def collect(args):
     oracle = CachedVerifier(target, tokenizer, args)
     graph = GraphCollector(args, engine, tokenizer.eos_token_id)
     status, failure = "complete", None
+    verifier_mismatches = []
     try:
         # Reuse references/calibration across anchors with the same exact prefix.
         prepared = {}
@@ -496,9 +519,16 @@ def collect(args):
             reference, timings, ref_key = prepared[key]
             accepted, _, _ = _score_greedy(row["proposal_token_ids_after_fill"][:8], reference,
                                            tokenizer.eos_token_id, args.max_proposal_tokens)
-            if accepted != int(row["accepted_len"]):
-                raise RuntimeError(f"Backbone verifier mismatch: {row['state_id']}")
-            graph.run_anchor(row, reference, timings, ref_key)
+            checked_row = annotate_verifier_acceptance(row, accepted)
+            if not checked_row["verifier_acceptance_matches_backbone"]:
+                mismatch = dict(state_id=row["state_id"],
+                    problem_id=int(row["problem_id"]), round_id=int(row["round_id"]),
+                    backbone_recorded_accepted_len=int(row["accepted_len"]),
+                    verifier_recomputed_accepted_len=accepted)
+                verifier_mismatches.append(mismatch)
+                print("[anchor] WARNING verifier acceptance differs from backbone; "
+                      f"using recomputed value for labels: {mismatch}", flush=True)
+            graph.run_anchor(checked_row, reference, timings, ref_key)
     except BaseException as exc:
         status, failure = "partial", repr(exc)
         raise
@@ -511,6 +541,8 @@ def collect(args):
             config=vars(args), nodes=len(graph.nodes), edges=len(graph.edges),
             node_acceptance_histogram=dict(Counter(n["submit_accepted_len"] for n in graph.nodes)),
             anchor_regime_counts=dict(Counter(regime(int(r["accepted_len"]), 8) for r in rows)),
+            backbone_verifier_mismatch_count=len(verifier_mismatches),
+            backbone_verifier_mismatches=verifier_mismatches,
             anchors=len(rows), action_semantics={"E": "append masks + one unmask forward in new segment",
                 "R": "one unmask forward in earliest unresolved logical frame", "S": "counterfactual fill + cached greedy LCP"},
             transition_backend="full_context_block_causal_replay_without_kv",
