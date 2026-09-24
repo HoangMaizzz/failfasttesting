@@ -44,12 +44,29 @@ snapshot_download("Efficient-Large-Model/Fast_dLLM_v2_1.5B", local_dir=str(dllm)
 
 run_dir = Path("/kaggle/working") / ("structured_sparse_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
 for dataset in DATASETS:
+    input_root = Path("/kaggle/input")
     candidates = [Path(f"/kaggle/input/datasets/yumesakihikari/speculativeworld/{dataset}_raw"),
                   Path(f"/kaggle/input/datasets/ainzkhail/specworld/{dataset}_raw"),
                   Path(f"/kaggle/input/specworld/{dataset}_raw")]
+    # Kaggle mounts an attached dataset by its slug, which can differ from
+    # the owner/slug URL. Discover raw folders under mounted dataset roots.
+    if input_root.exists():
+        for mount in input_root.iterdir():
+            if not mount.is_dir():
+                continue
+            candidates.append(mount / f"{dataset}_raw")
+            try:
+                candidates.extend(child / f"{dataset}_raw" for child in mount.iterdir()
+                                  if child.is_dir())
+            except PermissionError:
+                pass
     data = next((p for p in candidates if p.exists()), None)
     if data is None:
-        raise FileNotFoundError(f"Add SpecWorld input containing {dataset}_raw")
+        mounted = [str(p) for p in input_root.iterdir()] if input_root.exists() else []
+        raise FileNotFoundError(
+            f"Cannot find {dataset}_raw in Kaggle inputs. Checked: "
+            f"{[str(p) for p in candidates]}; mounted roots: {mounted}"
+        )
     archives = [p for p in data.rglob("*.zip") if zipfile.is_zipfile(p)]
     if len(archives) > 1:
         raise RuntimeError(f"Ambiguous input ZIP files: {archives}")
