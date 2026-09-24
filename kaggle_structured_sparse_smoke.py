@@ -44,7 +44,8 @@ snapshot_download("Efficient-Large-Model/Fast_dLLM_v2_1.5B", local_dir=str(dllm)
 
 run_dir = Path("/kaggle/working") / ("structured_sparse_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
 for dataset in DATASETS:
-    candidates = [Path(f"/kaggle/input/datasets/ainzkhail/specworld/{dataset}_raw"),
+    candidates = [Path(f"/kaggle/input/datasets/yumesakihikari/speculativeworld/{dataset}_raw"),
+                  Path(f"/kaggle/input/datasets/ainzkhail/specworld/{dataset}_raw"),
                   Path(f"/kaggle/input/specworld/{dataset}_raw")]
     data = next((p for p in candidates if p.exists()), None)
     if data is None:
