@@ -11,6 +11,51 @@ NUM_QUESTIONS = globals().get("NUM_QUESTIONS", 3)
 MAX_PROPOSAL_TOKENS = globals().get("MAX_PROPOSAL_TOKENS", 64)
 ANCHORS_PER_QUESTION = globals().get("ANCHORS_PER_QUESTION", 4)
 
+
+def find_dataset_input(dataset):
+    input_root = Path("/kaggle/input")
+    expected_name = f"{dataset}_raw"
+    known = [
+        Path(f"/kaggle/input/datasets/yumesakihikari/speculativeworldmodel/{expected_name}"),
+        Path(f"/kaggle/input/datasets/yumesakihikari/speculativeworld/{expected_name}"),
+        Path(f"/kaggle/input/datasets/ainzkhail/specworld/{expected_name}"),
+        Path(f"/kaggle/input/specworld/{expected_name}"),
+    ]
+    for candidate in known:
+        if candidate.exists():
+            return candidate
+
+    # Kaggle may mount inputs as /kaggle/input/datasets/<owner>/<slug>/...
+    # or directly by slug. Search directory names only, with a shallow bound.
+    frontier = [(input_root, 0)]
+    discovered = []
+    while frontier:
+        parent, depth = frontier.pop(0)
+        if depth >= 6 or not parent.is_dir():
+            continue
+        try:
+            children = list(parent.iterdir())
+        except PermissionError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            if child.name == expected_name:
+                discovered.append(child)
+            else:
+                frontier.append((child, depth + 1))
+    if discovered:
+        return sorted(discovered, key=lambda p: (len(p.parts), str(p)))[0]
+    mounted = [str(p) for p in input_root.iterdir()] if input_root.exists() else []
+    raise FileNotFoundError(
+        f"Cannot find {expected_name} in Kaggle inputs; mounted roots: {mounted}"
+    )
+
+
+# Fail before pip/model downloads when a requested input is not mounted.
+DATASET_INPUT_DIRS = {dataset: find_dataset_input(dataset) for dataset in DATASETS}
+print("Dataset inputs:", {k: str(v) for k, v in DATASET_INPUT_DIRS.items()}, flush=True)
+
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
     "transformers==4.53.1", "accelerate", "datasets", "einops", "numpy", "pandas",
     "matplotlib", "scipy", "sentencepiece", "huggingface_hub"], check=True)
@@ -44,29 +89,7 @@ snapshot_download("Efficient-Large-Model/Fast_dLLM_v2_1.5B", local_dir=str(dllm)
 
 run_dir = Path("/kaggle/working") / ("structured_sparse_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
 for dataset in DATASETS:
-    input_root = Path("/kaggle/input")
-    candidates = [Path(f"/kaggle/input/datasets/yumesakihikari/speculativeworld/{dataset}_raw"),
-                  Path(f"/kaggle/input/datasets/ainzkhail/specworld/{dataset}_raw"),
-                  Path(f"/kaggle/input/specworld/{dataset}_raw")]
-    # Kaggle mounts an attached dataset by its slug, which can differ from
-    # the owner/slug URL. Discover raw folders under mounted dataset roots.
-    if input_root.exists():
-        for mount in input_root.iterdir():
-            if not mount.is_dir():
-                continue
-            candidates.append(mount / f"{dataset}_raw")
-            try:
-                candidates.extend(child / f"{dataset}_raw" for child in mount.iterdir()
-                                  if child.is_dir())
-            except PermissionError:
-                pass
-    data = next((p for p in candidates if p.exists()), None)
-    if data is None:
-        mounted = [str(p) for p in input_root.iterdir()] if input_root.exists() else []
-        raise FileNotFoundError(
-            f"Cannot find {dataset}_raw in Kaggle inputs. Checked: "
-            f"{[str(p) for p in candidates]}; mounted roots: {mounted}"
-        )
+    data = DATASET_INPUT_DIRS[dataset]
     archives = [p for p in data.rglob("*.zip") if zipfile.is_zipfile(p)]
     if len(archives) > 1:
         raise RuntimeError(f"Ambiguous input ZIP files: {archives}")
