@@ -1,4 +1,4 @@
-# Structured sparse S/R/E collection (v2)
+# Structured sparse S/R/E collection (v3)
 
 Run `structured_sparse_collector.py`. The old `sparse_extend_world_model_collector.py`
 CLI delegates to this implementation. Do not reuse the legacy K=4 command: the
@@ -52,7 +52,7 @@ states come from positions `prefix_length + i`; prediction logits come from
 input, whose hash is stored. No inherited hidden-state rows or fallback merges.
 Submit fills only masked positions using this observation's predictions and
 compares with a cached greedy target continuation. It never mutates native state.
-This is a documented v2 observation protocol; do not silently mix its features
+This is a documented structured-sparse observation protocol; do not silently mix its features
 with the legacy archives' features from forwards preceding native commits.
 
 ## Files and labels
@@ -72,11 +72,29 @@ There is no duplicate raw Stop state: every node has `submit_accepted_len`,
 are separate fields. The collector has no misleading per-state rollout
 termination_reason. Node/edge IDs are independent of selection decisions.
 
+Schema v3 distinguishes `backbone_acceptance_regime` (the source label used to
+stratify initial anchors) from `current_submit_regime` (computed from the
+current state's Submit accepted length and proposal length). Expansion ranking,
+eligibility, and reported current-regime statistics use the current Submit
+outcome. The manifest reports source and current anchor regimes separately.
+Each node also has `observation_hash`, computed from prefix, native proposal,
+and the exact stored drafter observation (excluding timing noise), plus duplicate
+group size/flag. Duplicate observations remain separate graph records so their
+distinct paths/edges are preserved; training samplers should deduplicate or
+downweight by `observation_hash`, and train/test splits must be by problem or
+prefix rather than random node.
+
+Nodes and calibration rows share `verifier_calibration_key` (target identity
+plus exact prefix); `context_hash` separately identifies the exact prefix.
+Join calibration by `verifier_calibration_key` and `proposal_length`, never by
+context length alone. The reference-cache JSON stores both keys as well.
+
 ## Timing and limitations
 
 Greedy continuation is cached per exact prefix and target identity, to Lmax+1 or
-EOS. Original archived root Submit acceptance is checked against it; references
-are generated once when not already available, not magically recovered from old
+EOS. Original archived root Submit acceptance is compared against it; any
+mismatch is retained as provenance while current labels use the current greedy
+reference. References are generated once when not already available, not magically recovered from old
 ZIPs that do not contain them.
 Use `--reference_cache_dir` to reuse references between runs. The output archive
 also includes every reference used in that run. Lmax is a proposal limit:

@@ -7,7 +7,7 @@ See STRUCTURED_SPARSE_PROTOCOL.md for action and timing conventions.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import copy
 import hashlib
 import json
@@ -53,6 +53,33 @@ def annotate_verifier_acceptance(row, recomputed_accepted):
     # this run. Preserve the source value explicitly for auditing.
     checked["accepted_len"] = recomputed
     return checked
+
+
+def hash_observation(prefix, native, observation):
+    """Stable content hash for exact raw states; excludes timing noise."""
+    digest = hashlib.sha256()
+    identity_part = json.dumps(
+        {"prefix_token_ids": list(prefix),
+         "proposal_token_ids_before_fill": list(native),
+         "hidden_layer_indices": observation["hidden_layer_indices"]},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    digest.update(identity_part)
+    arrays = (
+        ("predictions", observation["predictions"], "<i8"),
+        ("probabilities", observation["probabilities"], "<f4"),
+        ("filled", observation["filled"], "<i8"),
+        ("filled_probabilities", observation["filled_probabilities"], "<f4"),
+        ("hidden_states", observation["hidden_states"], "<f4"),
+        ("topk_token_ids", observation["topk_token_ids"], "<i8"),
+        ("topk_logits", observation["topk_logits"], "<f4"),
+    )
+    for name, values, dtype in arrays:
+        array = np.ascontiguousarray(np.asarray(values, dtype=dtype))
+        digest.update(name.encode("utf-8"))
+        digest.update(json.dumps(array.shape).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 def select_anchors(rows, num_questions, anchors_per_question, max_rounds=0):
@@ -218,13 +245,17 @@ class CachedVerifier:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         if cache_file.exists():
             cached = json.loads(cache_file.read_text())
-            if cached["prefix_token_ids"] != prefix or cached["model_key"] != model_key:
+            if (cached["prefix_token_ids"] != prefix or cached["model_key"] != model_key
+                    or cached.get("context_hash", identity(prefix)) != identity(prefix)):
                 raise RuntimeError("Reference cache identity mismatch")
+            if cached.get("verifier_calibration_key", key) != key:
+                raise RuntimeError("Reference cache calibration-key mismatch")
             reference = cached["token_ids"]
         else:
             reference = _greedy_reference(self.model, prefix, self.tokenizer,
                                           args.max_proposal_tokens + 1)
             cache_file.write_text(json.dumps(dict(prefix_token_ids=prefix,
+                context_hash=identity(prefix), verifier_calibration_key=key,
                 model_key=model_key, token_ids=reference)), encoding="utf-8")
         exported = args.output_dir / "reference_cache" / cache_file.name
         exported.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +290,9 @@ class CachedVerifier:
                 if repeat:
                     samples.append(elapsed)
             timings[length] = statistics.median(samples)
-            self.records.append(dict(context_hash=identity(prefix), context_length=len(prefix),
+            self.records.append(dict(context_hash=identity(prefix),
+                verifier_calibration_key=key, reference_key=key,
+                context_length=len(prefix),
                 proposal_length=length, samples_ms=samples, median_ms=timings[length],
                 source="measured_prefix_kv_calibration", device=str(self.device),
                 model_key=model_key, query_tokens=length + 1))
@@ -268,9 +301,11 @@ class CachedVerifier:
 
 
 def choose_children(candidates, width=2, min_ratio=0.5):
-    eligible = [n for n in candidates if n["meta"]["submit_accepted_len"] / len(n["native"]) >= min_ratio
+    eligible = [n for n in candidates if n["meta"]["current_submit_acceptance_ratio"] >= min_ratio
                 and not n["meta"]["state_eos_committed"]]
-    ordered = sorted(eligible, key=lambda n: (-n["meta"]["submit_accepted_len"], n["meta"]["state_id"]))
+    ordered = sorted(eligible, key=lambda n: (-n["meta"]["current_submit_acceptance_ratio"],
+                                               -n["meta"]["submit_accepted_len"],
+                                               n["meta"]["state_id"]))
     if not ordered:
         return []
     best = ordered[0]
@@ -283,8 +318,9 @@ def choose_children(candidates, width=2, min_ratio=0.5):
                                 for x, y in zip(node["native"], best["native"]))
             return (a["source_refine_steps"] != b["source_refine_steps"],
                     mask_distance,
-                    abs(a["submit_accepted_len"] - b["submit_accepted_len"]),
-                    a["submit_accepted_len"])
+                    abs(a["current_submit_acceptance_ratio"] -
+                        b["current_submit_acceptance_ratio"]),
+                    a["current_submit_acceptance_ratio"])
         diverse = max(ordered[1:], key=diversity)
         diverse["meta"]["selection_reason"] = "diverse_refinement_mask_outcome"
         selected.append(diverse)
@@ -322,12 +358,15 @@ class GraphCollector:
             refine_available=bool(masks and not eos_committed and refine_steps < self.args.max_refinement_steps),
             extend_available=bool(length + self.args.extend_size <= self.args.max_proposal_tokens and not eos_committed),
             submit_accepted_len=accepted, submit_emitted_len=emitted,
+            current_submit_regime=regime(accepted, length),
+            current_submit_acceptance_ratio=accepted / max(length, 1),
             submit_emitted_token_ids=emitted_ids,
             submit_verifier_latency_ms=self.timings[length],
             submit_latency_source="measured_prefix_kv_calibration_estimate_for_node",
             submit_latency_is_node_measurement=False,
             submit_label_source="cached_greedy_reference_lcp",
-            reference_key=self.reference_key, reference_length=len(self.reference),
+            reference_key=self.reference_key, verifier_calibration_key=self.reference_key,
+            context_hash=identity(prefix), reference_length=len(self.reference),
             draft_latency_from_anchor_ms=draft_ms,
             draft_passes_from_anchor=(parent["meta"]["draft_passes_from_anchor"] + 1) if parent else 0,
             backbone_draft_latency_elapsed_ms=source.get("draft_latency_elapsed_ms"),
@@ -335,6 +374,7 @@ class GraphCollector:
             hidden_state_stage="exact_native_state_pre_counterfactual_fill",
             hidden_state_source="full_context_block_causal_reencode",
             hidden_state_input_hash=observation["input_state_hash"],
+            observation_hash=hash_observation(prefix, native, observation),
             hidden_token_positions="prefix_length + proposal_index",
             logits_token_positions="prefix_length + proposal_index - 1",
             feature_scope="entire_proposal_single_forward", feature_merge_mode="none",
@@ -419,7 +459,7 @@ class GraphCollector:
                         candidates.append(self.transition(boundary, "E"))
             selected = choose_children(candidates, self.args.branch_width, self.args.min_expand_acceptance_ratio)
             selected_ids = {n["meta"]["state_id"] for n in selected}
-            bad = [n for n in candidates if n["meta"]["submit_accepted_len"] / len(n["native"]) < self.args.min_expand_acceptance_ratio
+            bad = [n for n in candidates if n["meta"]["current_submit_acceptance_ratio"] < self.args.min_expand_acceptance_ratio
                    and n["meta"]["refine_available"]]
             # One deterministic representative bad rollout per level, never E.
             for node in sorted(bad, key=lambda n: n["meta"]["state_id"])[:self.args.bad_probe_branches]:
@@ -435,6 +475,12 @@ class GraphCollector:
 
     def finish(self):
         self.writer.flush()
+        duplicate_groups = defaultdict(list)
+        for meta in self.nodes:
+            duplicate_groups[meta["observation_hash"]].append(meta["state_id"])
+        for meta in self.nodes:
+            meta["observation_duplicate_count"] = len(duplicate_groups[meta["observation_hash"]])
+            meta["observation_is_duplicate"] = meta["observation_duplicate_count"] > 1
         # Metadata may be updated after a shard flush; nodes.jsonl is canonical.
         with self.writer.metadata_path.open(encoding="utf-8") as handle:
             storage = {r["state_id"]: r for r in map(json.loads, handle)}
@@ -536,19 +582,39 @@ def collect(args):
         graph.finish()
         (args.output_dir / "verifier_calibration.jsonl").write_text(
             "".join(json.dumps(r) + "\n" for r in oracle.records), encoding="utf-8")
-        manifest = dict(schema_version="structured_sparse_sre_v2", status=status, failure=failure,
+        roots = [n for n in graph.nodes if n["parent_state_id"] is None]
+        duplicate_groups = defaultdict(list)
+        for node in graph.nodes:
+            duplicate_groups[node["observation_hash"]].append(node["state_id"])
+        duplicate_groups = [dict(observation_hash=key, state_ids=ids, count=len(ids))
+                            for key, ids in sorted(duplicate_groups.items()) if len(ids) > 1]
+        all_regimes = ["full", "near_full", "mid", "early_mismatch"]
+        manifest = dict(schema_version="structured_sparse_sre_v3", status=status, failure=failure,
             collector_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             config=vars(args), nodes=len(graph.nodes), edges=len(graph.edges),
             node_acceptance_histogram=dict(Counter(n["submit_accepted_len"] for n in graph.nodes)),
-            anchor_regime_counts=dict(Counter(regime(int(r["accepted_len"]), 8) for r in rows)),
+            current_submit_regime_histogram=dict(Counter(
+                n["current_submit_regime"] for n in graph.nodes)),
+            backbone_anchor_regime_counts=dict(Counter(
+                regime(int(r.get("backbone_recorded_accepted_len", r["accepted_len"])), 8)
+                for r in rows)),
+            current_anchor_submit_regime_counts=dict(Counter(
+                n["current_submit_regime"] for n in roots)),
+            anchor_sampling_regime_source="backbone_recorded_accepted_len",
+            missing_current_anchor_regimes=sorted(set(all_regimes) -
+                {n["current_submit_regime"] for n in roots}),
+            observation_duplicate_group_count=len(duplicate_groups),
+            observation_duplicate_state_count=sum(g["count"] for g in duplicate_groups),
+            observation_duplicate_groups=duplicate_groups,
             backbone_verifier_mismatch_count=len(verifier_mismatches),
             backbone_verifier_mismatches=verifier_mismatches,
             anchors=len(rows), action_semantics={"E": "append masks + one unmask forward in new segment",
                 "R": "one unmask forward in earliest unresolved logical frame", "S": "counterfactual fill + cached greedy LCP"},
             transition_backend="full_context_block_causal_replay_without_kv",
             latency_caveat="Drafter replay costs measured; verifier cost calibrated with prefix KV, not measured per node. Raw observation/export overhead excluded from action costs.",
-            missing_regimes=sorted(set(["full", "near_full", "mid", "early_mismatch"]) -
-                {regime(int(r['accepted_len']), 8) for r in rows}))
+            backbone_missing_anchor_regimes=sorted(set(all_regimes) -
+                {regime(int(r.get("backbone_recorded_accepted_len", r["accepted_len"])), 8)
+                 for r in rows}))
         (args.output_dir / "graph_manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
         archive = args.output_dir / f"{args.dataset}_structured_graph.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as z:

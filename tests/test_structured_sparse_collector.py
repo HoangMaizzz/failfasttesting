@@ -13,7 +13,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from structured_sparse_collector import (
     MASK_ID, CachedVerifier, ExplicitDrafter, GraphCollector, annotate_verifier_acceptance,
-    collect, commit_one, identity, select_anchors,
+    collect, commit_one, hash_observation, identity, select_anchors,
 )
 
 
@@ -51,6 +51,13 @@ class StructuredGraphTests(unittest.TestCase):
         self.assertFalse(checked["verifier_acceptance_matches_backbone"])
         self.assertEqual(source["accepted_len"], 6)
 
+    def test_observation_hash_tracks_state_and_ignores_timing_noise(self):
+        observation = FakeEngine().observe([2, 3], [MASK_ID] * 8)
+        first = hash_observation([2, 3], [MASK_ID] * 8, observation)
+        changed_timing = dict(observation, forward_ms=999.0)
+        self.assertEqual(first, hash_observation([2, 3], [MASK_ID] * 8, changed_timing))
+        self.assertNotEqual(first, hash_observation([2, 4], [MASK_ID] * 8, observation))
+
     def run_graph(self, folder, bad=False):
         args = args_for(folder)
         graph = GraphCollector(args, FakeEngine(bad), eos_id=100)
@@ -75,6 +82,12 @@ class StructuredGraphTests(unittest.TestCase):
                 self.assertEqual(node['feature_merge_mode'], 'none')
                 self.assertEqual(node['masks_remaining'] + node['committed_tokens'], node['proposal_length'])
                 self.assertEqual(node['state_masks_resolved'], node['masks_remaining'] == 0)
+                self.assertEqual(node['current_submit_regime'],
+                                 'full' if node['submit_accepted_len'] >= node['proposal_length'] else
+                                 'near_full' if node['submit_accepted_len'] >= node['proposal_length'] - 2 else
+                                 'early_mismatch' if node['submit_accepted_len'] <= 1 else 'mid')
+                self.assertEqual(len(node['observation_hash']), 64)
+                self.assertEqual(node['verifier_calibration_key'], node['reference_key'])
             self.assertLessEqual(max(selected.values()), 2)
             adjacency = {}
             for e in graph.edges:
@@ -200,6 +213,8 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(set(timing), {8, 16})
             self.assertTrue(all(prefix_length == 3 for prefix_length, _ in model.cached_inputs))
             self.assertEqual({q for _, q in model.cached_inputs}, {9, 17})
+            self.assertTrue(all(r['verifier_calibration_key'] == key for r in oracle.records))
+            self.assertTrue(all(r['context_hash'] == identity([1, 2, 3, 4]) for r in oracle.records))
             oracle.prepare([1, 2, 3, 4])
             self.assertEqual(model.generate_calls, 1)
             self.assertTrue(all(prefix_length == 3 for prefix_length, _ in model.cached_inputs))
@@ -244,6 +259,7 @@ class PackagingTests(unittest.TestCase):
                 with zipfile.ZipFile(args.output_dir / 'gsm8k_structured_graph.zip') as archive:
                     manifest = json.loads(archive.read('graph_manifest.json'))
                     self.assertEqual(manifest['status'], 'partial' if broken else 'complete')
+                    self.assertEqual(manifest['schema_version'], 'structured_sparse_sre_v3')
                     self.assertIn('nodes.jsonl', archive.namelist())
                     self.assertIn('edges.jsonl', archive.namelist())
                     self.assertGreater(manifest['nodes'], 0)
