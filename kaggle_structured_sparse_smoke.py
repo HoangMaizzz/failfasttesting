@@ -10,6 +10,7 @@ DATASETS = globals().get("DATASETS", ["gsm8k"])
 NUM_QUESTIONS = globals().get("NUM_QUESTIONS", 3)
 MAX_PROPOSAL_TOKENS = globals().get("MAX_PROPOSAL_TOKENS", 64)
 ANCHORS_PER_QUESTION = globals().get("ANCHORS_PER_QUESTION", 4)
+DRAFTER_THRESHOLD = globals().get("DRAFTER_THRESHOLD", 0.5)
 VERIFIER_MODE = globals().get("VERIFIER_MODE", "prefix_kv_calibration")
 DRAFTER_KV_MODE = globals().get("DRAFTER_KV_MODE", "none")
 
@@ -108,7 +109,7 @@ for dataset in DATASETS:
         "--max_refinement_steps", "3", "--branch_width", "2",
         "--min_expand_acceptance_ratio", "0.5", "--bad_probe_branches", "1",
         "--bad_refinement_steps", "2", "--physical_block_size", "32",
-        "--small_block_size", "8", "--drafter_threshold", "0.3",
+        "--small_block_size", "8", "--drafter_threshold", str(DRAFTER_THRESHOLD),
         "--verifier_mode", VERIFIER_MODE,
         "--drafter_kv_mode", DRAFTER_KV_MODE,
         "--target_device", "0", "--drafter_device", "1",

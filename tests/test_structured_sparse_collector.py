@@ -147,6 +147,16 @@ class StructuredGraphTests(unittest.TestCase):
         self.assertEqual(updated, [5, 8, MASK_ID])
         self.assertEqual(native, [5, MASK_ID, MASK_ID])
 
+    def test_half_threshold_keeps_lower_confidence_masks_closed(self):
+        native = [MASK_ID, MASK_ID]
+        predictions = [5, 6]
+        probabilities = [0.4, 0.35]
+        _, selected_old = commit_one(native, predictions, probabilities, 8, 0.3)
+        updated, selected_new = commit_one(native, predictions, probabilities, 8, 0.5)
+        self.assertEqual(selected_old, [0, 1])
+        self.assertEqual(selected_new, [0])  # forced highest-confidence position
+        self.assertEqual(updated, [5, MASK_ID])
+
 
 class PositionalModel(torch.nn.Module):
     def __init__(self):

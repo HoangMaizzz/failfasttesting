@@ -36,7 +36,7 @@ State consists of the exact verifier prefix, current proposal tokens/mask, and
 the collector's local R budget. E appends `extend_size` masks, then performs one
 unmask forward in the first unresolved logical frame of the NEW segment. Parent
 proposal tokens are unchanged by E. R performs one unmask forward in the earliest
-unresolved proposal-relative logical frame. Threshold defaults to 0.3, with a
+unresolved proposal-relative logical frame. Threshold now defaults to 0.5, with a
 forced highest-confidence masked position only if none exceeds threshold.
 
 This protocol uses the existing dLLM weights and block-causal forward with a
@@ -131,7 +131,8 @@ with small deterministic models; it is not a pretrained T4x2 benchmark.
 ## Optional measured no-KV verifier and stable-block drafter KV (v4)
 
 Use `--verifier_mode full_context_no_kv --drafter_kv_mode stable_block_prefix`
-for the new measured run. The old defaults remain unchanged for reproducibility.
+for the new measured run. Its unmask threshold defaults to 0.5; explicitly pass
+`--drafter_threshold 0.3` when reproducing the older v3 collection.
 The new mode writes schema `structured_sparse_sre_v4` and must use a new output
 directory. Every Submit candidate is sent through an actual full-prefix target
 forward with `use_cache=False`, including the correction/bonus logit. Its

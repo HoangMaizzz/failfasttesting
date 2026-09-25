@@ -702,7 +702,7 @@ def parse_args():
     p.add_argument("--bad_refinement_steps", type=int, default=2)
     p.add_argument("--physical_block_size", type=int, default=32)
     p.add_argument("--small_block_size", type=int, default=8)
-    p.add_argument("--drafter_threshold", type=float, default=0.3)
+    p.add_argument("--drafter_threshold", type=float, default=0.5)
     p.add_argument("--drafter_kv_mode", choices=["none", "stable_block_prefix"],
                    default="none")
     p.add_argument("--raw_top_k", type=int, default=32)
@@ -733,6 +733,8 @@ def collect(args):
         raise ValueError("Invalid acceptance threshold or refinement budget")
     if args.remaining_output_budget is not None and args.remaining_output_budget < 1:
         raise ValueError("Remaining output budget must be positive")
+    if not 0.0 <= args.drafter_threshold <= 1.0:
+        raise ValueError("Drafter threshold must be between 0 and 1")
     if getattr(args, "target_gpu_memory_gib", 9) < 1:
         raise ValueError("Target GPU memory budget must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
