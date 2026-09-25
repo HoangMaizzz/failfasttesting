@@ -16,7 +16,7 @@ if (ROOT / '.test-deps').exists():
 import torch
 from transformers import Qwen2Config
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-from structured_sparse_collector import ExplicitDrafter, MASK_ID
+from structured_sparse_collector import ExplicitDrafter, KVExplicitDrafter, MASK_ID
 
 
 class NativeForwardTest(unittest.TestCase):
@@ -53,6 +53,23 @@ class NativeForwardTest(unittest.TestCase):
                     self.assertTrue(all(len(layer) == length for layer in obs['hidden_states']))
                     self.assertEqual(len(obs['filled']), length)
                     self.assertEqual(len(obs['topk_logits']), length)
+
+            # Complete cached blocks must reproduce a full-context forward.
+            cached = KVExplicitDrafter(model, SimpleNamespace(physical_block_size=32, raw_top_k=32))
+            full = ExplicitDrafter(model, SimpleNamespace(physical_block_size=32, raw_top_k=32))
+            prefix = [1] * 40
+            for native in ([MASK_ID] * 8,
+                           [1] * 24 + [MASK_ID] * 8):
+                expected = full.observe(prefix, native)
+                observed = cached.observe(prefix, native)
+                self.assertEqual(observed['kv_cached_prefix_len'] % 32, 0)
+                for layer_expected, layer_observed in zip(expected['hidden_states'], observed['hidden_states']):
+                    self.assertTrue(torch.allclose(torch.tensor(layer_expected),
+                                                    torch.tensor(layer_observed), atol=0.03, rtol=0.01))
+                # Only first-of-block logits intentionally differ from v3.
+                for index, (a, b) in enumerate(zip(expected['predictions'], observed['predictions'])):
+                    if (len(prefix) + index) % 32:
+                        self.assertEqual(a, b)
 
 
 if __name__ == '__main__':

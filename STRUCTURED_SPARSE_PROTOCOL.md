@@ -127,3 +127,28 @@ state/feature consistency but takes more collection time than the old merged
 feature implementation. The test suite checks graph actions, branch limits,
 position alignment through L=64, NPZ round trips and verifier cache isolation
 with small deterministic models; it is not a pretrained T4x2 benchmark.
+
+## Optional measured no-KV verifier and stable-block drafter KV (v4)
+
+Use `--verifier_mode full_context_no_kv --drafter_kv_mode stable_block_prefix`
+for the new measured run. The old defaults remain unchanged for reproducibility.
+The new mode writes schema `structured_sparse_sre_v4` and must use a new output
+directory. Every Submit candidate is sent through an actual full-prefix target
+forward with `use_cache=False`, including the correction/bonus logit. Its
+`submit_verifier_latency_ms` is a node measurement, not a prefix-KV estimate.
+Archived anchor acceptance is independently rechecked with that same verifier.
+`verifier_calibration.jsonl` contains direct per-proposal timing records in
+this mode, not calibrated median rows.
+
+The drafter KV mode caches only complete physical blocks strictly before the
+first mask, keyed by the exact token prefix. Mutable blocks are recomputed.
+The cache holds at most two prefixes; a cache miss includes the prefill cost.
+At a physical block's first token it uses that position's logit, matching the
+production block-shift rule; other positions use the preceding logit. Hence
+v4 observations are deliberately **not** bitwise comparable with v3's
+all-positions `p-1` logits. In this mode an R action charges the destination
+observation forward. E charges both the appended-mask and destination forwards.
+The raw feature export and CPU transfer remain collection overhead. This is
+stable-block-prefix KV reuse, not the mutable denoising-block cache path of
+`generate_draft_tokens_arbitrary_length`; a T4x2 smoke test must compare it
+against production before interpreting latency as deployment ground truth.

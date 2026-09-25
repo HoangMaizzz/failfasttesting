@@ -10,6 +10,8 @@ DATASETS = globals().get("DATASETS", ["gsm8k"])
 NUM_QUESTIONS = globals().get("NUM_QUESTIONS", 3)
 MAX_PROPOSAL_TOKENS = globals().get("MAX_PROPOSAL_TOKENS", 64)
 ANCHORS_PER_QUESTION = globals().get("ANCHORS_PER_QUESTION", 4)
+VERIFIER_MODE = globals().get("VERIFIER_MODE", "prefix_kv_calibration")
+DRAFTER_KV_MODE = globals().get("DRAFTER_KV_MODE", "none")
 
 
 def find_dataset_input(dataset):
@@ -78,6 +80,9 @@ import torch
 if torch.cuda.device_count() < 2:
     raise RuntimeError("Select GPU T4 x2 and enable Internet before running this cell")
 subprocess.run([sys.executable, str(repo / "tests/test_structured_sparse_collector.py")], cwd=repo, env=env, check=True)
+if DRAFTER_KV_MODE == "stable_block_prefix":
+    subprocess.run([sys.executable, str(repo / "tests/test_structured_native_forward.py")],
+                   cwd=repo, env=env, check=True)
 
 from huggingface_hub import snapshot_download
 
@@ -104,6 +109,8 @@ for dataset in DATASETS:
         "--min_expand_acceptance_ratio", "0.5", "--bad_probe_branches", "1",
         "--bad_refinement_steps", "2", "--physical_block_size", "32",
         "--small_block_size", "8", "--drafter_threshold", "0.3",
+        "--verifier_mode", VERIFIER_MODE,
+        "--drafter_kv_mode", DRAFTER_KV_MODE,
         "--target_device", "0", "--drafter_device", "1",
         "--target_gpu_memory_gib", "9",
         "--dllm_dir", str(dllm), "--output_dir", str(out),

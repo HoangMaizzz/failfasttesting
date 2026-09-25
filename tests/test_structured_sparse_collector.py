@@ -12,7 +12,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from structured_sparse_collector import (
-    MASK_ID, CachedVerifier, ExplicitDrafter, GraphCollector, annotate_verifier_acceptance,
+    MASK_ID, CachedVerifier, ExplicitDrafter, FullContextVerifier, KVExplicitDrafter,
+    GraphCollector, annotate_verifier_acceptance,
     collect, commit_one, hash_observation, identity, select_anchors,
 )
 
@@ -177,6 +178,48 @@ class AlignmentTests(unittest.TestCase):
                     self.assertEqual([v[0] for v in obs['hidden_states'][0]], list(range(prefix_length, prefix_length + length)))
                     self.assertEqual(len(obs['topk_logits']), length)
 
+    def test_stable_prefix_kv_matches_full_observation_and_reuses_prefix(self):
+        class CacheAwarePositionalModel(PositionalModel):
+            def __init__(self):
+                super().__init__()
+                self.prefills = 0
+
+            def forward(self, input_ids, past_key_values=None, update_past_key_values=False,
+                        logits_to_keep=0, **kwargs):
+                offset = 0 if past_key_values is None else past_key_values['length']
+                if update_past_key_values:
+                    self.prefills += 1
+                positions = torch.arange(offset, offset + input_ids.shape[1])
+                logits = torch.full((1, len(positions), 256), -10.0)
+                logits[0, torch.arange(len(positions)), positions % 256] = 10
+                if isinstance(logits_to_keep, torch.Tensor):
+                    logits = logits[:, logits_to_keep]
+                hidden = tuple(positions.reshape(1, -1, 1).float() + i * 1000
+                               for i in range(5))
+                cache = {'length': input_ids.shape[1]} if past_key_values is None else past_key_values
+                return SimpleNamespace(logits=logits, hidden_states=hidden,
+                                       past_key_values=cache)
+
+        model = CacheAwarePositionalModel()
+        args = SimpleNamespace(physical_block_size=32, raw_top_k=16)
+        full = ExplicitDrafter(model, args)
+        cached = KVExplicitDrafter(model, args)
+        prefix = [1] * 41
+        states = [[MASK_ID] * 8, [7] * 8 + [MASK_ID] * 8,
+                  [7] * 24 + [MASK_ID] * 8]
+        for native in states:
+            expected = full.observe(prefix, native)
+            actual = cached.observe(prefix, native)
+            for key in ('hidden_states', 'filled'):
+                self.assertEqual(actual[key], expected[key])
+            self.assertEqual(actual['predictions'], [
+                (p if p % 32 == 0 else p - 1) % 256
+                for p in range(len(prefix), len(prefix) + len(native))])
+            self.assertEqual(actual['kv_cached_prefix_len'] % 32, 0)
+        cached.observe(prefix, states[-1])
+        self.assertTrue(cached.observe(prefix, states[-1])['kv_cache_hit'])
+        self.assertGreater(model.prefills, 0)
+
 
 class MutatingTarget(PositionalModel):
     def __init__(self):
@@ -196,11 +239,34 @@ class MutatingTarget(PositionalModel):
         else:
             self.cached_inputs.append((past_key_values['length'], input_ids.shape[1]))
             past_key_values['length'] += input_ids.shape[1]
+        keep = kwargs.get('logits_to_keep', input_ids.shape[1])
+        length = input_ids.shape[1] if not isinstance(keep, int) else min(keep, input_ids.shape[1])
         return SimpleNamespace(past_key_values=past_key_values,
-                               logits=torch.ones((1, input_ids.shape[1], 32)))
+                               logits=torch.ones((1, length, 32)))
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_full_context_verifier_matches_greedy_acceptance_without_kv(self):
+        class DirectTarget(MutatingTarget):
+            def forward(self, input_ids, use_cache=None, logits_to_keep=None, **kwargs):
+                self.cached_inputs.append((use_cache, input_ids.shape[1]))
+                logits = torch.full((1, logits_to_keep, 32), -10.0)
+                logits[:, :, 1] = 10.0
+                logits[:, -1, 2] = 20.0
+                return SimpleNamespace(logits=logits)
+
+        model = DirectTarget()
+        args = SimpleNamespace(target_model_name='test')
+        oracle = FullContextVerifier(model, SimpleNamespace(eos_token_id=31), args)
+        _, _, key = oracle.prepare([4, 5])
+        accepted, emitted, ids, latency = oracle.score([4, 5], [1, 1, 1], 20)
+        self.assertEqual((accepted, emitted, ids), (3, 4, [1, 1, 1, 2]))
+        accepted_bad, emitted_bad, ids_bad, _ = oracle.score([4, 5], [1, 7, 1], 20)
+        self.assertEqual((accepted_bad, emitted_bad, ids_bad), (1, 2, [1, 1]))
+        self.assertEqual(model.cached_inputs, [(False, 5), (False, 5)])
+        self.assertGreaterEqual(latency, 0)
+        self.assertEqual(len(key), 64)
+
     def test_cache_isolation_and_reference_reuse(self):
         with tempfile.TemporaryDirectory() as folder:
             args = SimpleNamespace(output_dir=Path(folder), target_model_name='test',
@@ -221,6 +287,49 @@ class CalibrationTests(unittest.TestCase):
 
 
 class PackagingTests(unittest.TestCase):
+    def test_direct_no_kv_verifier_is_recorded_in_v4_archive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = args_for(Path(folder) / 'output')
+            args.max_proposal_tokens = 16
+            args.max_unmask_passes = None
+            args.remaining_output_budget = None
+            args.physical_block_size = 32
+            args.calibration_repeats = 2
+            args.seed = 42
+            args.backbone_zip = Path(folder) / 'unused.zip'
+            args.target_model_name = 'fake-target'
+            args.target_gpu_memory_gib = 9
+            args.num_questions = 1
+            args.anchors_per_question = 1
+            args.max_rounds_per_question = 0
+            args.verifier_mode = 'full_context_no_kv'
+            args.drafter_kv_mode = 'stable_block_prefix'
+            root = dict(state_id='root', problem_id=0, round_id=0,
+                        prefix_token_ids=[2, 3, 4],
+                        proposal_token_ids_before_fill=[MASK_ID] * 8,
+                        proposal_token_ids_after_fill=[1] * 8, accepted_len=8)
+            tokenizer = SimpleNamespace(eos_token_id=31, init_kwargs={})
+            with patch('structured_sparse_collector.load_anchors', return_value=[root]), \
+                 patch('structured_sparse_collector._load_models',
+                       return_value=(tokenizer, MutatingTarget(), None)), \
+                 patch('structured_sparse_collector.KVExplicitDrafter', return_value=FakeEngine()):
+                collect(args)
+            with zipfile.ZipFile(args.output_dir / 'gsm8k_structured_graph.zip') as archive:
+                manifest = json.loads(archive.read('graph_manifest.json'))
+                nodes = [json.loads(x) for x in archive.read('nodes.jsonl').splitlines()]
+                measures = [json.loads(x) for x in archive.read('verifier_calibration.jsonl').splitlines()]
+            self.assertEqual(manifest['schema_version'], 'structured_sparse_sre_v4')
+            self.assertEqual(manifest['verifier_mode'], 'full_context_no_kv')
+            self.assertTrue(all(n['submit_latency_is_node_measurement'] for n in nodes))
+            self.assertTrue(all(n['submit_label_source'] == 'direct_full_context_no_kv_greedy'
+                                for n in nodes))
+            self.assertEqual(len(measures), len(nodes) + 1)  # archived anchor check
+            self.assertEqual(len({n['submit_verifier_measurement_id'] for n in nodes}), len(nodes))
+            for node in nodes:
+                measurement = measures[node['submit_verifier_measurement_id']]
+                self.assertEqual(measurement['proposal_hash'], node['submit_verifier_measurement_key'])
+                self.assertEqual(measurement['latency_ms'], node['submit_verifier_latency_ms'])
+
     def test_complete_and_partial_archives(self):
         class BrokenEngine(FakeEngine):
             calls = 0

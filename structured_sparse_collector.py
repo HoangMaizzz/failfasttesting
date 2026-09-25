@@ -7,7 +7,7 @@ See STRUCTURED_SPARSE_PROTOCOL.md for action and timing conventions.
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 import copy
 import hashlib
 import json
@@ -219,6 +219,102 @@ class ExplicitDrafter:
         return result
 
 
+class KVExplicitDrafter(ExplicitDrafter):
+    """Reuse only complete, immutable 32-token blocks before the first mask.
+
+    A cache is keyed by the exact token prefix, never by branch ID or length.
+    The active/masked block is always recomputed. This is block-prefix KV reuse,
+    not reuse of a mutable denoising-block cache.
+    """
+
+    def __init__(self, model, args):
+        super().__init__(model, args)
+        self._prefix_cache = OrderedDict()
+        self._max_cached_prefixes = 2
+
+    @torch.inference_mode()
+    def observe(self, prefix, native):
+        if not prefix:
+            raise ValueError("A nonempty verifier prefix is required")
+        tokens = list(prefix) + list(native)
+        block_size = self.args.physical_block_size
+        first_mask = next((i for i, value in enumerate(native) if value == MASK_ID), len(native))
+        cached_count = ((len(prefix) + first_mask) // block_size) * block_size
+        if cached_count == 0:
+            result = super().observe(prefix, native)
+            result.update(kv_cache_hit=False, kv_cached_prefix_len=0)
+            return result
+        pad = (-len(tokens)) % block_size
+        all_ids = torch.tensor([tokens + [MASK_ID] * pad], device=self.device)
+        key = identity(tokens[:cached_count])
+        sync(self.device)
+        began = time.perf_counter()
+        cached = self._prefix_cache.get(key)
+        hit = cached is not None
+        if hit:
+            self._prefix_cache.move_to_end(key)
+        else:
+            if len(prefix) - 1 < cached_count:
+                prefill_indices = torch.arange(max(0, len(prefix) - 1), cached_count,
+                                               device=self.device)
+            else:
+                prefill_indices = torch.tensor([cached_count - 1], device=self.device)
+            prefill = self.model(input_ids=all_ids[:, :cached_count], use_cache=True,
+                                 update_past_key_values=True, block_size=block_size,
+                                 output_hidden_states=True, logits_to_keep=prefill_indices)
+            cached = (prefill, int(prefill_indices[0].item()))
+            self._prefix_cache[key] = cached
+            if len(self._prefix_cache) > self._max_cached_prefixes:
+                self._prefix_cache.popitem(last=False)
+        prefill, first_logit = cached
+        suffix = None
+        if cached_count < all_ids.shape[1]:
+            suffix = self.model(input_ids=all_ids[:, cached_count:],
+                past_key_values=prefill.past_key_values, use_cache=True,
+                update_past_key_values=False, block_size=block_size,
+                output_hidden_states=True)
+        sync(self.device)
+        forward_ms = (time.perf_counter() - began) * 1000
+        begin, end = len(prefix), len(tokens)
+        selected_logits = []
+        for token_position in range(begin, end):
+            # Production keeps the first logit of each physical block and
+            # shifts the other block logits by one position.
+            logit_position = (token_position if token_position % block_size == 0
+                              else token_position - 1)
+            selected_logits.append((prefill.logits[0, logit_position - first_logit]
+                if logit_position < cached_count else
+                suffix.logits[0, logit_position - cached_count]))
+        logits = torch.stack(selected_logits).float()
+        probs = logits.softmax(-1)
+        predicted_prob, predicted = probs.max(-1)
+        k = min(self.args.raw_top_k, logits.shape[-1])
+        top_values, top_ids = logits.topk(k, dim=-1)
+        layers_count = len(prefill.hidden_states)
+        layers = sorted({0, (layers_count - 1) // 4, (layers_count - 1) // 2,
+                         3 * (layers_count - 1) // 4, layers_count - 1})
+        hidden_rows = []
+        for layer in layers:
+            hidden_rows.append(torch.stack([
+                (prefill.hidden_states[layer][0, absolute]
+                 if absolute < cached_count else
+                 suffix.hidden_states[layer][0, absolute - cached_count])
+                for absolute in range(begin, end)
+            ]).half().cpu().tolist())
+        filled = [int(predicted[i]) if value == MASK_ID else int(value)
+                  for i, value in enumerate(native)]
+        filled_ids = torch.tensor(filled, device=self.device).unsqueeze(-1)
+        filled_probabilities = probs.gather(-1, filled_ids).squeeze(-1)
+        return dict(hidden_states=hidden_rows, hidden_layer_indices=layers,
+            topk_token_ids=top_ids.cpu().tolist(),
+            topk_logits=top_values.half().cpu().tolist(),
+            predictions=predicted.cpu().tolist(),
+            probabilities=predicted_prob.cpu().tolist(),
+            forward_ms=forward_ms, input_state_hash=identity(prefix, native),
+            filled=filled, filled_probabilities=filled_probabilities.cpu().tolist(),
+            kv_cache_hit=hit, kv_cached_prefix_len=cached_count)
+
+
 class CachedVerifier:
     """Greedy labels plus measured prefix-KV verification calibration per context."""
     def __init__(self, model, tokenizer, args):
@@ -300,6 +396,56 @@ class CachedVerifier:
         return reference, timings, key
 
 
+class FullContextVerifier:
+    """Measure and score each submitted proposal with the production no-KV path."""
+
+    def __init__(self, model, tokenizer, args):
+        self.model, self.tokenizer, self.args = model.eval(), tokenizer, args
+        self.device = model.get_input_embeddings().weight.device
+        self.records = []
+
+    def prepare(self, prefix):
+        model_key = dict(name=self.args.target_model_name,
+                         revision=getattr(self.model.config, "_commit_hash", None),
+                         dtype=str(self.model.dtype),
+                         device_map=sorted((str(k), str(v)) for k, v in
+                                           getattr(self.model, "hf_device_map", {}).items()),
+                         mode="full_context_no_kv_greedy")
+        return None, None, identity(prefix, model_key)
+
+    @torch.inference_mode()
+    def score(self, prefix, proposal, remaining_output_budget):
+        if not prefix or not proposal:
+            raise ValueError("A nonempty prefix and proposal are required")
+        ids = torch.tensor([list(prefix) + list(proposal)], dtype=torch.long,
+                           device=self.device)
+        attention_mask = torch.ones_like(ids)
+        sync(self.device)
+        began = time.perf_counter()
+        outputs = self.model(input_ids=ids, attention_mask=attention_mask,
+                             use_cache=False, logits_to_keep=len(proposal) + 1)
+        sync(self.device)
+        elapsed_ms = (time.perf_counter() - began) * 1000
+        predictions = outputs.logits[0].argmax(dim=-1)
+        if predictions.numel() != len(proposal) + 1:
+            raise RuntimeError("Verifier did not return proposal logits plus bonus logit")
+        predicted = predictions.tolist()
+        accepted = 0
+        while accepted < len(proposal) and int(proposal[accepted]) == int(predicted[accepted]):
+            accepted += 1
+        emitted = [int(x) for x in proposal[:accepted]] + [int(predicted[accepted])]
+        if self.tokenizer.eos_token_id in emitted:
+            emitted = emitted[:emitted.index(self.tokenizer.eos_token_id) + 1]
+        emitted = emitted[:int(remaining_output_budget)]
+        # Production reports accepted_len before EOS/budget truncation.
+        self.records.append(dict(measurement_id=len(self.records),
+            context_hash=identity(prefix),
+            proposal_hash=identity(prefix, proposal),
+            proposal_length=len(proposal), latency_ms=elapsed_ms,
+            source="measured_full_context_no_kv_per_proposal"))
+        return accepted, len(emitted), emitted, elapsed_ms
+
+
 def choose_children(candidates, width=2, min_ratio=0.5):
     eligible = [n for n in candidates if n["meta"]["current_submit_acceptance_ratio"] >= min_ratio
                 and not n["meta"]["state_eos_committed"]]
@@ -330,16 +476,27 @@ def choose_children(candidates, width=2, min_ratio=0.5):
 
 
 class GraphCollector:
-    def __init__(self, args, engine, eos_id):
+    def __init__(self, args, engine, eos_id, verifier=None):
         self.args, self.engine, self.eos_id = args, engine, eos_id
+        self.verifier = verifier
         self.nodes, self.edges, self.serial = [], [], 0
         self.writer = RawShardWriter(args.output_dir / "raw", args.dataset + "_structured", args.shard_rows)
 
     def node(self, prefix, native, observation, refine_steps, draft_ms, source, parent=None,
              action=None, action_ms=0.0, committed=None):
         self.serial += 1
-        accepted, emitted, emitted_ids = _score_greedy(observation["filled"], self.reference,
-            self.eos_id, getattr(self.args, "remaining_output_budget", None) or self.args.max_proposal_tokens + 1)
+        remaining = getattr(self.args, "remaining_output_budget", None) or self.args.max_proposal_tokens + 1
+        if self.verifier is None:
+            accepted, emitted, emitted_ids = _score_greedy(observation["filled"], self.reference,
+                self.eos_id, remaining)
+            verifier_ms = self.timings[len(native)]
+            latency_source = "measured_prefix_kv_calibration_estimate_for_node"
+            label_source = "cached_greedy_reference_lcp"
+        else:
+            accepted, emitted, emitted_ids, verifier_ms = self.verifier.score(
+                prefix, observation["filled"], remaining)
+            latency_source = "measured_full_context_no_kv_per_proposal"
+            label_source = "direct_full_context_no_kv_greedy"
         length = len(native)
         masks = sum(t == MASK_ID for t in native)
         eos_committed = (self.eos_id in native and
@@ -361,24 +518,41 @@ class GraphCollector:
             current_submit_regime=regime(accepted, length),
             current_submit_acceptance_ratio=accepted / max(length, 1),
             submit_emitted_token_ids=emitted_ids,
-            submit_verifier_latency_ms=self.timings[length],
-            submit_latency_source="measured_prefix_kv_calibration_estimate_for_node",
-            submit_latency_is_node_measurement=False,
-            submit_label_source="cached_greedy_reference_lcp",
+            submit_verifier_latency_ms=verifier_ms,
+            submit_verifier_measurement_key=(identity(prefix, observation["filled"])
+                if self.verifier is not None else None),
+            submit_verifier_measurement_id=(self.verifier.records[-1]["measurement_id"]
+                if self.verifier is not None else None),
+            submit_latency_source=latency_source,
+            submit_latency_is_node_measurement=self.verifier is not None,
+            submit_label_source=label_source,
             reference_key=self.reference_key, verifier_calibration_key=self.reference_key,
-            context_hash=identity(prefix), reference_length=len(self.reference),
+            context_hash=identity(prefix),
+            reference_length=len(self.reference) if self.reference is not None else None,
             draft_latency_from_anchor_ms=draft_ms,
             draft_passes_from_anchor=(parent["meta"]["draft_passes_from_anchor"] + 1) if parent else 0,
             backbone_draft_latency_elapsed_ms=source.get("draft_latency_elapsed_ms"),
-            stop_latency_per_output_token_from_anchor=(draft_ms + self.timings[length]) / max(emitted, 1),
+            stop_latency_per_output_token_from_anchor=(draft_ms + verifier_ms) / max(emitted, 1),
             hidden_state_stage="exact_native_state_pre_counterfactual_fill",
-            hidden_state_source="full_context_block_causal_reencode",
+            hidden_state_source=("exact_state_block_causal_kv_prefill_plus_suffix"
+                if getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix"
+                else "full_context_block_causal_reencode"),
             hidden_state_input_hash=observation["input_state_hash"],
             observation_hash=hash_observation(prefix, native, observation),
             hidden_token_positions="prefix_length + proposal_index",
-            logits_token_positions="prefix_length + proposal_index - 1",
-            feature_scope="entire_proposal_single_forward", feature_merge_mode="none",
+            logits_token_positions=("physical_block_first_self_else_previous"
+                if getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix"
+                else "prefix_length + proposal_index - 1"),
+            feature_scope=("entire_proposal_cached_prefill_plus_suffix"
+                if getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix"
+                else "entire_proposal_single_forward"),
+            feature_merge_mode=("immutable_prefix_kv_reuse"
+                if getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix"
+                else "none"),
             observation_forward_ms=observation["forward_ms"],
+            drafter_kv_mode=getattr(self.args, "drafter_kv_mode", "none"),
+            drafter_kv_cache_hit=observation.get("kv_cache_hit", False),
+            drafter_kv_cached_prefix_len=observation.get("kv_cached_prefix_len", 0),
             selected_for_expansion=False, selection_reason=None,
             collection_disposition="stored", parent_state_id=parent["meta"]["state_id"] if parent else None,
             action_from_parent=action, newly_unmasked_positions=committed or [],
@@ -401,10 +575,15 @@ class GraphCollector:
         if parent:
             self.edges.append(dict(src_state_id=parent["meta"]["state_id"], dst_state_id=meta["state_id"],
                 action=action, action_cost_ms=action_ms,
-                action_cost_source="measured_full_context_drafter_forward",
-                action_cost_includes_kv_reuse=False,
+                action_cost_source=("measured_post_decision_kv_drafter_forwards"
+                    if getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix"
+                    else "measured_full_context_drafter_forward"),
+                action_cost_includes_kv_reuse=(getattr(self.args, "drafter_kv_mode", "none")
+                                               == "stable_block_prefix"),
                 extend_delta=length - len(parent["native"]),
                 native_unmask_forwards=1, terminal=False,
+                action_forward_count=(2 if action == "E" and
+                    getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix" else 1),
                 destination_observation_forward_ms=observation["forward_ms"]))
         return node
 
@@ -423,9 +602,19 @@ class GraphCollector:
         if not committed:
             raise RuntimeError("An R/E action must include one actual unmask forward")
         obs = self.engine.observe(self.prefix, updated)
+        if getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix":
+            # The parent observation exists before this decision. The child
+            # observation is the next forward needed after choosing R/E.
+            action_ms = obs["forward_ms"] + (observation["forward_ms"] if action == "E" else 0.0)
+            forward_count = 2 if action == "E" else 1
+        else:
+            action_ms = observation["forward_ms"]
+            forward_count = 1
         child = self.node(self.prefix, updated, obs, refine_steps,
-                          parent["meta"]["draft_latency_from_anchor_ms"] + observation["forward_ms"],
-                          self.source, parent, action, observation["forward_ms"], committed)
+                          parent["meta"]["draft_latency_from_anchor_ms"] + action_ms,
+                          self.source, parent, action, action_ms, committed)
+        if forward_count != 1:
+            child["meta"]["draft_passes_from_anchor"] = parent["meta"]["draft_passes_from_anchor"] + forward_count
         return child
 
     def backbone(self, node, steps):
@@ -514,8 +703,12 @@ def parse_args():
     p.add_argument("--physical_block_size", type=int, default=32)
     p.add_argument("--small_block_size", type=int, default=8)
     p.add_argument("--drafter_threshold", type=float, default=0.3)
+    p.add_argument("--drafter_kv_mode", choices=["none", "stable_block_prefix"],
+                   default="none")
     p.add_argument("--raw_top_k", type=int, default=32)
     p.add_argument("--calibration_repeats", type=int, default=3)
+    p.add_argument("--verifier_mode", choices=["prefix_kv_calibration", "full_context_no_kv"],
+                   default="prefix_kv_calibration")
     p.add_argument("--reference_cache_dir", type=Path, default=None)
     p.add_argument("--target_model_name", default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--dllm_dir", required=True)
@@ -548,23 +741,31 @@ def collect(args):
     torch.manual_seed(args.seed)
     rows = load_anchors(args.backbone_zip, args)
     tokenizer, target, drafter = _load_models(args)
-    engine = ExplicitDrafter(drafter, args)
-    oracle = CachedVerifier(target, tokenizer, args)
-    graph = GraphCollector(args, engine, tokenizer.eos_token_id)
+    kv_drafter = getattr(args, "drafter_kv_mode", "none") == "stable_block_prefix"
+    engine = (KVExplicitDrafter if kv_drafter else ExplicitDrafter)(drafter, args)
+    full_verifier = getattr(args, "verifier_mode", "prefix_kv_calibration") == "full_context_no_kv"
+    oracle = (FullContextVerifier if full_verifier else CachedVerifier)(target, tokenizer, args)
+    graph = GraphCollector(args, engine, tokenizer.eos_token_id,
+                           verifier=oracle if full_verifier else None)
     status, failure = "complete", None
     verifier_mismatches = []
     try:
         # Reuse references/calibration across anchors with the same exact prefix.
         prepared = {}
-        for row in rows:
+        collection_began = time.perf_counter()
+        for anchor_number, row in enumerate(rows, 1):
             prefix = row["prefix_token_ids"]
             key = identity(prefix)
             if key not in prepared:
                 print(f"[prepare] problem={row['problem_id']} round={row['round_id']} calibration", flush=True)
                 prepared[key] = oracle.prepare(prefix)
             reference, timings, ref_key = prepared[key]
-            accepted, _, _ = _score_greedy(row["proposal_token_ids_after_fill"][:8], reference,
-                                           tokenizer.eos_token_id, args.max_proposal_tokens)
+            if full_verifier:
+                accepted, _, _, _ = oracle.score(prefix, row["proposal_token_ids_after_fill"][:8],
+                                                  args.max_proposal_tokens)
+            else:
+                accepted, _, _ = _score_greedy(row["proposal_token_ids_after_fill"][:8], reference,
+                                               tokenizer.eos_token_id, args.max_proposal_tokens)
             checked_row = annotate_verifier_acceptance(row, accepted)
             if not checked_row["verifier_acceptance_matches_backbone"]:
                 mismatch = dict(state_id=row["state_id"],
@@ -575,6 +776,11 @@ def collect(args):
                 print("[anchor] WARNING verifier acceptance differs from backbone; "
                       f"using recomputed value for labels: {mismatch}", flush=True)
             graph.run_anchor(checked_row, reference, timings, ref_key)
+            elapsed = time.perf_counter() - collection_began
+            eta = elapsed * (len(rows) - anchor_number) / anchor_number
+            print(f"[progress] dataset={args.dataset} anchors={anchor_number}/{len(rows)} "
+                  f"nodes={len(graph.nodes)} elapsed_min={elapsed/60:.1f} "
+                  f"eta_min={eta/60:.1f}", flush=True)
     except BaseException as exc:
         status, failure = "partial", repr(exc)
         raise
@@ -589,7 +795,9 @@ def collect(args):
         duplicate_groups = [dict(observation_hash=key, state_ids=ids, count=len(ids))
                             for key, ids in sorted(duplicate_groups.items()) if len(ids) > 1]
         all_regimes = ["full", "near_full", "mid", "early_mismatch"]
-        manifest = dict(schema_version="structured_sparse_sre_v3", status=status, failure=failure,
+        manifest = dict(schema_version=("structured_sparse_sre_v4" if full_verifier or kv_drafter
+                                        else "structured_sparse_sre_v3"),
+            status=status, failure=failure,
             collector_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             config=vars(args), nodes=len(graph.nodes), edges=len(graph.edges),
             node_acceptance_histogram=dict(Counter(n["submit_accepted_len"] for n in graph.nodes)),
@@ -611,7 +819,11 @@ def collect(args):
             anchors=len(rows), action_semantics={"E": "append masks + one unmask forward in new segment",
                 "R": "one unmask forward in earliest unresolved logical frame", "S": "counterfactual fill + cached greedy LCP"},
             transition_backend="full_context_block_causal_replay_without_kv",
-            latency_caveat="Drafter replay costs measured; verifier cost calibrated with prefix KV, not measured per node. Raw observation/export overhead excluded from action costs.",
+            verifier_mode=getattr(args, "verifier_mode", "prefix_kv_calibration"),
+            drafter_kv_mode=getattr(args, "drafter_kv_mode", "none"),
+            latency_caveat=("Drafter replay costs measured; verifier measured per proposal with full context and no KV. Raw observation/export overhead excluded from action costs."
+                if full_verifier else
+                "Drafter replay costs measured; verifier cost calibrated with prefix KV, not measured per node. Raw observation/export overhead excluded from action costs."),
             backbone_missing_anchor_regimes=sorted(set(all_regimes) -
                 {regime(int(r.get("backbone_recorded_accepted_len", r["accepted_len"])), 8)
                  for r in rows}))
