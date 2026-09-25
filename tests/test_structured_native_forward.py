@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import patch
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,6 +19,7 @@ import torch
 from transformers import Qwen2Config
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from structured_sparse_collector import ExplicitDrafter, KVExplicitDrafter, MASK_ID
+from native_elysia_graph import NativeElysiaRunner
 
 
 class NativeForwardTest(unittest.TestCase):
@@ -70,6 +73,30 @@ class NativeForwardTest(unittest.TestCase):
                 for index, (a, b) in enumerate(zip(expected['predictions'], observed['predictions'])):
                     if (len(prefix) + index) % 32:
                         self.assertEqual(a, b)
+
+            if device == 'cpu':
+                class CpuEvent:
+                    def __init__(self, **kwargs):
+                        self.timestamp = 0.0
+
+                    def record(self):
+                        self.timestamp = time.perf_counter()
+
+                    def elapsed_time(self, later):
+                        return max(0.0, (later.timestamp - self.timestamp) * 1000.0)
+
+                runner_args = SimpleNamespace(raw_top_k=8, physical_block_size=32,
+                    small_block_size=8, extend_size=8, drafter_threshold=0.5,
+                    max_refinement_steps=3)
+                tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: '')
+                native = NativeElysiaRunner(model, tokenizer, runner_args)
+                with patch.object(torch.cuda, 'Event', CpuEvent), \
+                     patch.object(torch.cuda, 'synchronize', lambda: None):
+                    for prefix_length in (29, 32):
+                        snapshots = native.segment([1] * prefix_length)
+                        self.assertTrue(snapshots)
+                        self.assertEqual(len(snapshots[0]['proposal_token_ids_after_fill']), 8)
+                        self.assertTrue(snapshots[0]['hidden_states'])
 
 
 if __name__ == '__main__':

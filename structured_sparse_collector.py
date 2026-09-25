@@ -141,13 +141,14 @@ def load_anchors(path, args):
     return result
 
 
-def commit_one(native, predictions, probabilities, small_block, threshold, start=0):
-    """Commit in the first unresolved proposal-relative logical frame only."""
+def commit_one(native, predictions, probabilities, small_block, threshold, start=0,
+               prefix_length=0):
+    """Commit in the first unresolved absolute-position logical frame only."""
     masked = [i for i in range(start, len(native)) if native[i] == MASK_ID]
     if not masked:
         return list(native), []
-    frame = (masked[0] // small_block) * small_block
-    eligible = [i for i in masked if i < frame + small_block]
+    frame_end = ((prefix_length + masked[0]) // small_block + 1) * small_block
+    eligible = [i for i in masked if prefix_length + i < frame_end]
     chosen = [i for i in eligible if probabilities[i] > threshold]
     if not chosen:
         chosen = [max(eligible, key=lambda i: (probabilities[i], -i))]
@@ -483,7 +484,9 @@ class GraphCollector:
         self.writer = RawShardWriter(args.output_dir / "raw", args.dataset + "_structured", args.shard_rows)
 
     def node(self, prefix, native, observation, refine_steps, draft_ms, source, parent=None,
-             action=None, action_ms=0.0, committed=None):
+             action=None, action_ms=0.0, committed=None,
+             pre_extension_filled=None, pre_extension_filled_ids=None,
+             extra_meta=None):
         self.serial += 1
         remaining = getattr(self.args, "remaining_output_budget", None) or self.args.max_proposal_tokens + 1
         if self.verifier is None:
@@ -513,7 +516,8 @@ class GraphCollector:
             state_masks_resolved=masks == 0, state_eos_committed=eos_committed,
             submit_available=True,
             refine_available=bool(masks and not eos_committed and refine_steps < self.args.max_refinement_steps),
-            extend_available=bool(length + self.args.extend_size <= self.args.max_proposal_tokens and not eos_committed),
+            extend_available=bool(length + self.args.extend_size <= self.args.max_proposal_tokens
+                and not eos_committed and self.eos_id not in observation["filled"]),
             submit_accepted_len=accepted, submit_emitted_len=emitted,
             current_submit_regime=regime(accepted, length),
             current_submit_acceptance_ratio=accepted / max(length, 1),
@@ -556,12 +560,16 @@ class GraphCollector:
             selected_for_expansion=False, selection_reason=None,
             collection_disposition="stored", parent_state_id=parent["meta"]["state_id"] if parent else None,
             action_from_parent=action, newly_unmasked_positions=committed or [],
+            pre_extension_top1_filled_positions=pre_extension_filled or [],
+            pre_extension_top1_filled_token_ids=pre_extension_filled_ids or [],
         )
+        if extra_meta:
+            meta.update(extra_meta)
         if meta["hidden_state_input_hash"] != identity(prefix, native):
             raise RuntimeError("Observation does not describe this native state")
         node = dict(native=list(native), obs=observation, meta=meta)
         self.nodes.append(meta)
-        self.writer.append(dict(
+        raw_row = dict(
             proposal_token_ids=observation["filled"], proposal_token_ids_before_fill=list(native),
             proposal_token_ids_after_fill=observation["filled"],
             proposal_mask=[t == MASK_ID for t in native],
@@ -571,7 +579,12 @@ class GraphCollector:
             hidden_states=observation["hidden_states"],
             hidden_layer_indices=observation["hidden_layer_indices"],
             topk_token_ids=observation["topk_token_ids"], topk_logits=observation["topk_logits"],
-            prefix_token_ids=list(prefix), metadata=meta))
+            prefix_token_ids=list(prefix), metadata=meta)
+        for name in ("native_active_hidden_states", "native_active_hidden_layer_indices",
+                     "native_active_topk_token_ids", "native_active_topk_logits"):
+            if name in observation:
+                raw_row[name] = observation[name]
+        self.writer.append(raw_row)
         if parent:
             self.edges.append(dict(src_state_id=parent["meta"]["state_id"], dst_state_id=meta["state_id"],
                 action=action, action_cost_ms=action_ms,
@@ -584,13 +597,25 @@ class GraphCollector:
                 native_unmask_forwards=1, terminal=False,
                 action_forward_count=(2 if action == "E" and
                     getattr(self.args, "drafter_kv_mode", "none") == "stable_block_prefix" else 1),
-                destination_observation_forward_ms=observation["forward_ms"]))
+                destination_observation_forward_ms=observation["forward_ms"],
+                pre_extension_top1_filled_positions=pre_extension_filled or [],
+                pre_extension_top1_filled_token_ids=pre_extension_filled_ids or [],
+                pre_extension_fill_source=("parent_observation_top1" if action == "E" else None)))
         return node
 
     def transition(self, parent, action):
         native = list(parent["native"])
+        pre_extension_filled = []
+        pre_extension_filled_ids = []
         if action == "E":
             old_length = len(native)
+            pre_extension_filled = [i for i, token in enumerate(native) if token == MASK_ID]
+            # The already-available parent forward supplies a zero-extra-forward
+            # top-1 fill. Never carry old masks into the new extension segment.
+            native = list(parent["obs"]["filled"])
+            pre_extension_filled_ids = [native[i] for i in pre_extension_filled]
+            if MASK_ID in native or self.eos_id in native:
+                raise RuntimeError("Cannot extend an unresolved or EOS-terminated parent")
             native += [MASK_ID] * self.args.extend_size
             observation = self.engine.observe(self.prefix, native)
             start, refine_steps = old_length, 0
@@ -598,7 +623,8 @@ class GraphCollector:
             observation = parent["obs"]
             start, refine_steps = 0, parent["meta"]["refine_steps_since_extend"] + 1
         updated, committed = commit_one(native, observation["predictions"], observation["probabilities"],
-                                       self.args.small_block_size, self.args.drafter_threshold, start)
+                                       self.args.small_block_size, self.args.drafter_threshold, start,
+                                       prefix_length=len(self.prefix))
         if not committed:
             raise RuntimeError("An R/E action must include one actual unmask forward")
         obs = self.engine.observe(self.prefix, updated)
@@ -612,7 +638,8 @@ class GraphCollector:
             forward_count = 1
         child = self.node(self.prefix, updated, obs, refine_steps,
                           parent["meta"]["draft_latency_from_anchor_ms"] + action_ms,
-                          self.source, parent, action, action_ms, committed)
+                          self.source, parent, action, action_ms, committed,
+                          pre_extension_filled, pre_extension_filled_ids)
         if forward_count != 1:
             child["meta"]["draft_passes_from_anchor"] = parent["meta"]["draft_passes_from_anchor"] + forward_count
         return child
@@ -705,6 +732,8 @@ def parse_args():
     p.add_argument("--drafter_threshold", type=float, default=0.5)
     p.add_argument("--drafter_kv_mode", choices=["none", "stable_block_prefix"],
                    default="none")
+    p.add_argument("--unmask_backend", choices=["explicit_replay", "native_elysia"],
+                   default="explicit_replay")
     p.add_argument("--raw_top_k", type=int, default=32)
     p.add_argument("--calibration_repeats", type=int, default=3)
     p.add_argument("--verifier_mode", choices=["prefix_kv_calibration", "full_context_no_kv"],
@@ -724,6 +753,11 @@ def parse_args():
 def collect(args):
     if args.max_unmask_passes is not None:
         args.max_refinement_steps = args.max_unmask_passes - 1
+    native_backend = getattr(args, "unmask_backend", "explicit_replay") == "native_elysia"
+    if native_backend and (args.extend_size != 8 or args.small_block_size != 8
+                           or args.physical_block_size != 32
+                           or getattr(args, "verifier_mode", None) != "full_context_no_kv"):
+        raise ValueError("Native Elysia smoke requires 8-token extension, 8/32 blocks and direct no-KV verifier")
     if args.max_proposal_tokens < 8 or args.extend_size < 1 or (args.max_proposal_tokens - 8) % args.extend_size:
         raise ValueError("Maximum length must be 8 + n * extend_size")
     if min(args.small_block_size, args.physical_block_size, args.calibration_repeats, args.shard_rows) < 1:
@@ -747,8 +781,14 @@ def collect(args):
     engine = (KVExplicitDrafter if kv_drafter else ExplicitDrafter)(drafter, args)
     full_verifier = getattr(args, "verifier_mode", "prefix_kv_calibration") == "full_context_no_kv"
     oracle = (FullContextVerifier if full_verifier else CachedVerifier)(target, tokenizer, args)
-    graph = GraphCollector(args, engine, tokenizer.eos_token_id,
-                           verifier=oracle if full_verifier else None)
+    if native_backend:
+        from native_elysia_graph import NativeElysiaGraphCollector, NativeElysiaRunner
+        graph = NativeElysiaGraphCollector(args, engine,
+            NativeElysiaRunner(drafter, tokenizer, args), tokenizer.eos_token_id,
+            verifier=oracle if full_verifier else None)
+    else:
+        graph = GraphCollector(args, engine, tokenizer.eos_token_id,
+                               verifier=oracle if full_verifier else None)
     status, failure = "complete", None
     verifier_mismatches = []
     try:
@@ -797,10 +837,16 @@ def collect(args):
         duplicate_groups = [dict(observation_hash=key, state_ids=ids, count=len(ids))
                             for key, ids in sorted(duplicate_groups.items()) if len(ids) > 1]
         all_regimes = ["full", "near_full", "mid", "early_mismatch"]
-        manifest = dict(schema_version=("structured_sparse_sre_v4" if full_verifier or kv_drafter
-                                        else "structured_sparse_sre_v3"),
+        manifest = dict(schema_version=("structured_sparse_native_elysia_v1"
+            if native_backend else "structured_sparse_sre_v5"),
             status=status, failure=failure,
             collector_source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            native_runner_source_sha256=(hashlib.sha256(
+                (Path(__file__).parent / "native_elysia_graph.py").read_bytes()).hexdigest()
+                if native_backend else None),
+            native_modeling_source_sha256=(hashlib.sha256(
+                (Path(__file__).parent / "Fast_dLLM_v2_1_5B/modeling.py").read_bytes()).hexdigest()
+                if native_backend else None),
             config=vars(args), nodes=len(graph.nodes), edges=len(graph.edges),
             node_acceptance_histogram=dict(Counter(n["submit_accepted_len"] for n in graph.nodes)),
             current_submit_regime_histogram=dict(Counter(
@@ -818,12 +864,22 @@ def collect(args):
             observation_duplicate_groups=duplicate_groups,
             backbone_verifier_mismatch_count=len(verifier_mismatches),
             backbone_verifier_mismatches=verifier_mismatches,
-            anchors=len(rows), action_semantics={"E": "append masks + one unmask forward in new segment",
-                "R": "one unmask forward in earliest unresolved logical frame", "S": "counterfactual fill + cached greedy LCP"},
-            transition_backend="full_context_block_causal_replay_without_kv",
+            anchors=len(rows), action_semantics=({
+                "E": "fill all parent masks from native same-forward top-1, call native generator on filled prefix plus new eight-token segment",
+                "R": "consecutive oracle snapshots from one native generator call",
+                "S": "native same-forward top-1 STOP proposal, scored by direct verifier"}
+                if native_backend else {
+                "E": "top-1 fill all remaining parent masks from parent observation, append masks, then unmask in the new absolute-position logical frame",
+                "R": "commit in earliest unresolved absolute-position logical frame",
+                "S": "counterfactual fill from current observation, then greedy verifier"}),
+            transition_backend=("generate_draft_tokens_arbitrary_length_native_snapshots"
+                if native_backend else "stable_block_prefix_kv_replay" if kv_drafter else
+                "full_context_block_causal_replay_without_kv"),
             verifier_mode=getattr(args, "verifier_mode", "prefix_kv_calibration"),
             drafter_kv_mode=getattr(args, "drafter_kv_mode", "none"),
-            latency_caveat=("Drafter replay costs measured; verifier measured per proposal with full context and no KV. Raw observation/export overhead excluded from action costs."
+            latency_caveat=("Native generator-reported forward time per segment; direct full-context no-KV verifier per proposal. Separate full-state feature re-encoding and export are collection overhead, excluded from action costs. Each E call starts a fresh prefix prefill."
+                if native_backend and full_verifier else
+                "Drafter replay costs measured; verifier measured per proposal with full context and no KV. Raw observation/export overhead excluded from action costs."
                 if full_verifier else
                 "Drafter replay costs measured; verifier cost calibrated with prefix KV, not measured per node. Raw observation/export overhead excluded from action costs."),
             backbone_missing_anchor_regimes=sorted(set(all_regimes) -

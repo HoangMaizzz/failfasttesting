@@ -3220,6 +3220,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             raw_snapshot_fields["hidden_layer_indices"] = selected
                                             hidden_start = max(0, local_start - raw_hidden_offset)
                                             hidden_end = min(int(hidden[-1].shape[1]), hidden_start + int(target_len))
+                                            raw_snapshot_fields["native_hidden_start_offset"] = int(
+                                                block_abs_start + raw_hidden_offset + hidden_start
+                                                - draft_token_start_idx
+                                            )
                                             raw_snapshot_fields["hidden_states"] = [
                                                 hidden[index][0, hidden_start:hidden_end].detach().to(torch.float16).cpu().tolist()
                                                 for index in selected
@@ -3237,6 +3241,10 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             k = min(raw_top_k, int(adaptive_full_block_logits.shape[-1]))
                                             logit_start = max(0, local_start - raw_logits_offset)
                                             logit_end = min(int(adaptive_full_block_logits.shape[1]), logit_start + int(target_len))
+                                            raw_snapshot_fields["native_topk_start_offset"] = int(
+                                                block_abs_start + raw_logits_offset + logit_start
+                                                - draft_token_start_idx
+                                            )
                                             values, indices = torch.topk(
                                                 adaptive_full_block_logits[0, logit_start:logit_end].float(),
                                                 k=k,
@@ -3490,6 +3498,17 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         # logger.debug(f"{Colors.CYAN}current conf_of_unmasked_tokens {conf_of_unmasked_tokens}{Colors.RESET}")
                         small_block_tokens = args.target_tokenizer.decode(x_1[0], skip_special_tokens=False)
                         # logger.debug(f"{Colors.CYAN}Small_block_tokens: {small_block_tokens}{Colors.RESET}")
+
+                        if (
+                            is_drafter
+                            and args is not None
+                            and getattr(args, "collector_max_oracle_snapshots", None) is not None
+                            and len(frontier_stats["oracle_refinement_snapshots"])
+                            >= int(args.collector_max_oracle_snapshots)
+                        ):
+                            frontier_stats["collector_snapshot_limit_reached"] = True
+                            frontier_stats["stop_reason"] = "collector_snapshot_limit"
+                            draft_tokens_unmasked = True
 
                         if (
                             is_drafter

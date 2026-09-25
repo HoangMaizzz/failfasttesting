@@ -33,11 +33,16 @@ the original boundary index is retained rather than described as a new E.
 ## Exact state/action conventions
 
 State consists of the exact verifier prefix, current proposal tokens/mask, and
-the collector's local R budget. E appends `extend_size` masks, then performs one
-unmask forward in the first unresolved logical frame of the NEW segment. Parent
-proposal tokens are unchanged by E. R performs one unmask forward in the earliest
-unresolved proposal-relative logical frame. Threshold now defaults to 0.5, with a
-forced highest-confidence masked position only if none exceeds threshold.
+the collector's local R budget. Before E, all remaining parent masks are
+committed using top-1 tokens from the already-available parent observation;
+this fill adds no forward. E then appends `extend_size` fresh masks and performs
+one unmask forward in the first absolute-position logical frame of the NEW
+segment. R commits in the earliest unresolved absolute-position logical frame.
+Frame alignment uses `prefix_length + proposal_index`, not proposal-relative
+index. Threshold defaults to 0.5, with a forced highest-confidence masked
+position only if none exceeds threshold. E prefill is exempt from the threshold:
+it must resolve every remaining parent mask before the extension is created.
+The exact prefill positions and token IDs are stored on each E edge.
 
 This protocol uses the existing dLLM weights and block-causal forward with a
 physical block size of 32. It is an explicit-state replay protocol, NOT a claim
@@ -132,8 +137,9 @@ with small deterministic models; it is not a pretrained T4x2 benchmark.
 
 Use `--verifier_mode full_context_no_kv --drafter_kv_mode stable_block_prefix`
 for the new measured run. Its unmask threshold defaults to 0.5; explicitly pass
-`--drafter_threshold 0.3` when reproducing the older v3 collection.
-The new mode writes schema `structured_sparse_sre_v4` and must use a new output
+`--drafter_threshold 0.3` when reproducing the older collection.
+The updated E prefill and absolute-frame semantics write schema
+`structured_sparse_sre_v5` and must use a new output
 directory. Every Submit candidate is sent through an actual full-prefix target
 forward with `use_cache=False`, including the correction/bonus logit. Its
 `submit_verifier_latency_ms` is a node measurement, not a prefix-KV estimate.
@@ -146,10 +152,44 @@ first mask, keyed by the exact token prefix. Mutable blocks are recomputed.
 The cache holds at most two prefixes; a cache miss includes the prefill cost.
 At a physical block's first token it uses that position's logit, matching the
 production block-shift rule; other positions use the preceding logit. Hence
-v4 observations are deliberately **not** bitwise comparable with v3's
+KV observations are deliberately **not** bitwise comparable with the older
 all-positions `p-1` logits. In this mode an R action charges the destination
 observation forward. E charges both the appended-mask and destination forwards.
 The raw feature export and CPU transfer remain collection overhead. This is
 stable-block-prefix KV reuse, not the mutable denoising-block cache path of
 `generate_draft_tokens_arbitrary_length`; a T4x2 smoke test must compare it
 against production before interpreting latency as deployment ground truth.
+
+## Native Elysia unmask backend (smoke)
+
+Select `--unmask_backend native_elysia --drafter_threshold 0.5
+--verifier_mode full_context_no_kv`. The source archive supplies verifier
+prefixes and IDs only. Each eight-token segment is regenerated with the same
+`generate_draft_tokens_arbitrary_length` entrypoint used in `failfast.py`.
+Successive native oracle snapshots form R edges. For E, all parent masks are
+filled from that parent's same-forward native top-1 snapshot; the filled
+proposal is appended to the verifier prefix before calling the native generator
+for the next eight-token segment. A fresh native call is made for each E branch.
+If a segment crosses a physical-block boundary, early forwards may not yet
+have a complete same-forward top-1 fill for all eight positions. Those bridge
+forwards are charged in native elapsed latency but are not labeled as S/R
+states. Collection stops after the first four *observable* native snapshots
+(one initial state plus three R states), or when the segment resolves earlier.
+No archived draft tokens or logits become graph nodes. The raw archive can have
+a different threshold without silently mixing trajectories.
+
+Submit proposals come only from native snapshot `proposal_token_ids_after_fill`.
+Each is sent to the real verifier. Full-state re-encoded hidden/top-k features
+remain in the standard NPZ fields and are explicitly *diagnostic*, not the
+action-producing forward. The extra `native_active_*` NPZ fields contain raw
+hidden/top-k rows from the native forward; their valid masks and start offsets
+in the index identify which part of the current eight-token segment they cover.
+The manifest uses `structured_sparse_native_elysia_v1` to prevent these data
+from being confused with explicit-state replay archives.
+
+The native generator call matches the actual `failfast.py` call's default
+`use_block_cache=False`; it uses prefix KV within each call. A separate E call
+starts a fresh prefix prefill, so its measured cost can differ from deployment
+which may reuse an already available prefill output. This is a latency caveat,
+not a different unmask/STOP token rule. Check a five-question GPU smoke before
+running larger collections.

@@ -157,6 +157,30 @@ class StructuredGraphTests(unittest.TestCase):
         self.assertEqual(selected_new, [0])  # forced highest-confidence position
         self.assertEqual(updated, [5, MASK_ID])
 
+    def test_unmask_frame_uses_absolute_context_position(self):
+        native = [MASK_ID] * 8
+        updated, chosen = commit_one(native, list(range(1, 9)), [0.6] * 8,
+                                     8, 0.5, prefix_length=5)
+        self.assertEqual(chosen, [0, 1, 2])
+        self.assertEqual(updated[:3], [1, 2, 3])
+        self.assertEqual(updated[3:], [MASK_ID] * 5)
+
+    def test_extend_top1_fills_parent_before_new_masks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            graph = self.run_graph(folder)
+            nodes = {n['state_id']: n for n in graph.nodes}
+            root = next(n for n in graph.nodes if n['parent_state_id'] is None)
+            edge = next(e for e in graph.edges if e['src_state_id'] == root['state_id']
+                        and e['action'] == 'E')
+            child = nodes[edge['dst_state_id']]
+            self.assertEqual(edge['pre_extension_top1_filled_positions'], list(range(8)))
+            self.assertEqual(edge['pre_extension_top1_filled_token_ids'], list(range(1, 9)))
+            with np.load(Path(folder) / 'raw/gsm8k_structured' / child['shard']) as data:
+                native = data['proposal_token_ids_before_fill'][child['row'], :16].tolist()
+            self.assertEqual(native[:8], list(range(1, 9)))
+            self.assertNotIn(MASK_ID, native[:8])
+            self.assertGreater(sum(x == MASK_ID for x in native[8:]), 0)
+
 
 class PositionalModel(torch.nn.Module):
     def __init__(self):
@@ -297,7 +321,7 @@ class CalibrationTests(unittest.TestCase):
 
 
 class PackagingTests(unittest.TestCase):
-    def test_direct_no_kv_verifier_is_recorded_in_v4_archive(self):
+    def test_direct_no_kv_verifier_is_recorded_in_v5_archive(self):
         with tempfile.TemporaryDirectory() as folder:
             args = args_for(Path(folder) / 'output')
             args.max_proposal_tokens = 16
@@ -328,7 +352,7 @@ class PackagingTests(unittest.TestCase):
                 manifest = json.loads(archive.read('graph_manifest.json'))
                 nodes = [json.loads(x) for x in archive.read('nodes.jsonl').splitlines()]
                 measures = [json.loads(x) for x in archive.read('verifier_calibration.jsonl').splitlines()]
-            self.assertEqual(manifest['schema_version'], 'structured_sparse_sre_v4')
+            self.assertEqual(manifest['schema_version'], 'structured_sparse_sre_v5')
             self.assertEqual(manifest['verifier_mode'], 'full_context_no_kv')
             self.assertTrue(all(n['submit_latency_is_node_measurement'] for n in nodes))
             self.assertTrue(all(n['submit_label_source'] == 'direct_full_context_no_kv_greedy'
@@ -378,7 +402,7 @@ class PackagingTests(unittest.TestCase):
                 with zipfile.ZipFile(args.output_dir / 'gsm8k_structured_graph.zip') as archive:
                     manifest = json.loads(archive.read('graph_manifest.json'))
                     self.assertEqual(manifest['status'], 'partial' if broken else 'complete')
-                    self.assertEqual(manifest['schema_version'], 'structured_sparse_sre_v3')
+                    self.assertEqual(manifest['schema_version'], 'structured_sparse_sre_v5')
                     self.assertIn('nodes.jsonl', archive.namelist())
                     self.assertIn('edges.jsonl', archive.namelist())
                     self.assertGreater(manifest['nodes'], 0)

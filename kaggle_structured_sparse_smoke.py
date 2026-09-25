@@ -13,6 +13,8 @@ ANCHORS_PER_QUESTION = globals().get("ANCHORS_PER_QUESTION", 4)
 DRAFTER_THRESHOLD = globals().get("DRAFTER_THRESHOLD", 0.5)
 VERIFIER_MODE = globals().get("VERIFIER_MODE", "prefix_kv_calibration")
 DRAFTER_KV_MODE = globals().get("DRAFTER_KV_MODE", "none")
+UNMASK_BACKEND = globals().get("UNMASK_BACKEND", "explicit_replay")
+EXPECTED_COMMIT = globals().get("EXPECTED_COMMIT")
 
 
 def find_dataset_input(dataset):
@@ -75,12 +77,18 @@ if (repo / ".git").exists():
 else:
     subprocess.run(["git", "clone", "--depth", "1", "-b", branch,
                     "https://github.com/HoangMaizzz/failfasttesting.git", str(repo)], check=True, env=env)
-subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True)
+head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+print("Source commit:", head, flush=True)
+if EXPECTED_COMMIT and head != EXPECTED_COMMIT:
+    raise RuntimeError(f"Expected source commit {EXPECTED_COMMIT}, got {head}")
 
 import torch
 if torch.cuda.device_count() < 2:
     raise RuntimeError("Select GPU T4 x2 and enable Internet before running this cell")
 subprocess.run([sys.executable, str(repo / "tests/test_structured_sparse_collector.py")], cwd=repo, env=env, check=True)
+if UNMASK_BACKEND == "native_elysia":
+    subprocess.run([sys.executable, str(repo / "tests/test_native_elysia_graph.py")],
+                   cwd=repo, env=env, check=True)
 if DRAFTER_KV_MODE == "stable_block_prefix":
     subprocess.run([sys.executable, str(repo / "tests/test_structured_native_forward.py")],
                    cwd=repo, env=env, check=True)
@@ -112,11 +120,24 @@ for dataset in DATASETS:
         "--small_block_size", "8", "--drafter_threshold", str(DRAFTER_THRESHOLD),
         "--verifier_mode", VERIFIER_MODE,
         "--drafter_kv_mode", DRAFTER_KV_MODE,
+        "--unmask_backend", UNMASK_BACKEND,
         "--target_device", "0", "--drafter_device", "1",
         "--target_gpu_memory_gib", "9",
         "--dllm_dir", str(dllm), "--output_dir", str(out),
         "--reference_cache_dir", str(Path("/kaggle/temp") /
             f"structured_reference_cache_{run_dir.name}")]
     print("Running:", " ".join(cmd), flush=True)
-    subprocess.run(cmd, cwd=repo, env=env, check=True)
-    print("DOWNLOAD:", out / f"{dataset}_structured_graph.zip", flush=True)
+    run = subprocess.run(cmd, cwd=repo, env=env, check=False)
+    archive = out / f"{dataset}_structured_graph.zip"
+    if run.returncode:
+        print("Collector failed; partial archive, if written:", archive, flush=True)
+        raise subprocess.CalledProcessError(run.returncode, cmd)
+    with zipfile.ZipFile(archive) as z:
+        import json
+        manifest = json.loads(z.read("graph_manifest.json"))
+        if manifest["status"] != "complete" or z.testzip() is not None:
+            raise RuntimeError(f"Incomplete or corrupt archive: {archive}")
+        if UNMASK_BACKEND == "native_elysia" and manifest["schema_version"] != "structured_sparse_native_elysia_v1":
+            raise RuntimeError("Unexpected collector schema; refusing a misleading smoke result")
+        print("Native nodes:", manifest["nodes"], "edges:", manifest["edges"], flush=True)
+    print("DOWNLOAD:", archive, flush=True)
