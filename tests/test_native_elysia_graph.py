@@ -1,4 +1,5 @@
 import json
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -169,6 +170,27 @@ class NativeGraphTests(unittest.TestCase):
             self.assertEqual(len(stored), 6)
             self.assertTrue(all(r['submit_candidate_source'] == 'native_elysia_same_forward_top1'
                                 for r in stored))
+
+    def test_zero_acceptance_still_extends_through_sixty_four_tokens(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args = SimpleNamespace(output_dir=Path(folder), dataset='gsm8k', shard_rows=8,
+                max_proposal_tokens=64, extend_size=8, small_block_size=8,
+                max_refinement_steps=3, branch_width=2,
+                min_expand_acceptance_ratio=0.5, drafter_threshold=0.5)
+            runner = FakeNativeRunner()
+            verifier = FakeVerifier()
+            graph = NativeElysiaGraphCollector(args, FakeFeatureEngine(), runner,
+                                                eos_id=100, verifier=verifier)
+            source = dict(state_id='anchor', problem_id=0, round_id=2,
+                prefix_token_ids=[11, 12, 13], accepted_len=0)
+            graph.run_anchor(source, list(range(1, 100)), {}, 'ref')
+            graph.finish()
+            self.assertTrue(all(n['submit_accepted_len'] == 0 for n in graph.nodes))
+            self.assertEqual({n['proposal_length'] for n in graph.nodes},
+                             set(range(8, 65, 8)))
+            self.assertEqual(max(n['proposal_length'] for n in graph.nodes), 64)
+            self.assertTrue(any(n['selected_for_expansion'] and n['proposal_length'] == 56
+                                for n in graph.nodes))
 
     def test_full_collection_packages_native_schema_and_direct_verifier_records(self):
         with tempfile.TemporaryDirectory() as folder:

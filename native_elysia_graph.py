@@ -223,8 +223,11 @@ class NativeElysiaGraphCollector(GraphCollector):
                     if boundary["meta"]["extend_available"]:
                         candidate_chains.append(self._rollout(row, boundary))
             heads = [c[0] for c in candidate_chains]
-            selected = choose_children(heads, self.args.branch_width,
-                                       self.args.min_expand_acceptance_ratio)
+            # The confidence threshold governs native token commitment, not
+            # whether a counterfactual extension is allowed. Keep expanding
+            # the best/diverse heads even when the verifier accepts nothing.
+            # EOS and max_proposal_tokens are the only extension stops.
+            selected = choose_children(heads, self.args.branch_width, 0.0)
             selected_ids = {n["meta"]["state_id"] for n in selected}
             for child_chain in candidate_chains:
                 if child_chain[0]["meta"]["state_id"] not in selected_ids:

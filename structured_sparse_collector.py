@@ -754,6 +754,10 @@ def collect(args):
     if args.max_unmask_passes is not None:
         args.max_refinement_steps = args.max_unmask_passes - 1
     native_backend = getattr(args, "unmask_backend", "explicit_replay") == "native_elysia"
+    if native_backend:
+        # Native branching is exhaustive in length (up to EOS or the token
+        # cap); acceptance only ranks the bounded set of active branches.
+        args.min_expand_acceptance_ratio = 0.0
     if native_backend and (args.extend_size != 8 or args.small_block_size != 8
                            or args.physical_block_size != 32
                            or getattr(args, "verifier_mode", None) != "full_context_no_kv"):
@@ -872,6 +876,9 @@ def collect(args):
                 "E": "top-1 fill all remaining parent masks from parent observation, append masks, then unmask in the new absolute-position logical frame",
                 "R": "commit in earliest unresolved absolute-position logical frame",
                 "S": "counterfactual fill from current observation, then greedy verifier"}),
+            expansion_selection_policy=(
+                "best_and_diverse_without_acceptance_gate_until_eos_or_max_proposal_tokens"
+                if native_backend else "best_and_diverse_with_min_acceptance_gate"),
             transition_backend=("generate_draft_tokens_arbitrary_length_native_snapshots"
                 if native_backend else "stable_block_prefix_kv_replay" if kv_drafter else
                 "full_context_block_causal_replay_without_kv"),

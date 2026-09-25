@@ -115,7 +115,7 @@ for dataset in DATASETS:
         "--max_rounds_per_question", "0", "--extend_size", "8",
         "--max_proposal_tokens", str(MAX_PROPOSAL_TOKENS),
         "--max_refinement_steps", "3", "--branch_width", "2",
-        "--min_expand_acceptance_ratio", "0.5", "--bad_probe_branches", "1",
+        "--min_expand_acceptance_ratio", "0.0", "--bad_probe_branches", "1",
         "--bad_refinement_steps", "2", "--physical_block_size", "32",
         "--small_block_size", "8", "--drafter_threshold", str(DRAFTER_THRESHOLD),
         "--verifier_mode", VERIFIER_MODE,
