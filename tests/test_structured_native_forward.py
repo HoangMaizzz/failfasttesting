@@ -87,7 +87,7 @@ class NativeForwardTest(unittest.TestCase):
 
                 runner_args = SimpleNamespace(raw_top_k=8, physical_block_size=32,
                     small_block_size=8, extend_size=8, drafter_threshold=0.5,
-                    max_refinement_steps=3)
+                    max_refinement_steps=3, hidden_layers=[2, 4], max_proposal_tokens=64)
                 tokenizer = SimpleNamespace(decode=lambda *args, **kwargs: '')
                 native = NativeElysiaRunner(model, tokenizer, runner_args)
                 with patch.object(torch.cuda, 'Event', CpuEvent), \
@@ -97,6 +97,28 @@ class NativeForwardTest(unittest.TestCase):
                         self.assertTrue(snapshots)
                         self.assertEqual(len(snapshots[0]['proposal_token_ids_after_fill']), 8)
                         self.assertTrue(snapshots[0]['hidden_states'])
+                        # Training only requests the chosen next native boundary.
+                        root_only = native.segment([1] * prefix_length, max_snapshots=1)
+                        self.assertEqual(len(root_only), 1)
+                        self.assertEqual(root_only[0]['proposal_token_ids_after_fill'],
+                                         snapshots[0]['proposal_token_ids_after_fill'])
+                        from world_model_environment import NativeTrainingEnvironment
+                        class LabelStub:
+                            def score(self, prefix, proposal, remaining):
+                                return 0, 1, [1], 0.0
+                        rows = []
+                        env = NativeTrainingEnvironment(native, LabelStub(), -1, 16,
+                            runner_args, lambda *record: rows.append(record))
+                        root = env.start('tiny-random-weights', 0, [1] * prefix_length, 128)
+                        if 'R' in env.actions(root):
+                            refined = env.step(root, 'R', 128)
+                            if refined is not None:
+                                self.assertEqual(refined.observation.length, 8)
+                        extended = env.step(root, 'E', 128)
+                        self.assertEqual(extended.observation.length, 16)
+                        self.assertEqual(extended.observation.hidden.shape, (16, 2, 16))
+                        self.assertEqual(extended.observation.ids[:8, 0].tolist(),
+                                         root.observation.ids[:, 1].tolist())
 
 
 if __name__ == '__main__':

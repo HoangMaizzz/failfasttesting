@@ -20,7 +20,7 @@ class NativeElysiaRunner:
         self.device = model.get_input_embeddings().weight.device
 
     @torch.inference_mode()
-    def segment(self, prompt):
+    def segment(self, prompt, max_snapshots=None):
         """Return every native boundary of the next eight-token segment."""
         args = self.args
         call_args = SimpleNamespace(
@@ -44,7 +44,8 @@ class NativeElysiaRunner:
             bucket_current_context_len=len(prompt),
             collector_parent_native_length=0,
             collector_parent_fill_tokens=[],
-            collector_max_oracle_snapshots=args.max_refinement_steps + 1,
+            collector_max_oracle_snapshots=(args.max_refinement_steps + 1
+                if max_snapshots is None else int(max_snapshots)),
         )
         inputs = torch.tensor([prompt], dtype=torch.long, device=self.device)
         result = self.model.generate_draft_tokens_arbitrary_length(

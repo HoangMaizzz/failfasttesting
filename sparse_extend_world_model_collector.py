@@ -197,15 +197,17 @@ def _load_backbone_rows(backbone_path: Path, dataset: str, num_questions: int,
 
 def _load_models(args):
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_name)
+    single_target = getattr(args, "target_placement", "auto") == "single"
+    placement = ({"device_map": {"": args.target_device}} if single_target else {
+        "device_map": "auto",
+        "max_memory": {
+            **{gpu: f"{getattr(args, 'target_gpu_memory_gib', 9)}GiB"
+               for gpu in range(torch.cuda.device_count())}, "cpu": "32GiB"},
+    })
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model_name,
         torch_dtype=torch.float16,
-        device_map="auto",
-        max_memory={
-            **{gpu: f"{getattr(args, 'target_gpu_memory_gib', 9)}GiB"
-               for gpu in range(torch.cuda.device_count())},
-            "cpu": "32GiB",
-        },
+        **placement,
         attn_implementation="sdpa",
     )
     print(f"[models] target FP16 device map: {getattr(target, 'hf_device_map', {})}", flush=True)
