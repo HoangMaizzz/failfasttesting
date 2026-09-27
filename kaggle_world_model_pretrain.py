@@ -1,7 +1,8 @@
 """Kaggle T4 x2 launcher. Execute this file in ONE fresh notebook cell.
 
 Optional notebook globals: SOURCE_REF, NUM_QUESTIONS, VALIDATION_QUESTIONS,
-DATASET, MAX_ROUNDS_PER_QUESTION, MAX_NEW_TOKENS. No input ZIP required.
+DATASET, MAX_ROUNDS_PER_QUESTION, MAX_NEW_TOKENS, STOP_WEIGHT, EXTEND_WEIGHT,
+REFINE_WEIGHT. No input ZIP required.
 """
 from datetime import datetime, timezone
 import json
@@ -18,6 +19,9 @@ VALIDATION_QUESTIONS = int(globals().get("VALIDATION_QUESTIONS", 2))
 DATASET = globals().get("DATASET", "gsm8k")
 MAX_ROUNDS_PER_QUESTION = int(globals().get("MAX_ROUNDS_PER_QUESTION", 2))
 MAX_NEW_TOKENS = int(globals().get("MAX_NEW_TOKENS", 128))
+STOP_WEIGHT = float(globals().get("STOP_WEIGHT", 1.0))
+EXTEND_WEIGHT = float(globals().get("EXTEND_WEIGHT", 1.0))
+REFINE_WEIGHT = float(globals().get("REFINE_WEIGHT", 1.0))
 
 working = Path("/kaggle/working")
 temporary = Path("/kaggle/temp")
@@ -91,12 +95,15 @@ command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"
     "--max_rounds_per_question", str(MAX_ROUNDS_PER_QUESTION),
     "--max_new_tokens", str(MAX_NEW_TOKENS), "--max_proposal_tokens", "64",
     "--extend_size", "8", "--max_refinement_steps", "3", "--drafter_threshold", "0.5",
+    "--stop_weight", str(STOP_WEIGHT), "--extend_weight", str(EXTEND_WEIGHT),
+    "--refine_weight", str(REFINE_WEIGHT),
     "--target_model_name", "Qwen/Qwen2.5-7B-Instruct",
     "--target_device", "0", "--drafter_device", "1",
     "--dllm_dir", str(dllm), "--output_dir", str(output)]
 print("Running:", " ".join(command), flush=True)
 print("Split: verifier FP16 -> GPU 0; dLLM FP16 + trainable world model -> GPU 1", flush=True)
 print("No pre-collected ZIP needed. These are bounded smoke trajectories, not full-answer benchmarks.", flush=True)
+print("Random legal S/E/R; E includes first unmask, max 3 extra R. Only S calls verifier.", flush=True)
 completed = subprocess.run(command, cwd=repo, env=environment, check=False)
 archive = output.with_suffix(".zip")
 if archive.is_file():
@@ -109,8 +116,8 @@ with zipfile.ZipFile(archive) as zip_file:
     if summary["status"] != "complete" or zip_file.testzip() is not None:
         raise RuntimeError("Incomplete or corrupt result archive")
 print(json.dumps({key: summary.get(key) for key in (
-    "status", "questions_completed", "updates", "nodes", "edges", "parameter_l2_change",
-    "evaluation")}, indent=2), flush=True)
+    "status", "questions_completed", "updates", "dynamics_updates", "nodes", "edges", "parameter_l2_change",
+    "environment", "label_coverage", "evaluation")}, indent=2), flush=True)
 # The relative link is served by the live notebook; Save Version users can use
 # the top-level ZIP shown in Output after the run completes.
 from IPython.display import FileLink, display

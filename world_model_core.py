@@ -197,6 +197,12 @@ class ExperienceReplay:
         self.max_states = max_states
         self.rng = random.Random(seed)
 
+    def add_node(self, observation):
+        self.nodes[observation.uid] = observation
+        while len(self.nodes) > self.max_states:
+            removed, _ = self.nodes.popitem(last=False)
+            self.edges = [e for e in self.edges if removed not in e[:2]]
+
     def add(self, parent, child, action):
         if (parent.question, parent.round_id) != (child.question, child.round_id):
             raise ValueError("Cannot cross a verification round or question")
@@ -206,13 +212,10 @@ class ExperienceReplay:
                 action == "E" and parent.length >= child.length):
             raise ValueError("Action/length mismatch")
         for o in (parent, child):
-            self.nodes[o.uid] = o
+            self.add_node(o)
         edge = (parent.uid, child.uid, action)
         if edge not in self.edges:
             self.edges.append(edge)
-        while len(self.nodes) > self.max_states:
-            removed, _ = self.nodes.popitem(last=False)
-            self.edges = [e for e in self.edges if removed not in e[:2]]
 
     def sample(self, batch_size, horizon):
         if not self.edges:
@@ -246,17 +249,28 @@ class WorldModelLearner:
         self.ema_decay, self.latent_weight = ema_decay, latent_weight
         self.warmup_updates, self.horizon_warmup = warmup_updates, horizon_warmup
         self.updates = 0
+        self.dynamics_updates = 0
 
     def update(self, replay, batch_size=8, max_horizon=3):
         horizon = 1 if self.updates < self.horizon_warmup else max_horizon
-        paths = replay.sample(batch_size, horizon)
+        labeled = [o for o in replay.nodes.values() if o.accepted is not None]
+        dynamics_ready = bool(replay.edges) and self.updates >= self.warmup_updates
+        if not labeled and not dynamics_ready:
+            return None  # No supervised signal yet: no fake zero-label/optimizer update.
+        paths = replay.sample(batch_size, horizon) if dynamics_ready else []
         self.model.train()
-        batch = pack_observations([p[0][0] for p in paths], self.token_table, self.device)
-        imagined = self.model.encoder(batch)
-        current_losses = [acceptance_nll(self.model.acceptance(imagined), imagined.lengths,
-                                         batch["labels"])]
+        current_losses = []
+        if labeled:
+            # Include STOP-at-root and terminal states even when they have no R/E edge.
+            batch = pack_observations(replay.rng.choices(labeled, k=batch_size),
+                                      self.token_table, self.device)
+            actual = self.model.encoder(batch)
+            current_losses.append(acceptance_nll(self.model.acceptance(actual), actual.lengths,
+                                                batch["labels"]))
         rollout_losses, latent_losses = [], []
-        if self.updates >= self.warmup_updates:
+        if paths:
+            batch = pack_observations([p[0][0] for p in paths], self.token_table, self.device)
+            imagined = self.model.encoder(batch)
             for step in range(max(len(p[1]) for p in paths)):
                 active = [i for i, p in enumerate(paths) if len(p[1]) > step]
                 imagined = imagined.take(torch.tensor(active, device=self.device))
@@ -278,8 +292,8 @@ class WorldModelLearner:
                     + (1 - F.cosine_similarity(imagined.global_state, target.global_state)).mean())
                 rollout_losses.append(acceptance_nll(self.model.acceptance(imagined),
                                                        imagined.lengths, future["labels"]))
-        zero = current_losses[0] * 0
-        current = torch.stack(current_losses).mean()
+        zero = next(self.model.parameters()).sum() * 0
+        current = torch.stack(current_losses).mean() if current_losses else zero
         latent = torch.stack(latent_losses).mean() if latent_losses else zero
         rollout = torch.stack(rollout_losses).mean() if rollout_losses else zero
         loss = current + self.latent_weight * latent + rollout
@@ -293,9 +307,12 @@ class WorldModelLearner:
             for dst, src in zip(self.target_encoder.parameters(), self.model.encoder.parameters()):
                 dst.lerp_(src, 1 - self.ema_decay)
         self.updates += 1
+        self.dynamics_updates += int(bool(paths))
         return dict(update=self.updates, loss=float(loss.detach()), current_nll=float(current.detach()),
                     rollout_nll=float(rollout.detach()), latent_loss=float(latent.detach()),
-                    grad_norm=float(grad_norm), horizon=horizon, replay_states=len(replay.nodes))
+                    grad_norm=float(grad_norm), horizon=horizon if paths else 0,
+                    dynamics_trained=bool(paths), labeled_replay_states=len(labeled),
+                    replay_states=len(replay.nodes))
 
     @torch.no_grad()
     def predict(self, observations):
@@ -309,5 +326,6 @@ class WorldModelLearner:
         return dict(schema="acceptance_world_model_v1", model_config=self.model.config,
             model=self.model.state_dict(), target_encoder=self.target_encoder.state_dict(),
             optimizer=self.optimizer.state_dict(), updates=self.updates,
+            dynamics_updates=self.dynamics_updates,
             token_embedding_included=False,
             token_embedding_source="frozen drafter input embeddings; load separately")

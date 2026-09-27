@@ -9,6 +9,7 @@ from collections import defaultdict
 import faulthandler
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 import shutil
@@ -22,6 +23,7 @@ import torch
 from world_model_core import (AcceptanceWorldModel, ExperienceReplay, WorldModelLearner,
     acceptance_nll, expected_acceptance, pack_observations)
 from world_model_environment import NativeTrainingEnvironment
+from world_model_hindsight import HindsightLabeler
 
 
 def append_json(path, value):
@@ -43,6 +45,7 @@ class ExperienceWriter:
         self.shards = 0
         self.count = 0
         self.edge_count = 0
+        self.label_records = {}
         (output / "experience").mkdir()
 
     def add(self, state, parent, action, timing, split):
@@ -51,7 +54,8 @@ class ExperienceWriter:
         append_json(self.output / "states.jsonl", dict(state_id=o.uid,
             parent_state_id=None if parent is None else parent.observation.uid,
             question=o.question, round_id=o.round_id, split=split, action=action,
-            length=o.length, accepted_len=o.accepted, emitted=state.emitted,
+            length=o.length, accepted_len=None, label_status="pending_at_capture",
+            labels_join="labels.jsonl by state_id (latest record)",
             prefix_token_ids=state.prefix, segment_start=len(state.prior),
             native_unmask_forward_index=state.snapshot["unmask_forward_index"],
             native_hidden_start_offset=state.snapshot["native_hidden_start_offset"],
@@ -64,11 +68,15 @@ class ExperienceWriter:
             self.edge_count += 1
             append_json(self.output / "edges.jsonl", dict(parent=parent.observation.uid,
                 child=o.uid, action=action, question=o.question, split=split,
-                delta_acceptance=o.accepted-parent.observation.accepted))
+                delta_acceptance=None, labels_join="labels.jsonl by parent/child state_id"))
         self.pending.append(o)
         self.pending_topk.append((
             np.asarray(state.snapshot["topk_token_ids"], dtype=np.int32),
             np.asarray(state.snapshot["topk_logits"], dtype=np.float16)))
+
+    def label(self, record):
+        self.label_records[record["state_id"]] = record
+        append_json(self.output / "labels.jsonl", record)
 
     def flush(self):
         if not self.pending:
@@ -79,7 +87,10 @@ class ExperienceWriter:
                   for name in ("ids", "hidden", "gaps", "scalars")}
         arrays.update(lengths=lengths, offsets=np.concatenate([[0], np.cumsum(lengths)]),
             context=torch.stack([o.context for o in observations]).numpy(),
-            accepted=np.asarray([o.accepted for o in observations], dtype=np.int32),
+            accepted=np.asarray([-1 if o.accepted is None else o.accepted for o in observations], dtype=np.int32),
+            label_valid=np.asarray([o.accepted is not None for o in observations], dtype=np.bool_),
+            accepted_lower_bound=np.asarray([self.label_records.get(o.uid, {}).get("lower_bound", 0)
+                                              for o in observations], dtype=np.int32),
             native_topk_offsets=np.concatenate([[0], np.cumsum([len(p[0]) for p in self.pending_topk])]),
             native_topk_token_ids=np.concatenate([p[0] for p in self.pending_topk]),
             native_topk_logits=np.concatenate([p[1] for p in self.pending_topk]))
@@ -137,9 +148,10 @@ def evaluate(learner, replay, horizon=3):
         latent_globals.append(state.global_state.cpu())
         logits = learner.model.acceptance(state)
         predicted = expected_acceptance(logits, state.lengths)
-        count = len(predicted)
+        known = batch["labels"] >= 0
+        count = int(known.sum())
         totals["current"][0] += count
-        totals["current"][1] += float((predicted-batch["labels"]).abs().sum())
+        totals["current"][1] += float((predicted[known]-batch["labels"][known]).abs().sum())
         totals["current"][2] += float(acceptance_nll(logits, state.lengths, batch["labels"])) * count
     outgoing = defaultdict(list)
     for p, c, a in replay.edges:
@@ -158,12 +170,15 @@ def evaluate(learner, replay, horizon=3):
                 torch.tensor([int(action == "E")], device=learner.device), learner.extension_size)
             prediction = float(expected_acceptance(learner.model.acceptance(state), state.lengths)[0])
             label = replay.nodes[child].accepted
-            record = rollout_results[f"h{depth}"]
-            record["n"] += 1
-            record["absolute_error"] += abs(prediction-label)
-            record["baseline_error"] += abs(baseline-label)
-            record["gain_edges"] += int(label > first_label)
-            if depth == 1:
+            if label is not None:
+                record = rollout_results[f"h{depth}"]
+                record["n"] += 1
+                record["absolute_error"] += abs(prediction-label)
+                record["baseline_error"] += abs(baseline-label)
+                record["gain_edges"] += int(first_label is not None and label > first_label)
+                record.setdefault("gain_comparable_paths", 0)
+                record["gain_comparable_paths"] += int(first_label is not None)
+            if depth == 1 and label is not None and first_label is not None:
                 change = "gain" if label > first_label else "loss" if label < first_label else "same"
                 group = one_step_groups[f"{action}_{change}"]
                 group["n"] += 1
@@ -174,14 +189,23 @@ def evaluate(learner, replay, horizon=3):
             child, action = children[0]
     current = totals["current"]
     return dict(status="evaluated", questions=sorted({o.question for o in nodes}),
-        current=dict(n=int(current[0]), mae=current[1]/current[0], nll=current[2]/current[0]),
+        label_coverage=dict(total=len(nodes), exact=int(current[0]), unresolved=len(nodes)-int(current[0])),
+        current=dict(n=int(current[0]), mae=current[1]/current[0] if current[0] else None,
+                     nll=current[2]/current[0] if current[0] else None),
         global_latent_std_mean=float(torch.cat(latent_globals).std(dim=0, unbiased=False).mean()),
         one_step_by_action_and_change={key: dict(n=v["n"], mae=v["absolute_error"]/v["n"])
                                       for key, v in one_step_groups.items()},
         rollout={key: dict(n=value["n"], mae=value["absolute_error"]/value["n"],
             unchanged_prediction_baseline_mae=value["baseline_error"]/value["n"],
-            true_gain_paths=value["gain_edges"]) for key, value in rollout_results.items()},
+            true_gain_paths=value["gain_edges"], gain_comparable_paths=value["gain_comparable_paths"])
+            for key, value in rollout_results.items()},
         warning="10-question smoke checks the pipeline, not generalization or controller quality")
+
+
+def action_probabilities(actions, args):
+    weights = {"S": args.stop_weight, "E": args.extend_weight, "R": args.refine_weight}
+    total = sum(weights[a] for a in actions)
+    return {a: weights[a]/total for a in actions}
 
 
 def explore_questions(args, questions, tokenizer, environment, learner, writer, summary):
@@ -200,49 +224,63 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
             if len(prefix) > args.max_context_tokens:
                 raise ValueError(f"Question {question_id} exceeds context cap; no silent truncation")
             generated = []
+            labeler = HindsightLabeler(prefix, writer.label)
+            buffer = train_replay if split == "train" else validation_replay
             print(f"[question] {question_index+1}/{len(questions)} {question_id} split={split}", flush=True)
+
+            def train_available():
+                if split != "train":
+                    return
+                for _ in range(args.updates_per_transition):
+                    metrics = learner.update(buffer, args.batch_sequences, args.horizon)
+                    if metrics is None:
+                        continue
+                    append_json(args.output_dir / "training_metrics.jsonl", metrics)
+                    if learner.updates % 10 == 0:
+                        print(f"[train] update={learner.updates} loss={metrics['loss']:.4f} "
+                              f"h={metrics['horizon']} replay={metrics['replay_states']}", flush=True)
 
             def on_state(state, parent, action, timing):
                 if getattr(args, "watchdog_enabled", False):
                     faulthandler.dump_traceback_later(300, repeat=True)
                 writer.add(state, parent, action, timing, split)
+                labeler.register(state)
                 o = state.observation
                 if parent is not None:
-                    buffer = train_replay if split == "train" else validation_replay
                     buffer.add(parent.observation, o, action)
-                    if split == "train":
-                        for _ in range(args.updates_per_transition):
-                            metrics = learner.update(buffer, args.batch_sequences, args.horizon)
-                            append_json(args.output_dir / "training_metrics.jsonl", metrics)
-                            if learner.updates % 10 == 0:
-                                print(f"[train] update={learner.updates} loss={metrics['loss']:.4f} "
-                                      f"h={metrics['horizon']} replay={metrics['replay_states']}", flush=True)
-                elif split == "validation":
-                    validation_replay.nodes[o.uid] = o
+                    train_available()
+                else:
+                    buffer.add_node(o)
                 print(f"[state] {o.uid} action={action or 'root'} L={o.length} K={o.accepted}", flush=True)
 
             environment.on_state = on_state
+            end_reason = "max_rounds_per_question"
             for round_id in range(args.max_rounds_per_question):
                 remaining = args.max_new_tokens-len(generated)
                 if remaining <= 0 or len(prefix) > args.max_context_tokens:
+                    end_reason = "max_new_tokens" if remaining <= 0 else "max_context_tokens"
                     break
                 state = environment.start(question_id, round_id, prefix, remaining)
                 while True:
                     actions = environment.actions(state)
-                    if not actions:
+                    probabilities = action_probabilities(actions, args)
+                    chosen = rng.choices(actions, weights=[probabilities[a] for a in actions])[0]
+                    event = dict(state_id=state.observation.uid, question=question_id,
+                                 round_id=round_id, split=split, action=chosen,
+                                 legal_probabilities=probabilities)
+                    if chosen == "S":
+                        verifier_ms = environment.submit(state, remaining)
+                        labeler.after_stop(state)
+                        append_json(args.output_dir / "actions.jsonl", dict(**event, executed=True))
+                        train_available()
+                        print(f"[stop] {state.observation.uid} K={state.observation.accepted} "
+                              f"emitted={len(state.emitted)}", flush=True)
                         break
-                    # Fixed exploration mixture, NOT oracle/learned-policy action selection.
-                    chosen = ("R" if rng.random() < args.refine_probability else "E")
-                    if chosen not in actions:
-                        chosen = actions[0]
-                    if len(actions) == 2 and rng.random() < args.branch_probability:
-                        alternative = "E" if chosen == "R" else "R"
-                        environment.step(state, alternative, remaining)
                     child = environment.step(state, chosen, remaining)
+                    append_json(args.output_dir / "actions.jsonl", dict(**event, executed=child is not None,
+                        child_state_id=None if child is None else child.observation.uid))
                     if child is None:
-                        if "E" not in actions:
-                            break
-                        child = environment.step(state, "E", remaining)
+                        continue  # R exhausted: resample remaining legal S/E, never force E.
                     state = child
                 if not state.emitted:
                     raise RuntimeError("Verifier emitted no tokens")
@@ -250,16 +288,26 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 generated += state.emitted
                 append_json(args.output_dir / "rounds.jsonl", dict(question=question_id,
                     round_id=round_id, split=split, final_state=state.observation.uid,
+                    accepted_len=state.observation.accepted, verifier_ms=verifier_ms,
                     emitted=state.emitted))
                 if environment.eos_id in state.emitted:
+                    end_reason = "eos"
                     break
+            if end_reason != "eos" and len(generated) >= args.max_new_tokens:
+                end_reason = "max_new_tokens"
+            coverage = labeler.finish(end_reason)
+            for key, value in coverage.items():
+                summary.setdefault("label_coverage", {}).setdefault(key, 0)
+                summary["label_coverage"][key] += value
             summary["questions_completed"] += 1
             append_json(args.output_dir / "questions.jsonl", dict(**question, split=split,
                 generated_tokens=generated, decoded=tokenizer.decode(generated),
+                collection_end_reason=end_reason, label_coverage=coverage,
                 generation_is_bounded_smoke_not_answer_accuracy_benchmark=True))
             writer.flush()
             checkpoint(learner, train_replay, args, args.output_dir, rng)
-            summary.update(updates=learner.updates, nodes=writer.count, edges=writer.edge_count,
+            summary.update(updates=learner.updates, dynamics_updates=learner.dynamics_updates,
+                           nodes=writer.count, edges=writer.edge_count,
                            environment=environment.stats)
             atomic_json(args.output_dir / "summary.json", summary)
             if shutil.disk_usage(args.output_dir).free < 1024**3:
@@ -273,7 +321,8 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
     finally:
         writer.flush()
         checkpoint(learner, train_replay, args, args.output_dir, rng)
-        summary.update(updates=learner.updates, nodes=writer.count, edges=writer.edge_count,
+        summary.update(updates=learner.updates, dynamics_updates=learner.dynamics_updates,
+                       nodes=writer.count, edges=writer.edge_count,
                        environment=environment.stats)
 
 
@@ -306,9 +355,12 @@ def run(args):
     args.output_dir.mkdir(parents=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     atomic_json(args.output_dir / "config.json", config)
-    summary = dict(schema="interactive_acceptance_pretrain_v1", status="running",
+    summary = dict(schema="interactive_acceptance_pretrain_v2_hindsight", status="running",
         questions_completed=0, updates=0, nodes=0, edges=0,
-        labels="real greedy verifier, full context, KV disabled",
+        labels="actual STOP verifier + hindsight over emitted greedy tokens; unresolved is NOT zero",
+        verifier="full context, KV disabled; invoked only on chosen/forced STOP",
+        exploration="single real trajectory; random legal S/E/R; no side branches",
+        stop_is_policy_supervision=False,
         drafter="native Elysia, prefix KV inside each generator invocation",
         refine_execution="bounded deterministic segment replay with predecessor assertion",
         timings_are_profiling_only=True, required_input_archives=False)
@@ -370,7 +422,7 @@ def run(args):
     finally:
         faulthandler.cancel_dump_traceback_later()
         summary["elapsed_seconds"] = time.perf_counter()-began
-        for name in ("world_model_core.py", "world_model_environment.py",
+        for name in ("world_model_core.py", "world_model_environment.py", "world_model_hindsight.py",
                      "pretrain_acceptance_world_model.py", "native_elysia_graph.py",
                      "sparse_extend_world_model_collector.py", "Fast_dLLM_v2_1_5B/modeling.py"):
             source = Path(__file__).parent / name
@@ -394,8 +446,9 @@ def parse_args(argv=None):
     parser.add_argument("--drafter_threshold", type=float, default=0.5)
     parser.add_argument("--hidden_layers", type=int, nargs=2, default=[14, 28])
     parser.add_argument("--raw_top_k", type=int, default=32)
-    parser.add_argument("--refine_probability", type=float, default=0.5)
-    parser.add_argument("--branch_probability", type=float, default=0.2)
+    parser.add_argument("--stop_weight", type=float, default=1.0)
+    parser.add_argument("--extend_weight", type=float, default=1.0)
+    parser.add_argument("--refine_weight", type=float, default=1.0)
     parser.add_argument("--target_model_name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=1)
@@ -432,8 +485,10 @@ def parse_args(argv=None):
         parser.error("Invalid dropout or learning rate")
     if args.warmup_updates < 0 or args.horizon_warmup_updates < 0:
         parser.error("Warmup update counts cannot be negative")
-    if not all(0 <= p <= 1 for p in (args.refine_probability, args.branch_probability, args.drafter_threshold)):
-        parser.error("Probabilities/threshold must be within [0,1]")
+    if not 0 <= args.drafter_threshold <= 1:
+        parser.error("Threshold must be within [0,1]")
+    if any(not math.isfinite(w) or w <= 0 for w in (args.stop_weight, args.extend_weight, args.refine_weight)):
+        parser.error("S/E/R exploration weights must be finite and positive")
     return args
 
 

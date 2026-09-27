@@ -14,8 +14,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from world_model_core import (AcceptanceWorldModel, ExperienceReplay, WorldModelLearner,
     acceptance_nll, expected_acceptance, prefix_log_distribution, pack_observations)
 from world_model_environment import (MASK_ID, NativeTrainingEnvironment, native_observation)
+from world_model_hindsight import HindsightLabeler
 from pretrain_acceptance_world_model import (ExperienceWriter, explore_questions,
-    package, parse_args)
+    action_probabilities, evaluate, package, parse_args)
 
 torch.set_num_threads(1)
 
@@ -24,8 +25,7 @@ def settings(output=None):
     args = parse_args(["--dllm_dir", "unused", "--output_dir", str(output or "unused"),
         "--max_rounds_per_question", "1", "--max_proposal_tokens", "16",
         "--latent_dim", "16", "--raw_top_k", "2", "--batch_sequences", "2",
-        "--warmup_updates", "0", "--horizon_warmup_updates", "0",
-        "--refine_probability", "0.8"])
+        "--warmup_updates", "0", "--horizon_warmup_updates", "0"])
     return args
 
 
@@ -67,7 +67,7 @@ class FakeRunner:
 
 class FakeVerifier:
     def score(self, prefix, proposal, remaining):
-        expected = [i % 8 + 1 for i in range(len(proposal)+1)]
+        expected = [(i + len(prefix) - 3) % 8 + 1 for i in range(len(proposal)+1)]
         accepted = 0
         while accepted < len(proposal) and proposal[accepted] == expected[accepted]:
             accepted += 1
@@ -129,12 +129,18 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(self.runner.calls[-1][1], 1)
         child = env.step(root, "R", 128)
         self.assertEqual(self.runner.calls[-1][1], 2)
-        self.assertEqual((root.observation.accepted, child.observation.accepted), (7, 8))
+        self.assertEqual((root.observation.accepted, child.observation.accepted), (None, None))
         extended = env.step(root, "E", 128)
         self.assertEqual(self.runner.calls[-1][0], root.prefix + root.observation.ids[:, 1].tolist())
         self.assertEqual(extended.observation.length, 16)
-        self.assertEqual(extended.observation.accepted, 7)
+        self.assertIsNone(extended.observation.accepted)
         self.assertEqual(extended.observation.ids[:8, 0].tolist(), root.observation.ids[:, 1].tolist())
+        self.assertEqual(env.stats["verifier_calls"], 0)
+        env.submit(extended, 128)
+        self.assertEqual(extended.observation.accepted, 7)
+        self.assertEqual(env.stats["verifier_calls"], 1)
+        with self.assertRaises(ValueError):
+            env.submit(extended, 128)
 
     def test_exhaustion_no_fake_edge_and_drift_raises(self):
         env = self.make_env()
@@ -142,8 +148,10 @@ class NativeTests(unittest.TestCase):
         self.runner.exhaust = True
         self.assertIsNone(env.step(root, "R", 128))
         self.assertEqual(len(self.records), 1)
+        self.assertNotIn("R", env.actions(root))
         self.runner.exhaust = False
         self.runner.drift = True
+        root = env.start("q", 0, [10, 11, 12], 128)
         with self.assertRaisesRegex(RuntimeError, "drift"):
             env.step(root, "R", 128)
 
@@ -159,7 +167,7 @@ class NativeTests(unittest.TestCase):
         env = self.make_env()
         root = env.start("q", 0, [10, 11, 12], 128)
         root.terminal_reason = "candidate_eos"
-        self.assertEqual(env.actions(root), [])
+        self.assertEqual(env.actions(root), ["S"])
 
     def test_extension_reaches_64_without_acceptance_gate(self):
         env = self.make_env()
@@ -171,11 +179,122 @@ class NativeTests(unittest.TestCase):
             self.assertEqual(state.observation.hidden.shape, (length, 2, 4))
             self.assertEqual(state.observation.gaps.shape, (length, 2))
             self.assertTrue(torch.equal(state.observation.ids[:length-8, 0], previous))
-            self.assertEqual(state.observation.accepted, 7)
+            self.assertIsNone(state.observation.accepted)
         self.assertNotIn("E", env.actions(state))
+        self.assertEqual(env.stats["verifier_calls"], 0)
+
+    def test_three_extra_refines_reset_after_extension_and_action_weights(self):
+        env = self.make_env()
+        state = env.start("q", 0, [10, 11, 12], 128)
+        self.assertEqual(action_probabilities(env.actions(state), env.args),
+                         {"S": 1/3, "R": 1/3, "E": 1/3})
+        for i in range(3):
+            state = env.step(state, "R", 128)
+            self.assertEqual(state.snapshot_index, i+1)
+        self.assertNotIn("R", env.actions(state))
+        self.assertEqual(action_probabilities(env.actions(state), env.args), {"S": .5, "E": .5})
+        state = env.step(state, "E", 128)
+        self.assertEqual(state.snapshot_index, 0)
+        self.assertIn("R", env.actions(state))
+        self.assertEqual(self.runner.calls[-1][1], 1)
+
+
+class HindsightTests(unittest.TestCase):
+    def state(self, uid, candidate, prefix=None):
+        o = observation(uid, accepted=None)
+        o.ids[:, 1] = torch.tensor(candidate)
+        return SimpleNamespace(observation=o, prefix=list(prefix or [10, 11, 12]),
+                               submitted=False, emitted=[])
+
+    def test_mismatch_match_and_delayed_cross_round_labels(self):
+        events = []
+        labeler = HindsightLabeler([10, 11, 12], events.append)
+        long = self.state("long", list(range(1, 9)))
+        wrong = self.state("wrong", [1, 2, 99, 4, 5, 6, 7, 8])
+        stopped = self.state("stop", [1, 2, 3, 99, 5, 6, 7, 8])
+        for state in (long, wrong, stopped):
+            labeler.register(state)
+        stopped.submitted = True
+        stopped.observation.accepted = 3
+        stopped.emitted = [1, 2, 3, 4]
+        labeler.after_stop(stopped)
+        self.assertIsNone(long.observation.accepted)
+        self.assertEqual(labeler.records["long"]["lower_bound"], 4)
+        self.assertEqual(wrong.observation.accepted, 2)
+        next_round = self.state("next", list(range(5, 13)), labeler.verified)
+        labeler.register(next_round)
+        next_round.submitted = True
+        next_round.observation.accepted = 8
+        next_round.emitted = list(range(5, 14))
+        labeler.after_stop(next_round)
+        self.assertEqual(long.observation.accepted, 8)
+        self.assertEqual(labeler.finish("test")["unresolved"], 0)
+        self.assertEqual(len(events), 4)
+        with self.assertRaises(ValueError):
+            labeler.register(self.state("badprefix", list(range(8))))
+
+    def test_truncated_reference_and_eos_never_fabricate_labels(self):
+        for reason in ("eos", "max_new_tokens", "max_rounds_per_question"):
+            events = []
+            labeler = HindsightLabeler([10, 11, 12], events.append)
+            pending = self.state("pending", list(range(1, 9)))
+            stopped = self.state("stop", list(range(1, 9)))
+            labeler.register(pending)
+            labeler.register(stopped)
+            stopped.submitted = True
+            stopped.observation.accepted = 8
+            stopped.emitted = [1, 2]
+            labeler.after_stop(stopped)
+            self.assertEqual(stopped.observation.accepted, 8)
+            self.assertIsNone(pending.observation.accepted)
+            coverage = labeler.finish(reason)
+            self.assertEqual(coverage, dict(states=2, exact=1, unresolved=1))
+            self.assertEqual(events[-1]["lower_bound"], 2)
+            self.assertFalse(events[-1]["label_valid"])
+
+    def test_question_isolation_and_direct_consistency(self):
+        labeler = HindsightLabeler([10, 11, 12])
+        state = self.state("s", list(range(1, 9)))
+        labeler.register(state)
+        state.submitted = True
+        state.observation.accepted = 7  # contradictory result: emitted prefix matches all 8
+        state.emitted = list(range(1, 10))
+        with self.assertRaisesRegex(RuntimeError, "disagree"):
+            labeler.after_stop(state)
+        other = HindsightLabeler([10, 11, 12])
+        other.register(self.state("s", list(range(1, 9))))
+        self.assertIsNone(other.records["s"]["observation"].accepted)
 
 
 class ReplayTests(unittest.TestCase):
+    def test_stop_only_root_trains_and_unlabeled_warmup_skips(self):
+        learner = WorldModelLearner(AcceptanceWorldModel(4, 4, 2, dim=16),
+                                    torch.randn(MASK_ID+1, 4), "cpu")
+        buffer = ExperienceReplay()
+        node = observation(accepted=None)
+        buffer.add_node(node)
+        self.assertIsNone(learner.update(buffer, 2))
+        self.assertEqual(learner.updates, 0)
+        node.accepted = 7
+        metrics = learner.update(buffer, 2)
+        self.assertGreater(metrics["current_nll"], 0)
+        self.assertFalse(metrics["dynamics_trained"])
+        self.assertEqual(learner.updates, 1)
+
+    def test_unlabeled_edges_train_latents_not_acceptance(self):
+        learner = WorldModelLearner(AcceptanceWorldModel(4, 4, 2, dim=16),
+                                    torch.randn(MASK_ID+1, 4), "cpu", warmup_updates=0)
+        buffer = ExperienceReplay()
+        buffer.add(observation("a", accepted=None), observation("b", 1, accepted=None), "R")
+        metrics = learner.update(buffer, 2)
+        self.assertEqual(metrics["current_nll"], 0)
+        self.assertEqual(metrics["rollout_nll"], 0)
+        self.assertGreater(metrics["latent_loss"], 0)
+        report = evaluate(learner, buffer)
+        self.assertEqual(report["label_coverage"]["unresolved"], 2)
+        self.assertIsNone(report["current"]["mae"])
+        self.assertEqual(report["rollout"], {})
+
     def test_question_boundary_and_eviction(self):
         buffer = ExperienceReplay(3)
         a, b, c, d = [observation(uid=str(i), index=min(i, 3)) for i in range(4)]
@@ -219,6 +338,7 @@ class FullSmokeTests(unittest.TestCase):
             output = Path(folder) / "run"
             output.mkdir()
             args = settings(output)
+            args.max_rounds_per_question = 2
             writer = ExperienceWriter(output)
             model = AcceptanceWorldModel(4, 4, 2, dim=16, dropout=0)
             learner = WorldModelLearner(model, torch.randn(MASK_ID+1, 4), "cpu",
@@ -230,13 +350,25 @@ class FullSmokeTests(unittest.TestCase):
             self.assertEqual(summary["questions_completed"], 10)
             self.assertGreater(summary["updates"], 0)
             self.assertGreater(summary["parameter_l2_change"], 0)
+            self.assertGreater(summary["dynamics_updates"], 0)
             self.assertEqual(summary["evaluation"]["questions"], ["q8", "q9"])
             records = [json.loads(x) for x in (output / "states.jsonl").read_text().splitlines()]
             edges = [json.loads(x) for x in (output / "edges.jsonl").read_text().splitlines()]
-            self.assertEqual(summary["updates"], sum(e["split"] == "train" for e in edges))
+            self.assertEqual(summary["updates"], 16 + sum(e["split"] == "train" for e in edges))
+            self.assertEqual(env.stats["verifier_calls"], 20)
+            self.assertEqual(len(set(e["parent"] for e in edges)), len(edges))  # no side branches
+            labels = {x["state_id"]: x for x in map(json.loads, (output / "labels.jsonl").read_text().splitlines())}
+            actions = list(map(json.loads, (output / "actions.jsonl").read_text().splitlines()))
+            self.assertEqual(sum(x["action"] == "S" for x in actions), 20)
+            self.assertEqual({x["action"] for x in actions}, {"S", "E", "R"})
             for record in records:
                 with np.load(output / record["shard"], allow_pickle=False) as shard:
                     self.assertEqual(int(shard["lengths"][record["row"]]), record["length"])
+                    label = labels[record["state_id"]]
+                    self.assertEqual(bool(shard["label_valid"][record["row"]]), label["label_valid"])
+                    self.assertEqual(int(shard["accepted"][record["row"]]),
+                                     label["accepted_len"] if label["label_valid"] else -1)
+                    self.assertIsNone(record["accepted_len"])
             package(output, Path(folder) / "result.zip", summary)
             import zipfile
             with zipfile.ZipFile(Path(folder) / "result.zip") as archive:

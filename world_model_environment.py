@@ -100,6 +100,8 @@ class NativeState:
     snapshot_index: int
     emitted: list
     terminal_reason: str | None
+    refine_exhausted: bool = False
+    submitted: bool = False
 
 
 class NativeTrainingEnvironment:
@@ -107,7 +109,8 @@ class NativeTrainingEnvironment:
         self.runner, self.verifier, self.eos_id = runner, verifier, eos_id
         self.hidden_dim, self.args, self.on_state = hidden_dim, args, on_state
         self.counter = 0
-        self.stats = dict(native_calls=0, verifier_calls=0, unavailable_R=0)
+        self.stats = dict(native_calls=0, verifier_calls=0, unavailable_R=0,
+                          executed_S=0, executed_R=0, executed_E=0)
 
     def segment(self, prompt, limit):
         self.stats["native_calls"] += 1
@@ -122,24 +125,21 @@ class NativeTrainingEnvironment:
             prefix, prior, snapshot, None if parent is None else parent.observation,
             self.hidden_dim, self.args.raw_top_k, self.args, index)
         proposal = observation.ids[:, 1].tolist()
-        accepted, _, emitted, verifier_ms = self.verifier.score(prefix, proposal, remaining)
-        self.stats["verifier_calls"] += 1
-        observation.accepted = accepted
         terminal = "candidate_eos" if self.eos_id in proposal else None
         state = NativeState(observation, list(prefix), list(prior), snapshot, index,
-                            list(emitted), terminal)
+                            [], terminal)
         if parent is not None:
             previous = parent.observation
             if action == "E":
                 if proposal[:previous.length] != previous.ids[:, 1].tolist():
                     raise RuntimeError("E failed to commit the parent's STOP candidate")
-                if previous.accepted < previous.length and accepted != previous.accepted:
-                    raise RuntimeError("E changed a fixed accepted prefix; audit verifier determinism")
             elif any(a != MASK_ID and a != b for a, b in
                      zip(previous.ids[:, 0].tolist(), observation.ids[:, 0].tolist())):
                 raise RuntimeError("R changed a committed token")
+        if action in ("R", "E"):
+            self.stats[f"executed_{action}"] += 1
         self.on_state(state, parent, action, dict(native_replay_wall_seconds=wall_seconds,
-            verifier_ms=verifier_ms, timing_is_training_overhead_not_action_cost=True))
+            verifier_ms=None, timing_is_training_overhead_not_action_cost=True))
         return state
 
     def start(self, question, round_id, prefix, remaining):
@@ -149,18 +149,35 @@ class NativeTrainingEnvironment:
                                remaining, None, time.perf_counter()-began)
 
     def actions(self, state):
-        if state.terminal_reason:
+        if state.submitted:
             return []
-        actions = []
-        if (state.snapshot_index < self.args.max_refinement_steps
+        if state.terminal_reason:
+            return ["S"]
+        actions = ["S"]
+        if (not state.refine_exhausted and state.snapshot_index < self.args.max_refinement_steps
                 and bool(state.observation.ids[:, 0].eq(MASK_ID).any())):
             actions.append("R")
         if state.observation.length + self.args.extend_size <= self.args.max_proposal_tokens:
             actions.append("E")
         return actions
 
+    def submit(self, state, remaining):
+        """Only an actual STOP invokes the verifier. No re-encoding of the candidate."""
+        if "S" not in self.actions(state):
+            raise ValueError("State already submitted")
+        accepted, _, emitted, elapsed = self.verifier.score(
+            state.prefix, state.observation.ids[:, 1].tolist(), remaining)
+        if not 0 <= accepted <= state.observation.length or not emitted:
+            raise RuntimeError("Invalid verifier result")
+        self.stats["verifier_calls"] += 1
+        self.stats["executed_S"] += 1
+        state.observation.accepted = int(accepted)
+        state.emitted = list(emitted)
+        state.submitted = True
+        return elapsed
+
     def step(self, state, action, remaining):
-        if action not in self.actions(state):
+        if action not in ("R", "E") or action not in self.actions(state):
             raise ValueError(f"Action {action} is not observable/legal at this state")
         began = time.perf_counter()
         o = state.observation
@@ -180,6 +197,7 @@ class NativeTrainingEnvironment:
                     raise RuntimeError(f"Native predecessor replay drift in {key}; refusing false R edge")
             if len(snapshots) <= state.snapshot_index + 1:
                 self.stats["unavailable_R"] += 1
+                state.refine_exhausted = True
                 return None  # exhaustion is not a zero-yield training label
             index = state.snapshot_index + 1
             snapshot = snapshots[index]
