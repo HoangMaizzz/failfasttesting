@@ -19,7 +19,10 @@ class NativeEosWithoutSnapshot(RuntimeError):
 
     def __init__(self, candidate_token_ids, stats):
         self.candidate_token_ids = list(candidate_token_ids)
-        self.stats = dict(stats)
+        self.stats = {key: stats.get(key) for key in (
+            "stop_reason", "native_termination_reason", "actual_spec_len",
+            "oracle_snapshot_attempts", "oracle_snapshot_skipped_missing_fill",
+            "forward_pass_breakdown")}
         super().__init__(
             "Native Elysia terminated on EOS before exposing a raw snapshot; "
             f"candidate_len={len(self.candidate_token_ids)}, stats={self.stats}"
