@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from world_model_core import Observation
+from native_elysia_graph import NativeEosWithoutSnapshot
 
 MASK_ID = 151665
 
@@ -209,6 +210,15 @@ class NativeTrainingEnvironment:
             prior = o.ids[:, 1].tolist()
             try:
                 snapshots = self.segment(state.prefix + prior, 1)
+            except NativeEosWithoutSnapshot:
+                # EOS is a valid native outcome, but without its same-forward
+                # hidden/top-k snapshot it cannot become a trainable E state.
+                # Keep the parent and let the policy choose another legal action.
+                state.extend_exhausted = True
+                self.stats["unavailable_E"] = self.stats.get("unavailable_E", 0) + 1
+                self.stats["eos_without_snapshot_extend"] = (
+                    self.stats.get("eos_without_snapshot_extend", 0) + 1)
+                return None
             except RuntimeError as error:
                 # Disable only E for this state if native generation exposes no
                 # complete next snapshot; STOP and any legal R remain usable.

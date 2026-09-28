@@ -14,6 +14,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from world_model_core import pack_observations,WorldModelLearner,ExperienceReplay,prefix_log_distribution
 from world_model_probe import ProbeWorldModel
 from world_model_environment import native_observation,NativeTrainingEnvironment,MASK_ID
+from native_elysia_graph import NativeEosWithoutSnapshot
 from pretrain_acceptance_world_model import parse_args,ExperienceWriter,explore_questions,package
 from test_world_model_pretraining import FakeRunner,FakeVerifier,FakeTokenizer,snap
 
@@ -91,6 +92,22 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("E",env.actions(state))
         self.assertIn("S",env.actions(state))
         self.assertEqual(env.stats["unavailable_E"],1)
+
+    def test_native_eos_without_snapshot_disables_only_E(self):
+        class EosUnavailableRunner(FakeRunner):
+            def segment(self,prompt,max_snapshots):
+                if self.calls:
+                    self.calls.append((list(prompt),max_snapshots))
+                    raise NativeEosWithoutSnapshot([151645],{"native_termination_reason":"eos"})
+                return super().segment(prompt,max_snapshots)
+        args=settings(); env=NativeTrainingEnvironment(EosUnavailableRunner(),
+            FakeVerifier(),0,4,args,lambda *args:None)
+        state=env.start("q",0,[10,11,12],65)
+        self.assertIn("E",env.actions(state))
+        self.assertIsNone(env.step(state,"E",65))
+        self.assertNotIn("E",env.actions(state))
+        self.assertIn("S",env.actions(state))
+        self.assertEqual(env.stats["eos_without_snapshot_extend"],1)
 
     def test_region_loss_not_dominated_by_old_slots(self):
         errors=torch.cat([torch.zeros(1,56),torch.ones(1,8)],1)
