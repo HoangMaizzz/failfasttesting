@@ -193,6 +193,10 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(summary["episodes_completed"],20)
             self.assertEqual(env.stats["verifier_calls"],40)
             self.assertEqual(summary["evaluation"]["questions"],["q8","q9"])
+            self.assertIn("8",summary["evaluation"]["current_by_proposal_length"])
+            self.assertTrue(summary["evaluation"]["current_by_question"])
+            self.assertTrue(summary["evaluation"]["rollout_by_horizon_and_action"])
+            self.assertIsNotNone(summary["evaluation"]["current"]["train_mean_baseline_mae"])
             predictions=[json.loads(x) for x in (output/"online_predictions.jsonl").read_text().splitlines()]
             holdout=[r for r in predictions if r["split"]=="validation"]
             self.assertEqual(len({r["updates"] for r in holdout}),1)

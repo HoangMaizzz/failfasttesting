@@ -1,16 +1,16 @@
-"""One-cell, no-input-ZIP, 10-question dual-latent GSM8K training smoke."""
+"""One-cell, no-input-ZIP, 40-question dual-latent GSM8K generalization probe."""
 from urllib.request import urlopen
 
 MODEL_ARCHITECTURE = "token_dual"
 SOURCE_REF = globals().get("SOURCE_REF","codex/sparse-extend-world-model")
-NUM_QUESTIONS = int(globals().get("NUM_QUESTIONS",10))
-VALIDATION_QUESTIONS = int(globals().get("VALIDATION_QUESTIONS",2))
+NUM_QUESTIONS = int(globals().get("NUM_QUESTIONS",40))
+VALIDATION_QUESTIONS = int(globals().get("VALIDATION_QUESTIONS",8))
 DATASET = "gsm8k"
-EPISODES_PER_QUESTION = int(globals().get("EPISODES_PER_QUESTION",2))
+EPISODES_PER_QUESTION = int(globals().get("EPISODES_PER_QUESTION",1))
 MAX_ROUNDS_PER_QUESTION = int(globals().get("MAX_ROUNDS_PER_QUESTION",0))
 MAX_NEW_TOKENS = int(globals().get("MAX_NEW_TOKENS",0))
 MAX_CONTEXT_TOKENS = int(globals().get("MAX_CONTEXT_TOKENS",4096))
-UPDATES_PER_TRANSITION = int(globals().get("UPDATES_PER_TRANSITION",4))
+UPDATES_PER_TRANSITION = int(globals().get("UPDATES_PER_TRANSITION",1))
 LATENT_DIM = int(globals().get("LATENT_DIM",128))
 STOP_WEIGHT = float(globals().get("STOP_WEIGHT",1.0))
 EXTEND_WEIGHT = float(globals().get("EXTEND_WEIGHT",1.0))

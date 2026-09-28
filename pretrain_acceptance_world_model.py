@@ -148,11 +148,15 @@ def checkpoint(learner, replay, args, output, exploration_rng=None):
 
 
 @torch.no_grad()
-def evaluate(learner, replay, horizon=3, output=None):
+def evaluate(learner, replay, horizon=3, output=None, baseline_replay=None):
     if not replay.nodes:
         return dict(status="no_holdout_observations")
     learner.model.eval()
     totals = defaultdict(lambda: [0.0, 0.0, 0.0])
+    current_by_length = defaultdict(lambda: dict(n=0, absolute_error=0.0, exact=0, zero_baseline_error=0.0))
+    current_by_question = defaultdict(lambda: dict(n=0, absolute_error=0.0, exact=0))
+    current_labels = []
+    current_labels_by_length = defaultdict(list)
     latent_globals = []
     nodes = list(replay.nodes.values())
     exact = 0
@@ -170,6 +174,21 @@ def evaluate(learner, replay, horizon=3, output=None):
         totals["current"][1] += float((predicted[known]-batch["labels"][known]).abs().sum())
         totals["current"][2] += float(acceptance_nll(logits, state.lengths, batch["labels"])) * count
         exact += int((mode[known] == batch["labels"][known]).sum())
+        for j, o in enumerate(nodes[begin:begin+8]):
+            if o.accepted is None:
+                continue
+            error = abs(float(predicted[j])-o.accepted)
+            length_group = current_by_length[o.length]
+            length_group["n"] += 1
+            length_group["absolute_error"] += error
+            length_group["exact"] += int(int(mode[j]) == o.accepted)
+            length_group["zero_baseline_error"] += o.accepted
+            question_group = current_by_question[o.question]
+            question_group["n"] += 1
+            question_group["absolute_error"] += error
+            question_group["exact"] += int(int(mode[j]) == o.accepted)
+            current_labels.append(o.accepted)
+            current_labels_by_length[o.length].append(o.accepted)
         if output is not None:
             for j,o in enumerate(nodes[begin:begin+8]):
                 append_json(output/"validation_predictions.jsonl",dict(state_id=o.uid,kind="current",
@@ -179,6 +198,7 @@ def evaluate(learner, replay, horizon=3, output=None):
     for p, c, a in replay.edges:
         outgoing[p].append((c, a))
     rollout_results = defaultdict(lambda: dict(n=0, absolute_error=0.0, baseline_error=0.0, gain_edges=0))
+    rollout_by_action = defaultdict(lambda: dict(n=0, absolute_error=0.0, baseline_error=0.0, exact=0, gains=0))
     one_step_groups = defaultdict(lambda: dict(n=0, absolute_error=0.0))
     # Every real first edge is represented once. Longer paths choose a stable child,
     # not the child with the best oracle yield. No training on held-out questions.
@@ -204,6 +224,12 @@ def evaluate(learner, replay, horizon=3, output=None):
                 record["gain_edges"] += int(first_label is not None and label > first_label)
                 record.setdefault("gain_comparable_paths", 0)
                 record["gain_comparable_paths"] += int(first_label is not None)
+                action_record = rollout_by_action[f"h{depth}_{action}"]
+                action_record["n"] += 1
+                action_record["absolute_error"] += abs(prediction-label)
+                action_record["baseline_error"] += abs(baseline-label)
+                action_record["exact"] += int(mode == label)
+                action_record["gains"] += int(first_label is not None and label > first_label)
             if output is not None:
                 row=dict(kind="rollout",source=parent,state_id=child,depth=depth,action=action,
                          K=label,predicted_K=mode,expected_K=prediction)
@@ -223,11 +249,33 @@ def evaluate(learner, replay, horizon=3, output=None):
                 break
             child, action = children[0]
     current = totals["current"]
+    train_labels = ([] if baseline_replay is None else
+        [o.accepted for o in baseline_replay.nodes.values() if o.accepted is not None])
+    train_mean = sum(train_labels)/len(train_labels) if train_labels else None
+    train_median = float(torch.tensor(train_labels,dtype=torch.float32).median()) if train_labels else None
+    train_by_length = defaultdict(list)
+    if baseline_replay is not None:
+        for observation in baseline_replay.nodes.values():
+            if observation.accepted is not None:
+                train_by_length[observation.length].append(observation.accepted)
     return dict(status="evaluated", questions=sorted({o.question for o in nodes}),
         label_coverage=dict(total=len(nodes), exact=int(current[0]), unresolved=len(nodes)-int(current[0])),
         current=dict(n=int(current[0]), mae=current[1]/current[0] if current[0] else None,
                      nll=current[2]/current[0] if current[0] else None,
-                     exact_K=exact/current[0] if current[0] else None),
+                     exact_K=exact/current[0] if current[0] else None,
+                     train_mean_baseline_mae=(sum(abs(x-train_mean) for x in current_labels)/len(current_labels)
+                         if current_labels and train_mean is not None else None),
+                     train_median_baseline_mae=(sum(abs(x-train_median) for x in current_labels)/len(current_labels)
+                         if current_labels and train_median is not None else None)),
+        current_by_proposal_length={str(key): dict(n=value["n"],
+            mae=value["absolute_error"]/value["n"], exact_K=value["exact"]/value["n"],
+            always_zero_MAE=value["zero_baseline_error"]/value["n"],
+            train_mean_baseline_MAE=(sum(abs(x-sum(train_by_length[key])/len(train_by_length[key]))
+                for x in current_labels_by_length[key])/value["n"] if train_by_length.get(key) else None))
+            for key,value in sorted(current_by_length.items()) if value["n"]},
+        current_by_question={key: dict(n=value["n"],mae=value["absolute_error"]/value["n"],
+            exact_K=value["exact"]/value["n"])
+            for key,value in sorted(current_by_question.items()) if value["n"]},
         global_latent_std_mean=float(torch.cat(latent_globals).std(dim=0, unbiased=False).mean()),
         one_step_by_action_and_change={key: dict(n=v["n"], mae=v["absolute_error"]/v["n"])
                                       for key, v in one_step_groups.items()},
@@ -236,7 +284,13 @@ def evaluate(learner, replay, horizon=3, output=None):
             unchanged_prediction_baseline_mae=value["baseline_error"]/value["n"],
             true_gain_paths=value["gain_edges"], gain_comparable_paths=value["gain_comparable_paths"])
             for key, value in rollout_results.items()},
-        warning="10-question smoke checks the pipeline, not generalization or controller quality")
+        rollout_by_horizon_and_action={key:dict(n=value["n"],
+            mae=value["absolute_error"]/value["n"],
+            unchanged_prediction_baseline_mae=value["baseline_error"]/value["n"],
+            exact_K=value["exact"]/value["n"],
+            true_gain_rate=value["gains"]/value["n"])
+            for key,value in sorted(rollout_by_action.items()) if value["n"]},
+        warning="Small-question probe checks learning and rollout signals, not controller quality")
 
 
 def action_probabilities(actions, args):
@@ -378,7 +432,8 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
             if shutil.disk_usage(args.output_dir).free < 1024**3:
                 raise OSError("Less than 1 GiB free; stop before corrupting artifacts")
         summary["evaluation"] = evaluate(learner, validation_replay, args.horizon,
-                                          args.output_dir if getattr(args,"model_architecture","legacy")=="token_dual" else None)
+            args.output_dir if getattr(args,"model_architecture","legacy")=="token_dual" else None,
+            baseline_replay=train_replay)
         delta = sum(float((p.detach().cpu()-initial[n]).square().sum())
                     for n, p in learner.model.named_parameters()) ** 0.5
         summary["parameter_l2_change"] = delta

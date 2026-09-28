@@ -27,6 +27,7 @@ MODEL_ARCHITECTURE = globals().get("MODEL_ARCHITECTURE", "legacy")
 EPISODES_PER_QUESTION = int(globals().get("EPISODES_PER_QUESTION", 1))
 UPDATES_PER_TRANSITION = int(globals().get("UPDATES_PER_TRANSITION", 1))
 LATENT_DIM = int(globals().get("LATENT_DIM", 128))
+REPLAY_STATES = int(globals().get("REPLAY_STATES", 4096))
 
 working = Path("/kaggle/working")
 temporary = Path("/kaggle/temp")
@@ -104,6 +105,7 @@ command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"
     "--validation_questions", str(VALIDATION_QUESTIONS),
     "--model_architecture",MODEL_ARCHITECTURE,"--episodes_per_question",str(EPISODES_PER_QUESTION),
     "--updates_per_transition",str(UPDATES_PER_TRANSITION),"--latent_dim",str(LATENT_DIM),
+    "--replay_states",str(REPLAY_STATES),
     "--max_rounds_per_question", str(MAX_ROUNDS_PER_QUESTION),
     "--max_new_tokens", str(MAX_NEW_TOKENS), "--max_proposal_tokens", "64",
     "--max_context_tokens",str(MAX_CONTEXT_TOKENS),
@@ -121,7 +123,7 @@ print("No pre-collected ZIP needed. Generation stops on verified EOS; "
       f"round cap={MAX_ROUNDS_PER_QUESTION or 'none'}, answer token cap={MAX_NEW_TOKENS or 'none'}.", flush=True)
 print(f"Context safety guard={MAX_CONTEXT_TOKENS}; hitting it before EOS in uncapped mode is a PARTIAL run, not success.",flush=True)
 print("Random legal S/E/R; E includes first unmask, max 3 extra R. Only S calls verifier.", flush=True)
-print(f"Architecture={MODEL_ARCHITECTURE}; episodes/question={EPISODES_PER_QUESTION}; updates/transition={UPDATES_PER_TRANSITION}",flush=True)
+print(f"Architecture={MODEL_ARCHITECTURE}; episodes/question={EPISODES_PER_QUESTION}; updates/transition={UPDATES_PER_TRANSITION}; replay capacity={REPLAY_STATES}",flush=True)
 completed = subprocess.run(command, cwd=repo, env=environment, check=False)
 archive = output.with_suffix(".zip")
 if archive.is_file():
