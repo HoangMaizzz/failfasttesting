@@ -23,54 +23,84 @@ class NativeElysiaRunner:
     def segment(self, prompt, max_snapshots=None):
         """Return every native boundary of the next eight-token segment."""
         args = self.args
-        call_args = SimpleNamespace(
-            target_tokenizer=self.tokenizer,
-            full_refinement_oracle=True,
-            raw_top_k=args.raw_top_k,
-            collect_bucket_oracle=True,
-            bucket_oracle_force_continue=True,
-            frontier_stop_mode="disabled",
-            adaptive_td=False,
-            adaptive_freeze=False,
-            global_oracle_graph=False,
-            strict_greedy_local_oracle=False,
-            bucket_acceptance_calibration={},
-            bucket_min_observations=8,
-            bucket_prior_strength=8.0,
-            bucket_gain_calibration={
-                "length_score_masks": {}, "score_masks": {}, "length_score": {},
-                "score": {}, "step": {}, "global": [0.0, 0],
-            },
-            bucket_current_context_len=len(prompt),
-            collector_parent_native_length=0,
-            collector_parent_fill_tokens=[],
-            collector_max_oracle_snapshots=(args.max_refinement_steps + 1
-                if max_snapshots is None else int(max_snapshots)),
-        )
+        snapshot_limit = (args.max_refinement_steps + 1
+            if max_snapshots is None else int(max_snapshots))
+        base_pass_limit = args.extend_size + args.max_refinement_steps
+        # A segment beginning near a physical-block boundary can need several
+        # bridge forwards before all positions in its first logical proposal
+        # have same-forward predictions. Reserve one complete physical-block
+        # worth of extra forwards for a retry if the first attempt observes no
+        # usable boundary.
+        retry_pass_limit = base_pass_limit + max(
+            1, (args.physical_block_size + args.small_block_size - 1)
+            // args.small_block_size)
+
+        def run_generator(pass_limit):
+            call_args = SimpleNamespace(
+                target_tokenizer=self.tokenizer,
+                full_refinement_oracle=True,
+                raw_top_k=args.raw_top_k,
+                collect_bucket_oracle=True,
+                bucket_oracle_force_continue=True,
+                frontier_stop_mode="disabled",
+                adaptive_td=False,
+                adaptive_freeze=False,
+                global_oracle_graph=False,
+                strict_greedy_local_oracle=False,
+                bucket_acceptance_calibration={},
+                bucket_min_observations=8,
+                bucket_prior_strength=8.0,
+                bucket_gain_calibration={
+                    "length_score_masks": {}, "score_masks": {}, "length_score": {},
+                    "score": {}, "step": {}, "global": [0.0, 0],
+                },
+                bucket_current_context_len=len(prompt),
+                collector_parent_native_length=0,
+                collector_parent_fill_tokens=[],
+                collector_max_oracle_snapshots=snapshot_limit,
+            )
+            return self.model.generate_draft_tokens_arbitrary_length(
+                inputs,
+                max_new_tokens=3 * args.physical_block_size,
+                small_block_size=args.small_block_size,
+                block_size=args.physical_block_size,
+                threshold=args.drafter_threshold,
+                do_sample=False, temperature=0.0, top_p=1.0, top_k=0.0,
+                # Match the failfast.py production call: prefix KV, but no mutable
+                # block cache (use_block_cache is not passed there).
+                is_drafter=True, spec_len=args.extend_size,
+                return_prefill_kvs=True, prev_prefill_output=None,
+                args=call_args, lowconf_threshold=0.0,
+                max_spec_len=args.extend_size, incr_len=args.extend_size,
+                last_round_rejected=None, return_frontier_stats=True,
+                max_denoising_passes=pass_limit,
+            )
+
         inputs = torch.tensor([prompt], dtype=torch.long, device=self.device)
-        result = self.model.generate_draft_tokens_arbitrary_length(
-            inputs,
-            max_new_tokens=3 * args.physical_block_size,
-            small_block_size=args.small_block_size,
-            block_size=args.physical_block_size,
-            threshold=args.drafter_threshold,
-            do_sample=False, temperature=0.0, top_p=1.0, top_k=0.0,
-            # Match the failfast.py production call: prefix KV, but no mutable
-            # block cache (use_block_cache is not passed there).
-            is_drafter=True, spec_len=args.extend_size,
-            return_prefill_kvs=True, prev_prefill_output=None,
-            args=call_args, lowconf_threshold=0.0,
-            max_spec_len=args.extend_size, incr_len=args.extend_size,
-            last_round_rejected=None, return_frontier_stats=True,
-            # A draft crossing a physical block may need bridge forwards before
-            # its first complete same-forward STOP candidate is observable.
-            max_denoising_passes=args.extend_size + args.max_refinement_steps,
-        )
+        result = run_generator(base_pass_limit)
         stats = result[-1]
         snapshots = sorted(stats.get("oracle_refinement_snapshots", []),
                            key=lambda x: int(x["unmask_forward_index"]))
         if not snapshots:
-            raise RuntimeError("Native Elysia generator returned no oracle refinement snapshots")
+            first_attempt = stats
+            result = run_generator(retry_pass_limit)
+            stats = result[-1]
+            snapshots = sorted(stats.get("oracle_refinement_snapshots", []),
+                               key=lambda x: int(x["unmask_forward_index"]))
+            if not snapshots:
+                def brief(value):
+                    return {key: value.get(key) for key in (
+                        "stop_reason", "native_termination_reason",
+                        "actual_spec_len", "oracle_snapshot_attempts",
+                        "oracle_snapshot_skipped_missing_fill",
+                        "collector_pass_limit_reached", "collector_pass_limit",
+                        "forward_pass_breakdown")}
+                raise RuntimeError(
+                    "Native Elysia generator returned no oracle refinement snapshots "
+                    f"after retry (prefix_len={len(prompt)}, base_pass_limit={base_pass_limit}, "
+                    f"retry_pass_limit={retry_pass_limit}, first_stats={brief(first_attempt)}, "
+                    f"retry_stats={brief(stats)})"
+                )
         previous = None
         previous_forward = None
         for snap in snapshots:

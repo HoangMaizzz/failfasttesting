@@ -212,7 +212,9 @@ class NativeTrainingEnvironment:
             except RuntimeError as error:
                 # Disable only E for this state if native generation exposes no
                 # complete next snapshot; STOP and any legal R remain usable.
-                if str(error) != "Native Elysia generator returned no oracle refinement snapshots":
+                if not str(error).startswith(
+                    "Native Elysia generator returned no oracle refinement snapshots"
+                ):
                     raise
                 state.extend_exhausted = True
                 self.stats["unavailable_E"] = self.stats.get("unavailable_E", 0) + 1

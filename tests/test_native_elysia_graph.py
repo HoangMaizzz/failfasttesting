@@ -116,6 +116,26 @@ class NativeGraphTests(unittest.TestCase):
         rows = NativeElysiaRunner(model, SimpleNamespace(), args).segment([11] * 29)
         self.assertEqual(rows[0]['unmask_forward_index'], 2)
 
+    def test_missing_first_boundary_retries_with_physical_block_bridge_budget(self):
+        model = FakeNativeModel()
+        limits = []
+
+        def retry_once(inputs, **kwargs):
+            limits.append(kwargs['max_denoising_passes'])
+            snapshots = [] if len(limits) == 1 else [snapshot(1)]
+            return None, None, None, None, None, dict(
+                oracle_refinement_snapshots=snapshots,
+                oracle_snapshot_attempts=0 if not snapshots else 1,
+            )
+
+        model.generate_draft_tokens_arbitrary_length = retry_once
+        args = SimpleNamespace(raw_top_k=32, physical_block_size=32,
+            small_block_size=8, extend_size=8, drafter_threshold=0.5,
+            max_refinement_steps=3)
+        rows = NativeElysiaRunner(model, SimpleNamespace(), args).segment([11] * 29)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(limits, [11, 15])
+
     def test_native_forward_can_leave_proposal_mask_unchanged(self):
         model = FakeNativeModel()
         unchanged = dict(snapshot(1), unmask_forward_index=2,
