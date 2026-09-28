@@ -84,6 +84,13 @@ class FakeTokenizer:
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_pretraining_defaults_to_sharded_fp16_verifier(self):
+        args = parse_args(["--dllm_dir", "unused", "--output_dir", "unused",
+                           "--dataset", "math", "--num_questions", "10",
+                           "--validation_questions", "2"])
+        self.assertEqual(args.target_placement, "auto")
+        self.assertEqual(args.target_gpu_memory_gib, 8)
+
     def test_distribution_padding_normalization_and_boundaries(self):
         logits = torch.zeros(3, 8, requires_grad=True)
         lengths = torch.tensor([1, 4, 8])

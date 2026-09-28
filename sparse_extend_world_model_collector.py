@@ -201,7 +201,7 @@ def _load_models(args):
     placement = ({"device_map": {"": args.target_device}} if single_target else {
         "device_map": "auto",
         "max_memory": {
-            **{gpu: f"{getattr(args, 'target_gpu_memory_gib', 9)}GiB"
+            **{gpu: f"{getattr(args, 'target_gpu_memory_gib', 8)}GiB"
                for gpu in range(torch.cuda.device_count())}, "cpu": "32GiB"},
     })
     target = AutoModelForCausalLM.from_pretrained(

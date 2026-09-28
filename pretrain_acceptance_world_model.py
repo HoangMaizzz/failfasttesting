@@ -540,8 +540,14 @@ def run(args):
             drafter_revision=getattr(drafter.config, "_commit_hash", None))
         target.eval().requires_grad_(False)
         drafter.eval().requires_grad_(False)
-        if {str(p.device) for p in target.parameters()} != {f"cuda:{args.target_device}"}:
-            raise RuntimeError("Verifier was not placed exclusively on its requested GPU")
+        target_devices = {str(p.device) for p in target.parameters()}
+        expected_target_devices = {f"cuda:{args.target_device}", f"cuda:{args.drafter_device}"}
+        if not target_devices.issubset(expected_target_devices):
+            raise RuntimeError(f"Verifier was placed on unexpected devices: {sorted(target_devices)}")
+        if len(target_devices) < 2:
+            raise RuntimeError(
+                "Memory-optimized run expected the FP16 verifier to be sharded across both GPUs; "
+                f"actual devices: {sorted(target_devices)}")
         if {str(p.device) for p in drafter.parameters()} != {f"cuda:{args.drafter_device}"}:
             raise RuntimeError("Drafter was not placed exclusively on its requested GPU")
         table = drafter.get_input_embeddings().weight.detach()
@@ -575,6 +581,9 @@ def run(args):
         summary["prototype_limits"] = "No verifier-prefix hidden memory; prefix memory uses frozen token embeddings; no raw verifier-hidden distillation"
         summary["devices"] = dict(verifier=f"cuda:{args.target_device}",
             drafter=f"cuda:{args.drafter_device}", world_model=f"cuda:{args.drafter_device}")
+        summary["verifier_devices"] = sorted(target_devices)
+        summary["verifier_device_map"] = getattr(target, "hf_device_map", {})
+        summary["verifier_memory_mode"] = "FP16 model sharded across both GPUs; 8 GiB placement cap per GPU"
         explore_questions(args, questions, tokenizer, environment, learner, writer, summary)
         summary["status"] = "complete"
     except BaseException as error:
@@ -617,6 +626,8 @@ def parse_args(argv=None):
     parser.add_argument("--target_model_name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--target_device", type=int, default=0)
     parser.add_argument("--drafter_device", type=int, default=1)
+    parser.add_argument("--target_gpu_memory_gib", type=int, default=8,
+                        help="Maximum verifier weight placement per GPU when sharding")
     parser.add_argument("--dllm_dir", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -637,11 +648,13 @@ def parse_args(argv=None):
     if args.model_architecture=="token_dual" and args.latent_dim%8:
         parser.error("Dual latent dimension must be divisible by 8")
     args.capture_verifier_teacher = args.model_architecture=="token_dual"
-    args.target_placement = "single"
+    args.target_placement = "auto"
     if not 0 < args.validation_questions < args.num_questions:
         parser.error("Need both training and validation questions")
     if args.target_device == args.drafter_device:
         parser.error("Drafter and verifier must be on distinct GPUs")
+    if args.target_gpu_memory_gib < 1:
+        parser.error("target_gpu_memory_gib must be positive")
     for key in ("num_questions", "episodes_per_question", "max_context_tokens",
                 "extend_size", "batch_sequences", "horizon", "updates_per_transition", "raw_top_k",
                 "physical_block_size", "small_block_size", "latent_dim"):

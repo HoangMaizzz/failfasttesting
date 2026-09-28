@@ -403,7 +403,16 @@ class FullContextVerifier:
     def __init__(self, model, tokenizer, args):
         self.model, self.tokenizer, self.args = model.eval(), tokenizer, args
         self.device = model.get_input_embeddings().weight.device
+        self.cuda_devices = sorted({p.device for p in model.parameters()
+                                    if p.device.type == "cuda"}, key=str)
         self.records = []
+
+    def _sync_model_devices(self):
+        # A sharded verifier may finish its last layers on another GPU than the
+        # input embedding device. Synchronize all participating cards so timing
+        # includes the complete forward and cross-device transfers.
+        for device in self.cuda_devices:
+            torch.cuda.synchronize(device)
 
     def prepare(self, prefix):
         model_key = dict(name=self.args.target_model_name,
@@ -422,11 +431,11 @@ class FullContextVerifier:
         ids = torch.tensor([list(prefix) + list(proposal)], dtype=torch.long,
                            device=self.device)
         attention_mask = torch.ones_like(ids)
-        sync(self.device)
+        self._sync_model_devices()
         began = time.perf_counter()
         outputs = self.model(input_ids=ids, attention_mask=attention_mask,
                              use_cache=False, logits_to_keep=len(proposal) + 1)
-        sync(self.device)
+        self._sync_model_devices()
         elapsed_ms = (time.perf_counter() - began) * 1000
         predictions = outputs.logits[0].argmax(dim=-1)
         if predictions.numel() != len(proposal) + 1:

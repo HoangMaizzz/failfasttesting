@@ -114,11 +114,13 @@ command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"
     "--refine_weight", str(REFINE_WEIGHT),
     "--target_model_name", "Qwen/Qwen2.5-7B-Instruct",
     "--target_device", "0", "--drafter_device", "1",
+    "--target_gpu_memory_gib", "8",
     "--dllm_dir", str(dllm), "--output_dir", str(output)]
 if MODEL_ARCHITECTURE=="token_dual":
     command += ["--package_every_question","--warmup_updates","16","--horizon_warmup_updates","64"]
 print("Running:", " ".join(command), flush=True)
-print("Split: verifier FP16 -> GPU 0; dLLM FP16 + trainable world model -> GPU 1", flush=True)
+print("Memory layout: verifier FP16 sharded across GPU 0+1 (8 GiB placement cap/card); "
+      "dLLM FP16 + world model also on GPU 1", flush=True)
 print("No pre-collected ZIP needed. Generation stops on verified EOS; "
       f"round cap={MAX_ROUNDS_PER_QUESTION or 'none'}, answer token cap={MAX_NEW_TOKENS or 'none'}.", flush=True)
 print(f"Context safety guard={MAX_CONTEXT_TOKENS}; hitting it before EOS in uncapped mode is a PARTIAL run, not success.",flush=True)
