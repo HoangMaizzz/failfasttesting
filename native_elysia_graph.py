@@ -14,6 +14,18 @@ from sparse_extend_world_model_collector import MASK_ID
 from structured_sparse_collector import GraphCollector, choose_children
 
 
+class NativeEosWithoutSnapshot(RuntimeError):
+    """The native drafter emitted EOS before exposing a feature snapshot."""
+
+    def __init__(self, candidate_token_ids, stats):
+        self.candidate_token_ids = list(candidate_token_ids)
+        self.stats = dict(stats)
+        super().__init__(
+            "Native Elysia terminated on EOS before exposing a raw snapshot; "
+            f"candidate_len={len(self.candidate_token_ids)}, stats={self.stats}"
+        )
+
+
 class NativeElysiaRunner:
     def __init__(self, model, tokenizer, args):
         self.model, self.tokenizer, self.args = model.eval(), tokenizer, args
@@ -83,6 +95,12 @@ class NativeElysiaRunner:
                            key=lambda x: int(x["unmask_forward_index"]))
         if not snapshots:
             first_attempt = stats
+            if first_attempt.get("native_termination_reason") == "eos":
+                generated = result[0][0, len(prompt):].detach().cpu().tolist()
+                eos_id = self.tokenizer.eos_token_id
+                if eos_id in generated:
+                    eos_pos = generated.index(eos_id)
+                    raise NativeEosWithoutSnapshot(generated[:eos_pos + 1], first_attempt)
             result = run_generator(retry_pass_limit)
             stats = result[-1]
             snapshots = sorted(stats.get("oracle_refinement_snapshots", []),
@@ -95,6 +113,12 @@ class NativeElysiaRunner:
                         "oracle_snapshot_skipped_missing_fill",
                         "collector_pass_limit_reached", "collector_pass_limit",
                         "forward_pass_breakdown")}
+                if stats.get("native_termination_reason") == "eos":
+                    generated = result[0][0, len(prompt):].detach().cpu().tolist()
+                    eos_id = self.tokenizer.eos_token_id
+                    if eos_id in generated:
+                        eos_pos = generated.index(eos_id)
+                        raise NativeEosWithoutSnapshot(generated[:eos_pos + 1], brief(stats))
                 raise RuntimeError(
                     "Native Elysia generator returned no oracle refinement snapshots "
                     f"after retry (prefix_len={len(prompt)}, base_pass_limit={base_pass_limit}, "

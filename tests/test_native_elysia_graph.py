@@ -12,7 +12,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from native_elysia_graph import NativeElysiaGraphCollector, NativeElysiaRunner
+from native_elysia_graph import (NativeElysiaGraphCollector, NativeElysiaRunner,
+                                 NativeEosWithoutSnapshot)
 from structured_sparse_collector import collect, identity
 from sparse_extend_world_model_collector import MASK_ID
 
@@ -135,6 +136,20 @@ class NativeGraphTests(unittest.TestCase):
         rows = NativeElysiaRunner(model, SimpleNamespace(), args).segment([11] * 29)
         self.assertEqual(len(rows), 1)
         self.assertEqual(limits, [11, 15])
+
+    def test_eos_before_snapshot_returns_actual_terminal_proposal(self):
+        model = FakeNativeModel()
+        model.generate_draft_tokens_arbitrary_length = lambda inputs, **kwargs: (
+            torch.tensor([[11, 12, 13, 42, 151645]], device=inputs.device),
+            8, None, 1, [1.0], dict(oracle_refinement_snapshots=[],
+                native_termination_reason='eos', oracle_snapshot_attempts=0))
+        args = SimpleNamespace(raw_top_k=32, physical_block_size=32,
+            small_block_size=8, extend_size=8, drafter_threshold=0.5,
+            max_refinement_steps=3)
+        tokenizer = SimpleNamespace(eos_token_id=151645)
+        with self.assertRaises(NativeEosWithoutSnapshot) as raised:
+            NativeElysiaRunner(model, tokenizer, args).segment([11, 12, 13], 1)
+        self.assertEqual(raised.exception.candidate_token_ids, [42, 151645])
 
     def test_native_forward_can_leave_proposal_mask_unchanged(self):
         model = FakeNativeModel()

@@ -23,6 +23,7 @@ import torch
 from world_model_core import (AcceptanceWorldModel, ExperienceReplay, WorldModelLearner,
     acceptance_nll, expected_acceptance, pack_observations, prefix_log_distribution)
 from world_model_environment import NativeTrainingEnvironment
+from native_elysia_graph import NativeEosWithoutSnapshot
 from world_model_hindsight import HindsightLabeler
 
 
@@ -373,7 +374,38 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 if remaining <= 0 or len(prefix) > args.max_context_tokens:
                     end_reason = "max_new_tokens" if remaining <= 0 else "max_context_tokens"
                     break
-                state = environment.start(question_id, round_id, prefix, remaining)
+                try:
+                    state = environment.start(question_id, round_id, prefix, remaining)
+                except NativeEosWithoutSnapshot as terminal:
+                    # Native Elysia can predict EOS before the raw-snapshot hook
+                    # fires. Preserve the actual EOS proposal and obtain its real
+                    # verifier outcome, but do not invent hidden/top-k features.
+                    accepted, _, emitted, verifier_ms = environment.verifier.score(
+                        prefix, terminal.candidate_token_ids, remaining)
+                    environment.stats["verifier_calls"] += 1
+                    environment.stats["native_eos_without_snapshot"] = (
+                        environment.stats.get("native_eos_without_snapshot", 0) + 1)
+                    append_json(args.output_dir / "native_eos_without_snapshot.jsonl", dict(
+                        question=question_id, round_id=round_id, split=split,
+                        proposal_token_ids=terminal.candidate_token_ids,
+                        verifier_accepted_len=accepted, emitted_token_ids=emitted,
+                        verifier_ms=verifier_ms, native_stats=terminal.stats,
+                        feature_snapshot_available=False,
+                        excluded_from_world_model_state_training=True))
+                    append_json(args.output_dir / "actions.jsonl", dict(
+                        state_id=None, question=question_id, round_id=round_id,
+                        split=split, action="forced_stop_native_eos",
+                        executed=True, child_state_id=None,
+                        feature_snapshot_available=False))
+                    prefix += emitted
+                    generated += emitted
+                    print(f"[native-eos-stop] {question_id} proposal="
+                          f"{terminal.candidate_token_ids} accepted={accepted} "
+                          f"emitted={len(emitted)}", flush=True)
+                    if environment.eos_id in emitted:
+                        end_reason = "eos"
+                        break
+                    continue
                 while True:
                     actions = environment.actions(state)
                     probabilities = action_probabilities(actions, args)
