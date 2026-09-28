@@ -1,5 +1,10 @@
 # Interactive world-model pretraining (Kaggle T4 x2)
 
+The newer dual-latent probe launcher is documented in [PROBE_PRETRAINING.md](PROBE_PRETRAINING.md).
+It reuses this pipeline but defaults to verified-EOS completion (no round or
+answer-token cap), a 64-token proposal cap, and at most 3 extra R per segment.
+The bounded defaults described below apply only to the legacy launcher.
+
 This is **interact → real verifier labels → replay minibatches → gradient update**,
 not a launcher for collecting an entire dataset before training. No old ZIP input
 is required. Exploration is a fixed random S/E/R mixture, not an actor/RL algorithm

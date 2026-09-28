@@ -22,6 +22,10 @@ class Observation:
     scalars: torch.Tensor         # CPU fp32 [L, 16], explicit validity/provenance
     context: torch.Tensor         # CPU fp32 [8], no verifier-derived information
     accepted: int | None = None   # target ONLY
+    prefix_ids: torch.Tensor | None = None
+    topk_ids: torch.Tensor | None = None
+    history: torch.Tensor | None = None
+    teacher_margin: torch.Tensor | None = None  # target ONLY; never encoder input
 
     @property
     def length(self):
@@ -167,6 +171,9 @@ class AcceptanceWorldModel(nn.Module):
         global_rows = state.global_state[:, None].expand(-1, state.tokens.shape[1], -1)
         return self.head(torch.cat([state.tokens, global_rows], dim=-1)).squeeze(-1)
 
+    def transition(self, state, actions, extension_size):
+        return self.dynamics(state, actions, extension_size)
+
 
 def pack_observations(observations, token_table, device):
     """The verifier label is deliberately separated from all encoder features."""
@@ -181,12 +188,34 @@ def pack_observations(observations, token_table, device):
     ids = stack("ids").long()
     with torch.no_grad():
         vectors = F.embedding(ids.to(token_table.device), token_table).to(device).float()
-    return dict(hidden=stack("hidden").float(), gaps=stack("gaps").float(),
+    result = dict(hidden=stack("hidden").float(), gaps=stack("gaps").float(),
         scalars=stack("scalars").float(), token_vectors=vectors,
         context=torch.stack([o.context for o in observations]).to(device),
         lengths=torch.tensor([o.length for o in observations], device=device),
         labels=torch.tensor([-1 if o.accepted is None else o.accepted for o in observations],
                             dtype=torch.long, device=device))
+    if all(o.prefix_ids is not None and o.topk_ids is not None for o in observations):
+        topk = stack("topk_ids").long()
+        prefix_width = max(len(o.prefix_ids) for o in observations)
+        prefix_ids = torch.stack([F.pad(o.prefix_ids, (0, prefix_width-len(o.prefix_ids)))
+                                  for o in observations]).to(device)
+        with torch.no_grad():
+            alternatives = F.embedding(topk.to(token_table.device), token_table).to(device).float()
+            # Conditional top-K weights only, NOT full-vocabulary probabilities.
+            weights = torch.softmax(result["gaps"], dim=-1)
+            top_summary = (alternatives * weights[..., None]).sum(-2)
+            prefix_vectors = F.embedding(prefix_ids.to(token_table.device), token_table).to(device).float()
+        result.update(topk_vectors=top_summary, prefix_vectors=prefix_vectors,
+                      prefix_lengths=torch.tensor([len(o.prefix_ids) for o in observations], device=device),
+                      history=stack("history").float())
+    margins = torch.zeros(len(observations), width, device=device)
+    teacher_valid = torch.zeros(len(observations), width, dtype=torch.bool, device=device)
+    for row, observation in enumerate(observations):
+        if observation.teacher_margin is not None:
+            margins[row, :observation.length] = observation.teacher_margin.to(device)
+            teacher_valid[row, :observation.length] = True
+    result.update(teacher_margin=margins, teacher_valid=teacher_valid)
+    return result
 
 
 class ExperienceReplay:
@@ -267,7 +296,9 @@ class WorldModelLearner:
             actual = self.model.encoder(batch)
             current_losses.append(acceptance_nll(self.model.acceptance(actual), actual.lengths,
                                                 batch["labels"]))
-        rollout_losses, latent_losses = [], []
+        rollout_losses, latent_losses, auxiliary_losses, structural_losses = [], [], [], []
+        if labeled and hasattr(self.model, "teacher_loss"):
+            auxiliary_losses.append(self.model.teacher_loss(actual, batch))
         if paths:
             batch = pack_observations([p[0][0] for p in paths], self.token_table, self.device)
             imagined = self.model.encoder(batch)
@@ -276,27 +307,37 @@ class WorldModelLearner:
                 imagined = imagined.take(torch.tensor(active, device=self.device))
                 paths = [paths[i] for i in active]
                 actions = torch.tensor([int(p[1][step] == "E") for p in paths], device=self.device)
-                imagined = self.model.dynamics(imagined, actions, self.extension_size)
+                imagined = self.model.transition(imagined, actions, self.extension_size)
                 future = pack_observations([p[0][step+1] for p in paths], self.token_table, self.device)
                 # True child ONLY supplies targets/current-observation supervision.
                 if not torch.equal(imagined.lengths, future["lengths"]):
                     raise RuntimeError("Imagined/real length mismatch")
                 actual = self.model.encoder(future)
+                if hasattr(self.model, "teacher_loss"):
+                    auxiliary_losses.append(self.model.teacher_loss(actual, future))
+                    structural_losses.append(self.model.structural_loss(imagined, future))
                 current_losses.append(acceptance_nll(self.model.acceptance(actual),
                                                        actual.lengths, future["labels"]))
                 with torch.no_grad():
                     target = self.target_encoder(future)
                 mask = valid_positions(imagined.lengths, imagined.tokens.shape[1])
                 distance = 1 - F.cosine_similarity(imagined.tokens, target.tokens, dim=-1)
-                latent_losses.append(((distance * mask).sum(-1) / imagined.lengths).mean()
-                    + (1 - F.cosine_similarity(imagined.global_state, target.global_state)).mean())
+                if hasattr(self.model, "region_mean"):
+                    start = imagined.context[:, 2] * 64
+                    focus = mask & (torch.arange(mask.shape[1], device=self.device)[None] >= start[:, None])
+                    token_loss = self.model.region_mean(distance, focus) + .1*self.model.region_mean(distance, mask & ~focus)
+                else:
+                    token_loss = ((distance * mask).sum(-1) / imagined.lengths).mean()
+                latent_losses.append(token_loss + (1-F.cosine_similarity(imagined.global_state, target.global_state)).mean())
                 rollout_losses.append(acceptance_nll(self.model.acceptance(imagined),
                                                        imagined.lengths, future["labels"]))
         zero = next(self.model.parameters()).sum() * 0
         current = torch.stack(current_losses).mean() if current_losses else zero
         latent = torch.stack(latent_losses).mean() if latent_losses else zero
         rollout = torch.stack(rollout_losses).mean() if rollout_losses else zero
-        loss = current + self.latent_weight * latent + rollout
+        teacher = torch.stack(auxiliary_losses).mean() if auxiliary_losses else zero
+        structure = torch.stack(structural_losses).mean() if structural_losses else zero
+        loss = current + self.latent_weight * latent + rollout + .1*teacher + .1*structure
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite world-model loss")
         self.optimizer.zero_grad(set_to_none=True)
@@ -311,6 +352,7 @@ class WorldModelLearner:
         return dict(update=self.updates, loss=float(loss.detach()), current_nll=float(current.detach()),
                     rollout_nll=float(rollout.detach()), latent_loss=float(latent.detach()),
                     grad_norm=float(grad_norm), horizon=horizon if paths else 0,
+                    teacher_loss=float(teacher.detach()), structural_loss=float(structure.detach()),
                     dynamics_trained=bool(paths), labeled_replay_states=len(labeled),
                     replay_states=len(replay.nodes))
 
@@ -323,7 +365,7 @@ class WorldModelLearner:
         return expected_acceptance(logits, state.lengths).cpu().tolist()
 
     def checkpoint(self):
-        return dict(schema="acceptance_world_model_v1", model_config=self.model.config,
+        return dict(schema=getattr(self.model, "schema", "acceptance_world_model_v1"), model_config=self.model.config,
             model=self.model.state_dict(), target_encoder=self.target_encoder.state_dict(),
             optimizer=self.optimizer.state_dict(), updates=self.updates,
             dynamics_updates=self.dynamics_updates,

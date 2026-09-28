@@ -19,9 +19,14 @@ VALIDATION_QUESTIONS = int(globals().get("VALIDATION_QUESTIONS", 2))
 DATASET = globals().get("DATASET", "gsm8k")
 MAX_ROUNDS_PER_QUESTION = int(globals().get("MAX_ROUNDS_PER_QUESTION", 2))
 MAX_NEW_TOKENS = int(globals().get("MAX_NEW_TOKENS", 128))
+MAX_CONTEXT_TOKENS = int(globals().get("MAX_CONTEXT_TOKENS", 768))
 STOP_WEIGHT = float(globals().get("STOP_WEIGHT", 1.0))
 EXTEND_WEIGHT = float(globals().get("EXTEND_WEIGHT", 1.0))
 REFINE_WEIGHT = float(globals().get("REFINE_WEIGHT", 1.0))
+MODEL_ARCHITECTURE = globals().get("MODEL_ARCHITECTURE", "legacy")
+EPISODES_PER_QUESTION = int(globals().get("EPISODES_PER_QUESTION", 1))
+UPDATES_PER_TRANSITION = int(globals().get("UPDATES_PER_TRANSITION", 1))
+LATENT_DIM = int(globals().get("LATENT_DIM", 128))
 
 working = Path("/kaggle/working")
 temporary = Path("/kaggle/temp")
@@ -31,6 +36,8 @@ temporary.mkdir(parents=True, exist_ok=True)
 os.chdir(working)
 if DATASET not in ("gsm8k", "math") or not 0 < VALIDATION_QUESTIONS < NUM_QUESTIONS:
     raise ValueError("Choose gsm8k/math and nonempty training + validation splits")
+if MODEL_ARCHITECTURE not in ("legacy","token_dual"):
+    raise ValueError("Unknown world-model architecture")
 import torch
 if torch.cuda.device_count() != 2:
     raise RuntimeError("Select GPU T4 x2 and enable Internet before running this cell")
@@ -71,6 +78,9 @@ subprocess.run([sys.executable, str(repo / "tests/test_world_model_pretraining.p
                cwd=repo, env=environment, check=True)
 subprocess.run([sys.executable, str(repo / "tests/test_native_elysia_graph.py")],
                cwd=repo, env=environment, check=True)
+if MODEL_ARCHITECTURE=="token_dual":
+    subprocess.run([sys.executable,str(repo/"tests/test_world_model_probe.py")],
+                   cwd=repo,env=environment,check=True)
 
 # Weights and source are outside /kaggle/working, so they are not published Output.
 # Download in a fresh Python subprocess, avoiding stale imports after pip changes.
@@ -88,22 +98,30 @@ if shutil.disk_usage(working).free < 2 * 1024**3:
     raise OSError("Need at least 2 GiB free for smoke outputs/checkpoints")
 
 stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
-output = working / f"wm_pretrain_{DATASET}_{NUM_QUESTIONS}q_{stamp}"
+output = working / f"wm_{MODEL_ARCHITECTURE}_{DATASET}_{NUM_QUESTIONS}q_{stamp}"
 command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"),
     "--dataset", DATASET, "--num_questions", str(NUM_QUESTIONS),
     "--validation_questions", str(VALIDATION_QUESTIONS),
+    "--model_architecture",MODEL_ARCHITECTURE,"--episodes_per_question",str(EPISODES_PER_QUESTION),
+    "--updates_per_transition",str(UPDATES_PER_TRANSITION),"--latent_dim",str(LATENT_DIM),
     "--max_rounds_per_question", str(MAX_ROUNDS_PER_QUESTION),
     "--max_new_tokens", str(MAX_NEW_TOKENS), "--max_proposal_tokens", "64",
+    "--max_context_tokens",str(MAX_CONTEXT_TOKENS),
     "--extend_size", "8", "--max_refinement_steps", "3", "--drafter_threshold", "0.5",
     "--stop_weight", str(STOP_WEIGHT), "--extend_weight", str(EXTEND_WEIGHT),
     "--refine_weight", str(REFINE_WEIGHT),
     "--target_model_name", "Qwen/Qwen2.5-7B-Instruct",
     "--target_device", "0", "--drafter_device", "1",
     "--dllm_dir", str(dllm), "--output_dir", str(output)]
+if MODEL_ARCHITECTURE=="token_dual":
+    command += ["--package_every_question","--warmup_updates","16","--horizon_warmup_updates","64"]
 print("Running:", " ".join(command), flush=True)
 print("Split: verifier FP16 -> GPU 0; dLLM FP16 + trainable world model -> GPU 1", flush=True)
-print("No pre-collected ZIP needed. These are bounded smoke trajectories, not full-answer benchmarks.", flush=True)
+print("No pre-collected ZIP needed. Generation stops on verified EOS; "
+      f"round cap={MAX_ROUNDS_PER_QUESTION or 'none'}, answer token cap={MAX_NEW_TOKENS or 'none'}.", flush=True)
+print(f"Context safety guard={MAX_CONTEXT_TOKENS}; hitting it before EOS in uncapped mode is a PARTIAL run, not success.",flush=True)
 print("Random legal S/E/R; E includes first unmask, max 3 extra R. Only S calls verifier.", flush=True)
+print(f"Architecture={MODEL_ARCHITECTURE}; episodes/question={EPISODES_PER_QUESTION}; updates/transition={UPDATES_PER_TRANSITION}",flush=True)
 completed = subprocess.run(command, cwd=repo, env=environment, check=False)
 archive = output.with_suffix(".zip")
 if archive.is_file():
@@ -116,7 +134,7 @@ with zipfile.ZipFile(archive) as zip_file:
     if summary["status"] != "complete" or zip_file.testzip() is not None:
         raise RuntimeError("Incomplete or corrupt result archive")
 print(json.dumps({key: summary.get(key) for key in (
-    "status", "questions_completed", "updates", "dynamics_updates", "nodes", "edges", "parameter_l2_change",
+    "status", "questions_completed", "episodes_completed", "updates", "dynamics_updates", "nodes", "edges", "parameter_l2_change",
     "environment", "label_coverage", "evaluation")}, indent=2), flush=True)
 # The relative link is served by the live notebook; Save Version users can use
 # the top-level ZIP shown in Output after the run completes.

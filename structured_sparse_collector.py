@@ -416,6 +416,7 @@ class FullContextVerifier:
 
     @torch.inference_mode()
     def score(self, prefix, proposal, remaining_output_budget):
+        self.last_teacher = None
         if not prefix or not proposal:
             raise ValueError("A nonempty prefix and proposal are required")
         ids = torch.tensor([list(prefix) + list(proposal)], dtype=torch.long,
@@ -431,6 +432,16 @@ class FullContextVerifier:
         if predictions.numel() != len(proposal) + 1:
             raise RuntimeError("Verifier did not return proposal logits plus bonus logit")
         predicted = predictions.tolist()
+        if getattr(self.args, "capture_verifier_teacher", False):
+            # Predict candidate i from the preceding causal position. No extra
+            # verifier forward, no target features passed to the student encoder.
+            scores = outputs.logits[0, :len(proposal)].float()
+            candidates = torch.tensor(proposal, device=scores.device)
+            top_values, top_ids = scores.topk(2, dim=-1)
+            candidate_scores = scores.gather(1, candidates[:, None]).squeeze(1)
+            rival = torch.where(top_ids[:, 0] == candidates, top_values[:, 1], top_values[:, 0])
+            self.last_teacher = dict(margin=(candidate_scores-rival).cpu().tolist(),
+                                     source="actual_stop_verifier_shifted_candidate_margin")
         accepted = 0
         while accepted < len(proposal) and int(proposal[accepted]) == int(predicted[accepted]):
             accepted += 1

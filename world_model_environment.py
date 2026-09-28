@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 import torch
+import torch.nn.functional as F
 
 from world_model_core import Observation
 
@@ -25,19 +26,22 @@ def native_observation(uid, question, round_id, prefix, prior, snapshot, parent,
     if any(a != MASK_ID and a != b for a, b in zip(before, filled)):
         raise ValueError("STOP changed committed tokens")
     ids = torch.tensor(list(zip(before, filled)), dtype=torch.long)
-    hidden = torch.zeros(length, 2, hidden_dim, dtype=torch.float16)
+    selected_layers = getattr(args, "hidden_layers", [14, 28])
+    hidden = torch.zeros(length, len(selected_layers), hidden_dim, dtype=torch.float16)
     gaps = torch.zeros(length, top_k, dtype=torch.float16)
+    topk_ids = torch.zeros(length, top_k, dtype=torch.long)
     scalars = torch.zeros(length, 16)
     if parent is not None:
         count = min(length, parent.length)
         hidden[:count] = parent.hidden[:count]
         gaps[:count] = parent.gaps[:count]
         scalars[:count] = parent.scalars[:count]
+        if parent.topk_ids is not None:
+            topk_ids[:count] = parent.topk_ids[:count]
         # Ages count decision transitions, not elapsed milliseconds or forwards.
         scalars[:count, 5:7] += 1 / 8
     layer_ids = list(snapshot["hidden_layer_indices"])
-    selected_layers = getattr(args, "hidden_layers", [14, 28])
-    if not all(layer in layer_ids for layer in selected_layers) or len(selected_layers) != 2:
+    if not selected_layers or not all(layer in layer_ids for layer in selected_layers):
         raise ValueError(f"Need native layers {selected_layers}, received {layer_ids}")
     raw_hidden = snapshot["hidden_states"]
     h_offset = int(snapshot["native_hidden_start_offset"])
@@ -52,6 +56,7 @@ def native_observation(uid, question, round_id, prefix, prior, snapshot, parent,
                 scalars[position, 3] = 1
                 scalars[position, 5] = 0
     raw_logits = torch.as_tensor(snapshot["topk_logits"], dtype=torch.float32)
+    raw_ids = torch.as_tensor(snapshot["topk_token_ids"], dtype=torch.long)
     if raw_logits.ndim != 2 or raw_logits.shape[-1] < top_k:
         raise ValueError("Native top-k shape mismatch")
     logit_offset = int(snapshot["native_topk_start_offset"])
@@ -59,6 +64,7 @@ def native_observation(uid, question, round_id, prefix, prior, snapshot, parent,
         position = start + logit_offset + row
         if start <= position < length:
             gaps[position] = (raw_logits[row, :top_k] - raw_logits[row, 0]).half()
+            topk_ids[position] = raw_ids[row, :top_k]
             scalars[position, 4] = 1
             scalars[position, 6] = 0
     confidences = torch.tensor(snapshot["confidences"], dtype=torch.float32)
@@ -88,7 +94,17 @@ def native_observation(uid, question, round_id, prefix, prior, snapshot, parent,
         raise ValueError("Nonfinite native features")
     if not scalars[start:, 3].any() or not scalars[start:, 4].any():
         raise ValueError("No native coverage of current segment")
-    return Observation(uid, question, round_id, ids, hidden, gaps, scalars, context)
+    history = torch.zeros(length, 4)
+    if parent is not None:
+        count = min(parent.length, length)
+        valid = (parent.scalars[:count, 3] > 0) & (scalars[:count, 3] > 0)
+        history[:count, 0] = scalars[:count, 7] - parent.scalars[:count, 7]
+        history[:count, 1] = ids[:count, 1].ne(parent.ids[:count, 1]).float()
+        history[:count, 2] = (1-F.cosine_similarity(hidden[:count].float().flatten(1),
+                               parent.hidden[:count].float().flatten(1), dim=-1))*valid
+        history[:count, 3] = valid.float()
+    return Observation(uid, question, round_id, ids, hidden, gaps, scalars, context,
+                       prefix_ids=torch.tensor(prefix, dtype=torch.long), topk_ids=topk_ids, history=history)
 
 
 @dataclass
@@ -172,6 +188,12 @@ class NativeTrainingEnvironment:
         self.stats["verifier_calls"] += 1
         self.stats["executed_S"] += 1
         state.observation.accepted = int(accepted)
+        teacher = getattr(self.verifier, "last_teacher", None)
+        if teacher is not None:
+            margins = torch.tensor(teacher["margin"], dtype=torch.float32)
+            if len(margins) != state.observation.length or not torch.isfinite(margins).all():
+                raise RuntimeError("Invalid verifier teacher target")
+            state.observation.teacher_margin = margins
         state.emitted = list(emitted)
         state.submitted = True
         return elapsed

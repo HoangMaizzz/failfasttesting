@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from world_model_core import (AcceptanceWorldModel, ExperienceReplay, WorldModelLearner,
-    acceptance_nll, expected_acceptance, pack_observations)
+    acceptance_nll, expected_acceptance, pack_observations, prefix_log_distribution)
 from world_model_environment import NativeTrainingEnvironment
 from world_model_hindsight import HindsightLabeler
 
@@ -78,6 +78,12 @@ class ExperienceWriter:
         self.label_records[record["state_id"]] = record
         append_json(self.output / "labels.jsonl", record)
 
+    def teacher(self, state):
+        if state.observation.teacher_margin is not None:
+            append_json(self.output / "teacher_targets.jsonl", dict(state_id=state.observation.uid,
+                margin=state.observation.teacher_margin.tolist(), source="actual_STOP_forward",
+                role="training_target_only_not_encoder_feature"))
+
     def flush(self):
         if not self.pending:
             return
@@ -85,6 +91,13 @@ class ExperienceWriter:
         lengths = np.asarray([o.length for o in observations], dtype=np.int32)
         arrays = {name: torch.cat([getattr(o, name) for o in observations]).numpy()
                   for name in ("ids", "hidden", "gaps", "scalars")}
+        if all(o.topk_ids is not None for o in observations):
+            arrays["aligned_topk_token_ids"] = torch.cat([o.topk_ids for o in observations]).numpy().astype(np.int32)
+            arrays["history"] = torch.cat([o.history for o in observations]).numpy()
+        arrays["teacher_margin"] = torch.cat([o.teacher_margin if o.teacher_margin is not None
+            else torch.zeros(o.length) for o in observations]).numpy()
+        arrays["teacher_valid"] = np.concatenate([np.full(o.length,o.teacher_margin is not None,dtype=np.bool_)
+                                                  for o in observations])
         arrays.update(lengths=lengths, offsets=np.concatenate([[0], np.cumsum(lengths)]),
             context=torch.stack([o.context for o in observations]).numpy(),
             accepted=np.asarray([-1 if o.accepted is None else o.accepted for o in observations], dtype=np.int32),
@@ -135,24 +148,33 @@ def checkpoint(learner, replay, args, output, exploration_rng=None):
 
 
 @torch.no_grad()
-def evaluate(learner, replay, horizon=3):
+def evaluate(learner, replay, horizon=3, output=None):
     if not replay.nodes:
         return dict(status="no_holdout_observations")
     learner.model.eval()
     totals = defaultdict(lambda: [0.0, 0.0, 0.0])
     latent_globals = []
     nodes = list(replay.nodes.values())
+    exact = 0
     for begin in range(0, len(nodes), 8):
         batch = pack_observations(nodes[begin:begin+8], learner.token_table, learner.device)
         state = learner.model.encoder(batch)
         latent_globals.append(state.global_state.cpu())
         logits = learner.model.acceptance(state)
         predicted = expected_acceptance(logits, state.lengths)
+        distribution = prefix_log_distribution(logits,state.lengths)
+        mode = distribution.argmax(-1)
         known = batch["labels"] >= 0
         count = int(known.sum())
         totals["current"][0] += count
         totals["current"][1] += float((predicted[known]-batch["labels"][known]).abs().sum())
         totals["current"][2] += float(acceptance_nll(logits, state.lengths, batch["labels"])) * count
+        exact += int((mode[known] == batch["labels"][known]).sum())
+        if output is not None:
+            for j,o in enumerate(nodes[begin:begin+8]):
+                append_json(output/"validation_predictions.jsonl",dict(state_id=o.uid,kind="current",
+                    question=o.question,length=o.length,K=o.accepted,predicted_K=int(mode[j]),
+                    expected_K=float(predicted[j]),probabilities=distribution[j,:o.length+1].exp().tolist()))
     outgoing = defaultdict(list)
     for p, c, a in replay.edges:
         outgoing[p].append((c, a))
@@ -166,18 +188,31 @@ def evaluate(learner, replay, horizon=3):
         baseline = float(expected_acceptance(learner.model.acceptance(state), state.lengths)[0])
         first_label = replay.nodes[parent].accepted
         for depth in range(1, horizon+1):
-            state = learner.model.dynamics(state,
+            state = learner.model.transition(state,
                 torch.tensor([int(action == "E")], device=learner.device), learner.extension_size)
             prediction = float(expected_acceptance(learner.model.acceptance(state), state.lengths)[0])
+            lp = prefix_log_distribution(learner.model.acceptance(state),state.lengths)
+            mode = int(lp.argmax(-1)[0])
             label = replay.nodes[child].accepted
             if label is not None:
                 record = rollout_results[f"h{depth}"]
                 record["n"] += 1
                 record["absolute_error"] += abs(prediction-label)
                 record["baseline_error"] += abs(baseline-label)
+                record.setdefault("exact_K",0)
+                record["exact_K"] += int(mode == label)
                 record["gain_edges"] += int(first_label is not None and label > first_label)
                 record.setdefault("gain_comparable_paths", 0)
                 record["gain_comparable_paths"] += int(first_label is not None)
+            if output is not None:
+                row=dict(kind="rollout",source=parent,state_id=child,depth=depth,action=action,
+                         K=label,predicted_K=mode,expected_K=prediction)
+                if hasattr(state,"mask_probs"):
+                    truth = replay.nodes[child].scalars[:,0].to(learner.device)
+                    start = int(state.context[0,2]*64)
+                    row["active_mask_accuracy"] = float(((state.mask_probs[0,start:len(truth)]>.5)==truth[start:].bool()).float().mean())
+                    row["predicted_mask_probabilities"] = state.mask_probs[0,:len(truth)].tolist()
+                append_json(output/"validation_predictions.jsonl",row)
             if depth == 1 and label is not None and first_label is not None:
                 change = "gain" if label > first_label else "loss" if label < first_label else "same"
                 group = one_step_groups[f"{action}_{change}"]
@@ -191,11 +226,13 @@ def evaluate(learner, replay, horizon=3):
     return dict(status="evaluated", questions=sorted({o.question for o in nodes}),
         label_coverage=dict(total=len(nodes), exact=int(current[0]), unresolved=len(nodes)-int(current[0])),
         current=dict(n=int(current[0]), mae=current[1]/current[0] if current[0] else None,
-                     nll=current[2]/current[0] if current[0] else None),
+                     nll=current[2]/current[0] if current[0] else None,
+                     exact_K=exact/current[0] if current[0] else None),
         global_latent_std_mean=float(torch.cat(latent_globals).std(dim=0, unbiased=False).mean()),
         one_step_by_action_and_change={key: dict(n=v["n"], mae=v["absolute_error"]/v["n"])
                                       for key, v in one_step_groups.items()},
         rollout={key: dict(n=value["n"], mae=value["absolute_error"]/value["n"],
+            exact_K=value["exact_K"]/value["n"],
             unchanged_prediction_baseline_mae=value["baseline_error"]/value["n"],
             true_gain_paths=value["gain_edges"], gain_comparable_paths=value["gain_comparable_paths"])
             for key, value in rollout_results.items()},
@@ -214,8 +251,11 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
     validation_replay = ExperienceReplay(args.replay_states, args.seed+1)
     train_count = len(questions)-args.validation_questions
     initial = {name: parameter.detach().cpu().clone() for name, parameter in learner.model.named_parameters()}
+    next_round_id = defaultdict(int)
     try:
-        for question_index, question in enumerate(questions):
+        episodes = getattr(args,"episodes_per_question",1)
+        itinerary = [(i,episode,q) for i,q in enumerate(questions) for episode in range(episodes)]
+        for question_index, episode, question in itinerary:
             split = "train" if question_index < train_count else "validation"
             question_id = str(question["question_id"])
             prompt = tokenizer.apply_chat_template([
@@ -226,7 +266,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
             generated = []
             labeler = HindsightLabeler(prefix, writer.label)
             buffer = train_replay if split == "train" else validation_replay
-            print(f"[question] {question_index+1}/{len(questions)} {question_id} split={split}", flush=True)
+            print(f"[question] {question_index+1}/{len(questions)} episode={episode+1}/{episodes} {question_id} split={split}", flush=True)
 
             def train_available():
                 if split != "train":
@@ -246,6 +286,15 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 writer.add(state, parent, action, timing, split)
                 labeler.register(state)
                 o = state.observation
+                if getattr(args,"model_architecture","legacy")=="token_dual":
+                    learner.model.eval()
+                    with torch.no_grad():
+                        b=pack_observations([o],learner.token_table,learner.device)
+                        z=learner.model.encoder(b)
+                        lp=prefix_log_distribution(learner.model.acceptance(z),z.lengths)[0,:o.length+1]
+                        append_json(args.output_dir/"online_predictions.jsonl",dict(state_id=o.uid,
+                            split=split,updates=learner.updates,predicted_K=int(lp.argmax()),probabilities=lp.exp().tolist(),
+                            captured_before_label_and_update=True))
                 if parent is not None:
                     buffer.add(parent.observation, o, action)
                     train_available()
@@ -255,8 +304,18 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
 
             environment.on_state = on_state
             end_reason = "max_rounds_per_question"
-            for round_id in range(args.max_rounds_per_question):
-                remaining = args.max_new_tokens-len(generated)
+            local_round = 0
+            while args.max_rounds_per_question == 0 or local_round < args.max_rounds_per_question:
+                round_id = next_round_id[question_id]
+                next_round_id[question_id] += 1
+                local_round += 1
+                # Unlimited answer length does NOT mean an unlimited proposal.
+                # A round can emit at most L accepted tokens plus one bonus.
+                remaining = (args.max_new_tokens-len(generated) if args.max_new_tokens
+                             else args.max_proposal_tokens+1)
+                if not args.max_new_tokens and len(prefix)+args.max_proposal_tokens+1 > args.max_context_tokens:
+                    raise RuntimeError(f"Context safety limit reached before EOS for {question_id}; "
+                                       "result is partial, not a completed answer. Increase max_context_tokens only if VRAM permits.")
                 if remaining <= 0 or len(prefix) > args.max_context_tokens:
                     end_reason = "max_new_tokens" if remaining <= 0 else "max_context_tokens"
                     break
@@ -270,6 +329,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                                  legal_probabilities=probabilities)
                     if chosen == "S":
                         verifier_ms = environment.submit(state, remaining)
+                        writer.teacher(state)
                         labeler.after_stop(state)
                         append_json(args.output_dir / "actions.jsonl", dict(**event, executed=True))
                         train_available()
@@ -293,26 +353,32 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 if environment.eos_id in state.emitted:
                     end_reason = "eos"
                     break
-            if end_reason != "eos" and len(generated) >= args.max_new_tokens:
+            if end_reason != "eos" and args.max_new_tokens and len(generated) >= args.max_new_tokens:
                 end_reason = "max_new_tokens"
             coverage = labeler.finish(end_reason)
             for key, value in coverage.items():
                 summary.setdefault("label_coverage", {}).setdefault(key, 0)
                 summary["label_coverage"][key] += value
-            summary["questions_completed"] += 1
-            append_json(args.output_dir / "questions.jsonl", dict(**question, split=split,
+            summary["questions_completed"] += int(episode==episodes-1)
+            summary["episodes_completed"] = summary.get("episodes_completed",0)+1
+            append_json(args.output_dir / "questions.jsonl", dict(**question, split=split,episode=episode,
                 generated_tokens=generated, decoded=tokenizer.decode(generated),
                 collection_end_reason=end_reason, label_coverage=coverage,
-                generation_is_bounded_smoke_not_answer_accuracy_benchmark=True))
+                generation_is_bounded_smoke_not_answer_accuracy_benchmark=bool(args.max_new_tokens or args.max_rounds_per_question)))
             writer.flush()
             checkpoint(learner, train_replay, args, args.output_dir, rng)
             summary.update(updates=learner.updates, dynamics_updates=learner.dynamics_updates,
                            nodes=writer.count, edges=writer.edge_count,
                            environment=environment.stats)
             atomic_json(args.output_dir / "summary.json", summary)
+            if getattr(args,"package_every_question",False) and episode==episodes-1:
+                # Atomic refresh: a completed-question ZIP survives a later hard
+                # notebook timeout (in-progress files after that checkpoint may not).
+                package(args.output_dir,args.output_dir.with_suffix(".zip"),dict(summary,status="partial_checkpoint"))
             if shutil.disk_usage(args.output_dir).free < 1024**3:
                 raise OSError("Less than 1 GiB free; stop before corrupting artifacts")
-        summary["evaluation"] = evaluate(learner, validation_replay, args.horizon)
+        summary["evaluation"] = evaluate(learner, validation_replay, args.horizon,
+                                          args.output_dir if getattr(args,"model_architecture","legacy")=="token_dual" else None)
         delta = sum(float((p.detach().cpu()-initial[n]).square().sum())
                     for n, p in learner.model.named_parameters()) ** 0.5
         summary["parameter_l2_change"] = delta
@@ -355,7 +421,8 @@ def run(args):
     args.output_dir.mkdir(parents=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     atomic_json(args.output_dir / "config.json", config)
-    summary = dict(schema="interactive_acceptance_pretrain_v2_hindsight", status="running",
+    summary = dict(schema=("interactive_acceptance_probe_v3" if args.model_architecture=="token_dual"
+                           else "interactive_acceptance_pretrain_v2_hindsight"), status="running",
         questions_completed=0, updates=0, nodes=0, edges=0,
         labels="actual STOP verifier + hindsight over emitted greedy tokens; unresolved is NOT zero",
         verifier="full context, KV disabled; invoked only on chosen/forced STOP",
@@ -401,8 +468,13 @@ def run(args):
         draft_vocab = {k: v for k, v in draft_tokenizer.get_vocab().items() if v != MASK_ID}
         if target_vocab != draft_vocab:
             raise RuntimeError("Drafter/verifier token ID mappings differ")
-        model = AcceptanceWorldModel(drafter.config.hidden_size, table.shape[-1],
-            args.raw_top_k, dim=args.latent_dim, dropout=args.dropout)
+        if args.model_architecture=="token_dual":
+            from world_model_probe import ProbeWorldModel
+            model = ProbeWorldModel(drafter.config.hidden_size,table.shape[-1],args.raw_top_k,
+                dim=args.latent_dim,num_hidden_layers=len(args.hidden_layers),dropout=args.dropout)
+        else:
+            model = AcceptanceWorldModel(drafter.config.hidden_size, table.shape[-1],
+                args.raw_top_k, dim=args.latent_dim, dropout=args.dropout)
         learner = WorldModelLearner(model, table, f"cuda:{args.drafter_device}", args.extend_size,
             args.learning_rate, warmup_updates=args.warmup_updates,
             horizon_warmup=args.horizon_warmup_updates)
@@ -411,6 +483,9 @@ def run(args):
             verifier, tokenizer.eos_token_id, drafter.config.hidden_size, args, None)
         writer = ExperienceWriter(args.output_dir)
         summary["trainable_parameters"] = sum(p.numel() for p in model.parameters())
+        summary["world_model_architecture"] = args.model_architecture
+        summary["verifier_teacher"] = ("candidate_vs_best_rival_margin_at_actual_STOP_only" if args.capture_verifier_teacher else "none")
+        summary["prototype_limits"] = "No verifier-prefix hidden memory; prefix memory uses frozen token embeddings; no raw verifier-hidden distillation"
         summary["devices"] = dict(verifier=f"cuda:{args.target_device}",
             drafter=f"cuda:{args.drafter_device}", world_model=f"cuda:{args.drafter_device}")
         explore_questions(args, questions, tokenizer, environment, learner, writer, summary)
@@ -422,9 +497,9 @@ def run(args):
     finally:
         faulthandler.cancel_dump_traceback_later()
         summary["elapsed_seconds"] = time.perf_counter()-began
-        for name in ("world_model_core.py", "world_model_environment.py", "world_model_hindsight.py",
+        for name in ("world_model_core.py", "world_model_probe.py", "world_model_environment.py", "world_model_hindsight.py",
                      "pretrain_acceptance_world_model.py", "native_elysia_graph.py",
-                     "sparse_extend_world_model_collector.py", "Fast_dLLM_v2_1_5B/modeling.py"):
+                     "structured_sparse_collector.py", "sparse_extend_world_model_collector.py", "Fast_dLLM_v2_1_5B/modeling.py"):
             source = Path(__file__).parent / name
             summary.setdefault("source_sha256", {})[name] = hashlib.sha256(source.read_bytes()).hexdigest()
         package(args.output_dir, archive, summary)
@@ -435,8 +510,11 @@ def parse_args(argv=None):
     parser.add_argument("--dataset", choices=["gsm8k", "math"], default="gsm8k")
     parser.add_argument("--num_questions", type=int, default=10)
     parser.add_argument("--validation_questions", type=int, default=2)
-    parser.add_argument("--max_rounds_per_question", type=int, default=2)
-    parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--episodes_per_question",type=int,default=1)
+    parser.add_argument("--model_architecture",choices=["legacy","token_dual"],default="legacy")
+    parser.add_argument("--package_every_question",action="store_true")
+    parser.add_argument("--max_rounds_per_question", type=int, default=2, help="0: no round cap; stop on verified EOS")
+    parser.add_argument("--max_new_tokens", type=int, default=128, help="0: no answer token cap; stop on verified EOS")
     parser.add_argument("--max_context_tokens", type=int, default=768)
     parser.add_argument("--max_proposal_tokens", type=int, default=64)
     parser.add_argument("--extend_size", type=int, default=8)
@@ -444,7 +522,7 @@ def parse_args(argv=None):
     parser.add_argument("--physical_block_size", type=int, default=32)
     parser.add_argument("--small_block_size", type=int, default=8)
     parser.add_argument("--drafter_threshold", type=float, default=0.5)
-    parser.add_argument("--hidden_layers", type=int, nargs=2, default=[14, 28])
+    parser.add_argument("--hidden_layers", type=int, nargs="+", default=None)
     parser.add_argument("--raw_top_k", type=int, default=32)
     parser.add_argument("--stop_weight", type=float, default=1.0)
     parser.add_argument("--extend_weight", type=float, default=1.0)
@@ -465,16 +543,25 @@ def parse_args(argv=None):
     parser.add_argument("--warmup_updates", type=int, default=8)
     parser.add_argument("--horizon_warmup_updates", type=int, default=24)
     args = parser.parse_args(argv)
+    if args.hidden_layers is None:
+        args.hidden_layers = [7,14,28] if args.model_architecture=="token_dual" else [14,28]
+    if args.model_architecture=="legacy" and len(args.hidden_layers)!=2:
+        parser.error("Legacy architecture needs exactly 2 hidden layers")
+    if args.model_architecture=="token_dual" and args.latent_dim%8:
+        parser.error("Dual latent dimension must be divisible by 8")
+    args.capture_verifier_teacher = args.model_architecture=="token_dual"
     args.target_placement = "single"
     if not 0 < args.validation_questions < args.num_questions:
         parser.error("Need both training and validation questions")
     if args.target_device == args.drafter_device:
         parser.error("Drafter and verifier must be on distinct GPUs")
-    for key in ("num_questions", "max_rounds_per_question", "max_new_tokens", "max_context_tokens",
+    for key in ("num_questions", "episodes_per_question", "max_context_tokens",
                 "extend_size", "batch_sequences", "horizon", "updates_per_transition", "raw_top_k",
                 "physical_block_size", "small_block_size", "latent_dim"):
         if getattr(args, key) < 1:
             parser.error(f"{key} must be positive")
+    if args.max_rounds_per_question < 0 or args.max_new_tokens < 0:
+        parser.error("Round/token caps must be nonnegative (0 means no cap)")
     if args.max_proposal_tokens < args.extend_size or args.max_proposal_tokens % args.extend_size:
         parser.error("Proposal cap must be a multiple of extend_size")
     if args.replay_states < 2 or args.latent_dim % 4 or args.max_refinement_steps < 0:
