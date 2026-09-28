@@ -1,11 +1,11 @@
-"""One-cell, no-input-ZIP, 40-question dual-latent GSM8K generalization probe."""
+"""One-cell, no-input-ZIP, dual-latent acceptance-world-model probe."""
 from urllib.request import urlopen
 
 MODEL_ARCHITECTURE = "token_dual"
 SOURCE_REF = globals().get("SOURCE_REF","codex/sparse-extend-world-model")
 NUM_QUESTIONS = int(globals().get("NUM_QUESTIONS",40))
 VALIDATION_QUESTIONS = int(globals().get("VALIDATION_QUESTIONS",8))
-DATASET = "gsm8k"
+DATASET = globals().get("DATASET", "gsm8k")
 EPISODES_PER_QUESTION = int(globals().get("EPISODES_PER_QUESTION",1))
 MAX_ROUNDS_PER_QUESTION = int(globals().get("MAX_ROUNDS_PER_QUESTION",0))
 MAX_NEW_TOKENS = int(globals().get("MAX_NEW_TOKENS",0))
