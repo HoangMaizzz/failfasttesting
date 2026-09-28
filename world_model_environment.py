@@ -117,6 +117,7 @@ class NativeState:
     emitted: list
     terminal_reason: str | None
     refine_exhausted: bool = False
+    extend_exhausted: bool = False
     submitted: bool = False
 
 
@@ -173,7 +174,8 @@ class NativeTrainingEnvironment:
         if (not state.refine_exhausted and state.snapshot_index < self.args.max_refinement_steps
                 and bool(state.observation.ids[:, 0].eq(MASK_ID).any())):
             actions.append("R")
-        if state.observation.length + self.args.extend_size <= self.args.max_proposal_tokens:
+        if (not state.extend_exhausted and
+                state.observation.length + self.args.extend_size <= self.args.max_proposal_tokens):
             actions.append("E")
         return actions
 
@@ -205,7 +207,20 @@ class NativeTrainingEnvironment:
         o = state.observation
         if action == "E":
             prior = o.ids[:, 1].tolist()
-            snapshots = self.segment(state.prefix + prior, 1)
+            try:
+                snapshots = self.segment(state.prefix + prior, 1)
+            except RuntimeError as error:
+                # Disable only E for this state if native generation exposes no
+                # complete next snapshot; STOP and any legal R remain usable.
+                if str(error) != "Native Elysia generator returned no oracle refinement snapshots":
+                    raise
+                state.extend_exhausted = True
+                self.stats["unavailable_E"] = self.stats.get("unavailable_E", 0) + 1
+                return None
+            if not snapshots:
+                state.extend_exhausted = True
+                self.stats["unavailable_E"] = self.stats.get("unavailable_E", 0) + 1
+                return None
             snapshot, index = snapshots[0], 0
         else:
             prior = state.prior

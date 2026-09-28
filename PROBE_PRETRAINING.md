@@ -18,6 +18,8 @@ Use `kaggle_probe_pretrain.py` on Kaggle with Internet and T4 x2 enabled.
 4. S alone calls GPU 0's frozen Qwen2.5-7B-Instruct verifier (FP16, no KV).
    Append accepted prefix plus correction/bonus to the verified answer. Start a
    new round; **64 limits one proposal, not the complete answer**.
+   If native generation has no next snapshot at an E boundary, disable E at that
+   state and resample from the remaining legal actions, preserving its STOP/R path.
 5. Continue until the verifier emits EOS. A draft EOS only forces submission;
    it is not itself proof that the answer is done. Defaults have no round or
    answer-token cap (`MAX_ROUNDS_PER_QUESTION=MAX_NEW_TOKENS=0`).
