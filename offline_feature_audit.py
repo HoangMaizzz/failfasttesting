@@ -86,6 +86,19 @@ Keep lengths, legality, mask/frontier and validity flags factual in every arm.
         b['token_vectors'][:, :, int(group == 'token_stop')] = 0
     elif group == 'topk':
         zero('gaps'); zero('topk_vectors')
+    elif group == 'topk_gaps_channel':
+        zero('gaps')  # weighted candidate summary still contains probability information
+    elif group == 'topk_candidate_channel':
+        zero('topk_vectors')  # explicit logit gaps remain
+    elif group == 'topk_no_probabilities':
+        zero('gaps')
+        b['topk_vectors'] = batch['topk_uniform_vectors']
+    elif group in ('hidden_last_only', 'compact_last', 'prefix_history'):
+        if group != 'prefix_history':
+            b['hidden'] = batch['hidden'].clone()
+            b['hidden'][:, :, :-1] = 0
+        if group != 'hidden_last_only':
+            zero('prefix_vectors'); zero('history')
     elif group == 'prefix_content':
         zero('prefix_vectors')  # preserve prefix length and positional encoding
     elif group == 'history':
@@ -134,6 +147,18 @@ def metric(rows):
     return result
 
 
+def add_diagnostics(row, source_observation, source_prediction):
+    """Labels are used after prediction ONLY; never fed to dynamics/encoder."""
+    if row is None or row['depth'] == 0 or source_observation.accepted is None:
+        return row
+    row['source_length'] = source_observation.length
+    row['source_K'] = source_observation.accepted
+    row['true_delta_K'] = row['K']-source_observation.accepted
+    row['predicted_delta_K'] = row['expected_K']-source_prediction
+    row['change'] = 'gain' if row['true_delta_K'] > 0 else ('loss' if row['true_delta_K'] < 0 else 'same')
+    return row
+
+
 def record(model, z, index, observation, meta, group, source, depth, actions, baseline=None, truth=None):
     if observation.accepted is None:
         return None
@@ -162,10 +187,22 @@ def record(model, z, index, observation, meta, group, source, depth, actions, ba
 
 def make_report(rows, bootstrap=1000):
     groups = defaultdict(list)
+    common3 = {(r['split'], r['variant'], r['source']) for r in rows if r['depth'] == 3}
     for r in rows:
         groups[(r['split'], r['variant'], r['group'])].append(r)
         if r['depth']:
             groups[(r['split'], r['variant'], f"h{r['depth']}_all")].append(r)
+            if (r['split'], r['variant'], r['source']) in common3:
+                groups[(r['split'], r['variant'], f"h{r['depth']}_common3")].append(r)
+        else:
+            if 'length' in r:
+                groups[(r['split'], r['variant'], f"current_L{r['length']}")].append(r)
+        if r['depth'] == 1 and 'change' in r:
+            groups[(r['split'], r['variant'], r['group']+'_'+r['change'])].append(r)
+            if r['change'] != 'same':
+                groups[(r['split'], r['variant'], r['group']+'_changed')].append(r)
+            bucket = 'source8' if r['source_length'] == 8 else ('source_over8' if r['source_length'] > 8 else 'source_under8')
+            groups[(r['split'], r['variant'], r['group']+'_'+bucket)].append(r)
     output = {}; rng = np.random.default_rng(42)
     def key(r):
         return r['source'], r['state_id'], r['depth'], r['actions']
@@ -176,6 +213,17 @@ def make_report(rows, bootstrap=1000):
             per_q[r['question']].append(abs(r['expected_K']-r['K']))
         stats['question_macro_mae'] = float(np.mean([np.mean(v) for v in per_q.values()]))
         stats['questions'] = len(per_q)
+        comparable = [r for r in values if 'true_delta_K' in r]
+        if comparable:
+            stats['delta_K_mae'] = float(np.mean([abs(r['predicted_delta_K']-r['true_delta_K']) for r in comparable]))
+            # Persistence uses the frozen model's source prediction, NOT true source K.
+            differences = defaultdict(list)
+            for r in comparable:
+                differences[r['question']].append(abs(r['expected_K']-r['K'])-r['persistence_error'])
+            d = np.array([np.mean(v) for v in differences.values()])
+            draws = d[rng.integers(0, len(d), (bootstrap, len(d)))].mean(1)
+            stats['dynamics_minus_persistence_macro'] = float(d.mean())
+            stats['dynamics_minus_persistence_macro_ci95'] = np.quantile(draws, [.025, .975]).tolist()
         if variant != 'full':
             reference = {key(r): r for r in groups[(split, 'full', group)]}
             paired = [(r, reference[key(r)]) for r in values]
@@ -254,6 +302,14 @@ def audit(args):
         outgoing[e['parent']] = (e['child'], e['action'])
     variants = ['full', 'hidden_all', *[f'hidden_layer_{i}' for i in range(model.config['num_hidden_layers'])],
         'token_native', 'token_stop', 'topk', 'prefix_content', 'history', 'confidence', 'position_age', 'mask_encoder', 'encoder_context']
+    suite = getattr(args, 'suite', 'standard')
+    if suite == 'followup':
+        variants = ['full', 'topk_gaps_channel', 'topk_candidate_channel', 'topk_no_probabilities',
+                    'topk', 'hidden_last_only', 'prefix_history', 'compact_last']
+    if getattr(args, 'validation_only', False):
+        questions = {q: m for q, m in questions.items() if m[0]['split'] != 'train'}
+    if not questions:
+        raise ValueError('No questions selected')
     extension = checkpoint['args'].get('extend_size', 8)
     rows = []
     saved = {}
@@ -276,6 +332,13 @@ def audit(args):
         for begin in range(0, len(nodes), args.batch_size):
             chunk = nodes[begin:begin+args.batch_size]
             b = pack_observations(chunk, table, args.device)
+            if suite == 'followup':
+                width = b['gaps'].shape[1]
+                # Mean of actual candidate embeddings, without original probability weights.
+                # Original top-K candidate membership still depends on model predictions.
+                uniform = [F.embedding(o.topk_ids, table).float().mean(-2) for o in chunk]
+                b['topk_uniform_vectors'] = torch.stack([
+                    F.pad(v, (0, 0, 0, width-len(v))) for v in uniform]).to(args.device)
             validation = qmeta[0]['split'] != 'train'
             for variant in variants if validation or args.ablate_train else ['full']:
                 z = encode(model, b, variant)
@@ -285,6 +348,7 @@ def audit(args):
                     for i, uid in enumerate(current):
                         r = record(model, z, i, observations[uid], metadata[uid], variant, source[i], depth,
                             actions[i], persistence[i] if depth else None, factual[uid] if depth else None)
+                        add_diagnostics(r, observations[source[i]], persistence[i])
                         if r is not None:
                             qrows.append(r)
                             key = (source[i], uid, depth)
@@ -316,7 +380,15 @@ def audit(args):
     summary = dict(status='complete' if parity['passed'] else 'baseline_not_verified', elapsed_seconds=time.monotonic()-started,
         llm_forward_calls=0, training_updates=0, input=str(args.input), embedding=provenance,
         hidden_layer_indices=checkpoint['args'].get('hidden_layers'),
-        variants=variants, ablate_train=args.ablate_train,
+        variants=variants, ablate_train=args.ablate_train, suite=suite,
+        validation_only=getattr(args, 'validation_only', False),
+        followup_semantics={
+            'topk_gaps_channel': 'Zero explicit gaps only; weighted candidate embedding retains probability information.',
+            'topk_candidate_channel': 'Zero weighted candidate embedding; keep explicit gaps.',
+            'topk_no_probabilities': 'Zero gaps and use unweighted mean candidate embedding; keep confidence and candidate membership.',
+            'hidden_last_only': 'Zero earlier hidden layers; keep last layer indicated by hidden_layer_indices.',
+            'compact_last': 'Keep last hidden layer; also zero separate prefix content and history.',
+            'prefix_history': 'Zero prefix content and history together; preserve every hidden layer.'},
         parity_with_saved_predictions=parity, metrics=results,
         caveats=['Zero-input sensitivity is not retrained feature utility; perturbations can be OOD.',
                  'Train results are in-sample; draw conclusions from validation only.',
@@ -354,6 +426,8 @@ def parse_args():
     p.add_argument('--horizon', type=int, default=3)
     p.add_argument('--bootstrap', type=int, default=1000)
     p.add_argument('--ablate-train', action='store_true')
+    p.add_argument('--suite', choices=['standard', 'followup'], default='standard')
+    p.add_argument('--validation-only', action='store_true')
     p.add_argument('--trust-checkpoint', action='store_true')
     args = p.parse_args()
     if min(args.batch_size, args.bootstrap) < 1 or not 0 <= args.horizon <= 3:

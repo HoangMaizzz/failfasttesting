@@ -84,3 +84,49 @@ input immutability, teacher leakage guards and paired metrics) and has been
 checked against the real MATH archive's schema/edge lengths/checkpoint. A full
 real-feature GPU evaluation must still be run; synthetic tests do not establish
 feature importance, T4 runtime or numerical parity on that GPU.
+
+## Follow-up suite: top-K separation and compact-latent candidates
+
+Set `SUITE="followup"` in the same launcher. Default `VALIDATION_ONLY=True`
+avoids recomputing 80 in-sample questions. Keep the original training ZIP/folder,
+not the small audit output ZIP. For the current dataset use:
+`INPUT_PATH="/kaggle/input/datasets/yumesakihikari/math100"`.
+
+Eight arms (one reference and seven perturbations), no retraining:
+
+| Arm | Modification |
+|---|---|
+| full | Original checkpoint and inputs |
+| topk_gaps_channel | Zero explicit gaps; retain weighted candidate embedding |
+| topk_candidate_channel | Zero weighted candidate embedding; retain explicit gaps |
+| topk_no_probabilities | Zero gaps AND replace weighted summary with uniform mean of original candidates |
+| topk | Zero both top-K channels, as in first audit |
+| hidden_last_only | Keep last stored hidden layer (28 in this run), zero layers 7 and 14 |
+| prefix_history | Zero separate prefix content and history together |
+| compact_last | Last hidden layer only plus zero prefix/history |
+
+Uniform candidate averaging still reveals which tokens belonged to top-K;
+confidence and other features remain available. This is not a claim that ALL
+drafter probability information has been removed. Zeroing hidden input layers
+does not physically shrink or retrain the checkpoint. Compact arms screen
+candidates for a later smaller-model training experiment, not certify their
+retrained performance or speedup.
+
+Additional metrics (available in both suites):
+
+* `h1_R_gain/loss/same/changed` and equivalent E groups, based on exact labels.
+* `h1_R_source8/source_over8` separates initial proposal from extended ones.
+* `delta_K_mae` evaluates the change in predicted acceptance versus true change.
+* `dynamics_minus_persistence_macro_ci95` compares learned transition with keeping
+  the MODEL's source prediction (never use true source K as a deployment baseline).
+* `h1_common3/h2_common3/h3_common3` score the same sources whose recorded paths
+  reach horizon 3. Actual recorded actions are followed, not optimized by labels.
+* `current_L8/L16/...` provides error by proposal length.
+
+All group labels are attached AFTER predictions, not fed as features or used to
+choose actions. Small gain/loss subsets should be interpreted using question
+counts and uncertainty intervals, not just the mean MAE. Confidence intervals are
+exploratory paired question-bootstrap intervals, without multiple-testing adjustment.
+
+ZIP output: `/kaggle/working/offline_feature_followup_<timestamp>.zip`.
+No large model weights or original raw shards are packaged.

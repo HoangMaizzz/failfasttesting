@@ -20,6 +20,14 @@ if not input_path:
     input_path = str(candidates[0])
 if not Path(input_path).exists():
     raise FileNotFoundError(input_path)
+# Accept the dataset mount root, an extracted run folder, or the original ZIP.
+if Path(input_path).is_dir():
+    checkpoints = list(Path(input_path).rglob('checkpoint.pt'))
+    if not checkpoints:
+        archives = list(Path(input_path).rglob('*.zip'))
+        if len(archives) != 1:
+            raise RuntimeError('No checkpoint; specify exactly one training ZIP: '+str(archives))
+        input_path = str(archives[0])
 print('Input:', input_path, flush=True)
 source_ref = globals().get('SOURCE_REF', 'codex/sparse-extend-world-model')
 temporary = Path('/kaggle/temp'); temporary.mkdir(exist_ok=True)
@@ -33,9 +41,14 @@ import torch
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
 output = working / f'offline_feature_audit_{stamp}'
+suite = globals().get('SUITE', 'standard')
+if suite == 'followup':
+    output = working / f'offline_feature_followup_{stamp}'
 cmd = [sys.executable, '-u', str(repo/'offline_feature_audit.py'), '--input', input_path,
     '--output', str(output), '--device', device, '--trust-checkpoint',
-    '--batch-size', str(globals().get('BATCH_SIZE', 4)), '--horizon', '3']
+    '--batch-size', str(globals().get('BATCH_SIZE', 4)), '--horizon', '3', '--suite', suite]
+if globals().get('VALIDATION_ONLY', suite == 'followup'):
+    cmd += ['--validation-only']
 embedding_file = globals().get('EMBEDDING_FILE', '')
 if not embedding_file:
     cached = Path('/kaggle/temp/wm_fast_dllm_1_5b/model.safetensors')
@@ -45,7 +58,7 @@ if embedding_file:
     cmd += ['--embeddings', embedding_file]
 if globals().get('ABLATE_TRAIN', False):
     cmd += ['--ablate-train']
-print('Baseline: all questions; feature sensitivity: held-out questions only unless ABLATE_TRAIN=True.', flush=True)
+print('Suite:', suite, '| validation-only:', '--validation-only' in cmd, flush=True)
 print('NO drafter/verifier inference and NO retraining. One GPU is sufficient.', flush=True)
 subprocess.run(cmd, cwd=repo, check=True)
 print('DOWNLOAD:', output.with_suffix('.zip'))

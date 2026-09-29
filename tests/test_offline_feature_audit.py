@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from safetensors.torch import save_file
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offline_feature_audit import Archive, audit, encode, make_report, perturb, load_observations
+from offline_feature_audit import Archive, audit, encode, make_report, perturb, load_observations, add_diagnostics
 from world_model_core import Observation, pack_observations, expected_acceptance
 from world_model_probe import ProbeWorldModel
 
@@ -53,6 +53,40 @@ class AuditTests(unittest.TestCase):
         b['labels'].fill_(99); b['teacher_margin'].fill_(99); b['teacher_valid'].fill_(True)
         after = encode(self.model, b, 'full')
         self.assertTrue(torch.equal(before.tokens, after.tokens))
+
+    def test_followup_channels_and_last_layer(self):
+        b = pack_observations([observation('a', 'q', 2)], self.table, 'cpu')
+        b['gaps'].fill_(-2)
+        b['topk_uniform_vectors'] = b['topk_vectors'] + 1
+        gaps = perturb(b, 'topk_gaps_channel')
+        self.assertEqual(float(gaps['gaps'].abs().sum()), 0)
+        self.assertTrue(torch.equal(gaps['topk_vectors'], b['topk_vectors']))
+        candidates = perturb(b, 'topk_candidate_channel')
+        self.assertTrue(torch.equal(candidates['gaps'], b['gaps']))
+        self.assertEqual(float(candidates['topk_vectors'].abs().sum()), 0)
+        no_probabilities = perturb(b, 'topk_no_probabilities')
+        self.assertTrue(torch.equal(no_probabilities['topk_vectors'], b['topk_uniform_vectors']))
+        compact = perturb(b, 'compact_last')
+        self.assertTrue(torch.equal(compact['hidden'][:, :, -1], b['hidden'][:, :, -1]))
+        self.assertEqual(float(compact['hidden'][:, :, :-1].abs().sum()), 0)
+        self.assertEqual(float(compact['history'].abs().sum()), 0)
+        self.assertTrue(torch.equal(compact['scalars'], b['scalars']))
+
+    def test_change_groups_and_matched_horizon(self):
+        source = observation('a', 'q', 8); source.accepted = 2
+        rows = []
+        for depth, target in [(1, 4), (2, 5), (3, 5)]:
+            row = dict(split='validation', variant='full', group=f'h{depth}_R',
+                source='a', state_id=str(depth), depth=depth, actions='R'*depth,
+                question='q', expected_K=3., K=target, nll=1., persistence_error=abs(2.-target))
+            add_diagnostics(row, source, 2.)
+            rows.append(row)
+        report = make_report(rows, 10)
+        self.assertEqual(report['validation/full/h1_R_gain']['n'], 1)
+        self.assertEqual(report['validation/full/h1_R_changed']['delta_K_mae'], 1.)
+        self.assertEqual(report['validation/full/h1_R_source8']['n'], 1)
+        self.assertEqual(report['validation/full/h1_common3']['n'], 1)
+        self.assertEqual(report['validation/full/h1_R']['dynamics_minus_persistence_macro'], -1.)
 
     def test_paired_metrics_cluster_bootstrap(self):
         rows = []
@@ -114,6 +148,16 @@ class AuditTests(unittest.TestCase):
             with zipfile.ZipFile(out.with_suffix('.zip')) as z:
                 self.assertIn('report.md', z.namelist())
                 self.assertIsNone(z.testzip())
+            followup = root/'followup'
+            audit(SimpleNamespace(input=archive, output=followup, trust_checkpoint=True, device='cpu',
+                embeddings=str(embeddings), embedding_repo='unused', embedding_revision='unused',
+                cache=str(root), batch_size=2, horizon=3, bootstrap=30, ablate_train=False,
+                suite='followup', validation_only=True))
+            result = json.loads((followup/'summary.json').read_text())
+            self.assertTrue(result['parity_with_saved_predictions']['passed'])
+            self.assertNotIn('train/full/current', result['metrics'])
+            self.assertEqual(result['metrics']['validation/compact_last/current']['n'], 3)
+            self.assertEqual(result['metrics']['validation/full/h1_R_same']['n'], 1)
 
 
 if __name__ == '__main__':
