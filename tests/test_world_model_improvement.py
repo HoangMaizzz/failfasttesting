@@ -1,6 +1,7 @@
 """Tiny CPU fixtures: verify experiment isolation, real graph paths and packaging."""
 import copy
 from collections import defaultdict
+import gzip
 import io
 import json
 from pathlib import Path
@@ -18,7 +19,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from world_model_core import Observation, pack_observations, ExperienceReplay
 from world_model_probe import ProbeWorldModel
 from world_model_probe_v2 import ImprovedProbeWorldModel, experiment_variants
-from world_model_improvement_test import build_plan, make_learner, run
+from world_model_improvement_test import (build_plan, make_learner, run,
+                                          summarize_token_predictions)
 from offline_feature_audit import Archive, load_observations
 
 torch.set_num_threads(1)
@@ -63,6 +65,19 @@ def fixture(root):
 
 
 class ImprovementTests(unittest.TestCase):
+    def test_tokenwise_acceptance_metrics_and_censoring(self):
+        rows=[]
+        for pos,(y,p,q) in enumerate(((1,.9,.9),(0,.3,.4),(0,.1,.5))):
+            rows.append(dict(scope='panel',group='current',question='q',state_id='s',
+                source_state_id='s',action='',K=1,length=3,position=pos,accepted=y,
+                at_risk=pos<=1,p_accept=p,conditional_pass_probability=q,
+                persistence_p_accept=None))
+        metrics=summarize_token_predictions(rows)['panel/current']
+        self.assertEqual(metrics['boundary_exact'],1.)
+        self.assertEqual(metrics['boundary_mae'],0.)
+        self.assertEqual(metrics['conditional_hazard']['n'],2)
+        self.assertEqual(metrics['average_precision'],1.)
+
     def test_shared_initialization_baseline_and_oracle_exclusion(self):
         config=ProbeWorldModel(4,4,top_k=2,dim=16,num_hidden_layers=2,dropout=0).config
         table=torch.randn(16,4)
@@ -173,8 +188,19 @@ class ImprovementTests(unittest.TestCase):
             self.assertIn('full/h1_R_gain',effects['change_balanced_minus_improved'])
             balanced=next(p for p in summary['points'] if p['variant']=='change_balanced' and p['update']==17)
             self.assertGreater(sum(balanced['sampled_root_edge_counts'].values()),0)
+            action_point=next(p for p in summary['points'] if p['variant']=='action_balanced' and p['update']==17)
+            self.assertIn('panel/current',action_point['token_metrics'])
+            self.assertIn('panel/h1_R',action_point['token_metrics'])
+            self.assertIn('full/current',action_point['token_metrics'])
+            self.assertTrue((root/'result/action_balanced/42/final_model.pt').exists())
+            token_path=root/'result'/action_point['token_predictions']
+            with gzip.open(token_path,'rt',encoding='utf-8') as f:
+                token_rows=[json.loads(line) for line in f]
+            self.assertTrue(any(r['group']=='h1_R' for r in token_rows))
+            self.assertTrue(all((r['accepted']==1)==(r['position']<r['K']) for r in token_rows))
             with zipfile.ZipFile(root/'result.zip') as z:
                 self.assertIsNone(z.testzip()); self.assertIn('learning_curves.png',z.namelist())
+                self.assertTrue(any(n.endswith('token_predictions_00017.jsonl.gz') for n in z.namelist()))
                 report=z.read('report.md').decode()
                 self.assertIn('Sampling effects on changed-K edges',report)
                 self.assertIn('change_balanced',report)

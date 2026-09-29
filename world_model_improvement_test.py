@@ -102,8 +102,133 @@ def pack(model, obs, table, device):
     return pack_observations(obs, table, device, include_candidates=getattr(model,'needs_candidates',False))
 
 
+def _binary_auc(y, p):
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    positives, negatives = int(y.sum()), int((1-y).sum())
+    if not positives or not negatives:
+        return None
+    order = np.argsort(p, kind='mergesort')
+    ranks = np.empty(len(p), dtype=np.float64)
+    i = 0
+    while i < len(order):
+        j = i + 1
+        while j < len(order) and p[order[j]] == p[order[i]]:
+            j += 1
+        ranks[order[i:j]] = (i + 1 + j) / 2
+        i = j
+    return float((ranks[y == 1].sum() - positives*(positives+1)/2) / (positives*negatives))
+
+
+def _binary_ap(y, p):
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    positives = int(y.sum())
+    if not positives:
+        return None
+    order = np.argsort(-p, kind='mergesort')
+    ordered = y[order]
+    precision = np.cumsum(ordered) / np.arange(1, len(ordered)+1)
+    return float((precision * ordered).sum() / positives)
+
+
+def summarize_token_predictions(rows):
+    """Score marginal per-token verifier acceptance and conditional hazards."""
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row['scope'], row['group'])].append(row)
+    result = {}
+    eps = 1e-7
+    for (scope, group), values in grouped.items():
+        y = np.asarray([r['accepted'] for r in values], dtype=np.int64)
+        p = np.clip(np.asarray([r['p_accept'] for r in values]), eps, 1-eps)
+        pred = p >= .5
+        tp = int(((pred == 1) & (y == 1)).sum())
+        tn = int(((pred == 0) & (y == 0)).sum())
+        fp = int(((pred == 1) & (y == 0)).sum())
+        fn = int(((pred == 0) & (y == 1)).sum())
+        pos_rate = float(y.mean())
+        brier = float(np.mean((p-y)**2))
+        base_brier = float(np.mean((pos_rate-y)**2))
+        bins = []
+        ece = 0.0
+        for left in np.linspace(0, 1, 11)[:-1]:
+            right = left + .1
+            mask = (p >= left) & ((p < right) if right < 1 else (p <= right))
+            if mask.any():
+                confidence, frequency = float(p[mask].mean()), float(y[mask].mean())
+                ece += float(mask.mean()) * abs(confidence-frequency)
+                bins.append(dict(left=float(left), right=float(right), count=int(mask.sum()),
+                                 mean_probability=confidence, observed_rate=frequency))
+        by_question = defaultdict(list)
+        by_state = defaultdict(list)
+        for r in values:
+            by_question[r['question']].append(r)
+            by_state[(r['question'],r['state_id'],r['source_state_id'],r['action'])].append(r)
+        q_briers = [float(np.mean([(r['p_accept']-r['accepted'])**2 for r in group_rows]))
+                    for group_rows in by_question.values()]
+        persistence = [r for r in values if r.get('persistence_p_accept') is not None]
+        persistence_metrics = None
+        if persistence:
+            py = np.asarray([r['accepted'] for r in persistence],dtype=np.int64)
+            pp = np.clip(np.asarray([r['persistence_p_accept'] for r in persistence]),eps,1-eps)
+            persistence_metrics = dict(n_tokens=len(persistence),
+                brier=float(np.mean((pp-py)**2)),
+                logloss=float(-np.mean(py*np.log(pp)+(1-py)*np.log(1-pp))),
+                auroc=_binary_auc(py,pp),average_precision=_binary_ap(py,pp))
+        state_rows = []
+        hazard_y, hazard_p, mismatch_ranks = [], [], []
+        for state_key, state in by_state.items():
+            state.sort(key=lambda r:r['position'])
+            k = state[0]['K']
+            predicted_k = sum(r['p_accept'] >= .5 for r in state)
+            state_rows.append((predicted_k, k))
+            for r in state:
+                if r['at_risk']:
+                    hazard_y.append(r['position'] < k)
+                    hazard_p.append(r['conditional_pass_probability'])
+            if k < state[0]['length']:
+                eligible = state[:k+1]
+                order = sorted(range(len(eligible)),
+                               key=lambda i:(eligible[i]['conditional_pass_probability'], i))
+                mismatch_ranks.append(order.index(k)+1)
+        hp = np.clip(np.asarray(hazard_p,dtype=np.float64),eps,1-eps)
+        hy = np.asarray(hazard_y,dtype=np.int64)
+        if len(hy):
+            hpred = hp >= .5
+            htp = int(((hpred==1)&(hy==1)).sum()); htn = int(((hpred==0)&(hy==0)).sum())
+            hfp = int(((hpred==1)&(hy==0)).sum()); hfn = int(((hpred==0)&(hy==1)).sum())
+            hazard = dict(n=len(hy),positive_rate=float(hy.mean()),
+                brier=float(np.mean((hp-hy)**2)),logloss=float(-np.mean(hy*np.log(hp)+(1-hy)*np.log(1-hp))),
+                accuracy=float((hpred==hy).mean()),
+                balanced_accuracy=float(.5*(htp/max(1,htp+hfn)+htn/max(1,htn+hfp))),
+                auroc=_binary_auc(hy,hp),average_precision=_binary_ap(hy,hp))
+        else:
+            hazard = dict(n=0)
+        result[f'{scope}/{group}'] = dict(n_tokens=len(values),n_states=len(by_state),
+            n_questions=len(by_question),positive_rate=pos_rate,brier=brier,
+            prevalence_baseline_brier=base_brier,
+            brier_skill_vs_prevalence=(1-brier/base_brier if base_brier else None),
+            logloss=float(-np.mean(y*np.log(p)+(1-y)*np.log(1-p))),
+            accuracy=float((pred==y).mean()),
+            balanced_accuracy=float(.5*(tp/max(1,tp+fn)+tn/max(1,tn+fp))),
+            precision=float(tp/max(1,tp+fp)),recall=float(tp/max(1,tp+fn)),
+            f1=float(2*tp/max(1,2*tp+fp+fn)),auroc=_binary_auc(y,p),
+            average_precision=_binary_ap(y,p),ece_10_bins=float(ece),calibration_bins=bins,
+            question_macro_brier=float(np.mean(q_briers)) if q_briers else None,
+            boundary_exact=float(np.mean([a==b for a,b in state_rows])) if state_rows else None,
+            boundary_mae=float(np.mean([abs(a-b) for a,b in state_rows])) if state_rows else None,
+            boundary_within_1=float(np.mean([abs(a-b)<=1 for a,b in state_rows])) if state_rows else None,
+            first_mismatch_top1=float(np.mean([r==1 for r in mismatch_ranks])) if mismatch_ranks else None,
+            first_mismatch_mrr=float(np.mean([1/r for r in mismatch_ranks])) if mismatch_ranks else None,
+            first_mismatch_states=len(mismatch_ranks),conditional_hazard=hazard,
+            persistence_baseline=persistence_metrics)
+    return result
+
+
 @torch.inference_mode()
-def evaluate(model, obs, plan, table, device, extension, batch_size=8, full=False):
+def evaluate(model, obs, plan, table, device, extension, batch_size=8, full=False,
+             token_predictions=None):
     model.eval()
     rows = []
     def score(z, actual):
@@ -112,6 +237,24 @@ def evaluate(model, obs, plan, table, device, extension, batch_size=8, full=Fals
         probs = prefix_log_distribution(logits,z.lengths)
         return [dict(K=o.accepted, expected_K=means[i], length=o.length,
                      nll=float(-probs[i,o.accepted])) for i,o in enumerate(actual)]
+    def append_tokens(z, actual, scope, group, action='', source_ids=None,
+                      persistence_probabilities=None):
+        logits = model.acceptance(z)
+        conditional = torch.sigmoid(logits).cpu()
+        marginal = torch.cumprod(conditional, dim=-1)
+        for i,o in enumerate(actual):
+            k = int(o.accepted)
+            parent_id = source_ids[i] if source_ids is not None else o.uid
+            for pos in range(o.length):
+                token_predictions.append(dict(scope=scope,group=group,question=o.question,
+                    state_id=o.uid,source_state_id=parent_id,action=action,
+                    K=k,length=o.length,position=pos,
+                    native_token_id=int(o.ids[pos,0]),stop_token_id=int(o.ids[pos,1]),
+                    accepted=int(pos<k),at_risk=bool(pos<=k),
+                    p_accept=float(marginal[i,pos]),
+                    conditional_pass_probability=float(conditional[i,pos]),
+                    persistence_p_accept=(float(persistence_probabilities[i][pos])
+                        if persistence_probabilities is not None else None)))
     current_sets = [('panel',plan['panel_current']), ('train_monitor',plan['train_monitor'])]
     if full: current_sets.append(('full',plan['full_current']))
     for scope, ids in current_sets:
@@ -121,6 +264,8 @@ def evaluate(model, obs, plan, table, device, extension, batch_size=8, full=Fals
             for o,r in zip(batch,score(z,batch)):
                 rows.append(dict(r, scope=scope, group='current', question=o.question,
                                  source=o.uid, state_id=o.uid, depth=0, actions=''))
+            if token_predictions is not None and scope in ('panel','full'):
+                append_tokens(z,batch,scope,'current')
     edge_sets = [('panel',plan['panel_edges']), ('changed_diagnostic',plan['changed_edges'])]
     if full: edge_sets.append(('full',plan['full_edges']))
     for scope, edges in edge_sets:
@@ -129,6 +274,7 @@ def evaluate(model, obs, plan, table, device, extension, batch_size=8, full=Fals
             parents, children = [obs[e[0]] for e in es], [obs[e[1]] for e in es]
             z = model.encoder(pack(model,parents,table,device))
             base = expected_acceptance(model.acceptance(z),z.lengths)
+            persistence_probabilities=torch.cumprod(torch.sigmoid(model.acceptance(z)),-1).cpu()
             actions = torch.tensor([int(e[2]=='E') for e in es],device=device)
             predicted = model.transition(z,actions,extension)
             b = pack(model,children,table,device)
@@ -150,6 +296,14 @@ def evaluate(model, obs, plan, table, device, extension, batch_size=8, full=Fals
                     child_observed_prediction=float(actual_K[i]),
                     latent_cosine_error=float(latent_err[i]),mask_brier=float(mask_err[i]),
                     change='gain' if delta>0 else ('loss' if delta<0 else 'same')))
+            if token_predictions is not None and scope in ('panel','full'):
+                for action_name in sorted({e[2] for e in es}):
+                    selected=[i for i,e in enumerate(es) if e[2]==action_name]
+                    if action_name == 'R':
+                        append_tokens(predicted.take(torch.tensor(selected,device=device)),
+                            [children[i] for i in selected],scope,'h1_R','R',
+                            [es[i][0] for i in selected],
+                            persistence_probabilities[selected].tolist())
     # Open-loop rollouts: the child observations are labels only; never re-encode
     # the true child to reset the imagined state between actions.
     groups = defaultdict(list)
@@ -232,7 +386,8 @@ def make_learner(config, variant, table, device, seed, extension):
 def run(args):
     out = Path(args.output); out.mkdir(parents=True,exist_ok=False)
     started = time.monotonic()
-    summary = dict(status='preparing',llm_forward_calls=0,config=vars(args),completed_runs=[],points=[])
+    summary = dict(status='preparing',llm_forward_calls=0,config=vars(args),completed_runs=[],points=[],
+        token_label_definition='For proposal position i, accepted=1 iff i < verifier accepted-prefix K; positions after K are not accepted. p_accept is cumulative product of learned conditional pass probabilities.')
     summary['source_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (
         Path(__file__),Path(__file__).with_name('world_model_probe_v2.py'),
         Path(__file__).with_name('world_model_probe.py'),Path(__file__).with_name('world_model_core.py'),
@@ -293,8 +448,20 @@ def run(args):
                             if learner.updates%64==0:
                                 print(f'[train] {name} seed={seed} update={learner.updates} loss={metric["loss"]:.3f}',flush=True)
                     t=time.monotonic()
-                    rows=evaluate(learner.model,observations,plan,table,args.device,extension,args.eval_batch_size,full=target==steps[-1])
+                    # The same held-out panel is scored token-wise at every
+                    # learning-curve checkpoint; only the final checkpoint
+                    # writes the exhaustive per-token table.
+                    token_predictions=[]
+                    rows=evaluate(learner.model,observations,plan,table,args.device,extension,
+                        args.eval_batch_size,full=target==steps[-1],token_predictions=token_predictions)
                     metrics=summarize(rows)
+                    token_metrics=summarize_token_predictions(token_predictions or [])
+                    if token_predictions and target==steps[-1]:
+                        token_file=run_dir/f'token_predictions_{target:05d}.jsonl.gz'
+                        with gzip.open(token_file,'wt',encoding='utf-8') as f:
+                            for r in token_predictions: f.write(json.dumps(r,allow_nan=False)+'\n')
+                    else:
+                        token_file=None
                     pred_file=run_dir/f'predictions_{target:05d}.jsonl.gz'
                     with gzip.open(pred_file,'wt',encoding='utf-8') as f:
                         for r in rows: f.write(json.dumps(r,allow_nan=False)+'\n')
@@ -303,14 +470,16 @@ def run(args):
                         sampling_mode=replay.sampling_mode,
                         sampled_root_edge_counts=dict(replay.sampled_edge_counts),
                         parameters=sum(p.numel() for p in learner.model.parameters()),metrics=metrics,
+                        token_metrics=token_metrics,
                         predictions=str(pred_file.relative_to(out)),
+                        token_predictions=str(token_file.relative_to(out)) if token_file else None,
                         peak_gpu_bytes=torch.cuda.max_memory_allocated(args.device) if str(args.device).startswith('cuda') else None)
                     summary['points'].append(point)
                     print(f'[eval] {name} seed={seed} update={target} current_MAE={metrics["panel/current"]["mae"]:.3f}',flush=True)
                     # Durable partial ZIP after every completed evaluation.
                     summary['elapsed_seconds']=time.monotonic()-started
                     package(out,summary)
-                if name in ('baseline','improved'):
+                if target == steps[-1]:
                     torch.save(dict(model=learner.model.state_dict(),model_config=learner.model.config,
                         variant=variants[name],seed=seed,updates=learner.updates),run_dir/'final_model.pt')
                 summary['completed_runs'].append(dict(variant=name,seed=seed))
