@@ -1,10 +1,10 @@
 # Learning curve using an existing 100-question archive
 
-This experiment answers whether more examples help the acceptance world model.
-It uses the archived train/validation split and raw cached states/labels. It does
-not invoke the 1.5B drafter or 7B verifier. It does train fresh small world-model
-weights for the curve; this is necessary because the one saved checkpoint has
-already seen all 80 train questions.
+This experiment answers two separate questions: whether more examples help and
+whether the world model improves as optimizer training continues. It uses the
+archived train/validation split and raw cached states/labels. It does not invoke
+the 1.5B drafter or 7B verifier. It trains fresh small world-model weights; the
+saved checkpoint supplies architecture/configuration, not pretrained weights.
 
 Four nested train-set sizes (10, 20, 40, 80 questions) and three seeds are run
 under two schedules:
@@ -14,6 +14,14 @@ under two schedules:
 * `proportional`: add questions incrementally, run 8 optimizer updates per added
   question, and retain the learner between sizes. This represents scaling data
   and training work together.
+
+A third `training_progress` schedule fixes the data at the largest selected
+training subset and evaluates fresh models at updates `0, 16, 64, 128, 256, 512`.
+That curve isolates training time from data volume. Every checkpoint uses the
+same held-out questions and the same deterministic state/root sample. Read
+validation MAE (lower is better), not training loss alone, to decide whether it
+actually generalizes. R/E one-step and horizon-3 MAE reveal if state dynamics
+improve alongside current-state acceptance prediction.
 
 Unlike the original online replay buffer, the offline experiment retains all
 selected training observations at every size. Otherwise a 4096-state cap could
@@ -32,10 +40,10 @@ audit. The check stops the run if the embedding differs. If the cache from that
 audit is present at `/kaggle/temp/wm_audit_hf`, it is reused; otherwise only the
 embedding weight file is downloaded, and no LLM forward is run.
 
-Default work is about 8,064 small-model optimizer updates across both schedules
-and three seeds. Lower it with `UPDATES_PER_QUESTION` and `FIXED_UPDATES` for a
-quick feasibility pass; report those settings so results are not mistaken for
-the default curve. One GPU is sufficient.
+Default work is about 9,600 small-model optimizer updates across all schedules
+and three seeds. Lower it with `UPDATES_PER_QUESTION`, `FIXED_UPDATES`, and
+`PROGRESS_UPDATES` for a quick feasibility pass; report those settings so
+results are not mistaken for the default curve. One GPU is sufficient.
 
 ## Kaggle cell
 
@@ -54,6 +62,7 @@ config = {
     "SEEDS": "42,43,44",
     "UPDATES_PER_QUESTION": 8,
     "FIXED_UPDATES": 512,
+    "PROGRESS_UPDATES": "0,16,64,128,256,512",
     "VALIDATION_STATES_PER_QUESTION": 24,
     "VALIDATION_ROOTS_PER_QUESTION": 4,
 }

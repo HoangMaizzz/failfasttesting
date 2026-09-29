@@ -43,6 +43,7 @@ cmd = [sys.executable, '-u', str(repo/'world_model_learning_curve.py'),
     '--seeds', globals().get('SEEDS', '42,43,44'),
     '--updates-per-question', str(globals().get('UPDATES_PER_QUESTION', 8)),
     '--fixed-updates', str(globals().get('FIXED_UPDATES', 512)),
+    '--progress-updates', globals().get('PROGRESS_UPDATES', '0,16,64,128,256,512'),
     '--validation-states-per-question', str(globals().get('VALIDATION_STATES_PER_QUESTION', 24)),
     '--validation-roots-per-question', str(globals().get('VALIDATION_ROOTS_PER_QUESTION', 4))]
 embedding = globals().get('EMBEDDING_FILE', '')
@@ -52,6 +53,7 @@ if embedding:
     cmd += ['--embeddings', embedding]
 print(f'Running on {device}; training only the small world model from cached states.', flush=True)
 print('Drafter forwards: 0 | verifier forwards: 0 | question-counts/seeds: 10,20,40,80 × 3', flush=True)
+print('Fixed-data progress checkpoints:', globals().get('PROGRESS_UPDATES', '0,16,64,128,256,512'), flush=True)
 subprocess.run(cmd, cwd=repo, check=True)
 summary = json.loads((output/'summary.json').read_text())
 print('World-model optimizer updates:', summary['total_optimizer_updates'])

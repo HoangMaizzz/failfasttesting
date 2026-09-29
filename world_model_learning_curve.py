@@ -124,7 +124,7 @@ def validation_rows(model, observations, metadata, edges, limit_per_question=24,
 def aggregate(points):
     result = {}
     keys = sorted({(p['regime'], p['questions'], metric) for p in points for metric in
-                   ('current_mae', 'h1_R_mae', 'h1_E_mae', 'h3_all_mae')
+                   ('current_mae', 'current_question_macro_mae', 'h1_R_mae', 'h1_E_mae', 'h3_all_mae')
                    if metric in p['metrics']})
     for regime, count, metric in keys:
         vals = [p['metrics'][metric] for p in points if p['regime'] == regime
@@ -136,12 +136,34 @@ def aggregate(points):
     return result
 
 
+def evaluate_checkpoint(model, observations, metadata, edge_by_parent, args):
+    validation = validation_rows(model, observations, metadata, edge_by_parent,
+        args.validation_states_per_question, args.validation_roots_per_question)
+    report = make_report(validation, args.bootstrap)
+    selected = {k.split('/')[-1]: v for k, v in report.items()}
+    metrics = {
+        'current_mae': selected.get('current', {}).get('mae'),
+        'current_question_macro_mae': selected.get('current', {}).get('question_macro_mae'),
+        'h1_R_mae': selected.get('h1_R', {}).get('mae'),
+        'h1_E_mae': selected.get('h1_E', {}).get('mae'),
+        'h3_all_mae': selected.get('h3_all', {}).get('mae'),
+        'h1_R_persistence_delta': selected.get('h1_R', {}).get('dynamics_minus_persistence_macro'),
+        'h1_E_persistence_delta': selected.get('h1_E', {}).get('dynamics_minus_persistence_macro'),
+        'h1_R_changed_n': selected.get('h1_R_changed', {}).get('n', 0),
+        'h1_E_changed_n': selected.get('h1_E_changed', {}).get('n', 0),
+    }
+    return validation, report, metrics
+
+
 def parse_ints(value):
     return [int(x) for x in value.split(',') if x.strip()]
 
 
 def run(args):
     started = time.monotonic()
+    progress_steps = sorted(set(parse_ints(args.progress_updates)))
+    if not progress_steps or progress_steps[0] < 0:
+        raise ValueError('Progress checkpoints must be a non-empty list of non-negative updates')
     archive = Archive(args.input)
     out = Path(args.output); out.mkdir(parents=True, exist_ok=False)
     checkpoint = torch.load(io.BytesIO(archive.read('checkpoint.pt')), map_location='cpu', weights_only=False)
@@ -211,20 +233,8 @@ def run(args):
                     metric = learner.update(cumulative, batch_size=batch_size, max_horizon=max_horizon)
                     if metric is not None:
                         train_losses.append(metric['loss'])
-                validation = validation_rows(learner.model, observations, metadata, edge_by_parent,
-                    args.validation_states_per_question, args.validation_roots_per_question)
-                report = make_report(validation, args.bootstrap)
-                selected = {k.split('/')[-1]: v for k, v in report.items()}
-                metric_row = {
-                    'current_mae': selected.get('current', {}).get('mae'),
-                    'h1_R_mae': selected.get('h1_R', {}).get('mae'),
-                    'h1_E_mae': selected.get('h1_E', {}).get('mae'),
-                    'h3_all_mae': selected.get('h3_all', {}).get('mae'),
-                    'h1_R_persistence_delta': selected.get('h1_R', {}).get('dynamics_minus_persistence_macro'),
-                    'h1_E_persistence_delta': selected.get('h1_E', {}).get('dynamics_minus_persistence_macro'),
-                    'h1_R_changed_n': selected.get('h1_R_changed', {}).get('n', 0),
-                    'h1_E_changed_n': selected.get('h1_E_changed', {}).get('n', 0),
-                }
+                validation, report, metric_row = evaluate_checkpoint(
+                    learner.model, observations, metadata, edge_by_parent, args)
                 point = dict(regime=regime, questions=size, seed=seed,
                     selected_question_ids=selected_q, optimizer_updates=learner.updates,
                     new_updates=updates, replay_states=len(cumulative.nodes), replay_edges=len(cumulative.edges),
@@ -243,26 +253,71 @@ def run(args):
                 if regime == 'proportional':
                     previous_size = size
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Isolate training-time progress: train on the largest nested data subset,
+    # keep that replay fixed, and score the same holdout at each update checkpoint.
+    max_size = max(sizes)
+    for seed in seeds:
+        order = list(train_q); random.Random(seed).shuffle(order)
+        selected_q = order[:max_size]
+        replay = build_replay(selected_q, metadata_by_q, observations,
+                              edge_by_child, max_states, seed)
+        learner = make_learner(checkpoint, table, device, seed)
+        learner.model._audit_token_table = table
+        learner.model._audit_device = device
+        learner.model._audit_extension_size = int(cfg.get('extend_size', 8))
+        previous_update = 0
+        for target_update in progress_steps:
+            losses = []
+            while learner.updates < target_update:
+                result = learner.update(replay, batch_size=batch_size, max_horizon=max_horizon)
+                if result is not None:
+                    losses.append(result['loss'])
+            validation, report, metric_row = evaluate_checkpoint(
+                learner.model, observations, metadata, edge_by_parent, args)
+            point = dict(regime='training_progress', questions=max_size, seed=seed,
+                selected_question_ids=selected_q, optimizer_updates=learner.updates,
+                new_updates=learner.updates-previous_update, replay_states=len(replay.nodes),
+                replay_edges=len(replay.edges),
+                mean_recent_train_loss=float(np.mean(losses)) if losses else None,
+                metrics=metric_row, validation_metrics=report)
+            points.append(point)
+            with (out/'learning_curve.jsonl').open('a', encoding='utf-8') as f:
+                f.write(json.dumps(point, allow_nan=False)+'\n')
+            with (out/'validation_predictions.jsonl').open('a', encoding='utf-8') as f:
+                for row in validation:
+                    row.update(regime='training_progress', questions=max_size,
+                               seed=seed, optimizer_updates=learner.updates)
+                    f.write(json.dumps(row, allow_nan=False)+'\n')
+            print(f"[progress] seed={seed} questions={max_size} updates={learner.updates} "
+                  f"current_MAE={metric_row['current_mae']:.3f} h1R={metric_row['h1_R_mae']} "
+                  f"h1E={metric_row['h1_E_mae']}", flush=True)
+            previous_update = learner.updates
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     (out/'summary.json').write_text(json.dumps(dict(status='complete', elapsed_seconds=time.monotonic()-started,
         input=str(args.input), questions_train=len(train_q), validation_questions=len(val_q),
         question_sizes=sizes, seeds=seeds, updates_per_question=args.updates_per_question,
         fixed_updates=args.fixed_updates, total_optimizer_updates=sum(p['new_updates'] for p in points),
         fixed_validation_sample_per_question=args.validation_states_per_question,
         fixed_validation_roots_per_question=args.validation_roots_per_question,
+        progress_updates=progress_steps,
         llm_forward_calls=0, verifier_replayed=False, training_regimes={
             'proportional': 'updates increase proportionally with question count; measures added data under fixed updates per question.',
-            'fixed_updates': 'same number of gradient updates at each question count; isolates benefit of adding examples under matched compute.'},
+            'fixed_updates': 'same number of gradient updates at each question count; isolates benefit of adding examples under matched compute.',
+            'training_progress': 'fixed largest training subset; validation is measured from initialization through increasing optimizer-update checkpoints.'},
         embedding=embedding_meta, points=aggregate(points), caveats=[
             'Uses one fixed question-level train/validation split from the archive.',
             'Validation evaluation uses the same deterministic stratified subset at every checkpoint.',
             'Fixed-update models retrain from the same random initialization per seed and get equal optimizer steps.',
             'Proportional runs are nested incremental training; report includes the number of optimizer updates.',
             'Three seeds and 20 validation questions give an exploratory learning curve, not a final scaling law.',
+            'Training-progress curve isolates optimizer time at fixed data; data-size curves remain separate.',
             'World-model training updates are run; drafter/verifier calls remain zero.']), indent=2), encoding='utf-8')
     report_lines = ['# World-model learning curve', '',
         'Each point is evaluated on the same held-out questions and state sample.',
         '`fixed_updates` isolates data volume at matched optimizer steps; `proportional` scales steps with questions.', '',
-        '| Regime / train questions | Current MAE | R1 MAE | E1 MAE | H3 MAE | Seeds |',
+        '| Regime / train questions | Current MAE state-weighted / question-macro | R1 MAE | E1 MAE | H3 MAE | Seeds |',
         '|---|---:|---:|---:|---:|---:|']
     aggregated = aggregate(points)
     for regime in regimes:
@@ -270,8 +325,23 @@ def run(args):
             def show(metric):
                 v = aggregated.get(f'{regime}/q{size}/{metric}')
                 return '—' if v is None else f"{v['mean']:.3f} ± {v['std']:.3f}"
-            report_lines.append(f"| {regime} / {size} | {show('current_mae')} | {show('h1_R_mae')} | "
+            current_pair = f"{show('current_mae')} / {show('current_question_macro_mae')}"
+            report_lines.append(f"| {regime} / {size} | {current_pair} | {show('h1_R_mae')} | "
                 f"{show('h1_E_mae')} | {show('h3_all_mae')} | {len(seeds)} |")
+    report_lines += ['', '## Training progress at fixed data', '',
+        f"Training set fixed at {max(sizes)} questions; each row is scored on the same validation questions and states.", '',
+        '| Optimizer updates | Current MAE state-weighted / question-macro | R1 MAE | E1 MAE | H3 MAE | Seeds |',
+        '|---:|---:|---:|---:|---:|---:|']
+    for update in progress_steps:
+        matching = [p for p in points if p['regime'] == 'training_progress'
+                    and p['optimizer_updates'] == update]
+        def progress_show(metric):
+            values = [p['metrics'][metric] for p in matching if p['metrics'].get(metric) is not None]
+            if not values: return '—'
+            return f"{np.mean(values):.3f} ± {np.std(values, ddof=1) if len(values)>1 else 0.0:.3f}"
+        current_pair = f"{progress_show('current_mae')} / {progress_show('current_question_macro_mae')}"
+        report_lines.append(f"| {update} | {current_pair} | {progress_show('h1_R_mae')} | "
+            f"{progress_show('h1_E_mae')} | {progress_show('h3_all_mae')} | {len(matching)} |")
     report_lines += ['', 'Values are mean ± standard deviation across independent initialization/data-order seeds. '
         'Positive persistence delta means the learned transition has higher MAE than carrying the source prediction.', '',
         'Three seeds and one fixed 20-question holdout are exploratory. Do not call a noisy/non-monotonic curve a scaling law.']
@@ -295,6 +365,7 @@ def main():
     p.add_argument('--updates-per-question', type=int, default=8); p.add_argument('--fixed-updates', type=int, default=512)
     p.add_argument('--validation-states-per-question', type=int, default=24)
     p.add_argument('--validation-roots-per-question', type=int, default=4); p.add_argument('--bootstrap', type=int, default=500)
+    p.add_argument('--progress-updates', default='0,16,64,128,256,512')
     p.add_argument('--trust-checkpoint', action='store_true'); a = p.parse_args()
     if not a.trust_checkpoint:
         p.error('Use --trust-checkpoint only with your own training archive')
