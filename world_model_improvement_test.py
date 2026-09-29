@@ -275,7 +275,8 @@ def run(args):
         for seed in seeds:
             for name in names:
                 learner = make_learner(config,variants[name],table,args.device,seed,extension)
-                replay = ExperienceReplay(len(plan['train_ids']),seed)
+                replay = ExperienceReplay(len(plan['train_ids']),seed,
+                    sampling_mode=variants[name].get('sampling_mode','natural'))
                 for uid in plan['train_ids']: replay.add_node(observations[uid])
                 for p,c,a in plan['train_edges']: replay.add(observations[p],observations[c],a)
                 run_dir=out/name/str(seed); run_dir.mkdir(parents=True)
@@ -299,6 +300,8 @@ def run(args):
                         for r in rows: f.write(json.dumps(r,allow_nan=False)+'\n')
                     point=dict(variant=name,seed=seed,update=target,train_seconds=train_seconds,
                         eval_seconds=time.monotonic()-t,wall_seconds=time.monotonic()-started,
+                        sampling_mode=replay.sampling_mode,
+                        sampled_root_edge_counts=dict(replay.sampled_edge_counts),
                         parameters=sum(p.numel() for p in learner.model.parameters()),metrics=metrics,
                         predictions=str(pred_file.relative_to(out)),
                         peak_gpu_bytes=torch.cuda.max_memory_allocated(args.device) if str(args.device).startswith('cuda') else None)

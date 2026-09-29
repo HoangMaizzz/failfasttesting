@@ -8,7 +8,7 @@ No new question generation or LLM inference is performed.
 
 ## Experimental arms
 
-The default runs 15 arms, each on seeds 42/43/44 with updates 0/64/128/256/512:
+The full `all` run includes 18 arms, each on seeds 42/43/44 with updates 0/64/128/256/512:
 
 | Arm | Question tested |
 |---|---|
@@ -18,14 +18,26 @@ The default runs 15 arms, each on seeds 42/43/44 with updates 0/64/128/256/512:
 | residual_only | Does a gated residual transition with mask conditioning help? |
 | delta_only | Does an extra Smooth-L1 loss on predicted change in K help? |
 | improved | Combine the four changes above; this name is a hypothesis, not a claim of superiority |
+| action_balanced | Keep the improved model/losses, but sample root R/E edges equally |
+| change_balanced | Also sample K-gain / unchanged / K-loss root edges equally within each action |
+| change_balanced_delta | Same balanced sampler, with the ΔK loss weight raised from 0.1 to 0.3 |
 | no_attention / no_residual / no_delta / no_teacher | Remove one change from the combined arm |
 | no_latent_loss / no_structure_loss | Remove one auxiliary loss from the combined arm |
 | no_hidden / no_gaps / no_prefix_history | Retrain combined arm with that input channel removed |
 
-All common tensors are initialized identically for each seed; replay sampling,
-data, batch size and optimizer steps match. New modules have deterministically
-seeded initial weights. Architectural parameter counts and training/evaluation
-times are recorded because equal steps do not mean identical compute.
+All model arms use matched initialization and optimizer budgets. New modules
+have deterministically seeded initial weights. The targeted sampler arms
+deliberately vary root-edge sampling as described below. Architectural parameter
+counts and training/evaluation times are recorded because equal steps do not
+mean identical compute.
+
+## Targeted follow-up: does balanced replay teach K changes better?
+
+Use the same 100-question MATH archive. Run only `improved,action_balanced,change_balanced,change_balanced_delta`, seeds `42,43,44`, and updates `0,64,128,256,512`. This is 6,144 small-model optimizer updates and does not run the drafter or verifier.
+
+All arms share the same architecture, question split, initialization, and update budget. Only the root transition sampler changes, apart from the explicitly named 0.3 ΔK loss arm. Current-state examples use a separate seeded RNG, so changing edge sampling does not alter their sampling stream. Balanced modes choose an action uniformly among available actions; `change_balanced` then chooses among available K-change classes uniformly within that action. Later rollout steps follow actual outgoing graph edges, preserving a real trajectory. Verifier labels are used only to stratify training root edges; no validation label enters training or sampling.
+
+The output report compares each sampler with `improved` on the unchanged validation cohort and separately reports R/E gain, same, and loss groups. It also records sampled root-edge counts so balancing can be verified. Look for lower gain-group MAE across seeds without worsening natural full-cohort or current-state error. This remains exploratory because the same 20-question validation split has already been inspected.
 
 The old offline loader did not restore teacher margins. The new loader joins
 late `teacher_targets.jsonl` by state ID over the shard snapshot, counts coverage,
@@ -66,7 +78,7 @@ REF = "codex/sparse-extend-world-model"  # Pin the published commit for reproduc
 config = {
     "SOURCE_REF": REF,
     "INPUT_PATH": "/kaggle/input/datasets/yumesakihikari/math100",
-    "VARIANTS": "all",
+    "VARIANTS": "improved,action_balanced,change_balanced,change_balanced_delta",
     "SEEDS": "42,43,44",
     "STEPS": "0,64,128,256,512",
     "BATCH_SIZE": 8,
@@ -76,9 +88,7 @@ url = f"https://raw.githubusercontent.com/HoangMaizzz/failfasttesting/{REF}/kagg
 exec(compile(urlopen(url, timeout=60).read().decode(), "kaggle_world_model_improvement_test.py", "exec"), config)
 ```
 
-45 fits x 512 updates = 23,040 small-model updates. Compared with the earlier
-9,600-update run, this is more work and performs substantially broader evaluation;
-use printed train/eval times to estimate completion instead of assuming 25 minutes.
+This targeted comparison is 12 fits x 512 updates = 6,144 small-model updates.
 One GPU is used; no 7B verifier is loaded. A frozen drafter embedding weight file
 may be downloaded (and tensor hash checked); it is not included in output.
 

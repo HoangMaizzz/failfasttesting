@@ -13,6 +13,11 @@ def question_errors(out, point):
             r=json.loads(line)
             key=(r['scope'],r['group'],r['question'])
             by_q[key].append(abs(r['expected_K']-r['K']))
+            if r['depth']==1:
+                change=r.get('change')
+                if change in ('gain','same','loss'):
+                    by_q[(r['scope'],r['group']+'_'+change,r['question'])].append(
+                        abs(r['expected_K']-r['K']))
             identities.add((r['scope'],r['group'],r['question'],r['source'],r['state_id'],r['depth'],r['actions']))
     return {k:float(np.mean(v)) for k,v in by_q.items()}, identities
 
@@ -57,7 +62,8 @@ def create_report(out, summary):
     def select(name,update):
         return sorted([p for p in points if p['variant']==name and p['update']==update],key=lambda p:p['seed'])
     for name in names:
-        reference='improved' if name.startswith('no_') else 'baseline'
+        reference='improved' if (name.startswith('no_') or name in
+            ('action_balanced','change_balanced','change_balanced_delta')) else 'baseline'
         if name!=reference and reference in names:
             impacts[name+'_minus_'+reference]=paired_difference(out,select(name,final),select(reference,final),cache)
         steps=sorted({p['update'] for p in points if p['variant']==name})
@@ -99,6 +105,29 @@ def create_report(out, summary):
             m=metrics.get(group)
             cells.append('-' if m is None else f"{m['delta_mae']:+.3f} [{m['ci95_questions'][0]:+.3f}, {m['ci95_questions'][1]:+.3f}]")
         lines.append('| '+pair+' | '+' | '.join(cells)+' |')
+    sampler_names=('action_balanced','change_balanced','change_balanced_delta')
+    if 'improved' in names and any(n in names for n in sampler_names):
+        lines+=['','## Sampling effects on changed-K edges','',
+            'Each sampler is compared with `improved` (natural edge sampling). Negative delta means lower MAE.',
+            '| Sampler | R gain ΔMAE | R same ΔMAE | R loss ΔMAE | E gain ΔMAE | E same ΔMAE | E loss ΔMAE |',
+            '|---|---:|---:|---:|---:|---:|---:|']
+        for name in sampler_names:
+            if name not in impacts: continue
+            metrics=impacts[name+'_minus_improved']; cells=[]
+            for group in ('full/h1_R_gain','full/h1_R_same','full/h1_R_loss',
+                          'full/h1_E_gain','full/h1_E_same','full/h1_E_loss'):
+                m=metrics.get(group)
+                cells.append('-' if m is None else
+                    f"{m['delta_mae']:+.3f} [{m['ci95_questions'][0]:+.3f}, {m['ci95_questions'][1]:+.3f}]")
+            lines.append('| '+name+' | '+' | '.join(cells)+' |')
+        lines+=['','Root-edge draws actually used by each sampler at the final update, summed over seeds:','',
+            '| Sampler | Root edge action/change counts |','|---|---|']
+        for name in ('improved',)+sampler_names:
+            if name not in names: continue
+            counts=defaultdict(int)
+            for point in select(name,final):
+                for key,value in point.get('sampled_root_edge_counts',{}).items(): counts[key]+=value
+            lines.append(f"| {name} | `"+json.dumps(dict(sorted(counts.items())),sort_keys=True)+'` |')
     lines+=['','## Learning over updates','',
         '| Arm | Update | Panel current MAE | Panel R1 | Panel E1 | Panel H3 |','|---|---:|---:|---:|---:|---:|']
     for c in curves:
@@ -116,6 +145,7 @@ def create_report(out, summary):
         '- Latent cosine is a diagnostic within a representation; representations from different arms need not use the same coordinate system.',
         '- Teacher is an auxiliary training target only, never an encoder input. No teacher is recomputed.',
         '- Changed-edge diagnostics are selected by true labels for analysis only; they do not enter the train sampler or inference policy.',
+        '- Balanced sampling uses training labels only to select a root edge. Current-state supervision uses an independent seeded RNG; validation sampling is untouched.',
         '- Confidence intervals are exploratory, conditional on this split/seeds, without multiple-comparison correction. This validation set was previously inspected; a new question-level test set is needed for a final claim.',
         '- Parameter count and wall/training times are recorded; equal optimizer updates do not imply equal compute across architectures.',
         '- No new LLM inference, latency speedup experiment, or online controller is run.']
@@ -123,7 +153,8 @@ def create_report(out, summary):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    focus=[n for n in ('baseline','improved','attention_only','residual_only','teacher_only','delta_only') if n in names]
+    focus=[n for n in ('baseline','improved','action_balanced','change_balanced',
+                       'change_balanced_delta','attention_only','residual_only','teacher_only','delta_only') if n in names]
     fig,axes=plt.subplots(2,2,figsize=(12,8),layout='constrained')
     for ax,group in zip(axes.flat,('panel/current','panel/h1_R','panel/h1_E','rollout_panel/h3')):
         for name in focus:

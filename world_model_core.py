@@ -1,7 +1,7 @@
 """Small task-relevant latent dynamics. No LLM weights, timing or oracle inputs."""
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import copy
 import random
@@ -222,11 +222,15 @@ def pack_observations(observations, token_table, device, include_candidates=Fals
 
 class ExperienceReplay:
     """Bounded real graph: no edges across questions/rounds and no synthetic labels."""
-    def __init__(self, max_states=512, seed=42):
+    def __init__(self, max_states=512, seed=42, sampling_mode="natural"):
         self.nodes = OrderedDict()
         self.edges = []
         self.max_states = max_states
         self.rng = random.Random(seed)
+        # Keep current-state supervision identical when transition sampling changes.
+        self.state_rng = random.Random(seed + 1_000_003)
+        self.sampling_mode = sampling_mode
+        self.sampled_edge_counts = defaultdict(int)
 
     def add_node(self, observation):
         self.nodes[observation.uid] = observation
@@ -248,6 +252,42 @@ class ExperienceReplay:
         if edge not in self.edges:
             self.edges.append(edge)
 
+    def _sample_root_edge(self):
+        if self.sampling_mode == "natural":
+            edge = self.rng.choice(self.edges)
+        else:
+            if self.sampling_mode not in ("action_balanced", "change_balanced"):
+                raise ValueError(f"Unknown replay sampling mode: {self.sampling_mode}")
+            by_action = defaultdict(list)
+            by_action_change = defaultdict(lambda: defaultdict(list))
+            for item in self.edges:
+                parent_id, child_id, action = item
+                by_action[action].append(item)
+                if self.sampling_mode == "change_balanced":
+                    parent, child = self.nodes[parent_id], self.nodes[child_id]
+                    if parent.accepted is None or child.accepted is None:
+                        change = "unknown"
+                    else:
+                        delta = child.accepted-parent.accepted
+                        change = "gain" if delta > 0 else ("loss" if delta < 0 else "same")
+                    by_action_change[action][change].append(item)
+
+            action = self.rng.choice(sorted(by_action))
+            if self.sampling_mode == "action_balanced":
+                edge = self.rng.choice(by_action[action])
+            else:
+                change = self.rng.choice(sorted(by_action_change[action]))
+                edge = self.rng.choice(by_action_change[action][change])
+        parent, child, action = edge
+        source, target = self.nodes[parent], self.nodes[child]
+        if source.accepted is None or target.accepted is None:
+            change = "unknown"
+        else:
+            delta = target.accepted-source.accepted
+            change = "gain" if delta > 0 else ("loss" if delta < 0 else "same")
+        self.sampled_edge_counts[f"{action}/{change}"] += 1
+        return edge
+
     def sample(self, batch_size, horizon):
         if not self.edges:
             raise ValueError("Replay has no real transitions")
@@ -256,7 +296,7 @@ class ExperienceReplay:
             outgoing.setdefault(p, []).append((c, a))
         paths = []
         for _ in range(batch_size):
-            parent, _, _ = self.rng.choice(self.edges)
+            parent, _, _ = self._sample_root_edge()
             nodes, actions = [self.nodes[parent]], []
             for _ in range(self.rng.randint(1, horizon)):
                 if parent not in outgoing:
@@ -299,7 +339,7 @@ class WorldModelLearner:
         current_losses = []
         if labeled:
             # Include STOP-at-root and terminal states even when they have no R/E edge.
-            batch = self.pack(replay.rng.choices(labeled, k=batch_size))
+            batch = self.pack(replay.state_rng.choices(labeled, k=batch_size))
             actual = self.model.encoder(batch)
             current_losses.append(acceptance_nll(self.model.acceptance(actual), actual.lengths,
                                                 batch["labels"]))

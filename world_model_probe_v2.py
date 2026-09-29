@@ -95,6 +95,11 @@ def experiment_variants():
         'residual_only': dict(base, residual_dynamics=True),
         'delta_only': dict(base, delta_weight=.1),
         'improved': full,
+        # Training-only replay sampling arms. They reuse the exact same model;
+        # accepted-token labels are used only to stratify real root edges.
+        'action_balanced': dict(full, sampling_mode='action_balanced'),
+        'change_balanced': dict(full, sampling_mode='change_balanced'),
+        'change_balanced_delta': dict(full, sampling_mode='change_balanced', delta_weight=.3),
         'no_attention': dict(full, candidate_attention=False),
         'no_residual': dict(full, residual_dynamics=False),
         'no_delta': dict(full, delta_weight=0.),

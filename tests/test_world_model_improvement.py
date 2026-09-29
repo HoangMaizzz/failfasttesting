@@ -1,5 +1,6 @@
 """Tiny CPU fixtures: verify experiment isolation, real graph paths and packaging."""
 import copy
+from collections import defaultdict
 import io
 import json
 from pathlib import Path
@@ -110,6 +111,35 @@ class ImprovementTests(unittest.TestCase):
                     +variant['delta_weight']*m['delta_loss'])
                 self.assertAlmostEqual(m['loss'],expected,places=5)
 
+    def test_replay_samplers_balance_actions_and_delta_classes(self):
+        replay=ExperienceReplay(seed=19,sampling_mode='change_balanced')
+        # Deliberately skew both action and outcome counts: R=12, E=4;
+        # within each action, all three delta classes are present.
+        for action,n_same,n_gain,n_loss in (('R',8,2,2),('E',2,1,1)):
+            for category,count in (('same',n_same),('gain',n_gain),('loss',n_loss)):
+                for i in range(count):
+                    parent=observation(f'{action}_{category}_{i}_p','q',2,4)
+                    delta={'same':0,'gain':2,'loss':-2}[category]
+                    child_len=4 if action=='E' else 2
+                    child=observation(f'{action}_{category}_{i}_c','q',child_len,4+delta,2)
+                    replay.add(parent,child,action)
+        counts=defaultdict(int)
+        for _ in range(6000):
+            parent,child,action=replay._sample_root_edge()
+            delta=replay.nodes[child].accepted-replay.nodes[parent].accepted
+            category='gain' if delta>0 else ('loss' if delta<0 else 'same')
+            counts[f'{action}/{category}']+=1
+        self.assertTrue(all(2950 < sum(counts[f'{a}/{c}'] for c in ('same','gain','loss')) < 3050
+                            for a in ('R','E')))
+        for action in ('R','E'):
+            values=[counts[f'{action}/{category}'] for category in ('same','gain','loss')]
+            self.assertLess(max(values)-min(values),180)
+        # Changing edge sampling must not change the seeded current-state stream.
+        other=ExperienceReplay(seed=19,sampling_mode='natural')
+        self.assertEqual(replay.state_rng.choices(list(range(20)),k=10),
+                         other.state_rng.choices(list(range(20)),k=10))
+        self.assertEqual(sum(replay.sampled_edge_counts.values()),6000)
+
     def test_late_teacher_join_graph_and_split_protection(self):
         with tempfile.TemporaryDirectory() as d:
             data,states,labels,edges,emb=fixture(Path(d))
@@ -130,18 +160,24 @@ class ImprovementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); data,states,labels,edges,emb=fixture(root)
             args=SimpleNamespace(input=str(data),output=str(root/'result'),device='cpu',
-                variants='baseline,teacher_only,improved,no_teacher',seeds='42',steps='0,16,17',
+                variants='baseline,teacher_only,improved,no_teacher,action_balanced,change_balanced,change_balanced_delta',seeds='42',steps='0,16,17',
                 panel_states=2,panel_edges=1,panel_paths=2,batch_size=2,eval_batch_size=2,
                 embeddings=str(emb),embedding_repo='unused',embedding_revision='unused',cache=str(root),embedding_sha256='')
             run(args)
             summary=json.loads((root/'result/summary.json').read_text())
             self.assertEqual(summary['status'],'complete'); self.assertEqual(summary['llm_forward_calls'],0)
-            self.assertEqual(len(summary['points']),12); self.assertEqual(summary['teacher_train'],5)
+            self.assertEqual(len(summary['points']),21); self.assertEqual(summary['teacher_train'],5)
             self.assertEqual(summary['full_validation_edges'],4)
             effects=json.loads((root/'result/paired_factor_impacts.json').read_text())
             self.assertIn('full/h1_R',effects['improved_minus_baseline'])
+            self.assertIn('full/h1_R_gain',effects['change_balanced_minus_improved'])
+            balanced=next(p for p in summary['points'] if p['variant']=='change_balanced' and p['update']==17)
+            self.assertGreater(sum(balanced['sampled_root_edge_counts'].values()),0)
             with zipfile.ZipFile(root/'result.zip') as z:
                 self.assertIsNone(z.testzip()); self.assertIn('learning_curves.png',z.namelist())
+                report=z.read('report.md').decode()
+                self.assertIn('Sampling effects on changed-K edges',report)
+                self.assertIn('change_balanced',report)
                 self.assertNotIn('embedding.safetensors',z.namelist())
             args.output=str(root/'failed')
             with patch('world_model_improvement_test.load_embeddings',side_effect=RuntimeError('test fail')):
