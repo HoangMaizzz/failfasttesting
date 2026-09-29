@@ -34,12 +34,15 @@ class ProbeEncoder(nn.Module):
         self.context = nn.Linear(8, dim)
         self.network = transformer(dim, 2, dropout)
 
+    def candidate_features(self, b):
+        return self.token_projection(b['topk_vectors'])
+
     def forward(self, b):
         # Explicit allowlist: labels/teacher_margin/teacher_valid never read here.
         h = self.hidden_projection(self.hidden_norm(b["hidden"]).flatten(2))
         h = h*b["scalars"][:, :, 3, None]
         tokens = self.token_projection(b["token_vectors"]).flatten(2)
-        alternatives = self.token_projection(b["topk_vectors"])*b["scalars"][:, :, 4, None]
+        alternatives = self.candidate_features(b)*b["scalars"][:, :, 4, None]
         x = self.fuse(torch.cat([h,tokens,alternatives,self.gaps(b["gaps"].clamp(-40,0)/10),
                                  b["scalars"],b["history"]],dim=-1))
         prefix = self.prefix_projection(b["prefix_vectors"])

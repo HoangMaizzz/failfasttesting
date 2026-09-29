@@ -39,7 +39,7 @@ class Archive:
             return []
 
 
-def load_observations(archive, metadata, labels):
+def load_observations(archive, metadata, labels, include_teacher=False):
     grouped = defaultdict(list)
     for row in metadata:
         grouped[row['shard']].append(row)
@@ -49,6 +49,8 @@ def load_observations(archive, metadata, labels):
             # Load each NPZ member ONCE, not once per state (large hidden arrays).
             arrays = {k: source[k] for k in ('ids', 'hidden', 'gaps', 'scalars', 'context',
                       'offsets', 'aligned_topk_token_ids', 'history')}
+            if include_teacher and 'teacher_margin' in source and 'teacher_valid' in source:
+                arrays.update(teacher_margin=source['teacher_margin'], teacher_valid=source['teacher_valid'])
         for row in rows:
             i = row['row']; start, end = arrays['offsets'][i:i+2]
             def tensor(key):
@@ -63,6 +65,23 @@ def load_observations(archive, metadata, labels):
                 torch.from_numpy(arrays['context'][i].copy()), accepted,
                 torch.tensor(row['prefix_token_ids'], dtype=torch.long),
                 tensor('aligned_topk_token_ids').long(), tensor('history'))
+            if include_teacher and 'teacher_valid' in arrays:
+                valid = arrays['teacher_valid'][start:end]
+                if valid.any() and not valid.all():
+                    raise ValueError('Partially labeled teacher rows require a per-token validity mask')
+                if valid.all():
+                    result[row['state_id']].teacher_margin = tensor('teacher_margin').float()
+    if include_teacher:
+        # STOP may arrive after its raw shard was flushed. Late JSONL targets
+        # therefore take precedence over the shard's earlier missing teacher.
+        for row in archive.lines('teacher_targets.jsonl'):
+            if row['state_id'] not in result:
+                continue
+            obs = result[row['state_id']]
+            margin = torch.tensor(row['margin'], dtype=torch.float32)
+            if margin.shape != (obs.length,) or not torch.isfinite(margin).all():
+                raise ValueError(f"Invalid teacher target for {obs.uid}")
+            obs.teacher_margin = margin
     return result
 
 

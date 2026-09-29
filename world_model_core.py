@@ -175,7 +175,7 @@ class AcceptanceWorldModel(nn.Module):
         return self.dynamics(state, actions, extension_size)
 
 
-def pack_observations(observations, token_table, device):
+def pack_observations(observations, token_table, device, include_candidates=False):
     """The verifier label is deliberately separated from all encoder features."""
     width = max(o.length for o in observations)
     def stack(name):
@@ -208,6 +208,8 @@ def pack_observations(observations, token_table, device):
         result.update(topk_vectors=top_summary, prefix_vectors=prefix_vectors,
                       prefix_lengths=torch.tensor([len(o.prefix_ids) for o in observations], device=device),
                       history=stack("history").float())
+        if include_candidates:
+            result['candidate_vectors'] = alternatives
     margins = torch.zeros(len(observations), width, device=device)
     teacher_valid = torch.zeros(len(observations), width, dtype=torch.bool, device=device)
     for row, observation in enumerate(observations):
@@ -269,7 +271,8 @@ class ExperienceReplay:
 
 class WorldModelLearner:
     def __init__(self, model, token_table, device, extension_size=8, lr=3e-4,
-                 ema_decay=0.99, latent_weight=0.1, warmup_updates=8, horizon_warmup=24):
+                 ema_decay=0.99, latent_weight=0.1, warmup_updates=8, horizon_warmup=24,
+                 teacher_weight=0.1, structure_weight=0.1, delta_weight=0.0):
         self.model = model.to(device)
         self.target_encoder = copy.deepcopy(model.encoder).eval().requires_grad_(False)
         self.token_table = token_table.detach()
@@ -277,8 +280,13 @@ class WorldModelLearner:
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
         self.ema_decay, self.latent_weight = ema_decay, latent_weight
         self.warmup_updates, self.horizon_warmup = warmup_updates, horizon_warmup
+        self.teacher_weight, self.structure_weight, self.delta_weight = teacher_weight, structure_weight, delta_weight
         self.updates = 0
         self.dynamics_updates = 0
+
+    def pack(self, observations):
+        return pack_observations(observations, self.token_table, self.device,
+                                 include_candidates=getattr(self.model, 'needs_candidates', False))
 
     def update(self, replay, batch_size=8, max_horizon=3):
         horizon = 1 if self.updates < self.horizon_warmup else max_horizon
@@ -291,24 +299,35 @@ class WorldModelLearner:
         current_losses = []
         if labeled:
             # Include STOP-at-root and terminal states even when they have no R/E edge.
-            batch = pack_observations(replay.rng.choices(labeled, k=batch_size),
-                                      self.token_table, self.device)
+            batch = self.pack(replay.rng.choices(labeled, k=batch_size))
             actual = self.model.encoder(batch)
             current_losses.append(acceptance_nll(self.model.acceptance(actual), actual.lengths,
                                                 batch["labels"]))
         rollout_losses, latent_losses, auxiliary_losses, structural_losses = [], [], [], []
+        delta_losses = []
         if labeled and hasattr(self.model, "teacher_loss"):
             auxiliary_losses.append(self.model.teacher_loss(actual, batch))
         if paths:
-            batch = pack_observations([p[0][0] for p in paths], self.token_table, self.device)
+            batch = self.pack([p[0][0] for p in paths])
             imagined = self.model.encoder(batch)
             for step in range(max(len(p[1]) for p in paths)):
                 active = [i for i, p in enumerate(paths) if len(p[1]) > step]
                 imagined = imagined.take(torch.tensor(active, device=self.device))
                 paths = [paths[i] for i in active]
                 actions = torch.tensor([int(p[1][step] == "E") for p in paths], device=self.device)
+                if self.delta_weight:
+                    source_prediction = expected_acceptance(self.model.acceptance(imagined), imagined.lengths)
                 imagined = self.model.transition(imagined, actions, self.extension_size)
-                future = pack_observations([p[0][step+1] for p in paths], self.token_table, self.device)
+                future = self.pack([p[0][step+1] for p in paths])
+                if self.delta_weight:
+                    source_labels = torch.tensor([-1 if p[0][step].accepted is None else p[0][step].accepted
+                                                  for p in paths], device=self.device)
+                    labeled_pair = (source_labels >= 0) & (future['labels'] >= 0)
+                    if labeled_pair.any():
+                        delta_prediction = expected_acceptance(self.model.acceptance(imagined), imagined.lengths)-source_prediction
+                        delta_target = future['labels']-source_labels
+                        delta_losses.append(F.smooth_l1_loss(delta_prediction[labeled_pair],
+                                                            delta_target[labeled_pair].float()))
                 # True child ONLY supplies targets/current-observation supervision.
                 if not torch.equal(imagined.lengths, future["lengths"]):
                     raise RuntimeError("Imagined/real length mismatch")
@@ -337,7 +356,9 @@ class WorldModelLearner:
         rollout = torch.stack(rollout_losses).mean() if rollout_losses else zero
         teacher = torch.stack(auxiliary_losses).mean() if auxiliary_losses else zero
         structure = torch.stack(structural_losses).mean() if structural_losses else zero
-        loss = current + self.latent_weight * latent + rollout + .1*teacher + .1*structure
+        delta = torch.stack(delta_losses).mean() if delta_losses else zero
+        loss = (current + self.latent_weight * latent + rollout + self.teacher_weight*teacher
+                + self.structure_weight*structure + self.delta_weight*delta)
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite world-model loss")
         self.optimizer.zero_grad(set_to_none=True)
@@ -353,13 +374,14 @@ class WorldModelLearner:
                     rollout_nll=float(rollout.detach()), latent_loss=float(latent.detach()),
                     grad_norm=float(grad_norm), horizon=horizon if paths else 0,
                     teacher_loss=float(teacher.detach()), structural_loss=float(structure.detach()),
+                    delta_loss=float(delta.detach()),
                     dynamics_trained=bool(paths), labeled_replay_states=len(labeled),
                     replay_states=len(replay.nodes))
 
     @torch.no_grad()
     def predict(self, observations):
         self.model.eval()
-        batch = pack_observations(observations, self.token_table, self.device)
+        batch = self.pack(observations)
         state = self.model.encoder(batch)
         logits = self.model.acceptance(state)
         return expected_acceptance(logits, state.lengths).cpu().tolist()
