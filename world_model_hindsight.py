@@ -42,7 +42,13 @@ class HindsightLabeler:
         self._resolve(record, state.observation.accepted, "direct_stop_verifier")
         # Only emitted accepted-prefix + correction/bonus tokens are on-policy.
         # Full verifier argmax logits after a mismatch are NOT a reference stream.
-        self.verified.extend(state.emitted)
+        self.after_emitted(state.prefix, state.emitted)
+
+    def after_emitted(self, prefix, emitted):
+        """Advance even when native EOS had no trainable raw state."""
+        if list(prefix) != self.verified:
+            raise ValueError('Emitted stream must extend the verified prefix')
+        self.verified.extend(emitted)
         for record in self.records.values():
             o = record["observation"]
             candidate = o.ids[:, 1].tolist()
@@ -57,6 +63,8 @@ class HindsightLabeler:
 
     def finish(self, reason):
         for record in self.records.values():
+            if record['source'] is None and record['observation'].accepted is not None:
+                self._resolve(record, record['observation'].accepted, 'direct_shadow_verifier')
             if record["source"] is None:
                 self.on_label(dict(state_id=record["observation"].uid, accepted_len=None,
                     label_valid=False, lower_bound=record["lower_bound"], source=None,

@@ -79,11 +79,17 @@ class ExperienceWriter:
         self.label_records[record["state_id"]] = record
         append_json(self.output / "labels.jsonl", record)
 
-    def teacher(self, state):
+    def teacher(self, state, source='actual_STOP_forward'):
         if state.observation.teacher_margin is not None:
             append_json(self.output / "teacher_targets.jsonl", dict(state_id=state.observation.uid,
-                margin=state.observation.teacher_margin.tolist(), source="actual_STOP_forward",
-                role="training_target_only_not_encoder_feature"))
+                margin=state.observation.teacher_margin.tolist(), source=source,
+                role="training_target_only_not_encoder_feature",
+                features=(None if state.observation.teacher_features is None
+                          else state.observation.teacher_features.tolist()),
+                feature_layout=(None if state.observation.teacher_features is None else
+                    ['tanh_candidate_rival_margin_div5','candidate_probability','teacher_forced_local_agreement',
+                     'final_norm_causal_hidden_projected32_div10']),
+                hidden_projection_seed=901 if state.observation.teacher_features is not None else None))
 
     def flush(self):
         if not self.pending:
@@ -99,6 +105,13 @@ class ExperienceWriter:
             else torch.zeros(o.length) for o in observations]).numpy()
         arrays["teacher_valid"] = np.concatenate([np.full(o.length,o.teacher_margin is not None,dtype=np.bool_)
                                                   for o in observations])
+        if any(o.verifier_history is not None for o in observations):
+            history = [o.verifier_history if o.verifier_history is not None else torch.empty(0, 48)
+                       for o in observations]
+            arrays['verifier_history'] = torch.cat(history).numpy().astype(np.float16)
+            arrays['verifier_history_offsets'] = np.concatenate([[0], np.cumsum([len(h) for h in history])])
+            arrays['teacher_features'] = torch.cat([o.teacher_features if o.teacher_features is not None
+                else torch.zeros(o.length, 35) for o in observations]).numpy().astype(np.float16)
         arrays.update(lengths=lengths, offsets=np.concatenate([[0], np.cumsum(lengths)]),
             context=torch.stack([o.context for o in observations]).numpy(),
             accepted=np.asarray([-1 if o.accepted is None else o.accepted for o in observations], dtype=np.int32),
@@ -310,18 +323,41 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
     try:
         episodes = getattr(args,"episodes_per_question",1)
         itinerary = [(i,episode,q) for i,q in enumerate(questions) for episode in range(episodes)]
+        detailed = getattr(args, 'model_architecture', '') == 'two_source'
+        if detailed:
+            train_replay.sampling_mode = 'action_balanced'
+            # Collect a fixed holdout BEFORE training. Its labels never enter replay.
+            itinerary.sort(key=lambda item: item[0] < train_count)
+            summary['learning_curve'] = []
+            shadow_rng = random.Random(args.seed+7781)
+            audit_milestones = set(args.audit_milestones)
+            train_completed = 0
+            validation_completed = 0
+
+            def audit_stage(count):
+                from world_model_training_audit import audit_learning_stage
+                result = audit_learning_stage(learner, validation_replay, args.output_dir, count,
+                                               args.horizon, args.audit_states_per_question)
+                summary['learning_curve'].append(result)
+                atomic_json(args.output_dir/'learning_curve.json', summary['learning_curve'])
         for question_index, episode, question in itinerary:
             split = "train" if question_index < train_count else "validation"
             question_id = str(question["question_id"])
             prompt = tokenizer.apply_chat_template([
                 {"role": "user", "content": question["prompt"]}], tokenize=True, add_generation_prompt=True)
             prefix = list(prompt)
+            if hasattr(environment, 'reset_history'): environment.reset_history()
             if len(prefix) > args.max_context_tokens:
                 raise ValueError(f"Question {question_id} exceeds context cap; no silent truncation")
             generated = []
             labeler = HindsightLabeler(prefix, writer.label)
             buffer = train_replay if split == "train" else validation_replay
-            print(f"[question] {question_index+1}/{len(questions)} episode={episode+1}/{episodes} {question_id} split={split}", flush=True)
+            if detailed:
+                position = validation_completed+1 if split=='validation' else train_completed+1
+                size = args.validation_questions if split=='validation' else train_count
+                print(f'[question] {split} {position}/{size} episode={episode+1}/{episodes} {question_id}',flush=True)
+            else:
+                print(f"[question] {question_index+1}/{len(questions)} episode={episode+1}/{episodes} {question_id} split={split}", flush=True)
 
             def train_available():
                 if split != "train":
@@ -341,7 +377,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 writer.add(state, parent, action, timing, split)
                 labeler.register(state)
                 o = state.observation
-                if getattr(args,"model_architecture","legacy")=="token_dual":
+                if getattr(args,"model_architecture","legacy") in ("token_dual", "two_source"):
                     learner.model.eval()
                     with torch.no_grad():
                         b=pack_observations([o],learner.token_table,learner.device)
@@ -355,6 +391,14 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                     train_available()
                 else:
                     buffer.add_node(o)
+                if detailed and shadow_rng.random() < args.shadow_verify_probability:
+                    elapsed = environment.shadow(state, args.max_proposal_tokens+1)
+                    writer.teacher(state, source='shadow_forward')
+                    writer.label(dict(state_id=o.uid, accepted_len=o.accepted, label_valid=True,
+                        lower_bound=o.accepted, source='shadow_verifier', status='exact'))
+                    append_json(args.output_dir/'shadow_verifications.jsonl', dict(state_id=o.uid,
+                        split=split, accepted_len=o.accepted, verifier_ms=elapsed,
+                        history_updated=False, state_submitted=False))
                 print(f"[state] {o.uid} action={action or 'root'} L={o.length} K={o.accepted}", flush=True)
 
             environment.on_state = on_state
@@ -385,6 +429,8 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                     environment.stats["verifier_calls"] += 1
                     environment.stats["native_eos_without_snapshot"] = (
                         environment.stats.get("native_eos_without_snapshot", 0) + 1)
+                    if hasattr(environment, 'remember'):
+                        environment.remember(prefix, terminal.candidate_token_ids, accepted, emitted)
                     append_json(args.output_dir / "native_eos_without_snapshot.jsonl", dict(
                         question=question_id, round_id=round_id, split=split,
                         proposal_token_ids=terminal.candidate_token_ids,
@@ -397,6 +443,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                         split=split, action="forced_stop_native_eos",
                         executed=True, child_state_id=None,
                         feature_snapshot_available=False))
+                    labeler.after_emitted(prefix, emitted)
                     prefix += emitted
                     generated += emitted
                     print(f"[native-eos-stop] {question_id} proposal="
@@ -452,6 +499,14 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 collection_end_reason=end_reason, label_coverage=coverage,
                 generation_is_bounded_smoke_not_answer_accuracy_benchmark=bool(args.max_new_tokens or args.max_rounds_per_question)))
             writer.flush()
+            if detailed and episode == episodes-1:
+                if split == 'validation':
+                    validation_completed += 1
+                    if validation_completed == args.validation_questions: audit_stage(0)
+                else:
+                    train_completed += 1
+                    if train_completed in audit_milestones or train_completed == train_count:
+                        audit_stage(train_completed)
             checkpoint(learner, train_replay, args, args.output_dir, rng)
             summary.update(updates=learner.updates, dynamics_updates=learner.dynamics_updates,
                            nodes=writer.count, edges=writer.edge_count,
@@ -463,9 +518,13 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 package(args.output_dir,args.output_dir.with_suffix(".zip"),dict(summary,status="partial_checkpoint"))
             if shutil.disk_usage(args.output_dir).free < 1024**3:
                 raise OSError("Less than 1 GiB free; stop before corrupting artifacts")
-        summary["evaluation"] = evaluate(learner, validation_replay, args.horizon,
-            args.output_dir if getattr(args,"model_architecture","legacy")=="token_dual" else None,
-            baseline_replay=train_replay)
+        if detailed:
+            summary['evaluation'] = json.loads((args.output_dir/'evaluation'/
+                f'learning_{train_completed:03d}.json').read_text(encoding='utf-8'))
+        else:
+            summary["evaluation"] = evaluate(learner, validation_replay, args.horizon,
+                args.output_dir if getattr(args,"model_architecture","legacy")=='token_dual' else None,
+                baseline_replay=train_replay)
         delta = sum(float((p.detach().cpu()-initial[n]).square().sum())
                     for n, p in learner.model.named_parameters()) ** 0.5
         summary["parameter_l2_change"] = delta
@@ -508,9 +567,10 @@ def run(args):
     args.output_dir.mkdir(parents=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     atomic_json(args.output_dir / "config.json", config)
-    summary = dict(schema=("interactive_acceptance_probe_v3" if args.model_architecture=="token_dual"
+    summary = dict(schema=("interactive_acceptance_two_source_v1" if args.model_architecture=='two_source' else
+                          "interactive_acceptance_probe_v3" if args.model_architecture=="token_dual"
                            else "interactive_acceptance_pretrain_v2_hindsight"), status="running",
-        questions_completed=0, updates=0, nodes=0, edges=0,
+        questions_completed=0, updates=0, nodes=0, edges=0, source_revision=args.source_revision,
         labels="actual STOP verifier + hindsight over emitted greedy tokens; unresolved is NOT zero",
         verifier="full context, KV disabled; invoked only on chosen/forced STOP",
         exploration="single real trajectory; random legal S/E/R; no side branches",
@@ -561,7 +621,11 @@ def run(args):
         draft_vocab = {k: v for k, v in draft_tokenizer.get_vocab().items() if v != MASK_ID}
         if target_vocab != draft_vocab:
             raise RuntimeError("Drafter/verifier token ID mappings differ")
-        if args.model_architecture=="token_dual":
+        if args.model_architecture=='two_source':
+            from world_model_twosource import TwoSourceWorldModel, configure_losses
+            model = TwoSourceWorldModel(drafter.config.hidden_size, table.shape[-1], args.raw_top_k,
+                dim=args.latent_dim, num_hidden_layers=len(args.hidden_layers), dropout=args.dropout)
+        elif args.model_architecture=="token_dual":
             from world_model_probe import ProbeWorldModel
             model = ProbeWorldModel(drafter.config.hidden_size,table.shape[-1],args.raw_top_k,
                 dim=args.latent_dim,num_hidden_layers=len(args.hidden_layers),dropout=args.dropout)
@@ -574,8 +638,14 @@ def run(args):
         verifier = FullContextVerifier(target, tokenizer, args)
         environment = NativeTrainingEnvironment(NativeElysiaRunner(drafter, tokenizer, args),
             verifier, tokenizer.eos_token_id, drafter.config.hidden_size, args, None)
+        if args.model_architecture == 'two_source':
+            from world_model_teacher_environment import TeacherVerifier, TeacherTrainingEnvironment
+            configure_losses(learner, 'full')
+            verifier = TeacherVerifier(target, tokenizer, args)
+            environment = TeacherTrainingEnvironment(NativeElysiaRunner(drafter, tokenizer, args),
+                verifier, tokenizer.eos_token_id, drafter.config.hidden_size, args, None, token_table=table)
         writer = ExperienceWriter(args.output_dir)
-        summary["trainable_parameters"] = sum(p.numel() for p in model.parameters())
+        summary["trainable_parameters"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
         summary["world_model_architecture"] = args.model_architecture
         summary["verifier_teacher"] = ("candidate_vs_best_rival_margin_at_actual_STOP_only" if args.capture_verifier_teacher else "none")
         summary["prototype_limits"] = "No verifier-prefix hidden memory; prefix memory uses frozen token embeddings; no raw verifier-hidden distillation"
@@ -584,7 +654,23 @@ def run(args):
         summary["verifier_devices"] = sorted(target_devices)
         summary["verifier_device_map"] = getattr(target, "hf_device_map", {})
         summary["verifier_memory_mode"] = "FP16 model sharded across both GPUs; 8 GiB placement cap per GPU"
+        if args.model_architecture == 'two_source':
+            summary['prototype_limits'] = ('Verifier hidden uses fixed 32-dimensional projection; '
+                'GRU re-encodes last 8 actual STOP summaries, reset each episode; '
+                'shadow targets never change prefix/history; no online weight updates at deployment')
+            summary['verifier_teacher'] = 'margin + local agreement + probability + projected final hidden'
+            summary['verifier'] = 'full context, KV disabled; actual S and random shadow probes'
+            summary['labels'] = 'actual STOP, shadow verifier and hindsight verified greedy stream; unresolved is missing'
+            summary['teacher_capture_probability'] = args.shadow_verify_probability
         explore_questions(args, questions, tokenizer, environment, learner, writer, summary)
+        if args.model_architecture == 'two_source':
+            # Release both large models before matched small-model ablations.
+            environment.on_state = None
+            del environment, verifier, target, drafter
+            import gc
+            gc.collect(); torch.cuda.empty_cache()
+            from world_model_training_audit import run_retrained_audit
+            summary['factor_audit'] = run_retrained_audit(args, learner)
         summary["status"] = "complete"
     except BaseException as error:
         summary.update(status="partial", error=f"{type(error).__name__}: {error}")
@@ -598,6 +684,9 @@ def run(args):
                      "structured_sparse_collector.py", "sparse_extend_world_model_collector.py", "Fast_dLLM_v2_1_5B/modeling.py"):
             source = Path(__file__).parent / name
             summary.setdefault("source_sha256", {})[name] = hashlib.sha256(source.read_bytes()).hexdigest()
+        if args.model_architecture == 'two_source':
+            for name in ('world_model_twosource.py', 'world_model_teacher_environment.py', 'world_model_training_audit.py'):
+                summary['source_sha256'][name] = hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
         package(args.output_dir, archive, summary)
 
 
@@ -607,7 +696,14 @@ def parse_args(argv=None):
     parser.add_argument("--num_questions", type=int, default=10)
     parser.add_argument("--validation_questions", type=int, default=2)
     parser.add_argument("--episodes_per_question",type=int,default=1)
-    parser.add_argument("--model_architecture",choices=["legacy","token_dual"],default="legacy")
+    parser.add_argument("--model_architecture",choices=["legacy","token_dual","two_source"],default="legacy")
+    parser.add_argument('--shadow_verify_probability', type=float, default=.15)
+    parser.add_argument('--audit_milestones', nargs='+', type=int, default=[10,20,40,60,80])
+    parser.add_argument('--audit_states_per_question', type=int, default=32)
+    parser.add_argument('--audit_retrain_updates', type=int, default=400)
+    parser.add_argument('--audit_train_states_per_question', type=int, default=24)
+    parser.add_argument('--audit_seeds', nargs='+', type=int, default=[42,43])
+    parser.add_argument('--audit_variants', nargs='+', default=None)
     parser.add_argument("--package_every_question",action="store_true")
     parser.add_argument("--max_rounds_per_question", type=int, default=2, help="0: no round cap; stop on verified EOS")
     parser.add_argument("--max_new_tokens", type=int, default=128, help="0: no answer token cap; stop on verified EOS")
@@ -631,6 +727,7 @@ def parse_args(argv=None):
     parser.add_argument("--dllm_dir", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument('--source_revision', default='local_unpinned')
     parser.add_argument("--latent_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--batch_sequences", type=int, default=8)
@@ -642,12 +739,25 @@ def parse_args(argv=None):
     parser.add_argument("--horizon_warmup_updates", type=int, default=24)
     args = parser.parse_args(argv)
     if args.hidden_layers is None:
-        args.hidden_layers = [7,14,28] if args.model_architecture=="token_dual" else [14,28]
+        args.hidden_layers = [7,14,28] if args.model_architecture in ("token_dual", 'two_source') else [14,28]
     if args.model_architecture=="legacy" and len(args.hidden_layers)!=2:
         parser.error("Legacy architecture needs exactly 2 hidden layers")
     if args.model_architecture=="token_dual" and args.latent_dim%8:
         parser.error("Dual latent dimension must be divisible by 8")
-    args.capture_verifier_teacher = args.model_architecture=="token_dual"
+    args.capture_verifier_teacher = args.model_architecture in ("token_dual", 'two_source')
+    if not 0 <= args.shadow_verify_probability <= 1:
+        parser.error('shadow_verify_probability must be within [0,1]')
+    if args.model_architecture == 'two_source':
+        if args.horizon != 3 or args.latent_dim < 64 or args.latent_dim % 8:
+            parser.error('two_source test requires horizon=3 and latent_dim>=64 divisible by 8')
+        from world_model_twosource import FEATURE_VARIANTS
+        if args.audit_variants is None: args.audit_variants = list(FEATURE_VARIANTS)
+        if 'full' not in args.audit_variants or any(v not in FEATURE_VARIANTS for v in args.audit_variants):
+            parser.error('Ablations must include full and use supported variants')
+        if any(v.startswith('no_layer') for v in args.audit_variants) and args.hidden_layers != [7,14,28]:
+            parser.error('Layer-specific ablations require native hidden_layers 7 14 28')
+        if not args.audit_seeds or args.audit_retrain_updates < 1 or min(args.audit_states_per_question, args.audit_train_states_per_question) < 4:
+            parser.error('Invalid audit sizes/seeds/updates')
     args.target_placement = "auto"
     if not 0 < args.validation_questions < args.num_questions:
         parser.error("Need both training and validation questions")

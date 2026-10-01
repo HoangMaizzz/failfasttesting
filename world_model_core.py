@@ -26,6 +26,8 @@ class Observation:
     topk_ids: torch.Tensor | None = None
     history: torch.Tensor | None = None
     teacher_margin: torch.Tensor | None = None  # target ONLY; never encoder input
+    teacher_features: torch.Tensor | None = None  # current verifier, target ONLY
+    verifier_history: torch.Tensor | None = None  # preceding actual STOPs only
 
     @property
     def length(self):
@@ -217,6 +219,19 @@ def pack_observations(observations, token_table, device, include_candidates=Fals
             margins[row, :observation.length] = observation.teacher_margin.to(device)
             teacher_valid[row, :observation.length] = True
     result.update(teacher_margin=margins, teacher_valid=teacher_valid)
+    if any(o.verifier_history is not None for o in observations):
+        memories = [o.verifier_history if o.verifier_history is not None
+                    else torch.empty(0, 48) for o in observations]
+        memory_width = max(1, max(len(x) for x in memories))
+        result['verifier_history'] = torch.stack([
+            F.pad(x, (0, 0, 0, memory_width-len(x))) for x in memories]).to(device).float()
+        result['verifier_history_lengths'] = torch.tensor([len(x) for x in memories], device=device)
+    if any(o.teacher_features is not None for o in observations):
+        features = torch.zeros(len(observations), width, 35, device=device)
+        for row, observation in enumerate(observations):
+            if observation.teacher_features is not None:
+                features[row, :observation.length] = observation.teacher_features.to(device)
+        result['teacher_features'] = features
     return result
 
 
@@ -335,6 +350,8 @@ class WorldModelLearner:
         if not labeled and not dynamics_ready:
             return None  # No supervised signal yet: no fake zero-label/optimizer update.
         paths = replay.sample(batch_size, horizon) if dynamics_ready else []
+        path_depth_counts = dict((str(depth), sum(len(p[1]) == depth for p in paths))
+                                 for depth in range(1, max_horizon+1))
         self.model.train()
         current_losses = []
         if labeled:
@@ -374,6 +391,8 @@ class WorldModelLearner:
                 actual = self.model.encoder(future)
                 if hasattr(self.model, "teacher_loss"):
                     auxiliary_losses.append(self.model.teacher_loss(actual, future))
+                    if getattr(self.model, 'teach_imagined', False):
+                        auxiliary_losses.append(self.model.teacher_loss(imagined, future))
                     structural_losses.append(self.model.structural_loss(imagined, future))
                 current_losses.append(acceptance_nll(self.model.acceptance(actual),
                                                        actual.lengths, future["labels"]))
@@ -397,7 +416,7 @@ class WorldModelLearner:
         teacher = torch.stack(auxiliary_losses).mean() if auxiliary_losses else zero
         structure = torch.stack(structural_losses).mean() if structural_losses else zero
         delta = torch.stack(delta_losses).mean() if delta_losses else zero
-        loss = (current + self.latent_weight * latent + rollout + self.teacher_weight*teacher
+        loss = (current + self.latent_weight * latent + getattr(self, 'rollout_weight', 1.)*rollout + self.teacher_weight*teacher
                 + self.structure_weight*structure + self.delta_weight*delta)
         if not torch.isfinite(loss):
             raise FloatingPointError("Nonfinite world-model loss")
@@ -405,6 +424,8 @@ class WorldModelLearner:
         loss.backward()
         grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), 1.0, error_if_nonfinite=True)
         self.optimizer.step()
+        if hasattr(self.model, 'update_teacher_ema'):
+            self.model.update_teacher_ema(self.ema_decay)
         with torch.no_grad():
             for dst, src in zip(self.target_encoder.parameters(), self.model.encoder.parameters()):
                 dst.lerp_(src, 1 - self.ema_decay)
@@ -415,6 +436,7 @@ class WorldModelLearner:
                     grad_norm=float(grad_norm), horizon=horizon if paths else 0,
                     teacher_loss=float(teacher.detach()), structural_loss=float(structure.detach()),
                     delta_loss=float(delta.detach()),
+                    sampled_path_depth_counts=path_depth_counts,
                     dynamics_trained=bool(paths), labeled_replay_states=len(labeled),
                     replay_states=len(replay.nodes))
 

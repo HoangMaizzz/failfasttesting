@@ -37,7 +37,7 @@ temporary.mkdir(parents=True, exist_ok=True)
 os.chdir(working)
 if DATASET not in ("gsm8k", "math") or not 0 < VALIDATION_QUESTIONS < NUM_QUESTIONS:
     raise ValueError("Choose gsm8k/math and nonempty training + validation splits")
-if MODEL_ARCHITECTURE not in ("legacy","token_dual"):
+if MODEL_ARCHITECTURE not in ("legacy","token_dual", 'two_source'):
     raise ValueError("Unknown world-model architecture")
 import torch
 if torch.cuda.device_count() != 2:
@@ -48,7 +48,8 @@ for index in range(2):
 environment = os.environ.copy()
 environment.update(GIT_LFS_SKIP_SMUDGE="1", CUDA_VISIBLE_DEVICES="0,1",
     HF_HOME=str(temporary / "wm_hf_cache"), PYTHONUNBUFFERED="1",
-    TOKENIZERS_PARALLELISM="false", PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+    TOKENIZERS_PARALLELISM="false", PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
+    USE_TF='0', USE_FLAX='0', WANDB_MODE='disabled')
 print("Installing Python dependencies; keeping Kaggle's existing PyTorch.", flush=True)
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
     "transformers==4.53.1", "accelerate", "datasets", "einops", "numpy",
@@ -79,8 +80,11 @@ subprocess.run([sys.executable, str(repo / "tests/test_world_model_pretraining.p
                cwd=repo, env=environment, check=True)
 subprocess.run([sys.executable, str(repo / "tests/test_native_elysia_graph.py")],
                cwd=repo, env=environment, check=True)
-if MODEL_ARCHITECTURE=="token_dual":
+if MODEL_ARCHITECTURE in ("token_dual", 'two_source'):
     subprocess.run([sys.executable,str(repo/"tests/test_world_model_probe.py")],
+                   cwd=repo,env=environment,check=True)
+if MODEL_ARCHITECTURE=='two_source':
+    subprocess.run([sys.executable,str(repo/'tests/test_world_model_twosource.py')],
                    cwd=repo,env=environment,check=True)
 
 # Weights and source are outside /kaggle/working, so they are not published Output.
@@ -116,15 +120,29 @@ command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"
     "--target_device", "0", "--drafter_device", "1",
     "--target_gpu_memory_gib", "8",
     "--dllm_dir", str(dllm), "--output_dir", str(output)]
-if MODEL_ARCHITECTURE=="token_dual":
+command += ['--source_revision',commit]
+if MODEL_ARCHITECTURE in ("token_dual", 'two_source'):
     command += ["--package_every_question","--warmup_updates","16","--horizon_warmup_updates","64"]
+if MODEL_ARCHITECTURE=='two_source':
+    command += ['--horizon','3','--shadow_verify_probability',str(globals().get('SHADOW_VERIFY_PROBABILITY', .15)),
+        '--audit_retrain_updates',str(globals().get('AUDIT_RETRAIN_UPDATES',400)),
+        '--audit_states_per_question',str(globals().get('AUDIT_STATES_PER_QUESTION',32)),
+        '--audit_train_states_per_question',str(globals().get('AUDIT_TRAIN_STATES_PER_QUESTION',24)),
+        '--audit_seeds',*[str(s) for s in globals().get('AUDIT_SEEDS',[42,43])]]
+    if globals().get('AUDIT_VARIANTS'):
+        command += ['--audit_variants',*globals()['AUDIT_VARIANTS']]
 print("Running:", " ".join(command), flush=True)
 print("Memory layout: verifier FP16 sharded across GPU 0+1 (8 GiB placement cap/card); "
       "dLLM FP16 + world model also on GPU 1", flush=True)
 print("No pre-collected ZIP needed. Generation stops on verified EOS; "
       f"round cap={MAX_ROUNDS_PER_QUESTION or 'none'}, answer token cap={MAX_NEW_TOKENS or 'none'}.", flush=True)
 print(f"Context safety guard={MAX_CONTEXT_TOKENS}; hitting it before EOS in uncapped mode is a PARTIAL run, not success.",flush=True)
-print("Random legal S/E/R; E includes first unmask, max 3 extra R. Only S calls verifier.", flush=True)
+print("Random legal S/E/R; E includes first unmask, max 3 extra R. "
+      + ('Actual S and sampled shadow probes call verifier; shadow never changes prefix or memory.'
+         if MODEL_ARCHITECTURE=='two_source' else 'Only S calls verifier.'), flush=True)
+if MODEL_ARCHITECTURE=='two_source':
+    print('Fixed heldout collected first; curves at 0/10/20/40/60/80 training questions. '
+          'Feature sensitivity + independently retrained removals reuse saved data; no extra LLM forwards.',flush=True)
 print(f"Architecture={MODEL_ARCHITECTURE}; episodes/question={EPISODES_PER_QUESTION}; updates/transition={UPDATES_PER_TRANSITION}; replay capacity={REPLAY_STATES}",flush=True)
 completed = subprocess.run(command, cwd=repo, env=environment, check=False)
 archive = output.with_suffix(".zip")
