@@ -226,7 +226,9 @@ def evaluate_current(model, nodes, token_table, device, ablation=None, output_pa
         row = dict(state_id=obs.uid, question=obs.question, split="validation",
             accepted=int(obs.accepted), proposal_length=obs.length,
             expected_yield=float(expected_yield(logp, batch["lengths"])[0]),
-            mode=int(hazard_mode(logits)[0]),
+            # logits is 1-D here (the batch dimension was indexed above), so
+            # hazard_mode returns a 0-D scalar rather than a length-1 tensor.
+            mode=int(hazard_mode(logits).item()),
             hazards=probs, survival=surv, hazard_nll=nll,
             source="grounded_posterior_after_verifier" if bool(enc["has_verifier"][0]) else "drafter_prior")
         records.append(row)
@@ -313,7 +315,8 @@ def evaluate_dynamics(model, nodes, edges, token_table, device, max_horizon=3,
                     min(child.length, previous_y * child.length / max(1, previous_len)))
                 row = dict(source=parent_id, state_id=child_id, action=action,
                            depth=depth, accepted=int(child.accepted),
-                           expected_yield=pred, mode=int(hazard_mode(logits)[0]),
+                           expected_yield=pred,
+                           mode=int(hazard_mode(logits).reshape(-1)[0].item()),
                            hazards=probs, survival=surv, hazard_nll=nll,
                            persistence_expected_yield=persistence,
                            error=abs(pred-child.accepted))

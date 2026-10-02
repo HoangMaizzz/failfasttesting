@@ -45,6 +45,15 @@ def test_hazard_likelihood_uses_only_prefix_through_first_reject():
     assert int(hazard_mode(logits)[0]) <= 5
 
 
+def test_hazard_mode_supports_batched_and_single_state_logits():
+    logits = torch.tensor([[1.0, 0.5, -0.2, 8.0, -8.0]])
+    batched_mode = hazard_mode(logits)
+    single_mode = hazard_mode(logits[0])
+    assert batched_mode.shape == (1,)
+    assert single_mode.ndim == 0
+    assert int(single_mode.item()) == int(batched_mode[0].item())
+
+
 def test_verifier_encoder_masks_suffix_after_first_rejection():
     torch.manual_seed(1)
     model = PersistentWorldModelV1(hidden_dim=16, token_dim=12, top_k=4,
