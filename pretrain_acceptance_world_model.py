@@ -350,7 +350,8 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
             if len(prefix) > args.max_context_tokens:
                 raise ValueError(f"Question {question_id} exceeds context cap; no silent truncation")
             generated = []
-            labeler = HindsightLabeler(prefix, writer.label)
+            labeler = HindsightLabeler(prefix, writer.label,
+                lambda record: append_json(args.output_dir / "label_conflicts.jsonl", record))
             buffer = train_replay if split == "train" else validation_replay
             if detailed:
                 position = validation_completed+1 if split=='validation' else train_completed+1
@@ -394,8 +395,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 if detailed and shadow_rng.random() < args.shadow_verify_probability:
                     elapsed = environment.shadow(state, args.max_proposal_tokens+1)
                     writer.teacher(state, source='shadow_forward')
-                    writer.label(dict(state_id=o.uid, accepted_len=o.accepted, label_valid=True,
-                        lower_bound=o.accepted, source='shadow_verifier', status='exact'))
+                    labeler.mark_direct(state, 'shadow_verifier')
                     append_json(args.output_dir/'shadow_verifications.jsonl', dict(state_id=o.uid,
                         split=split, accepted_len=o.accepted, verifier_ms=elapsed,
                         history_updated=False, state_submitted=False))

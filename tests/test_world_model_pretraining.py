@@ -255,22 +255,43 @@ class HindsightTests(unittest.TestCase):
             self.assertEqual(stopped.observation.accepted, 8)
             self.assertIsNone(pending.observation.accepted)
             coverage = labeler.finish(reason)
-            self.assertEqual(coverage, dict(states=2, exact=1, unresolved=1))
+            self.assertEqual(coverage, dict(states=2, exact=1, unresolved=1,
+                                            label_conflicts=0))
             self.assertEqual(events[-1]["lower_bound"], 2)
             self.assertFalse(events[-1]["label_valid"])
 
-    def test_question_isolation_and_direct_consistency(self):
-        labeler = HindsightLabeler([10, 11, 12])
+    def test_question_isolation_and_direct_conflict_is_recorded(self):
+        conflicts = []
+        labeler = HindsightLabeler([10, 11, 12], on_conflict=conflicts.append)
         state = self.state("s", list(range(1, 9)))
         labeler.register(state)
         state.submitted = True
         state.observation.accepted = 7  # contradictory result: emitted prefix matches all 8
         state.emitted = list(range(1, 10))
-        with self.assertRaisesRegex(RuntimeError, "disagree"):
-            labeler.after_stop(state)
+        labeler.after_stop(state)
+        self.assertEqual(state.observation.accepted, 7)
+        self.assertEqual(len(conflicts), 0)  # resolved direct STOP is not re-inferred
         other = HindsightLabeler([10, 11, 12])
         other.register(self.state("s", list(range(1, 9))))
         self.assertIsNone(other.records["s"]["observation"].accepted)
+
+    def test_shadow_label_is_not_replaced_by_later_branch_stream(self):
+        events, conflicts = [], []
+        labeler = HindsightLabeler([10, 11, 12], events.append, conflicts.append)
+        shadow = self.state("shadow", [1, 2, 3, 4, 5, 6, 7, 8])
+        labeler.register(shadow)
+        shadow.observation.accepted = 4
+        labeler.mark_direct(shadow, "shadow_verifier")
+        stopped = self.state("stop", [1, 99, 3, 4, 5, 6, 7, 8])
+        labeler.register(stopped)
+        stopped.submitted = True
+        stopped.observation.accepted = 1
+        stopped.emitted = [1, 77]
+        labeler.after_stop(stopped)
+        self.assertEqual(shadow.observation.accepted, 4)
+        self.assertEqual(stopped.observation.accepted, 1)
+        self.assertEqual(conflicts, [])
+        self.assertEqual(sum(event["state_id"] == "shadow" for event in events), 1)
 
 
 class ReplayTests(unittest.TestCase):
