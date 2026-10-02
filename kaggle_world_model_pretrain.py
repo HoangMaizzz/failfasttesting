@@ -2,7 +2,7 @@
 
 Optional notebook globals: SOURCE_REF, NUM_QUESTIONS, VALIDATION_QUESTIONS,
 DATASET, MAX_ROUNDS_PER_QUESTION, MAX_NEW_TOKENS, STOP_WEIGHT, EXTEND_WEIGHT,
-REFINE_WEIGHT. No input ZIP required.
+REFINE_WEIGHT, RESUME_ARCHIVE. A partial ZIP can be attached as Kaggle input.
 """
 from datetime import datetime, timezone
 import json
@@ -28,6 +28,7 @@ EPISODES_PER_QUESTION = int(globals().get("EPISODES_PER_QUESTION", 1))
 UPDATES_PER_TRANSITION = int(globals().get("UPDATES_PER_TRANSITION", 1))
 LATENT_DIM = int(globals().get("LATENT_DIM", 128))
 REPLAY_STATES = int(globals().get("REPLAY_STATES", 4096))
+RESUME_ARCHIVE = globals().get("RESUME_ARCHIVE")
 
 working = Path("/kaggle/working")
 temporary = Path("/kaggle/temp")
@@ -39,6 +40,10 @@ if DATASET not in ("gsm8k", "math") or not 0 < VALIDATION_QUESTIONS < NUM_QUESTI
     raise ValueError("Choose gsm8k/math and nonempty training + validation splits")
 if MODEL_ARCHITECTURE not in ("legacy","token_dual", 'two_source'):
     raise ValueError("Unknown world-model architecture")
+if RESUME_ARCHIVE is not None:
+    RESUME_ARCHIVE = Path(RESUME_ARCHIVE)
+    if not RESUME_ARCHIVE.is_file():
+        raise FileNotFoundError(f"RESUME_ARCHIVE not found: {RESUME_ARCHIVE}; attach the ZIP as a Kaggle input")
 import torch
 if torch.cuda.device_count() != 2:
     raise RuntimeError("Select GPU T4 x2 and enable Internet before running this cell")
@@ -120,6 +125,8 @@ command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"
     "--target_device", "0", "--drafter_device", "1",
     "--target_gpu_memory_gib", "8",
     "--dllm_dir", str(dllm), "--output_dir", str(output)]
+if RESUME_ARCHIVE is not None:
+    command += ["--resume_archive", str(RESUME_ARCHIVE)]
 command += ['--source_revision',commit]
 if MODEL_ARCHITECTURE in ("token_dual", 'two_source'):
     command += ["--package_every_question","--warmup_updates","16","--horizon_warmup_updates","64"]
@@ -134,7 +141,9 @@ if MODEL_ARCHITECTURE=='two_source':
 print("Running:", " ".join(command), flush=True)
 print("Memory layout: verifier FP16 sharded across GPU 0+1 (8 GiB placement cap/card); "
       "dLLM FP16 + world model also on GPU 1", flush=True)
-print("No pre-collected ZIP needed. Generation stops on verified EOS; "
+print((f"Resuming from {RESUME_ARCHIVE.name}; completed questions will be skipped and the interrupted question restarted. "
+       if RESUME_ARCHIVE is not None else "No pre-collected ZIP needed. ")
+      + "Generation stops on verified EOS; "
       f"round cap={MAX_ROUNDS_PER_QUESTION or 'none'}, answer token cap={MAX_NEW_TOKENS or 'none'}.", flush=True)
 print(f"Context safety guard={MAX_CONTEXT_TOKENS}; hitting it before EOS in uncapped mode is a PARTIAL run, not success.",flush=True)
 print("Random legal S/E/R; E includes first unmask, max 3 extra R. "

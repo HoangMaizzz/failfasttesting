@@ -39,7 +39,7 @@ def atomic_json(path, value):
 
 
 class ExperienceWriter:
-    def __init__(self, output):
+    def __init__(self, output, resume=False):
         self.output = output
         self.pending = []
         self.pending_topk = []
@@ -47,7 +47,21 @@ class ExperienceWriter:
         self.count = 0
         self.edge_count = 0
         self.label_records = {}
-        (output / "experience").mkdir()
+        (output / "experience").mkdir(parents=True, exist_ok=resume)
+        if resume:
+            def read_rows(name):
+                path = output / name
+                if not path.exists(): return []
+                with path.open(encoding="utf-8") as stream:
+                    return [json.loads(row) for row in stream if row.strip()]
+            states = read_rows("states.jsonl")
+            edges = read_rows("edges.jsonl")
+            labels = read_rows("labels.jsonl")
+            shards = list((output / "experience").glob("shard_*.npz"))
+            self.count = len(states)
+            self.edge_count = len(edges)
+            self.shards = max((int(path.stem.split("_")[-1]) for path in shards), default=-1) + 1
+            self.label_records = {record["state_id"]: record for record in labels}
 
     def add(self, state, parent, action, timing, split):
         o = state.observation
@@ -131,6 +145,79 @@ class ExperienceWriter:
         self.shards += 1
 
 
+def read_jsonl(path):
+    path = Path(path)
+    if not path.exists(): return []
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(row) for row in stream if row.strip()]
+
+
+def restore_replays(output, args, checkpoint_value):
+    """Rebuild bounded training/holdout graphs from an atomic partial archive."""
+    from world_model_core import Observation
+    output = Path(output)
+    metadata = read_jsonl(output / "states.jsonl")
+    edges = read_jsonl(output / "edges.jsonl")
+    labels = {row["state_id"]: row for row in read_jsonl(output / "labels.jsonl")}
+    teachers = {row["state_id"]: row for row in read_jsonl(output / "teacher_targets.jsonl")}
+    selected = {"train": [], "validation": []}
+    for split in selected:
+        rows = [row for row in metadata if row["split"] == split]
+        selected[split] = rows[-args.replay_states:]
+    keep = {row["state_id"] for rows in selected.values() for row in rows}
+    by_shard = defaultdict(list)
+    for row in metadata:
+        if row["state_id"] in keep:
+            by_shard[row["shard"]].append(row)
+    restored = {}
+    for shard, rows in by_shard.items():
+        with np.load(output / shard, allow_pickle=False) as arrays:
+            # NpzFile is lazy and decompresses a member on every access. Cache
+            # each selected shard once; otherwise restoring 1k replay rows
+            # repeatedly inflates the same compressed arrays thousands of times.
+            arrays = {name: arrays[name] for name in arrays.files}
+            for meta in rows:
+                row = int(meta["row"])
+                begin, end = map(int, arrays["offsets"][row:row+2])
+                def tensor(name, dtype):
+                    return torch.tensor(arrays[name][begin:end], dtype=dtype)
+                label = labels.get(meta["state_id"], {})
+                observation = Observation(meta["state_id"], meta["question"],
+                    int(meta["round_id"]), tensor("ids", torch.long),
+                    tensor("hidden", torch.float16), tensor("gaps", torch.float16),
+                    tensor("scalars", torch.float32),
+                    torch.tensor(arrays["context"][row], dtype=torch.float32),
+                    (int(label["accepted_len"]) if label.get("label_valid") else None),
+                    torch.tensor(meta["prefix_token_ids"], dtype=torch.long),
+                    tensor("aligned_topk_token_ids", torch.long), tensor("history", torch.float32))
+                if "verifier_history_offsets" in arrays:
+                    h0, h1 = map(int, arrays["verifier_history_offsets"][row:row+2])
+                    observation.verifier_history = torch.tensor(
+                        arrays["verifier_history"][h0:h1], dtype=torch.float32)
+                teacher = teachers.get(meta["state_id"])
+                if teacher is not None:
+                    observation.teacher_margin = torch.tensor(teacher["margin"], dtype=torch.float32)
+                    if teacher.get("features") is not None:
+                        observation.teacher_features = torch.tensor(teacher["features"], dtype=torch.float32)
+                restored[meta["state_id"]] = observation
+    train = ExperienceReplay(args.replay_states, args.seed, sampling_mode="action_balanced")
+    validation = ExperienceReplay(args.replay_states, args.seed + 1)
+    for split, replay in (("train", train), ("validation", validation)):
+        for meta in selected[split]:
+            obs = restored.get(meta["state_id"])
+            if obs is not None: replay.add_node(obs)
+    for edge in edges:
+        parent, child = edge["parent"], edge["child"]
+        if parent not in keep or child not in keep: continue
+        replay = train if edge["split"] == "train" else validation
+        replay.add(restored[parent], restored[child], edge["action"])
+    if checkpoint_value.get("replay_rng") is not None:
+        train.rng.setstate(checkpoint_value["replay_rng"])
+    if checkpoint_value.get("replay_state_rng") is not None:
+        train.state_rng.setstate(checkpoint_value["replay_state_rng"])
+    return train, validation
+
+
 def package(output, archive, summary):
     """Only this run's small artifacts, never source/LLM/HF cache directories."""
     atomic_json(output / "summary.json", summary)
@@ -148,14 +235,16 @@ def package(output, archive, summary):
     print(f"[archive] status={summary['status']} {archive} ({archive.stat().st_size/2**20:.1f} MiB)", flush=True)
 
 
-def checkpoint(learner, replay, args, output, exploration_rng=None):
+def checkpoint(learner, replay, args, output, exploration_rng=None, shadow_rng=None):
     value = learner.checkpoint()
     value.update(args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         python_rng=random.getstate(), torch_rng=torch.get_rng_state(),
         cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
         replay_rng=replay.rng.getstate(),
+        replay_state_rng=replay.state_rng.getstate(),
         exploration_rng=None if exploration_rng is None else exploration_rng.getstate(),
-        resume_note="Optimizer/EMA saved; rebuild replay from experience shards for a future resume tool")
+        shadow_rng=None if shadow_rng is None else shadow_rng.getstate(),
+        resume_note="Optimizer/EMA and RNG saved; replay is reconstructed from experience shards on resume")
     temporary = output / "checkpoint.pt.tmp"
     torch.save(value, temporary)
     temporary.replace(output / "checkpoint.pt")
@@ -313,26 +402,44 @@ def action_probabilities(actions, args):
     return {a: weights[a]/total for a in actions}
 
 
-def explore_questions(args, questions, tokenizer, environment, learner, writer, summary):
+def explore_questions(args, questions, tokenizer, environment, learner, writer, summary, resume=None):
     rng = random.Random(args.seed)
-    train_replay = ExperienceReplay(args.replay_states, args.seed)
-    validation_replay = ExperienceReplay(args.replay_states, args.seed+1)
+    if resume and resume.get("exploration_rng") is not None:
+        rng.setstate(resume["exploration_rng"])
+    train_replay = (resume["train_replay"] if resume else
+                    ExperienceReplay(args.replay_states, args.seed))
+    validation_replay = (resume["validation_replay"] if resume else
+                         ExperienceReplay(args.replay_states, args.seed+1))
     train_count = len(questions)-args.validation_questions
     initial = {name: parameter.detach().cpu().clone() for name, parameter in learner.model.named_parameters()}
     next_round_id = defaultdict(int)
+    shadow_rng = None
+    if resume:
+        for state in read_jsonl(args.output_dir / "states.jsonl"):
+            next_round_id[state["question"]] = max(next_round_id[state["question"]],
+                                                     int(state["round_id"]) + 1)
+    completed = set()
+    if resume:
+        completed = {(str(row["question_id"]), int(row.get("episode", 0)))
+                     for row in resume["completed_questions"]}
     try:
         episodes = getattr(args,"episodes_per_question",1)
         itinerary = [(i,episode,q) for i,q in enumerate(questions) for episode in range(episodes)]
         detailed = getattr(args, 'model_architecture', '') == 'two_source'
+        itinerary = [item for item in itinerary
+                     if (str(item[2]["question_id"]), int(item[1])) not in completed]
         if detailed:
             train_replay.sampling_mode = 'action_balanced'
             # Collect a fixed holdout BEFORE training. Its labels never enter replay.
             itinerary.sort(key=lambda item: item[0] < train_count)
-            summary['learning_curve'] = []
+            summary.setdefault('learning_curve', [])
             shadow_rng = random.Random(args.seed+7781)
+            if resume and resume.get("shadow_rng") is not None:
+                shadow_rng.setstate(resume["shadow_rng"])
             audit_milestones = set(args.audit_milestones)
-            train_completed = 0
-            validation_completed = 0
+            train_completed = sum(row.get("split") == "train" for row in resume["completed_questions"]) if resume else 0
+            validation_completed = sum(row.get("split") == "validation" for row in resume["completed_questions"]) if resume else 0
+            audit_milestones = {m for m in audit_milestones if m > train_completed}
 
             def audit_stage(count):
                 from world_model_training_audit import audit_learning_stage
@@ -507,7 +614,8 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                     train_completed += 1
                     if train_completed in audit_milestones or train_completed == train_count:
                         audit_stage(train_completed)
-            checkpoint(learner, train_replay, args, args.output_dir, rng)
+            checkpoint(learner, train_replay, args, args.output_dir, rng,
+                       shadow_rng=shadow_rng if detailed else None)
             summary.update(updates=learner.updates, dynamics_updates=learner.dynamics_updates,
                            nodes=writer.count, edges=writer.edge_count,
                            environment=environment.stats)
@@ -532,7 +640,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
             raise RuntimeError("Smoke did not actually update world-model weights")
     finally:
         writer.flush()
-        checkpoint(learner, train_replay, args, args.output_dir, rng)
+        checkpoint(learner, train_replay, args, args.output_dir, rng, shadow_rng=shadow_rng)
         summary.update(updates=learner.updates, dynamics_updates=learner.dynamics_updates,
                        nodes=writer.count, edges=writer.edge_count,
                        environment=environment.stats)
@@ -560,14 +668,83 @@ def load_questions(args):
         for index in indices[:args.num_questions]]
 
 
+def load_resume_archive(archive, output, args):
+    """Restore an atomic question-boundary checkpoint and its saved experiences."""
+    archive = Path(archive)
+    output = Path(output)
+    if not archive.is_file():
+        raise FileNotFoundError(f"Resume ZIP not found: {archive}")
+    with zipfile.ZipFile(archive) as zf:
+        bad = zf.testzip()
+        if bad: raise RuntimeError(f"Resume ZIP checksum error: {bad}")
+        for member in zf.infolist():
+            target = (output / member.filename).resolve()
+            if not target.is_relative_to(output.resolve()):
+                raise RuntimeError(f"Unsafe path in resume archive: {member.filename}")
+        zf.extractall(output)
+    old_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    expected_keys = ("dataset", "num_questions", "validation_questions", "episodes_per_question",
+        "model_architecture", "seed", "latent_dim", "replay_states", "horizon", "extend_size",
+        "max_proposal_tokens", "max_refinement_steps", "max_context_tokens", "drafter_threshold",
+        "updates_per_transition", "learning_rate", "warmup_updates", "horizon_warmup_updates",
+        "hidden_layers", "raw_top_k", "dropout", "batch_sequences", "stop_weight", "extend_weight",
+        "refine_weight", "max_rounds_per_question", "max_new_tokens", "physical_block_size",
+        "small_block_size", "shadow_verify_probability", "audit_milestones", "audit_states_per_question",
+        "audit_retrain_updates", "audit_train_states_per_question", "audit_seeds", "audit_variants",
+        "target_model_name", "target_gpu_memory_gib")
+    for key in expected_keys:
+        if old_config.get(key) != getattr(args, key):
+            raise ValueError(f"Resume config mismatch for {key}: archive={old_config.get(key)!r}, run={getattr(args,key)!r}")
+    if old_config.get("model_architecture") != "two_source":
+        raise ValueError("Only two_source archives are supported for resume")
+    checkpoint_path = output / "checkpoint.pt"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError("Resume ZIP has no checkpoint.pt")
+    checkpoint_value = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    completed_questions = read_jsonl(output / "questions.jsonl")
+    if not completed_questions:
+        raise RuntimeError("Resume archive contains no completed-question ledger")
+    if checkpoint_value.get("model") is None or checkpoint_value.get("optimizer") is None:
+        raise RuntimeError("Resume archive checkpoint is missing model/optimizer state")
+    summary["resumed_from_archive"] = archive.name
+    summary["resumed_from_questions_completed"] = len(completed_questions)
+    summary["prior_run_error"] = summary.pop("error", None)
+    summary["status"] = "resuming"
+    summary["source_revision"] = args.source_revision
+    if (output / "error.txt").exists():
+        (output / "previous_error.txt").write_text(
+            (output / "error.txt").read_text(encoding="utf-8"), encoding="utf-8")
+        (output / "error.txt").unlink()
+    config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    config.update({k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()})
+    config["resume_archive"] = archive.name
+    atomic_json(output / "config.json", config)
+    train_replay, validation_replay = restore_replays(output, args, checkpoint_value)
+    return dict(summary=summary, checkpoint=checkpoint_value,
+        train_replay=train_replay, validation_replay=validation_replay,
+        completed_questions=completed_questions,
+        exploration_rng=checkpoint_value.get("exploration_rng"),
+        shadow_rng=checkpoint_value.get("shadow_rng"))
+
+
 def run(args):
     archive = args.output_dir.with_suffix(".zip")
     if args.output_dir.exists() or archive.exists():
         raise FileExistsError("Use a new output directory; existing results will not be overwritten")
-    args.output_dir.mkdir(parents=True)
-    config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
-    atomic_json(args.output_dir / "config.json", config)
-    summary = dict(schema=("interactive_acceptance_two_source_v1" if args.model_architecture=='two_source' else
+    if args.resume_archive:
+        args.output_dir.mkdir(parents=True)
+        resume = load_resume_archive(args.resume_archive, args.output_dir, args)
+        summary = resume["summary"]
+        prior_elapsed = float(summary.get("elapsed_seconds", 0.0))
+    else:
+        args.output_dir.mkdir(parents=True)
+        resume = None
+        prior_elapsed = 0.0
+        config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+        atomic_json(args.output_dir / "config.json", config)
+    if resume is None:
+        summary = dict(schema=("interactive_acceptance_two_source_v1" if args.model_architecture=='two_source' else
                           "interactive_acceptance_probe_v3" if args.model_architecture=="token_dual"
                            else "interactive_acceptance_pretrain_v2_hindsight"), status="running",
         questions_completed=0, updates=0, nodes=0, edges=0, source_revision=args.source_revision,
@@ -577,7 +754,7 @@ def run(args):
         stop_is_policy_supervision=False,
         drafter="native Elysia, prefix KV inside each generator invocation",
         refine_execution="bounded deterministic segment replay with predecessor assertion",
-        timings_are_profiling_only=True, required_input_archives=False)
+            timings_are_profiling_only=True, required_input_archives=False)
     began = time.perf_counter()
     args.watchdog_enabled = True
     faulthandler.enable()
@@ -586,9 +763,22 @@ def run(args):
         if torch.cuda.device_count() < 2:
             raise RuntimeError("This real-LLM run requires 2 GPUs; CPU unit tests are separate")
         questions = load_questions(args)
-        atomic_json(args.output_dir / "question_split.json", {
+        question_split = {
             "train": [q["question_id"] for q in questions[:-args.validation_questions]],
-            "validation": [q["question_id"] for q in questions[-args.validation_questions:]]})
+            "validation": [q["question_id"] for q in questions[-args.validation_questions:]]}
+        split_path = args.output_dir / "question_split.json"
+        if resume:
+            if not split_path.is_file() or json.loads(split_path.read_text(encoding="utf-8")) != question_split:
+                raise RuntimeError("Regenerated question split differs from the partial archive; refusing unsafe resume")
+            expected_ids = {q["question_id"] for q in questions}
+            if any(row["question_id"] not in expected_ids for row in resume["completed_questions"]):
+                raise RuntimeError("Completed-question ledger is inconsistent with regenerated questions")
+            regenerated = {q["question_id"]: q for q in questions}
+            for row in resume["completed_questions"]:
+                if row.get("prompt") != regenerated[row["question_id"]]["prompt"]:
+                    raise RuntimeError(f"Question text changed for {row['question_id']}; refusing to mix datasets")
+        else:
+            atomic_json(split_path, question_split)
         from sparse_extend_world_model_collector import _load_models
         from structured_sparse_collector import FullContextVerifier
         from native_elysia_graph import NativeElysiaRunner
@@ -635,6 +825,13 @@ def run(args):
         learner = WorldModelLearner(model, table, f"cuda:{args.drafter_device}", args.extend_size,
             args.learning_rate, warmup_updates=args.warmup_updates,
             horizon_warmup=args.horizon_warmup_updates)
+        if resume:
+            saved = resume["checkpoint"]
+            model.load_state_dict(saved["model"])
+            learner.target_encoder.load_state_dict(saved["target_encoder"])
+            learner.optimizer.load_state_dict(saved["optimizer"])
+            learner.updates = int(saved.get("updates", 0))
+            learner.dynamics_updates = int(saved.get("dynamics_updates", 0))
         verifier = FullContextVerifier(target, tokenizer, args)
         environment = NativeTrainingEnvironment(NativeElysiaRunner(drafter, tokenizer, args),
             verifier, tokenizer.eos_token_id, drafter.config.hidden_size, args, None)
@@ -644,7 +841,17 @@ def run(args):
             verifier = TeacherVerifier(target, tokenizer, args)
             environment = TeacherTrainingEnvironment(NativeElysiaRunner(drafter, tokenizer, args),
                 verifier, tokenizer.eos_token_id, drafter.config.hidden_size, args, None, token_table=table)
-        writer = ExperienceWriter(args.output_dir)
+        writer = ExperienceWriter(args.output_dir, resume=bool(resume))
+        environment.counter = writer.count
+        if resume:
+            environment.stats.update(resume["summary"].get("environment", {}))
+            # Model and data loading consume RNG; restore the saved streams only
+            # after all initialization so the sampling sequence continues.
+            saved = resume["checkpoint"]
+            if saved.get("python_rng") is not None: random.setstate(saved["python_rng"])
+            if saved.get("torch_rng") is not None: torch.set_rng_state(saved["torch_rng"])
+            if torch.cuda.is_available() and saved.get("cuda_rng"):
+                torch.cuda.set_rng_state_all(saved["cuda_rng"])
         summary["trainable_parameters"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
         summary["world_model_architecture"] = args.model_architecture
         summary["verifier_teacher"] = ("candidate_vs_best_rival_margin_at_actual_STOP_only" if args.capture_verifier_teacher else "none")
@@ -662,7 +869,7 @@ def run(args):
             summary['verifier'] = 'full context, KV disabled; actual S and random shadow probes'
             summary['labels'] = 'actual STOP, shadow verifier and hindsight verified greedy stream; unresolved is missing'
             summary['teacher_capture_probability'] = args.shadow_verify_probability
-        explore_questions(args, questions, tokenizer, environment, learner, writer, summary)
+        explore_questions(args, questions, tokenizer, environment, learner, writer, summary, resume=resume)
         if args.model_architecture == 'two_source':
             # Release both large models before matched small-model ablations.
             environment.on_state = None
@@ -678,7 +885,7 @@ def run(args):
         raise
     finally:
         faulthandler.cancel_dump_traceback_later()
-        summary["elapsed_seconds"] = time.perf_counter()-began
+        summary["elapsed_seconds"] = prior_elapsed + time.perf_counter()-began
         for name in ("world_model_core.py", "world_model_probe.py", "world_model_environment.py", "world_model_hindsight.py",
                      "pretrain_acceptance_world_model.py", "native_elysia_graph.py",
                      "structured_sparse_collector.py", "sparse_extend_world_model_collector.py", "Fast_dLLM_v2_1_5B/modeling.py"):
@@ -726,6 +933,8 @@ def parse_args(argv=None):
                         help="Maximum verifier weight placement per GPU when sharding")
     parser.add_argument("--dllm_dir", type=Path, required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--resume_archive", type=Path, default=None,
+                        help="Resume a partial two_source result ZIP into a new output directory")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument('--source_revision', default='local_unpinned')
     parser.add_argument("--latent_dim", type=int, default=128)
