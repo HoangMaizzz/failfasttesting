@@ -669,19 +669,27 @@ def load_questions(args):
 
 
 def load_resume_archive(archive, output, args):
-    """Restore an atomic question-boundary checkpoint and its saved experiences."""
+    """Restore an atomic question-boundary checkpoint from a ZIP or mounted folder."""
     archive = Path(archive)
     output = Path(output)
-    if not archive.is_file():
+    if not archive.exists():
         raise FileNotFoundError(f"Resume ZIP not found: {archive}")
-    with zipfile.ZipFile(archive) as zf:
-        bad = zf.testzip()
-        if bad: raise RuntimeError(f"Resume ZIP checksum error: {bad}")
-        for member in zf.infolist():
-            target = (output / member.filename).resolve()
-            if not target.is_relative_to(output.resolve()):
-                raise RuntimeError(f"Unsafe path in resume archive: {member.filename}")
-        zf.extractall(output)
+    if archive.is_dir():
+        required = ("config.json", "summary.json", "checkpoint.pt")
+        missing = [name for name in required if not (archive / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"Resume folder is missing required files: {missing}")
+        # Kaggle Dataset inputs often expose ZIP contents as a read-only folder.
+        shutil.copytree(archive, output, dirs_exist_ok=True)
+    else:
+        with zipfile.ZipFile(archive) as zf:
+            bad = zf.testzip()
+            if bad: raise RuntimeError(f"Resume ZIP checksum error: {bad}")
+            for member in zf.infolist():
+                target = (output / member.filename).resolve()
+                if not target.is_relative_to(output.resolve()):
+                    raise RuntimeError(f"Unsafe path in resume archive: {member.filename}")
+            zf.extractall(output)
     old_config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     expected_keys = ("dataset", "num_questions", "validation_questions", "episodes_per_question",
         "model_architecture", "seed", "latent_dim", "replay_states", "horizon", "extend_size",

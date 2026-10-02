@@ -42,8 +42,16 @@ if MODEL_ARCHITECTURE not in ("legacy","token_dual", 'two_source'):
     raise ValueError("Unknown world-model architecture")
 if RESUME_ARCHIVE is not None:
     RESUME_ARCHIVE = Path(RESUME_ARCHIVE)
-    if not RESUME_ARCHIVE.is_file():
-        raise FileNotFoundError(f"RESUME_ARCHIVE not found: {RESUME_ARCHIVE}; attach the ZIP as a Kaggle input")
+    if not RESUME_ARCHIVE.exists():
+        raise FileNotFoundError(f"RESUME_ARCHIVE not found: {RESUME_ARCHIVE}; attach the result as a Kaggle input")
+    if RESUME_ARCHIVE.is_dir() and not all(
+        (RESUME_ARCHIVE / name).is_file() for name in ("config.json", "summary.json", "checkpoint.pt")
+    ):
+        raise FileNotFoundError(
+            f"Resume folder must directly contain config.json, summary.json and checkpoint.pt: {RESUME_ARCHIVE}"
+        )
+    if RESUME_ARCHIVE.is_file() and RESUME_ARCHIVE.suffix.lower() != ".zip":
+        raise ValueError(f"Resume file must be a ZIP: {RESUME_ARCHIVE}")
 import torch
 if torch.cuda.device_count() != 2:
     raise RuntimeError("Select GPU T4 x2 and enable Internet before running this cell")
