@@ -764,6 +764,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
+        # Optional persistent-world-state adapter. The default path is exactly
+        # the pretrained path: no module or latent is attached unless an
+        # explicit fixed-policy experiment enables it. The hook is after the
+        # final decoder norm and before the tied LM head, so the frozen
+        # backbone/KV cache and baseline logits are untouched when disabled.
+        world_film = getattr(self, "_persistent_world_film_adapter", None)
+        world_latent = getattr(self, "_persistent_world_latent", None)
+        if world_film is not None and world_latent is not None:
+            hidden_states = world_film(hidden_states, world_latent)
         if self.training:
             hidden_states = hidden_states[:, :hidden_states.shape[1]//2, :]
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss

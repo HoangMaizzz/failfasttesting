@@ -449,7 +449,29 @@ class FullContextVerifier:
             top_values, top_ids = scores.topk(2, dim=-1)
             candidate_scores = scores.gather(1, candidates[:, None]).squeeze(1)
             rival = torch.where(top_ids[:, 0] == candidates, top_values[:, 1], top_values[:, 0])
+            teacher_k = min(int(getattr(self.args, "verifier_teacher_top_k", 32)), scores.shape[-1])
+            teacher_values, teacher_ids = scores.topk(teacher_k, dim=-1)
+            log_normalizer = torch.logsumexp(scores, dim=-1)
+            log_probabilities = scores - log_normalizer[:, None]
+            probabilities = log_probabilities.exp()
+            entropy = -(probabilities * log_probabilities).sum(-1) / math.log(max(2, scores.shape[-1]))
+            candidate_matches = teacher_ids == candidates[:, None]
+            candidate_in_topk = candidate_matches.any(-1)
+            candidate_rank = candidate_matches.float().argmax(-1)
+            # Reserve rank=1.0 for "outside teacher top-K"; rank=0 is a real
+            # top-1 match and must not be conflated with a missing candidate.
+            candidate_rank = torch.where(candidate_in_topk,
+                candidate_rank.float() / max(1, teacher_k - 1),
+                torch.ones_like(candidate_rank, dtype=torch.float32))
+            top1_probability = probabilities.gather(1, scores.argmax(-1, keepdim=True)).squeeze(1)
             self.last_teacher = dict(margin=(candidate_scores-rival).cpu().tolist(),
+                                     topk_ids=teacher_ids.cpu(),
+                                     topk_logits=teacher_values.half().cpu(),
+                                     logsumexp=log_normalizer.cpu(),
+                                     top1_probability=top1_probability.cpu(),
+                                     normalized_entropy=entropy.cpu(),
+                                     candidate_rank=candidate_rank.cpu(),
+                                     candidate_in_topk=candidate_in_topk.cpu(),
                                      source="actual_stop_verifier_shifted_candidate_margin")
         accepted = 0
         while accepted < len(proposal) and int(proposal[accepted]) == int(predicted[accepted]):

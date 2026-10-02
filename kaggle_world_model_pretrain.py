@@ -99,6 +99,10 @@ if MODEL_ARCHITECTURE in ("token_dual", 'two_source'):
 if MODEL_ARCHITECTURE=='two_source':
     subprocess.run([sys.executable,str(repo/'tests/test_world_model_twosource.py')],
                    cwd=repo,env=environment,check=True)
+    persistent_test = repo / 'tests/test_persistent_world_model_v1.py'
+    if persistent_test.is_file():
+        subprocess.run([sys.executable, str(persistent_test)],
+                       cwd=repo, env=environment, check=True)
 
 # Weights and source are outside /kaggle/working, so they are not published Output.
 # Download in a fresh Python subprocess, avoiding stale imports after pip changes.

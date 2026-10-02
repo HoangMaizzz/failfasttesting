@@ -67,10 +67,51 @@ class TeacherTrainingEnvironment(NativeTrainingEnvironment):
         try: return super().make_state(*args, **kwargs)
         finally: self.on_state = callback
 
-    def capture_teacher(self, state):
+    def capture_teacher(self, state, source):
         teacher = self.verifier.last_teacher
         state.observation.teacher_margin = torch.tensor(teacher['margin'], dtype=torch.float32)
         state.observation.teacher_features = teacher['features'].clone()
+        # Older test doubles and previously saved runs can expose only the compact
+        # teacher features. Keep that path usable; V1 FiLM training separately
+        # requires the full top-K distribution targets and checks for them clearly.
+        topk_available = all(key in teacher for key in ('topk_ids', 'topk_logits', 'logsumexp'))
+        if topk_available:
+            state.observation.teacher_topk_ids = torch.as_tensor(
+                teacher['topk_ids'], dtype=torch.long).cpu()
+            state.observation.teacher_topk_logits = torch.as_tensor(
+                teacher['topk_logits'], dtype=torch.float16).cpu()
+            state.observation.teacher_logsumexp = torch.as_tensor(
+                teacher['logsumexp'], dtype=torch.float32).cpu()
+        else:
+            state.observation.teacher_topk_ids = None
+            state.observation.teacher_topk_logits = None
+            state.observation.teacher_logsumexp = None
+        p_top1 = torch.as_tensor(teacher.get('top1_probability',
+            state.observation.teacher_features[:, 1]), dtype=torch.float32).cpu()
+        entropy = torch.as_tensor(teacher.get('normalized_entropy',
+            torch.zeros(state.observation.length)), dtype=torch.float32).cpu()
+        rank = torch.as_tensor(teacher.get('candidate_rank',
+            torch.zeros(state.observation.length)), dtype=torch.float32).cpu()
+        in_topk = torch.as_tensor(teacher.get('candidate_in_topk',
+            torch.zeros(state.observation.length, dtype=torch.bool)), dtype=torch.bool).cpu()
+        candidate_prob = state.observation.teacher_features[:, 1].clamp_min(1e-12)
+        draft_prob = torch.zeros(state.observation.length, dtype=torch.float32)
+        draft_valid = state.observation.scalars[:, 4].bool().cpu() & in_topk
+        for position in range(state.observation.length):
+            if not bool(draft_valid[position]):
+                continue
+            ids = state.observation.topk_ids[position]
+            matches = (ids == state.observation.ids[position, 1]).nonzero(as_tuple=False)
+            if not len(matches):
+                draft_valid[position] = False
+                continue
+            conditional = torch.softmax(state.observation.gaps[position].float(), dim=-1)
+            draft_prob[position] = conditional[int(matches[0, 0])].clamp_min(1e-12)
+        log_gap = (candidate_prob.log() - draft_prob.clamp_min(1e-12).log()).clamp(-20, 20)
+        state.observation.teacher_aux_features = torch.stack([
+            p_top1, entropy, rank, log_gap, draft_valid.float(), in_topk.float()
+        ], dim=-1)
+        state.observation.teacher_is_actual = source == 'actual_STOP_forward'
 
     @torch.inference_mode()
     def remember(self, prefix, candidate, accepted, emitted, masks=0, refinement=0):
@@ -87,7 +128,7 @@ class TeacherTrainingEnvironment(NativeTrainingEnvironment):
 
     def submit(self, state, remaining):
         elapsed = super().submit(state, remaining)
-        self.capture_teacher(state)
+        self.capture_teacher(state, 'actual_STOP_forward')
         self.remember(state.prefix, state.observation.ids[:, 1].tolist(), state.observation.accepted,
                       state.emitted, int(state.observation.scalars[:, 0].sum()), state.snapshot_index)
         return elapsed
@@ -95,7 +136,7 @@ class TeacherTrainingEnvironment(NativeTrainingEnvironment):
     def shadow(self, state, remaining):
         accepted, _, _, elapsed = self.verifier.score(state.prefix, state.observation.ids[:, 1].tolist(), remaining)
         state.observation.accepted = int(accepted)
-        self.capture_teacher(state)
+        self.capture_teacher(state, 'shadow_forward')
         self.stats['shadow_verifier_calls'] = self.stats.get('shadow_verifier_calls', 0)+1
         # Crucially: no emitted tokens, submitted flag or history update here.
         return elapsed

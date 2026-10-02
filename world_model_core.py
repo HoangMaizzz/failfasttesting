@@ -28,6 +28,11 @@ class Observation:
     teacher_margin: torch.Tensor | None = None  # target ONLY; never encoder input
     teacher_features: torch.Tensor | None = None  # current verifier, target ONLY
     verifier_history: torch.Tensor | None = None  # preceding actual STOPs only
+    teacher_aux_features: torch.Tensor | None = None  # verifier distribution summaries, target only
+    teacher_topk_ids: torch.Tensor | None = None      # verifier distillation support, target only
+    teacher_topk_logits: torch.Tensor | None = None   # verifier distillation support, target only
+    teacher_logsumexp: torch.Tensor | None = None     # exact full-vocabulary normalizer
+    teacher_is_actual: bool = False                   # false for counterfactual shadow probes
 
     @property
     def length(self):
@@ -232,6 +237,31 @@ def pack_observations(observations, token_table, device, include_candidates=Fals
             if observation.teacher_features is not None:
                 features[row, :observation.length] = observation.teacher_features.to(device)
         result['teacher_features'] = features
+    if any(o.teacher_aux_features is not None for o in observations):
+        features = torch.zeros(len(observations), width, 6, device=device)
+        for row, observation in enumerate(observations):
+            if observation.teacher_aux_features is not None:
+                features[row, :observation.length] = observation.teacher_aux_features.to(device)
+        result['teacher_aux_features'] = features
+    if any(o.teacher_topk_ids is not None for o in observations):
+        k = max((int(o.teacher_topk_ids.shape[-1]) for o in observations
+                 if o.teacher_topk_ids is not None), default=1)
+        ids = torch.zeros(len(observations), width, k, dtype=torch.long, device=device)
+        logits = torch.zeros(len(observations), width, k, dtype=torch.float32, device=device)
+        normalizer = torch.zeros(len(observations), width, dtype=torch.float32, device=device)
+        valid = torch.zeros(len(observations), width, dtype=torch.bool, device=device)
+        for row, observation in enumerate(observations):
+            if observation.teacher_topk_ids is None:
+                continue
+            count = min(k, observation.teacher_topk_ids.shape[-1])
+            ids[row, :observation.length, :count] = observation.teacher_topk_ids[:, :count].to(device)
+            logits[row, :observation.length, :count] = observation.teacher_topk_logits[:, :count].to(device).float()
+            normalizer[row, :observation.length] = observation.teacher_logsumexp.to(device).float()
+            valid[row, :observation.length] = True
+        result.update(teacher_topk_ids=ids, teacher_topk_logits=logits,
+                      teacher_logsumexp=normalizer, teacher_distribution_valid=valid)
+    result['teacher_actual'] = torch.tensor(
+        [bool(o.teacher_is_actual) for o in observations], dtype=torch.bool, device=device)
     return result
 
 

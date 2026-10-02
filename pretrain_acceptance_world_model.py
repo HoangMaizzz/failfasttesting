@@ -103,7 +103,11 @@ class ExperienceWriter:
                 feature_layout=(None if state.observation.teacher_features is None else
                     ['tanh_candidate_rival_margin_div5','candidate_probability','teacher_forced_local_agreement',
                      'final_norm_causal_hidden_projected32_div10']),
-                hidden_projection_seed=901 if state.observation.teacher_features is not None else None))
+                hidden_projection_seed=901 if state.observation.teacher_features is not None else None,
+                verifier_distribution=("top_k_logits_plus_exact_logsumexp_in_experience_npz"
+                    if state.observation.teacher_topk_ids is not None else None),
+                hidden_stage=(None if state.observation.teacher_features is None else
+                    "verifier_final_norm_at_causal_position_before_candidate_logit")))
 
     def flush(self):
         if not self.pending:
@@ -126,6 +130,28 @@ class ExperienceWriter:
             arrays['verifier_history_offsets'] = np.concatenate([[0], np.cumsum([len(h) for h in history])])
             arrays['teacher_features'] = torch.cat([o.teacher_features if o.teacher_features is not None
                 else torch.zeros(o.length, 35) for o in observations]).numpy().astype(np.float16)
+        arrays['teacher_aux_features'] = torch.cat([o.teacher_aux_features if o.teacher_aux_features is not None
+            else torch.zeros(o.length, 6) for o in observations]).numpy().astype(np.float16)
+        teacher_k = max((o.teacher_topk_ids.shape[-1] for o in observations
+                         if o.teacher_topk_ids is not None), default=0)
+        if teacher_k:
+            arrays['teacher_topk_token_ids'] = torch.cat([
+                o.teacher_topk_ids if o.teacher_topk_ids is not None else
+                torch.zeros(o.length, teacher_k, dtype=torch.long) for o in observations
+            ]).numpy().astype(np.int32)
+            arrays['teacher_topk_logits'] = torch.cat([
+                o.teacher_topk_logits if o.teacher_topk_logits is not None else
+                torch.zeros(o.length, teacher_k, dtype=torch.float16) for o in observations
+            ]).numpy().astype(np.float16)
+            arrays['teacher_logsumexp'] = torch.cat([
+                o.teacher_logsumexp if o.teacher_logsumexp is not None else
+                torch.zeros(o.length) for o in observations
+            ]).numpy().astype(np.float32)
+            arrays['teacher_distribution_valid'] = np.concatenate([
+                np.full(o.length, o.teacher_topk_ids is not None, dtype=np.bool_)
+                for o in observations
+            ])
+        arrays['teacher_actual'] = np.asarray([o.teacher_is_actual for o in observations], dtype=np.bool_)
         arrays.update(lengths=lengths, offsets=np.concatenate([[0], np.cumsum(lengths)]),
             context=torch.stack([o.context for o in observations]).numpy(),
             accepted=np.asarray([-1 if o.accepted is None else o.accepted for o in observations], dtype=np.int32),
@@ -199,6 +225,16 @@ def restore_replays(output, args, checkpoint_value):
                     observation.teacher_margin = torch.tensor(teacher["margin"], dtype=torch.float32)
                     if teacher.get("features") is not None:
                         observation.teacher_features = torch.tensor(teacher["features"], dtype=torch.float32)
+                    observation.teacher_is_actual = teacher.get("source") == 'actual_STOP_forward'
+                if "teacher_aux_features" in arrays:
+                    observation.teacher_aux_features = tensor("teacher_aux_features", torch.float32)
+                if "teacher_topk_token_ids" in arrays and bool(arrays.get(
+                        "teacher_distribution_valid", np.zeros(int(arrays["offsets"][row+1]-arrays["offsets"][row]),dtype=np.bool_)
+                        )[begin:end].any()):
+                    observation.teacher_topk_ids = tensor("teacher_topk_token_ids", torch.long)
+                    observation.teacher_topk_logits = tensor("teacher_topk_logits", torch.float16)
+                    observation.teacher_logsumexp = tensor("teacher_logsumexp", torch.float32)
+                    observation.teacher_is_actual = bool(arrays.get("teacher_actual", np.zeros(len(arrays["lengths"]),dtype=np.bool_))[row])
                 restored[meta["state_id"]] = observation
     train = ExperienceReplay(args.replay_states, args.seed, sampling_mode="action_balanced")
     validation = ExperienceReplay(args.replay_states, args.seed + 1)
