@@ -312,7 +312,8 @@ def evaluate_film(adapter, drafter, examples, device, batch_tokens=32,
         film_kl = grouped_distribution_kl(conditioned, teacher, lse, ids)
         base_top = base.argmax(-1)
         film_top = conditioned.argmax(-1)
-        teacher_top = teacher.argmax(-1)
+        # argmax over top-K returns a support index, not a vocabulary token ID.
+        teacher_top = ids.gather(-1, teacher.argmax(-1, keepdim=True)).squeeze(-1)
         match_base = base_top.eq(teacher_top)
         match_film = film_top.eq(teacher_top)
         changed = film_top.ne(base_top)

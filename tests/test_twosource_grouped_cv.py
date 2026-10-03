@@ -15,6 +15,21 @@ from persistent_world_model_v1 import GatedFiLMAdapter
 
 
 class GroupedCrossValidationTests(unittest.TestCase):
+    def test_top1_match_uses_vocabulary_id_not_topk_index(self):
+        from torch import nn
+        class Drafter(nn.Module):
+            def __init__(self):
+                super().__init__();self.head=nn.Linear(4,20,bias=False)
+                with torch.no_grad():
+                    self.head.weight.zero_();self.head.weight[17]=1
+            def get_output_embeddings(self):return self.head
+        example=dict(hidden=torch.ones(4),latent=torch.zeros(8),ids=torch.tensor([17,9,6]),
+            teacher_logits=torch.tensor([4.,1.,0.]),teacher_logsumexp=torch.tensor(5.),
+            question='q',state_id='s',position=0)
+        result=evaluate_film(GatedFiLMAdapter(4,8),Drafter(),[example],'cpu')
+        self.assertEqual(result['base_top1_match'],1.0)
+        self.assertEqual(result['film_top1_match'],1.0)
+
     def test_folds_partition_questions_without_overlap(self):
         questions = [f"gsm8k:{i}" for i in range(100)]
         folds = grouped_folds(questions, seed=7)

@@ -51,6 +51,11 @@ class NativeElysiaRunner:
             // args.small_block_size)
 
         def run_generator(pass_limit):
+            # Optional V2 native-tail instrumentation. Reset on BOTH attempts so
+            # forward IDs stay aligned with hidden_state_forward_pass on retry.
+            reset = getattr(self.model, '_wm_v2_reset_capture', None)
+            if reset is not None:
+                reset()
             call_args = SimpleNamespace(
                 target_tokenizer=self.tokenizer,
                 full_refinement_oracle=True,
