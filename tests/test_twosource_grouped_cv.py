@@ -5,9 +5,13 @@ import unittest
 import sys
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_twosource_grouped_cv import grouped_folds, load_experiences, make_replay
+from run_twosource_grouped_cv import (grouped_folds, load_experiences,
+    make_replay, make_film_examples, evaluate_film, train_film)
+from world_model_core import pack_observations
+from persistent_world_model_v1 import GatedFiLMAdapter
 
 
 class GroupedCrossValidationTests(unittest.TestCase):
@@ -55,7 +59,12 @@ class GroupedCrossValidationTests(unittest.TestCase):
                 ids=np.concatenate(ids), hidden=np.concatenate(hidden),
                 gaps=np.concatenate(gaps), scalars=np.concatenate(scalars),
                 context=np.stack(context), aligned_topk_token_ids=np.concatenate(topk),
-                history=np.concatenate(history))
+                history=np.concatenate(history),
+                teacher_topk_token_ids=np.tile(np.array([[3, 4, 5]], dtype=np.int32), (10, 1)),
+                teacher_topk_logits=np.tile(np.array([[2, 1, 0]], dtype=np.float16), (10, 1)),
+                teacher_logsumexp=np.full(10, 4.0, dtype=np.float32),
+                teacher_distribution_valid=np.arange(10) % 2 == 0,
+                teacher_actual=np.ones(10, dtype=np.bool_))
             for name, rows in (("states.jsonl", states), ("labels.jsonl", labels),
                                ("edges.jsonl", edges), ("teacher_targets.jsonl", [])):
                 (root / name).write_text("".join(json.dumps(row) + "\n" for row in rows),
@@ -78,6 +87,60 @@ class GroupedCrossValidationTests(unittest.TestCase):
             self.assertEqual({o.question for o in train.nodes.values()},
                              set(question_ids) - heldout)
             self.assertEqual({o.question for o in validation.nodes.values()}, heldout)
+            self.assertTrue(observations["s0_0"].teacher_distribution_valid.item())
+            self.assertFalse(observations["s0_1"].teacher_distribution_valid.item())
+            packed = pack_observations([observations["s0_0"], observations["s0_1"]],
+                                       torch.randn(32, 5), "cpu")
+            self.assertEqual(packed["teacher_distribution_valid"][:, 0].tolist(), [True, False])
+
+    def test_film_supervision_stops_at_first_rejection_and_uses_predicted_child_latent(self):
+        from world_model_core import Observation
+        obs = Observation("child", "q", 0,
+            ids=torch.tensor([[1, 2], [1, 3], [1, 4]]),
+            hidden=torch.randn(3, 2, 4).half(), gaps=torch.zeros(3, 3).half(),
+            scalars=torch.zeros(3, 16), context=torch.zeros(8), accepted=1,
+            prefix_ids=torch.tensor([9]), topk_ids=torch.ones(3, 3, dtype=torch.long),
+            history=torch.zeros(3, 4))
+        obs.teacher_topk_ids = torch.tensor([[3, 4, 5], [6, 7, 8], [9, 10, 11]])
+        obs.teacher_topk_logits = torch.tensor([[2, 1, 0], [2, 1, 0], [2, 1, 0]]).half()
+        obs.teacher_logsumexp = torch.tensor([4., 4., 4.])
+        obs.teacher_distribution_valid = torch.tensor([True, True, True])
+        latent = torch.arange(8).float()
+        rows = make_film_examples({"child": obs}, {"q"}, {"child": latent},
+                                  hidden_slot=1, vocab_size=32)
+        self.assertEqual([row["position"] for row in rows], [0, 1])
+        self.assertTrue(torch.equal(rows[0]["latent"], latent))
+
+    def test_film_training_and_heldout_metric_run_without_backbone_updates(self):
+        from torch import nn
+
+        class TinyDrafter(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(4, 20, bias=False)
+
+            def get_output_embeddings(self):
+                return self.head
+
+        drafter = TinyDrafter()
+        adapter = GatedFiLMAdapter(hidden_dim=4, latent_dim=8)
+        examples = []
+        for index in range(12):
+            examples.append(dict(hidden=torch.randn(4).half(), latent=torch.randn(8),
+                ids=torch.tensor([1, 2, 3]), teacher_logits=torch.tensor([3., 2., 1.]),
+                teacher_logsumexp=torch.tensor(4.), question=f"q{index % 3}",
+                state_id=str(index), position=0))
+        before = evaluate_film(adapter, drafter, examples, "cpu", batch_tokens=4,
+                               max_examples=8, seed=11)
+        self.assertAlmostEqual(before["base_kl"], before["film_kl"], places=6)
+        original = [parameter.detach().clone() for parameter in drafter.parameters()]
+        trained = train_film(adapter, drafter, examples, "cpu", steps=2,
+            batch_tokens=4, learning_rate=1e-4, seed=12, log_prefix="unit")
+        after = evaluate_film(adapter, drafter, examples, "cpu", batch_tokens=4,
+                              max_examples=8, seed=11)
+        self.assertEqual(trained["steps"], 2)
+        self.assertEqual(after["n"], 8)
+        self.assertTrue(all(torch.equal(a, b) for a, b in zip(original, drafter.parameters())))
 
 
 if __name__ == "__main__":

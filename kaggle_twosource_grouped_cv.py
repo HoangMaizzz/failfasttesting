@@ -19,6 +19,10 @@ FOLDS = int(globals().get("FOLDS", 5))
 UPDATES_PER_QUESTION = int(globals().get("UPDATES_PER_QUESTION", 16))
 MILESTONES = list(globals().get("MILESTONES", [10, 20, 40, 60, 80]))
 ROOTS_PER_QUESTION = int(globals().get("ROOTS_PER_QUESTION", 16))
+FILM_STEPS = int(globals().get("FILM_STEPS", 300))
+FILM_BATCH_TOKENS = int(globals().get("FILM_BATCH_TOKENS", 32))
+FILM_EVAL_TOKENS = int(globals().get("FILM_EVAL_TOKENS", 512))
+REAL_FILM_QUESTIONS_PER_FOLD = int(globals().get("REAL_FILM_QUESTIONS_PER_FOLD", 2))
 
 WORK = Path("/kaggle/working")
 TEMP = Path("/kaggle/temp")
@@ -110,8 +114,14 @@ command = [sys.executable, "-u", str(repo / "run_twosource_grouped_cv.py"),
     "--folds", str(FOLDS), "--milestones", *map(str, MILESTONES),
     "--updates_per_question", str(UPDATES_PER_QUESTION),
     "--roots_per_question", str(ROOTS_PER_QUESTION), "--horizon", "3",
-    "--batch_size", "8", "--device", "1", "--seed", "42"]
-print("\nStarting true grouped 5-fold retraining + heldout validation; no verifier/drafter calls.",
+    "--batch_size", "8", "--device", "1", "--target_device", "0",
+    "--target_gpu_memory_gib", "8", "--film_steps", str(FILM_STEPS),
+    "--film_batch_tokens", str(FILM_BATCH_TOKENS),
+    "--film_eval_tokens", str(FILM_EVAL_TOKENS),
+    "--real_film_questions_per_fold", str(REAL_FILM_QUESTIONS_PER_FOLD),
+    "--seed", "42"]
+print("\nStarting grouped 5-fold world-model CV + fold-isolated FiLM distillation/evaluation, "
+      "then a small paired real-verifier FiLM test.",
       flush=True)
 result = subprocess.run(command, cwd=repo, env=env, check=False)
 archive = output.with_suffix(".zip")
@@ -129,7 +139,8 @@ if cv_summary.get("status") != "complete" or cv_summary.get("completed_folds") !
 print(json.dumps({"status": cv_summary["status"],
                   "completed_folds": cv_summary["completed_folds"],
                   "pooled_oof": cv_summary["pooled_oof"]["groups"],
-                  "learning_curve_mean": cv_summary["learning_curve_mean"]},
+                  "learning_curve_mean": cv_summary["learning_curve_mean"],
+                  "film": cv_summary["film"]},
                  indent=2, ensure_ascii=False), flush=True)
 from IPython.display import FileLink, display
 display(FileLink(archive.name))
