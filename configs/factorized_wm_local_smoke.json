@@ -1,0 +1,11 @@
+{
+  "mode": "smoke",
+  "num_questions": 20, "seed": 42, "seeds": [42],
+  "hidden_dims": [8], "representations": ["SHT"],
+  "scaling_questions": [14], "capacities": {"medium": {"width": 32, "layers": 1}},
+  "projection_updates": 10, "drafter_updates": 20, "verifier_updates": 20, "direct_updates": 20,
+  "batch_size": 4, "eval_every": 10, "early_patience": 4, "h1_min_updates": 5,
+  "horizon": 3, "device_drafter": "cuda:0", "device_verifier": "cuda:0",
+  "max_proposal_tokens": 64, "extend_size": 8, "bootstrap_samples": 50,
+  "save_every_stage": true
+}

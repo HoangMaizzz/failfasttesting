@@ -1,0 +1,90 @@
+{
+  "num_questions": 100,
+  "seed": 42,
+  "seeds": [42, 43, 44],
+  "hidden_dims": [8, 16, 32],
+  "representations": ["S", "H", "SH", "SHT"],
+  "scaling_questions": [20, 40, 60, 70],
+  "capacities": {
+    "small": {"width": 64, "layers": 1},
+    "medium": {"width": 128, "layers": 2},
+    "large": {"width": 256, "layers": 3}
+  },
+  "projection_updates": 300,
+  "drafter_updates": 1200,
+  "verifier_updates": 1200,
+  "direct_updates": 800,
+  "batch_size": 16,
+  "eval_every": 100,
+  "early_patience": 4,
+  "h1_min_updates": 400,
+  "horizon": 3,
+  "device_drafter": "cuda:1",
+  "device_verifier": "cuda:0",
+  "max_proposal_tokens": 64,
+  "extend_size": 8,
+  "bootstrap_samples": 1000,
+  "save_every_stage": true,
+  "protocol": {
+    "dataset": "gsm8k",
+    "input": "original_100_question_experience_and_teacher_trace",
+    "split_unit": "question",
+    "split_seed": 42,
+    "split_fractions": [0.7, 0.15, 0.15],
+    "split_counts": {"train": 70, "validation": 15, "test": 15},
+    "fixed_split_across_jobs": true,
+    "drafter_families": {"D0": "ridge", "D1": "MLP", "D2": "Transformer"},
+    "verifier_families": {
+      "V0": "logistic",
+      "V1": "HistGradientBoosting",
+      "V2": "Transformer"
+    },
+    "hidden_projector": {
+      "method": "learned_autoencoder",
+      "inputs": "drafter_hidden_only",
+      "fit_split": "train",
+      "freeze_before_dynamics_targets": true,
+      "target_coordinates": "frozen_projector"
+    },
+    "native_decoder": {
+      "method": "D_only_learned_topk_readout",
+      "fit_split": "train",
+      "updates_from": "projection_updates",
+      "width": 128,
+      "frozen_after_fit": true,
+      "additional_bottleneck": true,
+      "real_state_floor_report": "native_decoder_real_state_floor.json"
+    },
+    "experiment_design": "deduplicated_one_axis_ablations",
+    "primary_pair": {
+      "drafter": "D2",
+      "verifier": "V2",
+      "hidden_dim_from": "max(hidden_dims)",
+      "representation": "SHT",
+      "capacity": "medium",
+      "seed_from": "seed",
+      "hidden_gate": true,
+      "train_questions": "entire_fixed_train_split"
+    },
+    "resume": {
+      "runner_manifest": "study_manifest.json",
+      "completion_marker": "jobs/<job>/result.json",
+      "training_completion_marker": "jobs/<job>/training_complete.json",
+      "granularity": "job_boundaries",
+      "optimizer_step_resume": false,
+      "partial_job_policy": "reuse_completed_training_otherwise_restart_fit",
+      "requires_identical_config": true
+    },
+    "curriculum": ["H1", "H2", "H3"],
+    "scaling_uses_train_subset_only": true,
+    "selection_split": "validation",
+    "final_evaluation_split": "test",
+    "bootstrap_unit": "question",
+    "teacher_support": "native_top32_conditional_only",
+    "full_vocabulary_kl_available": false,
+    "llm_inference": false,
+    "film": false,
+    "controller": false,
+    "verdict": "exploratory_not_impossibility_proof"
+  }
+}
