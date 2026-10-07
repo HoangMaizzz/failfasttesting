@@ -175,7 +175,7 @@ class NativeHiddenStore:
         if set(self.progress) - set(uids):
             raise ValueError('Capture progress contains foreign states')
         for uid, rec in self.progress.items():
-            known_K = rows[uid].get('accepted')
+            known_K = rows[uid].get('historical_accepted', rows[uid].get('accepted'))
             if rec.get('signature') != signature or (known_K is not None and rec.get('saved_K') != known_K):
                 raise ValueError('Capture progress is not bound to the saved verifier labels')
             if known_K is None and not readonly:
@@ -186,6 +186,8 @@ class NativeHiddenStore:
                     type(rec.get('matches')) is not bool or rec['matches'] != (saved == rerun) or
                     not rec.get('alignment', {}).get('passed') is True):
                 raise ValueError('Replayed reproduction or causal alignment record is inconsistent')
+            if 'label_reconciliation' in rec and not reconciled_capture(rec):
+                raise ValueError('Replayed label reconciliation is inconsistent')
 
     def record(self, uid, result):
         if self.readonly:
@@ -228,8 +230,9 @@ class NativeHiddenStore:
             if hasher.hexdigest()!=rec['raw_hidden_sha256']:
                 raise ValueError(f'Native hidden checksum failed for {uid}')
 
-    def qualified(self):
-        return sorted(uid for uid, rec in self.progress.items() if rec['matches'])
+    def qualified(self, include_reconciled=False):
+        return sorted(uid for uid, rec in self.progress.items()
+                      if rec['matches'] or (include_reconciled and reconciled_capture(rec)))
 
     def close(self):
         self.flush_progress()
@@ -241,8 +244,52 @@ class NativeHiddenStore:
         self.arrays.clear()
 
 
+def reconciled_capture(rec):
+    audit = rec.get('label_reconciliation', {})
+    return (audit.get('policy') == 'audited_direct' and audit.get('stable') is True
+            and audit.get('confirmation_passes') == 2
+            and audit.get('saved_K') == rec.get('saved_K')
+            and audit.get('rerun_K') == rec.get('rerun_K')
+            and audit.get('signature') == rec.get('signature')
+            and audit.get('raw_hidden_sha256') == rec.get('raw_hidden_sha256'))
+
+
+def apply_capture_labels(rows, store, policy):
+    """Keep original K auditable; all predictors use the same captured-forward K."""
+    if policy not in ('strict', 'audited_direct'):
+        raise ValueError('Unknown verifier label policy')
+    for uid in store.uids:
+        rec = store.progress.get(uid)
+        if rec is None or (not rec['matches'] and
+                           (policy != 'audited_direct' or not reconciled_capture(rec))):
+            raise ValueError('Incomplete or unconfirmed native labels cannot enter training')
+        row = rows[uid]
+        row['historical_accepted'] = rec['saved_K']
+        row['accepted'] = rec['rerun_K'] if policy == 'audited_direct' else rec['saved_K']
+        row['label_basis'] = 'native_direct_forward' if policy == 'audited_direct' else 'exact_historical'
+    if policy == 'strict':
+        return
+    for uid in store.uids:
+        row = rows[uid]; parent = row.get('parent_uid')
+        if parent is not None:
+            if parent not in store.progress:
+                raise ValueError('Parent labels must be captured before defining action cohorts')
+            row['historical_parent_K'] = row['parent_K']
+            row['parent_K'] = rows[parent]['accepted']
+            row['is_parent_full_prefix'] = row['parent_K'] == row['parent_length']
+
+
 def pack_native_batch(uids, spec, rows, cachez, store, candidate_table, device):
     group=[rows[u] for u in uids]
+    # Direct's API must remain teacher-asset blind. Its shared labels have
+    # already been reconciled by the runner, before workers are created.
+    for uid, row in ([] if spec['kind'] == 'direct' else zip(uids, group)):
+        rec = store.progress.get(uid)
+        if rec is None:
+            raise ValueError('An unavailable capture cannot provide supervised labels')
+        expected = rec['rerun_K'] if row.get('label_basis') == 'native_direct_forward' else rec['saved_K']
+        if row['accepted'] != expected:
+            raise ValueError('Supervision is not bound to the audited native capture')
     lengths=torch.tensor([r['length'] for r in group], dtype=torch.long, device=device)
     accepted=torch.tensor([r['accepted'] for r in group], dtype=torch.long, device=device)
     if bool((accepted < 0).any()):
@@ -263,7 +310,10 @@ def pack_native_batch(uids, spec, rows, cachez, store, candidate_table, device):
         return batch
     depth=spec['depth']; h=[]; embeddings=[]; structural=[]
     for uid,row in zip(uids,group):
-        if uid not in store.progress or not store.progress[uid]['matches']:
+        rec = store.progress.get(uid)
+        if rec is None or (not rec['matches'] and not (
+                reconciled_capture(rec) and row.get('label_basis') == 'native_direct_forward'
+                and row['accepted'] == rec['rerun_K'])):
             raise ValueError('An unavailable native capture entered a probe batch')
         begin,end=store.offsets[uid]; n=row['length']
         hidden=torch.tensor(np.array(store.arrays[depth][begin:end],copy=True),dtype=torch.float32)

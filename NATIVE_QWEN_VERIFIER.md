@@ -200,3 +200,46 @@ been run locally; those results must come from the Kaggle experiment.
 Launcher regression tests explicitly simulate Kaggle mounts and batch mode.
 Their `WORKING_DIR`/`TEMP_DIR` overrides stay isolated even on Kaggle; normal
 launches without overrides still use `/kaggle/working` and `/kaggle/temp`.
+
+## Recover a capture stopped by historical-label disagreement
+
+Use the newly published launcher with `CAPTURE_INPUT` pointing to the partial
+native-Qwen ZIP **or its unpacked Kaggle dataset folder**. Keep the original
+`RUN_DIR` and `PHASE0_INPUT`. Do not use `RESUME_INPUT`: a capture stopped before
+training has no study manifest or optimizer checkpoints to resume.
+
+Set `LABEL_POLICY="audited_direct"` explicitly. Strict reproduction remains the
+default. This amended protocol retains the historical labels and their FAILED
+exact reproduction audit, but all raw probes, the direct baseline, and all
+latent models use K from the forward that generated the native hidden. Parents
+and R/E evaluation cohorts are recomputed using that same K. No discrepant state
+is dropped or selected on predicted quality.
+
+Before reusing a mismatched state, the runner makes two direct confirmations.
+Both K values must equal the cached direct K and both prediction sequences must
+agree. It records candidate IDs, top-two logits and candidate-vs-rival margins
+in `mismatch_diagnostics.json`. These diagnostics are never predictor inputs;
+near-tie numerical drift is not asserted as the cause. Unstable predictions or
+historical drift greater than a fixed 0.1% refuse training and package a partial
+result. All completed hidden rows are checksum-verified; only mismatches are
+recaptured and missing states captured. Recovery does not regenerate questions
+or rerun the drafter. Model weights may still be downloaded in a fresh session.
+
+`label_reconciliation.json` is the independent training-label consistency gate.
+`verifier_reproduction_check.json.passed` remains FALSE if historical labels
+disagree. Reports explicitly disclose the amended direct-label protocol and
+keep `K_historical` beside `K_true`. This does not prove exact reproduction of
+the historical verifier stream. Imported ZIP extraction is temporary and cleaned
+before capture/training; the input dataset is never modified.
+
+Recovery regression verification: 155 focused tests pass under pinned
+Transformers 4.53.1 with Kaggle Batch environment simulation. The real tiny-Qwen
+CPU integration imports a legacy partial capture, confirms a mismatched state,
+preserves previously captured rows, completes missing states, trains all methods,
+and verifies that historical K remains distinct from the shared direct K.
+The real 7B recovery itself must still be run on Kaggle.
+
+When exactly one partial native result is mounted, `CAPTURE_INPUT="/kaggle/input"`
+auto-locates its unpacked capture manifest or its native capture ZIP, ignoring
+unrelated original/Phase0 result ZIPs. Multiple native captures are rejected;
+then provide the precise selected dataset folder or ZIP path instead.

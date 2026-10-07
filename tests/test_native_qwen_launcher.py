@@ -169,6 +169,17 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(launcher.build_config(base, {}), base)
         self.assertTrue(launcher.build_config(base, {"MODE": "smoke"})["pipeline_check_only"])
 
+    def test_audited_policy_is_explicit_full_only_and_strict_override_is_honored(self):
+        base=config_fixture()
+        audited=launcher.build_config(base, {'LABEL_POLICY':'audited_direct'})
+        self.assertEqual(audited['label_policy'],'audited_direct')
+        self.assertEqual(audited['max_reconciled_mismatch_rate'],.001)
+        self.assertEqual(launcher.build_config(audited, {'LABEL_POLICY':'strict'})['label_policy'],'strict')
+        with self.assertRaises(ValueError):
+            launcher.build_config(base, {'MODE':'smoke','LABEL_POLICY':'audited_direct'})
+        with self.assertRaises(ValueError):
+            launcher.build_config(base, {'LABEL_POLICY':'silently_ignore'})
+
     def test_invalid_mode_budget_split_or_reproduction_override_fails(self):
         for scope in ({"MODE": "typo"}, {"NUM_QUESTIONS": 8}, {"NUM_QUESTIONS": 100.0}):
             with self.subTest(scope=scope), self.assertRaises(ValueError):

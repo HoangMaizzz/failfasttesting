@@ -14,6 +14,8 @@ import torch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import run_native_qwen_verifier as runner
 from native_qwen_capture import load_verifier, MODEL_ID, REVISION
+from native_qwen_capture import capture_one, depth_indices
+from native_qwen_data import NativeHiddenStore, digest
 
 
 class RunnerTests(unittest.TestCase):
@@ -144,6 +146,109 @@ class RunnerTests(unittest.TestCase):
                 self.assertTrue(output.with_suffix('.zip').exists())
                 report=json.loads((output/'verifier_reproduction_check.json').read_text())
                 self.assertEqual(report['mismatches'],1)
+
+    def test_legacy_partial_capture_recovery_preserves_rows_and_trains_all_labels(self):
+        model,original=self.fixture()
+        uid='q000_root'
+        original['rows'][uid]['accepted']=7  # Cached direct verifier still says8.
+        for child in ('q000_E','q000_R'):
+            original['rows'][child]['parent_K']=7
+            original['rows'][child]['is_parent_full_prefix']=False
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);partial=root/'legacy';partial.mkdir();output=root/'recovery'
+            cfg=self.config();cfg.update(label_policy='audited_direct',max_reconciled_mismatch_rate=.001)
+            # Tiny fixture has300 states, so one discrepancy requires a larger
+            # test population to obey the exact production0.1% guard.
+            for i in range(100):
+                row=copy.deepcopy(original['rows'][f'q{i:03d}_root'])
+                for j in range(8):
+                    extra=f'q{i:03d}_extra{j}';row2=copy.deepcopy(row);row2['uid']=extra
+                    if i==0:row2['accepted']=8
+                    original['rows'][extra]=row2;original['cachez'][extra]=original['cachez'][f'q{i:03d}_root'].clone()
+            uids=runner.select_capture_uids(original['rows']);depths=depth_indices(model.config.num_hidden_layers)
+            key=digest(dict(original=original['provenance']['original_data_digest'],
+                phase0_artifacts=original['provenance']['artifact_hashes'],identity=original['identity'],
+                uids=uids,split=original['split']))
+            identity=dict(source_key=key,model_identity=original['identity'],depths=depths,
+                hidden_dim=model.config.hidden_size,num_hidden_layers=model.config.num_hidden_layers,
+                model_config=model.config.to_dict(),dtype=str(model.get_input_embeddings().weight.dtype),
+                capture_code_sha256=runner.source_code_hashes()['native_qwen_capture.py'])
+            signature=digest(identity);identity['signature']=signature
+            runner.write_json(partial/'capture_identity.json',identity)
+            store=NativeHiddenStore(partial,original['rows'],uids,depths,model.config.hidden_size,signature)
+            captured=['q000_E','q000_R','q000_root']
+            for state in captured:
+                r=original['rows'][state];store.record(state,capture_one(model,r['prefix'],r['candidate'],depths))
+            unchanged={d:store.arrays[d][store.offsets['q000_E'][0]:store.offsets['q000_E'][1]].copy() for d in depths}
+            store.close();runner.ensure_candidate_embeddings(model,original,uids,partial)
+            cfg_path=root/'cfg.json';cfg_path.write_text(json.dumps(cfg))
+            args=argparse.Namespace(input='fixture',phase0_input='fixture',output=str(output),
+                config=str(cfg_path),resume=False,capture_input=str(partial))
+            with patch.object(runner,'prepare_native_source',side_effect=lambda *a,**kw:copy.deepcopy(original)), \
+                 patch.object(runner,'load_verifier',return_value=model), \
+                 patch.object(runner,'execute_stage',side_effect=self.inline_stage), \
+                 patch.object(runner,'log'),patch('builtins.print'):
+                result=runner.run(args)
+            self.assertEqual(result['status'],'complete')
+            self.assertEqual(result['reused_capture_states'],3)
+            self.assertEqual(result['fresh_capture_calls'],len(uids)-3+2)
+            self.assertEqual(result['captured_states'],len(uids))
+            self.assertFalse(result['historical_exact_reproduction'])
+            self.assertFalse(json.loads((output/'verifier_reproduction_check.json').read_text())['passed'])
+            self.assertTrue(json.loads((output/'label_reconciliation.json').read_text())['passed'])
+            self.assertFalse(json.loads((partial/'capture_progress.json').read_text())[uid]['matches'])
+            rows={r['state_id']:r for r in map(json.loads,(output/'capture_rows.jsonl').read_text().splitlines())}
+            self.assertEqual((rows[uid]['K_historical'],rows[uid]['K_true']),(7,8))
+            self.assertTrue(rows['q000_E']['is_parent_full_prefix'])
+            payload=torch.load(output/'_cache/train_val.pt',map_location='cpu',weights_only=True)
+            self.assertEqual(payload['rows'][uid]['accepted'],8)
+            self.assertEqual(payload['rows']['q000_E']['parent_K'],8)
+            replay=NativeHiddenStore(output,original['rows'],uids,depths,model.config.hidden_size,signature,readonly=True)
+            self.assertEqual(len(replay.qualified(include_reconciled=True)),len(uids))
+            for d,h in unchanged.items():
+                begin,end=replay.offsets['q000_E'];self.assertTrue((replay.arrays[d][begin:end]==h).all())
+            replay.close()
+
+    def test_unstable_confirmation_refuses_relabel_and_keeps_cached_hidden(self):
+        row=dict(uid='x',question='gsm8k:0',prefix=[1],candidate=[2,3],accepted=2)
+        prior=dict(saved_K=2,rerun_K=1,matches=False,raw_hidden_sha256='unchanged')
+        store=type('Store',(),dict(depths=[1],progress={'x':prior},flush_progress=lambda self:None,
+                                  record=lambda self,*args:self.fail('must not replace cache')))()
+        results=[dict(K=1,predictions=[2,4,5]),dict(K=0,predictions=[4,4,5])]
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(runner,'capture_one',side_effect=results), \
+             patch.object(runner,'diagnose_mismatch',return_value={}), \
+             patch.object(store,'record') as record:
+            with self.assertRaisesRegex(RuntimeError,'Unstable'):
+                runner.confirm_mismatch(None,row,store,Path(temp),dict(fresh_capture_calls=0))
+            record.assert_not_called()
+            self.assertEqual(store.progress['x']['raw_hidden_sha256'],'unchanged')
+
+    def test_direct_reconciliation_guard_rejects_large_historical_drift(self):
+        rec=dict(matches=False)
+        store=type('Store',(),dict(uids=['x'],progress={'x':rec}))()
+        result=runner.reconciliation_report(store,'audited_direct',dict(max_reconciled_mismatch_rate=.001))
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['excluded_states'],0)
+
+    def test_capture_lookup_ignores_other_mounted_result_zips(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);inputs=root/'input';inputs.mkdir()
+            for name in ('old_source.zip','phase0.zip'):
+                with zipfile.ZipFile(inputs/name,'w') as z:z.writestr('summary.json','{}')
+            with zipfile.ZipFile(inputs/'arbitrary_native_name.zip','w') as z:
+                z.writestr('nested/capture_manifest.json','{}')
+                z.writestr('nested/capture_progress.json','{}')
+            found=runner.find_native_result(inputs,root/'cache')
+            self.assertTrue((found/'capture_manifest.json').exists())
+
+    def test_capture_lookup_rejects_ambiguous_native_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            for name in ('a','b'):
+                folder=root/name;folder.mkdir();(folder/'capture_manifest.json').write_text('{}')
+            with self.assertRaisesRegex(ValueError,'exactly one native'):
+                runner.find_native_result(root,root/'cache')
 
 
 if __name__=='__main__':unittest.main()

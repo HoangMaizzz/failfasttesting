@@ -28,7 +28,7 @@ from behavior_aware_source import sha_file
 from factorized_wm_metrics import write_json as _write_json, write_jsonl as _write_jsonl, write_csv as _write_csv
 from native_qwen_capture import load_verifier, depth_indices, capture_one, benchmark_partial
 from native_qwen_data import (prepare_native_source, select_capture_uids, NativeHiddenStore,
-    pack_native_batch, load_candidate_table, digest)
+    pack_native_batch, load_candidate_table, digest, apply_capture_labels, reconciled_capture)
 from native_qwen_metrics import (report, per_method_report, seed_summary, paired_bootstrap,
     select_layers, compression_comparison, feasibility_gate)
 from native_qwen_probe import make_model, call_model, train_model
@@ -80,6 +80,12 @@ def config_check(cfg):
         raise ValueError('Use top two validation layers and all 64/128/256 dimensions')
     if cfg['max_reproduction_mismatch_rate']!=0:
         raise ValueError('This version requires exact reproduction; no mismatch filtering is allowed')
+    policy = cfg.get('label_policy', 'strict')
+    if policy not in ('strict', 'audited_direct'):
+        raise ValueError('Unknown native label policy')
+    if policy == 'audited_direct' and (cfg['capture_states_per_question'] != 0 or
+            cfg.get('max_reconciled_mismatch_rate') != 0.001):
+        raise ValueError('Audited direct labels require full coverage and a fixed 0.1% drift guard')
     if not cfg['package_raw_hidden']:
         raise ValueError('Raw native representation must remain auditable in the result')
     if cfg['lambda_K_ablation']!=[0.,.1] or cfg['lambda_K']!=.1:
@@ -116,7 +122,7 @@ def find_native_result(path, cache):
     if (path/'capture_manifest.json').is_file():roots.add(path)
     if not roots:
         archives=[p for p in path.rglob('*') if p.is_file() and p.suffix.lower() not in ('.pt','.npy')
-                  and zipfile.is_zipfile(p)]
+                  and zipfile.is_zipfile(p) and is_native_capture_archive(p)]
         if len(archives)==1:return find_native_result(archives[0],cache)
     if len(roots)!=1:raise ValueError(f'Expected exactly one native capture root, found {len(roots)}')
     root=roots.pop()
@@ -124,15 +130,29 @@ def find_native_result(path, cache):
     return root
 
 
+def is_native_capture_archive(path):
+    with zipfile.ZipFile(path) as archive:
+        names=archive.namelist()
+        return any(n.split('/')[-1]=='capture_manifest.json' for n in names)
+
+
 def restore_capture(path, output, cache):
+    # Imported ZIP extraction must not leave a second 4.3GiB hidden copy in
+    # Output. On Kaggle this temporary directory is under /kaggle/temp.
+    with tempfile.TemporaryDirectory(prefix='native_qwen_capture_import_') as temp:
+        return _copy_capture(path, output, temp)
+
+
+def _copy_capture(path, output, cache):
     root=find_native_result(path,cache)
     required=['capture_manifest.json','capture_progress.json','candidate_embedding_ids.json',
               'candidate_embeddings.npy','candidate_embedding_manifest.json','capture_identity.json']
+    optional = ['label_reconciliation.json', 'mismatch_diagnostics.json']
     for name in required:
         if not (root/name).is_file():raise ValueError(f'Native capture lacks {name}')
     for p in root.rglob('*'):
         rel=p.relative_to(root)
-        wanted=(rel.parts[0]=='native_hidden' or rel.as_posix() in required or
+        wanted=(rel.parts[0]=='native_hidden' or rel.as_posix() in required + optional or
                 rel.as_posix()=='partial_qwen_latency/latency_by_layer.json')
         if p.is_file() and wanted:
             target=Path(output)/rel;target.parent.mkdir(parents=True,exist_ok=True)
@@ -141,7 +161,7 @@ def restore_capture(path, output, cache):
     return root
 
 
-def capture_audits(store, source, uids):
+def capture_audits(store, source, uids, policy='strict'):
     selected=[source['rows'][u] for u in uids]
     progress=store.progress
     failures=[dict(state_id=u,question_id=source['rows'][u]['question'],
@@ -150,7 +170,9 @@ def capture_audits(store, source, uids):
     reproduction=dict(selected_states=len(uids),checked_states=len(progress),mismatches=len(failures),
         exact_match_rate=None if not progress else 1-len(failures)/len(progress),
         passed=len(progress)==len(uids) and not failures,failures=failures,
-        policy='fail-fast on ANY mismatch; no favorable subset is silently retained')
+        policy=('fail-fast on ANY mismatch; no favorable subset is silently retained'
+                if policy == 'strict' else
+                'Historical agreement audit only; training uses audited native direct K for ALL states; no filtering'))
     alignment=dict(passed=bool(progress) and all(r['alignment']['passed'] for r in progress.values()),
         states_checked=len(progress),max_abs_error=max((r['alignment']['max_abs_error'] for r in progress.values()),default=None),
         fp16_max_abs_error=max((r['alignment']['fp16_max_abs_error'] for r in progress.values()),default=None),
@@ -168,6 +190,68 @@ def capture_audits(store, source, uids):
     return reproduction,alignment,audit
 
 
+def diagnose_mismatch(model, row, result):
+    """Diagnostic logits never become student features; margins do not imply cause."""
+    index = min(row['accepted'], result['K'])
+    head = model.get_output_embeddings()
+    with torch.inference_mode():
+        h = result['final_hidden_with_bonus'].to(device=head.weight.device, dtype=head.weight.dtype)
+        scores = head(h.unsqueeze(0))[0, index].float()
+        values, ids = scores.topk(2)
+        token = row['candidate'][index]
+        rival = values[1] if int(ids[0]) == token else values[0]
+    return dict(position_i=index+1, candidate_token_id=token,
+        top2_token_ids=ids.cpu().tolist(), top2_logits=values.cpu().tolist(),
+        candidate_logit=float(scores[token]), candidate_minus_best_rival=float(scores[token]-rival),
+        predictions=result['predictions'], causal_alignment_passed=result['alignment']['passed'])
+
+
+def confirm_mismatch(model, row, store, output, summary):
+    """Two stable direct forwards, including the cached K, precede any relabel."""
+    uid=row['uid'];previous=dict(store.progress[uid])
+    attempts=[];results=[]
+    for _ in range(2):
+        result=capture_one(model,row['prefix'],row['candidate'],store.depths)
+        summary['fresh_capture_calls']+=1;results.append(result)
+        attempts.append(dict(K=result['K'], **diagnose_mismatch(model,row,result)))
+    stable=(results[0]['K']==results[1]['K']==previous['rerun_K'] and
+            results[0]['predictions']==results[1]['predictions'])
+    diagnostic=dict(state_id=uid,question_id=row['question'],K_historical=row['accepted'],
+        K_cached=previous['rerun_K'],stable=stable,attempts=attempts,
+        previous_capture=previous,
+        cause='undetermined; direct/hindsight and floating-point differences require separate investigation')
+    path=Path(output)/'mismatch_diagnostics.json'
+    diagnostics=json.loads(path.read_text()) if path.exists() else {}
+    diagnostics[uid]=diagnostic;write_json(path,diagnostics)
+    if not stable:
+        store.flush_progress()
+        raise RuntimeError(f'Unstable direct verifier for {uid}; label reconciliation refused')
+    store.record(uid,results[0])
+    rec=store.progress[uid]
+    rec['label_reconciliation']=dict(policy='audited_direct',stable=True,confirmation_passes=2,
+        saved_K=rec['saved_K'],rerun_K=rec['rerun_K'],signature=rec['signature'],
+        raw_hidden_sha256=rec['raw_hidden_sha256'])
+    store.flush_progress()
+    log('mismatch_confirmed',state_id=uid,K_saved=rec['saved_K'],K_native=rec['rerun_K'])
+
+
+def reconciliation_report(store, policy, cfg):
+    mismatches=[u for u,r in store.progress.items() if not r['matches']]
+    complete=len(store.progress)==len(store.uids)
+    all_confirmed=all(reconciled_capture(store.progress[u]) for u in mismatches)
+    rate=len(mismatches)/len(store.uids)
+    limit=cfg.get('max_reconciled_mismatch_rate',0.) if policy=='audited_direct' else 0.
+    return dict(policy=policy,label_basis='native_direct_forward' if policy=='audited_direct' else 'exact_historical',
+        passed=complete and all_confirmed and rate<=limit,
+        checked_states=len(store.progress),required_states=len(store.uids),
+        historical_mismatches=len(mismatches),mismatch_rate=rate,max_mismatch_rate=limit,
+        all_mismatches_confirmed=all_confirmed,changed_state_ids=mismatches,
+        excluded_states=0,historical_exact_reproduction=not mismatches,
+        same_labels_for_direct_raw_and_latent=True,
+        interpretation='This is an explicitly amended direct-verifier-label study, not proof of exact historical reproduction'
+            if policy=='audited_direct' else 'Strict historical reproduction')
+
+
 def write_capture_metadata(output, source, store):
     rows=[]
     for uid in store.uids:
@@ -176,6 +260,9 @@ def write_capture_metadata(output, source, store):
             action=r['action'],proposal_length=r['length'],candidate_token_ids=r['candidate'],
             prefix_length=len(r['prefix']),prefix_sha256=digest(r['prefix']),
             K_true=r['accepted'],parent_K=r['parent_K'],parent_length=r['parent_length'],
+            K_historical=r.get('historical_accepted',r['accepted']),
+            parent_K_historical=r.get('historical_parent_K',r['parent_K']),
+            label_basis=r.get('label_basis','exact_historical'),
             is_parent_full_prefix=r['is_parent_full_prefix'],native_segment_start=r['segment_start'],
             position_offset=start,position_end=end,
             survival_true=[int(i<r['accepted']) for i in range(r['length'])],
@@ -254,6 +341,8 @@ def records_for(model,spec,uids,source,store,table,cfg,device,seed):
                 out.append(dict(question_id=row['question'],state_id=uid,method=method_name(spec),seed=seed,
                     split=row.get('split'),
                     action=row['action'],proposal_length=n,K_true=row['accepted'],K_pred=sum(q),q_pred=q,
+                    K_historical=row.get('historical_accepted',row['accepted']),
+                    label_basis=row.get('label_basis','exact_historical'),
                     parent_K=row['parent_K'],parent_length=row['parent_length'],
                     is_E_full_prefix=row['action']=='E' and row['is_parent_full_prefix'],
                     survival_true=[int(p<row['accepted']) for p in range(n)],
@@ -485,6 +574,9 @@ def build_outputs(output,cfg,depths,selection,specs,validation_rows,test_rows,ch
     lines=['# Native Qwen verifier-latent ceiling and compression',
         'This uses freshly rerun uncompressed native Qwen hidden, not the previous 32D projection.',
         'Checkpoint/config, causal alignment and saved K reproduction are audited before any training.',
+        f"Label policy: {cfg.get('label_policy','strict')}. Read label_reconciliation.json and verifier_reproduction_check.json separately.",
+        ('This recovery uses direct captured-forward K for ALL models/states, retains historical K, and confirms every mismatch twice. It does NOT establish exact historical reproduction; no state is filtered.'
+         if cfg.get('label_policy')=='audited_direct' else 'Training requires exact historical K reproduction.'),
         'No drafter dynamics, D-to-V bridge, planner, controller or online speedup is trained/claimed.',
         f"Pipeline-only smoke: {bool(cfg.get('pipeline_check_only'))}; exact question split: 70/15/15.",
         f'Validation-selected layers: {selected}. All dimensions were fixed before accessing test.',
@@ -541,6 +633,8 @@ def run(args):
         drafter_dynamics_trained=False,bridge_trained=False,planner_trained=False,old_projected_teacher_used=False)
     try:
         cfg=json.loads(Path(args.config).read_text());config_check(cfg)
+        label_policy=cfg.get('label_policy','strict')
+        summary['label_policy']=label_policy
         if args.resume and (output/'config.json').exists() and json.loads((output/'config.json').read_text())!=cfg:
             raise ValueError('Resume configuration differs; existing result was not overwritten')
         torch.set_num_threads(4)
@@ -601,11 +695,22 @@ def run(args):
         summary['fresh_capture_calls']=0
         store=NativeHiddenStore(output,source['rows'],uids,depths,hidden_dim,capture_signature)
         store.verify_saved_rows()
-        if len(store.progress)<len(uids) or not (output/'candidate_embeddings.npy').exists():
+        summary['reused_capture_states']=len(store.progress)
+        pending_mismatches=[u for u,r in store.progress.items()
+                            if not r['matches'] and not reconciled_capture(r)]
+        if label_policy=='strict' and any(not r['matches'] for r in store.progress.values()):
+            raise RuntimeError('Cached saved verifier K is not reproduced; strict training refused')
+        log('capture_reuse',reused_states=len(store.progress),remaining_states=len(uids)-len(store.progress),
+            pending_mismatches=pending_mismatches,label_policy=label_policy)
+        if (len(store.progress)<len(uids) or pending_mismatches or
+                not (output/'candidate_embeddings.npy').exists()):
             if model is None:model=load_verifier(source['identity'],verifier_options(cfg))
             if (model.config.hidden_size,depth_indices(model.config.num_hidden_layers))!=(hidden_dim,depths):
                 raise ValueError('Reloaded verifier configuration differs from captured geometry')
-            ensure_candidate_embeddings(model,source,uids,output)
+            if not (output/'candidate_embeddings.npy').exists():
+                ensure_candidate_embeddings(model,source,uids,output)
+            for uid in pending_mismatches:
+                confirm_mismatch(model,source['rows'][uid],store,output,summary)
             for index,uid in enumerate(uids):
                 if uid in store.progress:continue
                 row=source['rows'][uid]
@@ -618,18 +723,26 @@ def run(args):
                     raise
                 store.record(uid,result)
                 if result['K']!=row['accepted']:
-                    store.flush_progress();reproduction,alignment,audit=capture_audits(store,source,uids)
+                    store.flush_progress();reproduction,alignment,audit=capture_audits(store,source,uids,label_policy)
                     write_json(output/'verifier_reproduction_check.json',reproduction)
                     write_json(output/'alignment_unit_test.json',alignment);write_json(output/'capture_audit.json',audit)
-                    raise RuntimeError(f"Saved verifier K is not reproduced: {uid} saved={row['accepted']} rerun={result['K']}; training refused")
+                    if label_policy=='strict':
+                        raise RuntimeError(f"Saved verifier K is not reproduced: {uid} saved={row['accepted']} rerun={result['K']}; training refused")
+                    if reproduction['mismatches']/len(uids)>cfg['max_reconciled_mismatch_rate']:
+                        raise RuntimeError('Historical verifier drift exceeds 0.1%; training refused')
+                    confirm_mismatch(model,row,store,output,summary)
                 if index%64==0 or index+1==len(uids):
                     log('capture',done=len(store.progress),total=len(uids),state_id=uid,
                         seconds=time.perf_counter()-started,raw_GiB=round(store.total_positions*hidden_dim*2*4/2**30,3))
         store.flush_progress()
-        reproduction,alignment,audit=capture_audits(store,source,uids)
+        reproduction,alignment,audit=capture_audits(store,source,uids,label_policy)
         write_json(output/'verifier_reproduction_check.json',reproduction)
         write_json(output/'alignment_unit_test.json',alignment);write_json(output/'capture_audit.json',audit)
-        if not reproduction['passed'] or not alignment['passed']:raise ValueError('Required native capture checks failed')
+        reconciliation=reconciliation_report(store,label_policy,cfg)
+        write_json(output/'label_reconciliation.json',reconciliation)
+        if not reconciliation['passed'] or not alignment['passed']:
+            raise ValueError('Required native capture/label checks failed')
+        apply_capture_labels(source['rows'],store,label_policy)
         write_capture_metadata(output,source,store)
         table=load_candidate_table(output)
         emb_manifest=json.loads((output/'candidate_embedding_manifest.json').read_text())
@@ -663,7 +776,8 @@ def run(args):
         for device in cfg['devices']:
             if device.startswith('cuda'):
                 with torch.cuda.device(device):torch.cuda.empty_cache()
-        qualified=store.qualified()
+        qualified=store.qualified(include_reconciled=label_policy=='audited_direct')
+        if len(qualified)!=len(uids):raise ValueError('No state exclusion is allowed')
         source['ids']={split:[u for u in qualified if source['rows'][u]['question'] in questions]
                        for split,questions in source['split'].items()}
         if any(not values for values in source['ids'].values()):raise ValueError('A split has no captured observations')
@@ -673,6 +787,7 @@ def run(args):
                       for depth,slot in zip(depths,('layer25','layer50','layer75','layer100'))}
         signature=digest(dict(source_key=source_key,capture_signature=capture_signature,
             cfg=cfg,code=source_code_hashes(),native_hidden_hashes=hidden_hashes,
+            supervision_digest=digest({u:source['rows'][u]['accepted'] for u in uids}),
             candidate_sha256=emb_manifest['sha256']))
         manifest_path=output/'study_manifest.json'
         if args.resume:
@@ -707,7 +822,7 @@ def run(args):
         write_jsonl(output/'all_test_predictions.jsonl',test_rows)
         write_wide_predictions(test_rows,output,depths,selection['selected'])
         checks=dict(disjoint_question_splits=len(set(sum(source['split'].values(),[])))==100,
-            exact_saved_K_reproduction=reproduction['passed'],causal_hidden_alignment=alignment['passed'],
+            verifier_labels_consistent=reconciliation['passed'],causal_hidden_alignment=alignment['passed'],
             no_logits_as_features=True,no_test_layer_or_dimension_selection=True,
             identical_probe_architecture_across_depths=True,matched_state_subset_for_baseline=True,
             dimensions_use_identical_selected_layers=True,candidate_embeddings_frozen=emb_manifest['frozen'],
@@ -721,6 +836,8 @@ def run(args):
             selected_layers=selection['selected'],training_jobs=len(raw_training)+len(latent_training),
             test_prediction_rows=len(test_rows),validation_gate={d:g['status'] for d,g in gates.items()},
             original_capture_states=len(uids),model_identity=source['identity'],
+            historical_exact_reproduction=reproduction['passed'],
+            historical_mismatches=reproduction['mismatches'],label_basis=reconciliation['label_basis'],
             real_Qwen_call_note='fresh_capture_calls excludes warmup and measured partial/full benchmark forwards')
         write_json(output/'summary.json',summary)
         write_json(manifest_path,dict(schema=cfg['schema'],fingerprint=signature,status='complete'))

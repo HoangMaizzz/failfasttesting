@@ -194,6 +194,15 @@ def build_config(base, scope):
         raise ValueError("Full source config must capture all eligible states")
     if mode == "smoke":
         config.update(copy.deepcopy(SMOKE_OVERRIDES))
+    policy = scope.get("LABEL_POLICY", config.get("label_policy", "strict"))
+    if policy not in ("strict", "audited_direct"):
+        raise ValueError("LABEL_POLICY must be strict or audited_direct")
+    if "label_policy" in config or "LABEL_POLICY" in scope:
+        config["label_policy"] = policy
+    if policy == "audited_direct":
+        if mode != "full":
+            raise ValueError("Audited direct-label recovery requires full state/parent coverage")
+        config.update(label_policy=policy, max_reconciled_mismatch_rate=0.001)
     return config
 
 

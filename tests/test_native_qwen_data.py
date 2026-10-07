@@ -158,6 +158,41 @@ class HiddenStoreTests(DiskFixtures):
         self.assertIs(rec["matches"], False)
         self.assertEqual((rec["saved_K"], rec["rerun_K"]), (1, 0))
 
+    def test_confirmed_native_labels_keep_history_and_work_in_readonly_worker(self):
+        store=self.store()
+        store.record('a',capture_fixture(self.rows['a'],rerun_K=0))
+        store.record('b',capture_fixture(self.rows['b']))
+        rec=store.progress['a']
+        rec['label_reconciliation']=dict(policy='audited_direct',stable=True,confirmation_passes=2,
+            saved_K=rec['saved_K'],rerun_K=rec['rerun_K'],signature=rec['signature'],
+            raw_hidden_sha256=rec['raw_hidden_sha256'])
+        rows=copy.deepcopy(self.rows)
+        data.apply_capture_labels(rows,store,'audited_direct')
+        self.assertEqual((rows['a']['historical_accepted'],rows['a']['accepted']),(1,0))
+        self.assertEqual(store.qualified(),['b'])
+        self.assertEqual(store.qualified(include_reconciled=True),['a','b'])
+        store.close()
+        worker=self.store(rows=rows,readonly=True)
+        table=data.load_candidate_table(self.candidate_table())
+        batch=data.pack_native_batch(['a','b'],dict(kind='raw',depth=1),rows,{},worker,table,'cpu')
+        self.assertEqual(batch['accepted'].tolist(),[0,3])
+        bad=copy.deepcopy(rows);bad['a']['accepted']=1
+        with self.assertRaisesRegex(ValueError,'Supervision'):
+            data.pack_native_batch(['a'],dict(kind='raw',depth=1),bad,{},worker,table,'cpu')
+        # A modified audit is not sufficient to qualify arbitrary hidden bytes.
+        rec=worker.progress['a'];rec['label_reconciliation']['raw_hidden_sha256']='different'
+        self.assertFalse(data.reconciled_capture(rec))
+
+    def test_unconfirmed_labels_and_tampered_reconciliation_are_rejected(self):
+        store=self.store()
+        store.record('a',capture_fixture(self.rows['a'],rerun_K=0))
+        store.record('b',capture_fixture(self.rows['b']))
+        with self.assertRaises(ValueError):data.apply_capture_labels(copy.deepcopy(self.rows),store,'strict')
+        with self.assertRaises(ValueError):data.apply_capture_labels(copy.deepcopy(self.rows),store,'audited_direct')
+        store.progress['a']['label_reconciliation']={'stable':True}
+        store.close()
+        with self.assertRaisesRegex(ValueError,'reconciliation'):self.store()
+
     def test_failed_alignment_and_incomplete_hidden_do_not_commit_a_row(self):
         for case in ("alignment", "missing_layer", "wrong_shape", "nan"):
             with self.subTest(case=case):
