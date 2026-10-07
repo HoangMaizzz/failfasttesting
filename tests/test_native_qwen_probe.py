@@ -197,7 +197,7 @@ class ProbeContractTests(unittest.TestCase):
             self.assertEqual(result['z'].shape, (2, 64, dim))
             self.assertNotIn('reconstructed_hidden', result)
             loss, parts = probe_loss(s, result, batch_fixture())
-            self.assertEqual(float(parts['reconstruction']), 0.)
+            self.assertEqual(float(parts['reconstruction'].detach()), 0.)
             self.assertTrue(torch.equal(loss, parts['bce'] + .1 * parts['K_huber']))
         s = spec('latent', lambda_rec=.1)
         model = make_model(s, {}, 12)

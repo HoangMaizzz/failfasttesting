@@ -397,15 +397,26 @@ def show_archive(archive):
         pass
 
 
-def launch(scope):
+def launch_directories(scope):
+    """Explicit test/embedding paths override environment-derived defaults.
+
+    On Kaggle, normal callers supply neither override and retain the working
+    root and temporary cache. Unit tests must remain isolated even when the
+    real Kaggle mounts exist or KAGGLE_KERNEL_RUN_TYPE is inherited.
+    """
     kaggle = Path("/kaggle/input").exists() or bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE"))
-    working = (Path("/kaggle/working") if kaggle else Path(scope.get("WORKING_DIR", Path.cwd()))).resolve()
+    working = Path(scope.get("WORKING_DIR", "/kaggle/working" if kaggle else Path.cwd())).resolve()
+    temporary = Path(scope.get("TEMP_DIR", "/kaggle/temp" if kaggle else tempfile.gettempdir())).resolve()
+    return working, temporary
+
+
+def launch(scope):
+    working, temp_root = launch_directories(scope)
     working.mkdir(parents=True, exist_ok=True)
     os.chdir(working)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
     output = Path(tempfile.mkdtemp(prefix=f"native_qwen_verifier_{stamp}_", dir=working))
     try:
-        temp_root = Path("/kaggle/temp") if kaggle else Path(scope.get("TEMP_DIR", tempfile.gettempdir()))
         temp_root.mkdir(parents=True, exist_ok=True)
         temp = (_BOOTSTRAP_CHECKOUT.parent if _BOOTSTRAP_CHECKOUT is not None
                 else Path(tempfile.mkdtemp(prefix="native_qwen_verifier_", dir=temp_root)))

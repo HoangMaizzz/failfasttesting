@@ -189,10 +189,14 @@ Run the complete study suite:
 python -m unittest discover -s tests -p "test_native_qwen_*.py"
 ```
 
-Local verification passed 145 tests under both the installed Transformers
+Local verification passed 147 tests under both the installed Transformers
 4.57.3 and an isolated pinned 4.53.1 runtime. The integration fixture uses a
 real randomly initialized tiny Qwen on CPU and synthetic 100-question inputs;
 it validates capture, training, locked test evaluation, packaging and resume.
 The original real-source schema, checkpoint identity and 70/15/15 split were
 also checked locally. No real 7B capture or two-T4 feasibility measurement has
 been run locally; those results must come from the Kaggle experiment.
+
+Launcher regression tests explicitly simulate Kaggle mounts and batch mode.
+Their `WORKING_DIR`/`TEMP_DIR` overrides stay isolated even on Kaggle; normal
+launches without overrides still use `/kaggle/working` and `/kaggle/temp`.

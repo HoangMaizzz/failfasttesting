@@ -1,6 +1,7 @@
 """Launcher contracts without downloads, model loading, GPU queries or training."""
 import builtins
 import copy
+from contextlib import redirect_stdout
 import importlib.util
 import io
 import json
@@ -93,11 +94,37 @@ class LauncherTests(unittest.TestCase):
         self.bootstrap = patch.multiple(launcher, _BOOTSTRAP_CHECKOUT=None,
                                         _BOOTSTRAP_REVISION=None, _BOOTSTRAP_SOURCE_REF=None)
         self.bootstrap.start()
+        # Simulated failure cases intentionally print ERROR diagnostics; keep
+        # them out of the real Kaggle launch log so they cannot look like a
+        # live fetch/model failure. unittest failures still use stderr.
+        self.captured_stdout = io.StringIO()
+        self.stdout_capture = redirect_stdout(self.captured_stdout)
+        self.stdout_capture.__enter__()
 
     def tearDown(self):
         os.chdir(self.old_cwd)
         self.bootstrap.stop()
+        self.stdout_capture.__exit__(None, None, None)
         self.temporary.cleanup()
+
+    def test_explicit_directories_override_real_kaggle_mounts(self):
+        scope = dict(WORKING_DIR=self.root / 'isolated_working', TEMP_DIR=self.root / 'isolated_temp')
+        with patch.dict(os.environ, {'KAGGLE_KERNEL_RUN_TYPE': 'Batch'}), \
+                patch.object(Path, 'exists', return_value=True):
+            working, temporary = launcher.launch_directories(scope)
+        self.assertEqual(working, scope['WORKING_DIR'].resolve())
+        self.assertEqual(temporary, scope['TEMP_DIR'].resolve())
+        self.assertFalse(working.exists())
+        self.assertFalse(temporary.exists())
+
+    def test_normal_kaggle_launch_keeps_production_defaults(self):
+        for detected_by_mount in (False, True):
+            with self.subTest(mount=detected_by_mount), \
+                    patch.dict(os.environ, {'KAGGLE_KERNEL_RUN_TYPE': '' if detected_by_mount else 'Batch'}), \
+                    patch.object(Path, 'exists', return_value=detected_by_mount):
+                working, temporary = launcher.launch_directories({})
+            self.assertEqual(working, Path('/kaggle/working').resolve())
+            self.assertEqual(temporary, Path('/kaggle/temp').resolve())
 
     def test_ordinary_import_is_standalone_and_has_no_side_effects(self):
         spec = importlib.util.spec_from_file_location("_native_launcher_import", ROOT / "kaggle_native_qwen_verifier.py")
@@ -419,7 +446,7 @@ class LauncherTests(unittest.TestCase):
                 patch.object(launcher, "run_command", side_effect=command), \
                 patch.object(launcher, "show_archive"), \
                 patch.object(launcher, "assert_two_gpus") as gpu, \
-                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": "", "HF_HUB_OFFLINE": "1"}):
+                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": "Batch", "HF_HUB_OFFLINE": "1"}):
             output = launcher.launch(dict(MODE="smoke", WORKING_DIR=self.root / "working",
                 TEMP_DIR=self.root / "temp", RUN_DIR=original, PHASE0_INPUT=phase0, CAPTURE_INPUT=capture))
         gpu.assert_not_called()
@@ -435,7 +462,7 @@ class LauncherTests(unittest.TestCase):
     def test_failure_packages_diagnostic_and_reraises(self):
         with patch.object(launcher, "_bootstrap_checkout", side_effect=RuntimeError("fetch failed")), \
                 patch.object(launcher, "show_archive"), \
-                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": ""}):
+                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": "Batch"}):
             with self.assertRaisesRegex(RuntimeError, "fetch failed"):
                 launcher.launch(dict(WORKING_DIR=self.root / "working", TEMP_DIR=self.root / "temp"))
         archives = list((self.root / "working").glob("*.zip"))
@@ -471,7 +498,7 @@ class LauncherTests(unittest.TestCase):
                 patch.object(launcher, "run_command", side_effect=command), \
                 patch.object(launcher, "assert_two_gpus", side_effect=lambda *a: events.append(["gpu"])) as gpu, \
                 patch.object(launcher, "show_archive"), \
-                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": ""}):
+                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": "Batch"}):
             with self.assertRaisesRegex(RuntimeError, "runner failed"):
                 launcher.launch(dict(WORKING_DIR=self.root / "working", TEMP_DIR=self.root / "temp",
                                      RUN_DIR=inputs, PHASE0_INPUT=inputs, RESUME_INPUT=source))
@@ -497,7 +524,7 @@ class LauncherTests(unittest.TestCase):
                 patch.object(launcher, "_load_helpers") as helpers, \
                 patch.object(launcher, "assert_two_gpus") as gpu, \
                 patch.object(launcher, "show_archive"), \
-                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": ""}):
+                patch.dict(os.environ, {"KAGGLE_KERNEL_RUN_TYPE": "Batch"}):
             with self.assertRaisesRegex(RuntimeError, "tests failed"):
                 launcher.launch(dict(WORKING_DIR=self.root / "working", TEMP_DIR=self.root / "temp"))
         helpers.assert_not_called()
