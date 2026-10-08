@@ -357,9 +357,13 @@ def launch(scope):
         for path in output.iterdir():
             if path.name not in LAUNCHER_ARTIFACTS or not path.is_file() or path.is_symlink():
                 raise RuntimeError(f"Unexpected artifact before runner launch: {path}")
-        for path in list(output.iterdir()):
-            path.replace(staged_provenance / path.name)
+        # Kaggle working/temp can be separate mounts: rename/Path.replace raises
+        # EXDEV. Copy first, unlink only after success, and keep failure metadata
+        # in staging even if a later provenance copy fails.
         metadata_path = staged_provenance / "launcher_metadata.json"
+        for path in list(output.iterdir()):
+            shutil.copy2(path, staged_provenance / path.name)
+            path.unlink()
         print("Fresh GSM8K collection; max_new_tokens is a collection cap, not finished answers.", flush=True)
         print("Mode:", record["mode"], "config:", config, flush=True)
         result = run_command(command, cwd=repo, env=env, check=False)

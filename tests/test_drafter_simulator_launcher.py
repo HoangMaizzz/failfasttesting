@@ -1,6 +1,7 @@
 """Launcher contract checks using stdlib mocks: no network, GPU or training."""
 import contextlib
 import copy
+import errno
 import importlib.util
 import io
 import json
@@ -330,6 +331,40 @@ class LaunchTests(unittest.TestCase):
         output2 = self.launch_mocked()
         self.assertNotEqual(output, output2)
         self.assertNotEqual(first_temp, json.loads((output2 / "launcher_metadata.json").read_text())["temp_dir"])
+
+    def test_cross_mount_provenance_does_not_use_rename(self):
+        attempted=[]
+        original_replace,original_rename=os.replace,os.rename
+        def cross_mount_guard(original):
+            def guarded(source,destination,*args,**kwargs):
+                if (Path(source).is_relative_to(self.working)
+                        and Path(destination).is_relative_to(self.root / 'temp')):
+                    attempted.append((source,destination))
+                    raise OSError(errno.EXDEV,'Invalid cross-device link')
+                return original(source,destination,*args,**kwargs)
+            return guarded
+        with patch.object(os,'replace',side_effect=cross_mount_guard(original_replace)), \
+                patch.object(os,'rename',side_effect=cross_mount_guard(original_rename)):
+            output=self.launch_mocked()
+        self.assertEqual(attempted,[])
+        with zipfile.ZipFile(output.with_suffix('.zip')) as zipped:
+            self.assertEqual(json.loads(zipped.read('launcher_metadata.json'))['status'],'complete')
+
+    def test_provenance_copy_failure_keeps_failure_metadata_and_skips_runner(self):
+        original_copy=launcher.shutil.copy2
+        def failed_copy(source,destination,*args,**kwargs):
+            if (Path(destination).parent.name=='launcher_provenance'
+                    and Path(source).name=='versions.json'):
+                raise OSError('injected staging copy failure')
+            return original_copy(source,destination,*args,**kwargs)
+        with patch.object(launcher.shutil,'copy2',side_effect=failed_copy), \
+                self.assertRaisesRegex(OSError,'injected staging copy failure'):
+            self.launch_mocked()
+        self.assertFalse(any(str(launcher.RUNNER_RELATIVE) in [Path(part).name for part in command]
+                             for command,_,_,_ in self.commands))
+        with zipfile.ZipFile(self.shown[-1]) as zipped:
+            self.assertEqual(json.loads(zipped.read('launcher_metadata.json'))['status'],'failed')
+            self.assertIn('injected staging copy failure',zipped.read('launcher_error.txt').decode())
 
     def test_setup_failures_package_diagnostics_and_never_run_model(self):
         for stage in ("source", "dependencies", "weights"):
