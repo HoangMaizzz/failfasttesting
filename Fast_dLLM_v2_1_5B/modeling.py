@@ -1164,6 +1164,13 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
         **kwargs
     ):
         """Generate n draft tokens, where n is dynamically determined"""
+        drafter_simulator_observer = getattr(args, "drafter_simulator_observer", None)
+        drafter_simulator_max_context = getattr(args, "drafter_simulator_max_context", None)
+        if drafter_simulator_observer is not None:
+            if not callable(drafter_simulator_observer):
+                raise TypeError("drafter_simulator_observer must be callable")
+            if use_block_cache or input_ids.shape[0] != 1:
+                raise ValueError("drafter simulator observation requires batch one and no block cache")
         num_blocks = max_new_tokens // block_size
         if num_blocks == 1:
             logger.debug(f"{Colors.RED}Warning: <{max_new_tokens} tokens might be generated if only 1 block is needed. {Colors.RESET}")
@@ -1230,7 +1237,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 "total": 0,
             },
         }
-        collect_raw = bool(getattr(args, "full_refinement_oracle", False))
+        collect_raw = bool(getattr(args, "full_refinement_oracle", False)) or drafter_simulator_observer is not None
         raw_top_k = max(1, int(getattr(args, "raw_top_k", 32)))
         committed_confidences = {}
         committed_margins = {}
@@ -1476,8 +1483,14 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 frontier_stats["forward_pass_breakdown"]["prefill"] += 1
                 logits, past_key_values = output.logits, output.past_key_values
                 if input_ids.shape[1] % block_size == 0:
-                    next_token = logits[:, -1:, :].argmax(dim=-1)
-                    input_ids = torch.cat([input_ids, next_token], dim=1)
+                    if (
+                        drafter_simulator_max_context is not None
+                        and input_ids.shape[1] >= int(drafter_simulator_max_context)
+                    ):
+                        frontier_stats["drafter_simulator_context_cap_reached"] = True
+                    else:
+                        next_token = logits[:, -1:, :].argmax(dim=-1)
+                        input_ids = torch.cat([input_ids, next_token], dim=1)
                 if return_prefill_kvs:
                     prefill_output = output
         else:
@@ -1490,6 +1503,15 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 logger.debug(f"{Colors.GREEN}Stopping generation as stop_token 1 {stop_token} found.{Colors.RESET}")
                 break
             prompt_length = input_ids.shape[1]
+            # Optional collection cap: keep whole physical canvases and stop at
+            # the native block boundary, without cropping or completing masks.
+            if (
+                drafter_simulator_max_context is not None
+                and prompt_length + block_size - prompt_length % block_size
+                > int(drafter_simulator_max_context)
+            ):
+                frontier_stats["drafter_simulator_context_cap_reached"] = True
+                break
             # Initialize x_init with mask_id
             x_init = mask_id * torch.ones((input_ids.shape[0], block_size-prompt_length%block_size), device=self.device, dtype=torch.long)
             x_init = torch.cat([input_ids, x_init], dim=1)
@@ -1505,6 +1527,12 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                 mask_idx = (x_t[:, -block_size:] == mask_id)
                 # Decode a complete block, update cache, and generate the next token
                 if mask_idx.sum() == 0:
+                    if (
+                        drafter_simulator_max_context is not None
+                        and x_t.shape[1] >= int(drafter_simulator_max_context)
+                    ):
+                        frontier_stats["drafter_simulator_context_cap_reached"] = True
+                        break
                     ##################Start of timer##################
                     start_time = torch.cuda.Event(enable_timing=True)
                     start_time.record()
@@ -1720,12 +1748,43 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                 x1_p[x1_p != -torch.inf].float().cpu().numpy().tolist()
                             )
 
+                        simulator_tokens_pre = (
+                            x_t[:, -block_size:].clone()
+                            if drafter_simulator_observer is not None else None
+                        )
                         unmask_idx = (x1_p > threshold)
                         max_prob_idx = x1_p.argmax(dim=-1)
                         unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
                         unmask_idx = unmask_idx & mask_idx[:, start:end]  # only allowed to update MASK tokens
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
+                        if drafter_simulator_observer is not None:
+                            simulator_observation_started = time.perf_counter()
+                            # Hidden/logits are from this forward BEFORE commit;
+                            # tokens are exposed only AFTER the native x_t update.
+                            # The callback must synchronously copy to CPU and must
+                            # not retain these ephemeral accelerator views.
+                            drafter_simulator_observer({
+                                "phase": "post_native_commit",
+                                "hidden": torch.cat([
+                                    output.hidden_states[-1][:, :1, :],
+                                    output.hidden_states[-1][:, :-1, :],
+                                ], dim=1),
+                                "logits": adaptive_full_block_logits,
+                                "tokens_pre": simulator_tokens_pre,
+                                "tokens_post": x_t[:, -block_size:],
+                                "past_key_values": past_key_values,
+                                "committed": unmask_idx,
+                                "mask_id": mask_id,
+                                "block_start": int(x_t.shape[1] - block_size),
+                                "small_block_idx": int(small_block_idx),
+                                "context_len": int(x_t.shape[1]),
+                                "forward_id": int(num_forward_passes),
+                                "denoising_forward_id": int(denoising_forward_passes),
+                                "forward_ms": float(forward_pass_latencies[-1]),
+                                "observation_started": simulator_observation_started,
+                            })
+                            simulator_tokens_pre = None
                         if collect_step_stats:
                             frontier_mode = getattr(args, "frontier_stop_mode", "disabled") if args is not None else "disabled"
                             tau_f = float(lowconf_threshold)
