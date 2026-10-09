@@ -462,6 +462,19 @@ def _write_manifest(path, manifest):
     temporary.replace(path)
 
 
+def load_native_drafter(dllm_dir, device):
+    """Resolve the generation class, not AutoModel's headless backbone."""
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(
+        str(dllm_dir), trust_remote_code=True, local_files_only=True,
+        torch_dtype=torch.float16, attn_implementation="sdpa")
+    if not callable(getattr(model, "generate_draft_tokens_arbitrary_length", None)):
+        raise RuntimeError(f"Loaded {type(model).__name__}, but the native drafter generator is missing")
+    if not callable(getattr(model, "lm_head", None)):
+        raise RuntimeError(f"Loaded {type(model).__name__}, but the native drafter LM head is missing")
+    return model.to(device).eval().requires_grad_(False)
+
+
 def collect(config, output, dllm_dir):
     """Collect GSM8K train natural trajectories and return the manifest Path.
 
@@ -474,7 +487,7 @@ file. Each completed/failed question is flushed before the next one starts.
     manifest_path = output / "capture_manifest.json"
     manifest = dict(schema_version=SCHEMA_VERSION, config=config,
         model=dict(local_path=str(Path(dllm_dir).resolve()), dtype="float16", device=config["collect_device"],
-                   loading="AutoModel trust_remote_code=True", verifier=None),
+                   loading="AutoModelForCausalLM trust_remote_code=True", verifier=None),
         dataset=dict(id="openai/gsm8k", name="main", source_split="train", shuffle_seed=config["dataset_seed"]),
         semantic_projection=dict(kind="fixed_gaussian_native_input_embeddings", dim=config["embedding_dim"],
                                  seed=config["projection_seed"], train_independent=True),
@@ -487,7 +500,7 @@ file. Each completed/failed question is flushed before the next one starts.
     _write_manifest(manifest_path, manifest)
     try:
         from datasets import load_dataset
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoTokenizer
         if config["collect_device"] != "cuda:0" or not torch.cuda.is_available():
             raise RuntimeError("production collection requires FP16 single GPU cuda:0")
         dataset = load_dataset("openai/gsm8k", "main", split="train")
@@ -502,8 +515,8 @@ file. Each completed/failed question is flushed before the next one starts.
         manifest["split"] = manifest["splits"]
         manifest["dataset"]["fingerprint"] = getattr(dataset, "_fingerprint", None)
         tokenizer = AutoTokenizer.from_pretrained(str(dllm_dir), trust_remote_code=True, local_files_only=True)
-        model = AutoModel.from_pretrained(str(dllm_dir), trust_remote_code=True, local_files_only=True,
-            torch_dtype=torch.float16, attn_implementation="sdpa").to("cuda:0").eval().requires_grad_(False)
+        model = load_native_drafter(dllm_dir, "cuda:0")
+        manifest["model"]["resolved_class"] = type(model).__name__
         method_source = inspect.getsource(model.generate_draft_tokens_arbitrary_length)
         if "drafter_simulator_observer" not in method_source:
             raise RuntimeError("local model code lacks native drafter_simulator_observer hook")

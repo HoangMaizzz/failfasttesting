@@ -8,6 +8,7 @@ import contextlib
 import copy
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -70,6 +71,7 @@ class FakeCore:
         with torch.no_grad():
             self.embedding.weight.copy_(torch.arange(self.embedding.weight.numel()).reshape_as(self.embedding.weight) % 19 / 19)
         self.head = torch.nn.Identity()
+        self.lm_head = self.head
         self.eos = eos
         self.calls = []
 
@@ -316,7 +318,9 @@ import drafter_simulator_collect
         def load_model(*args, **kwargs):
             load_calls.append(kwargs)
             return core
-        transformers.AutoModel = SimpleNamespace(from_pretrained=load_model)
+        transformers.AutoModelForCausalLM = SimpleNamespace(from_pretrained=load_model)
+        transformers.AutoModel = SimpleNamespace(from_pretrained=lambda *a, **kw:
+            self.fail("AutoModel resolves the headless backbone; use AutoModelForCausalLM"))
         tokenizer = SimpleNamespace(eos_token_id=15, decode=lambda *a, **k: "",
             apply_chat_template=lambda messages, **kw: [2] * (65 if "oversize" in messages[0]["content"] else 35))
         transformers.AutoTokenizer = SimpleNamespace(from_pretrained=lambda *a, **k: tokenizer)
@@ -328,6 +332,8 @@ import drafter_simulator_collect
             self.assertEqual(path.name, "capture_manifest.json")
             manifest = json.loads(path.read_text())
             self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["model"]["loading"], "AutoModelForCausalLM trust_remote_code=True")
+            self.assertEqual(manifest["model"]["resolved_class"], type(core).__name__)
             self.assertEqual(len(manifest["audits"]), 2)
             self.assertEqual(set(manifest["split"]), {"train", "validation", "test"})
             self.assertTrue(all(len(ids) == 1 for ids in manifest["split"].values()))
@@ -522,7 +528,7 @@ class BenchmarkRuntimeTests(unittest.TestCase):
             module.__spec__ = importlib.util.spec_from_loader(name, loader=None)
         modules["datasets"].load_dataset = lambda *a, **kw: Dataset([dict(question=str(i)) for i in range(5)])
         core = FakeCore()
-        modules["transformers"].AutoModel = SimpleNamespace(from_pretrained=lambda *a, **kw: core)
+        modules["transformers"].AutoModelForCausalLM = SimpleNamespace(from_pretrained=lambda *a, **kw: core)
         tokenizer = SimpleNamespace(eos_token_id=15, decode=lambda *a, **kw: "",
                                    apply_chat_template=lambda *a, **kw: [2] * 35)
         modules["transformers"].AutoTokenizer = SimpleNamespace(from_pretrained=lambda *a, **kw: tokenizer)
@@ -591,6 +597,32 @@ class NativeTinyModelTest(unittest.TestCase):
             config.bd_size = 32
             config._attn_implementation = "sdpa"
             model = module.Fast_dLLM_QwenForCausalLM(config).to(device="cuda:0", dtype=torch.float16).eval()
+            # Exercise the same local AutoModelForCausalLM path used in Kaggle,
+            # with the real checkpoint's distinct backbone/generation mappings.
+            with tempfile.TemporaryDirectory(prefix="drafter_native_loader_") as local_model:
+                local_model = Path(local_model)
+                config.auto_map = {
+                    "AutoConfig": "configuration.Fast_dLLM_QwenConfig",
+                    "AutoModel": "modeling.Fast_dLLM_QwenModel",
+                    "AutoModelForCausalLM": "modeling.Fast_dLLM_QwenForCausalLM",
+                }
+                model.save_pretrained(local_model)
+                saved_config = json.loads((local_model / "config.json").read_text())
+                saved_config["model_type"] = "Fast_dLLM_Qwen"
+                (local_model / "config.json").write_text(json.dumps(saved_config), encoding="utf-8")
+                (local_model / "configuration.py").write_text(
+                    'from transformers import Qwen2Config\n'
+                    'class Fast_dLLM_QwenConfig(Qwen2Config):\n'
+                    '    model_type = "Fast_dLLM_Qwen"\n', encoding="utf-8")
+                shutil.copy2(ROOT / "Fast_dLLM_v2_1_5B/modeling.py", local_model / "modeling.py")
+                loaded = collector.load_native_drafter(local_model, "cuda:0")
+                self.assertEqual(type(loaded).__name__, "Fast_dLLM_QwenForCausalLM")
+                self.assertTrue(callable(loaded.generate_draft_tokens_arbitrary_length))
+                self.assertTrue(callable(loaded.lm_head))
+                self.assertFalse(any(parameter.requires_grad for parameter in loaded.parameters()))
+                torch.testing.assert_close(loaded.get_input_embeddings().weight,
+                                           model.get_input_embeddings().weight)
+                model = loaded
             tokenizer = SimpleNamespace(eos_token_id=151645, decode=lambda *a, **kw: "")
             cfg = dict(max_new_tokens=32, max_context=96, benchmark_native_states=1,
                        benchmark_warmup=1, benchmark_repetitions=3)
