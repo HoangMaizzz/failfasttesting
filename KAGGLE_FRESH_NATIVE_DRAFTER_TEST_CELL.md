@@ -12,6 +12,8 @@ the latent model on question-disjoint 70/15/15 splits through horizon 3.
 - Select a GPU accelerator. **One T4 is sufficient**; this experiment does not
   load the verifier, so a second T4 is not used.
 - No data ZIP, Kaggle Secret, or verifier model is required.
+- The launcher discovers tests directly from the checkout so installed
+  packages named `tests` cannot shadow the repository's test files.
 
 Paste this as one Python cell and run it:
 

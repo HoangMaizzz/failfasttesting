@@ -67,16 +67,24 @@ TEMP.mkdir(parents=True, exist_ok=True)
 if REPO.exists():
     shutil.rmtree(REPO)
 run_live(["git", "clone", "--depth", "1", "--branch", SOURCE_REF,
-          "https://github.com/HoangMaizzz/failfasttesting.git", str(REPO)])
+          "https://github.com/HoangMaizzz/failfasttesting.git", str(REPO)], cwd=TEMP)
 commit = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
 print("Source commit:", commit, flush=True)
 if EXPECTED_COMMIT and commit != EXPECTED_COMMIT:
     raise RuntimeError(f"Expected source commit {EXPECTED_COMMIT}, got {commit}")
 
-run_live([sys.executable, "-m", "unittest",
-          "tests.test_fresh_native_drafter_test",
-          "tests.test_latent_sufficiency_audit",
-          "tests.test_native_elysia_graph"], cwd=REPO)
+# Discover from the checkout explicitly: Kaggle dependencies can install a
+# regular package named "tests" that shadows this repository's test directory.
+test_dir = REPO / "tests"
+for test_file in (
+    "test_fresh_native_drafter_test.py",
+    "test_latent_sufficiency_audit.py",
+    "test_native_elysia_graph.py",
+):
+    if not (test_dir / test_file).is_file():
+        raise FileNotFoundError(f"Source checkout is missing required test: {test_dir / test_file}")
+    run_live([sys.executable, "-m", "unittest", "discover",
+              "-s", str(test_dir), "-p", test_file], cwd=REPO)
 
 from huggingface_hub import snapshot_download
 DLLM_DIR.mkdir(parents=True, exist_ok=True)
