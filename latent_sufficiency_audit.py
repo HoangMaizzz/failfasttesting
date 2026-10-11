@@ -321,6 +321,18 @@ class DirectPredictor(nn.Module):
         return self.head(self.encoder(x))
 
 
+class ActionDirectPredictor(DirectPredictor):
+    action_conditioned = True
+    content_loss_mode = "cosine"
+
+    def __init__(self, input_dim, width, content_dim):
+        super().__init__(input_dim, width, content_dim)
+        self.action = nn.Embedding(2, width)
+
+    def forward(self, x, actions):
+        return self.head(self.encoder(x) + self.action(actions)[:, None, :])
+
+
 class LatentDynamics(nn.Module):
     def __init__(self, input_dim: int, content_dim: int, latent_dim: int = LATENT_DIM):
         super().__init__()
@@ -347,7 +359,8 @@ def device_batch(states: list[State], device: torch.device):
     return x, mask, conf, change, content
 
 
-def edge_loss(pred, edges: list[Edge], states: dict[str, State], device: torch.device):
+def edge_loss(pred, edges: list[Edge], states: dict[str, State], device: torch.device,
+              content_loss_mode="legacy"):
     sources = [states[e.src] for e in edges]
     targets = [states[e.dst] for e in edges]
     valid = torch.as_tensor(np.stack([e.valid for e in edges]), dtype=torch.bool, device=device)
@@ -365,7 +378,13 @@ def edge_loss(pred, edges: list[Edge], states: dict[str, State], device: torch.d
     pred_content = pred["content"][valid]
     true_content = ycontent[valid]
     if pred_content.shape[-1] == true_content.shape[-1]:
-        loss = loss + .15 * F.smooth_l1_loss(pred_content, true_content)
+        if content_loss_mode == "cosine":
+            # Native input embeddings have small RMS; raw regression can make
+            # ignoring content almost cost-free. Direction has unit-scale loss.
+            loss = loss + .3 * (1.0 - F.cosine_similarity(
+                pred_content, true_content, dim=-1, eps=1e-8)).mean()
+        else:
+            loss = loss + .15 * F.smooth_l1_loss(pred_content, true_content)
     return loss
 
 
@@ -422,7 +441,11 @@ def _collect_direct(model, edges: list[Edge], states: dict[str, State], device, 
             batch = edges[start:start + batch_size]
             src = [states[e.src] for e in batch]
             x = torch.as_tensor(np.stack([s.x for s in src]), dtype=torch.float32, device=device)
-            pred = model(x)
+            if getattr(model, "action_conditioned", False):
+                actions = torch.as_tensor([e.action for e in batch], dtype=torch.long, device=device)
+                pred = model(x, actions)
+            else:
+                pred = model(x)
             for i, edge in enumerate(batch):
                 records.append((edge, {k: v[i].float().cpu().numpy() for k, v in pred.items()}))
     return records
@@ -532,6 +555,15 @@ def _seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def _validation_score(metrics, content_loss_mode="legacy"):
+    score = metrics.get("mask_brier", 1.0) + metrics.get("confidence_mae", 1.0)
+    if content_loss_mode == "cosine":
+        score += .3 * (1.0 - metrics.get("content_cosine", 0.0))
+        if metrics.get("candidate_change_brier") is not None:
+            score += metrics["candidate_change_brier"]
+    return score
+
+
 def _fit_direct(model, train_edges, val_edges, states, device, updates, seed,
                 batch_size=16, eval_every=40, label="direct"):
     _seed(seed)
@@ -546,7 +578,13 @@ def _fit_direct(model, train_edges, val_edges, states, device, updates, seed,
         batch = [train_edges[int(i)] for i in picks]
         src = [states[e.src] for e in batch]
         x = torch.as_tensor(np.stack([s.x for s in src]), dtype=torch.float32, device=device)
-        loss = edge_loss(model(x), batch, states, device)
+        if getattr(model, "action_conditioned", False):
+            actions = torch.as_tensor([e.action for e in batch], dtype=torch.long, device=device)
+            prediction = model(x, actions)
+        else:
+            prediction = model(x)
+        content_mode = getattr(model, "content_loss_mode", "legacy")
+        loss = edge_loss(prediction, batch, states, device, content_mode)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -554,8 +592,9 @@ def _fit_direct(model, train_edges, val_edges, states, device, updates, seed,
         if step % eval_every == 0 or step == updates:
             if val_edges:
                 metrics = score_records(_collect_direct(model, val_edges, states, device), states, train_edges)
-                score = metrics["mask_brier"] + metrics["confidence_mae"]
-                logs.append({"update": step, "train_loss": float(loss.detach().cpu()), "val_score": score})
+                score = _validation_score(metrics, content_mode)
+                logs.append({"update": step, "train_loss": float(loss.detach().cpu()),
+                             "val_score": score, "validation_metrics": metrics})
                 print(f"[{label}] update={step}/{updates} val_mask_brier={metrics['mask_brier']:.4f} "
                       f"val_conf_mae={metrics['confidence_mae']:.4f}", flush=True)
                 if score < best_score:
@@ -598,7 +637,8 @@ def _fit_dynamics(model, train_paths, val_paths, states, device, updates, seed,
             actions = torch.as_tensor([edge.action for edge in edge_batch], dtype=torch.long, device=device)
             z_next = model.advance(z[active], actions)
             pred = model.head(z_next)
-            loss = loss + edge_loss(pred, edge_batch, states, device)
+            loss = loss + edge_loss(pred, edge_batch, states, device,
+                                    getattr(model, "content_loss_mode", "legacy"))
             next_z = z.clone()
             next_z[active] = z_next
             z = next_z
@@ -610,9 +650,11 @@ def _fit_dynamics(model, train_paths, val_paths, states, device, updates, seed,
         optimizer.step()
         if step % eval_every == 0 or step == updates:
             val_rollouts = _collect_rollout(model, val_paths, states, device, horizon)
-            metrics = score_records(val_rollouts.get(1, []), states, train_paths[0] if False else [])
-            score = metrics.get("mask_brier", 1.0) + metrics.get("confidence_mae", 1.0)
-            logs.append({"update": step, "train_loss": float(loss.detach().cpu()), "val_score": score})
+            validation_edges = [path[0] for path in train_paths if path]
+            metrics = score_records(val_rollouts.get(1, []), states, validation_edges)
+            score = _validation_score(metrics, getattr(model, "content_loss_mode", "legacy"))
+            logs.append({"update": step, "train_loss": float(loss.detach().cpu()),
+                         "val_score": score, "validation_metrics": metrics})
             print(f"[{label}] update={step}/{updates} val_mask_brier={metrics.get('mask_brier', float('nan')):.4f} "
                   f"val_conf_mae={metrics.get('confidence_mae', float('nan')):.4f}", flush=True)
             if score < best_score:

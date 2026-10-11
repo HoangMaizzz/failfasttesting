@@ -99,6 +99,25 @@ class FreshNativeDrafterTests(unittest.TestCase):
             with np.load(root / "features" / "shard_00000.npz") as arrays:
                 self.assertIn("filled_token_ids", arrays.files)
 
+    def test_legacy_change_labels_are_rebuilt_from_candidate_ids(self):
+        # Force immediate flush: later in-memory mutations cannot repair disk.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            writer = ShardWriter(root, shard_rows=1)
+            base = _state_row(fake_snapshot(), FakeModel(), 50, 0, 8, 151645, 4)
+            for sid, token in (("a", 30), ("b", 31)):
+                candidate = base["candidate_token_ids"].copy()
+                candidate[1] = token
+                writer.append({**base, "candidate_token_ids": candidate,
+                               "meta": {"state_id": sid, "question_id": "q0"}})
+            (root / "edges.jsonl").write_text(json.dumps({
+                "src_state_id": "a", "dst_state_id": "b", "action": "R",
+                "valid": [True] * 8, "changed_valid": [True] * 8,
+                "new_suffix": [False] * 8}) + "\n")
+            states, _, _ = load_capture(root)
+            self.assertTrue(states["b"].changed[1])
+            self.assertEqual(int(states["b"].changed.sum()), 1)
+
     def test_audit_trains_and_reports_separate_r_e_horizons(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

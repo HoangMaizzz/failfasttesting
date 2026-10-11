@@ -27,7 +27,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from latent_sufficiency_audit import (
-    DirectPredictor, Edge, LatentDynamics, State, _average_metric_dict,
+    ActionDirectPredictor, Edge, LatentDynamics, State, _average_metric_dict, _seed,
     _collect_direct, _collect_rollout, _fit_direct, _fit_dynamics,
     _paths_for_edges, _restrict_edges, normalize_states, question_split,
     score_records,
@@ -379,7 +379,6 @@ def collect(args) -> dict:
                         snapshot_forward_index=int(snapshot["unmask_forward_index"]),
                         termination_reason=("eos_committed" if raw["eos_in_native"] else None),
                     )
-                    writer.append({**raw, "meta": meta})
                     state = State(
                         sid=sid, qid=qid, x=raw["x"], mask=raw["mask"],
                         eligible=raw["valid"], confidence=raw["confidence"],
@@ -400,6 +399,10 @@ def collect(args) -> dict:
                                           action="R", valid=edge.valid.tolist(),
                                           changed_valid=edge.changed_valid.tolist(),
                                           new_suffix=edge.new_suffix.tolist()))
+                    # Serialize only after the incoming R edge has computed
+                    # candidate changes; the writer may flush immediately.
+                    raw["changed"] = state.changed.copy()
+                    writer.append({**raw, "meta": meta})
                     segment_states.append(entry)
                     question_state_ids.append(sid)
                     if raw["eos_in_native"]:
@@ -486,6 +489,7 @@ def load_capture(root: Path):
     states: dict[str, State] = {}
     metadata = {}
     shard_cache = {}
+    candidates = {}
     with (root / "states.jsonl").open(encoding="utf-8") as handle:
         rows = [json.loads(line) for line in handle if line.strip()]
     for row in rows:
@@ -496,6 +500,7 @@ def load_capture(root: Path):
         arrays = shard_cache[shard]
         index = int(row["row"])
         sid = str(row["state_id"])
+        candidates[sid] = arrays["candidate_token_ids"][index].copy()
         states[sid] = State(
             sid=sid, qid=str(row["question_id"]), x=arrays["x"][index].astype(np.float16),
             mask=arrays["mask"][index].astype(bool), eligible=arrays["valid"][index].astype(bool),
@@ -517,6 +522,12 @@ def load_capture(root: Path):
                 changed_valid=np.asarray(row["changed_valid"], dtype=bool),
                 new_suffix=np.asarray(row["new_suffix"], dtype=bool),
             ))
+    # Repair legacy captures whose serialized `changed` rows were still zero.
+    # IDs are immutable raw observations, so this needs no model forward.
+    for edge in edges:
+        if edge.action == 0:
+            before, after = candidates[edge.src], candidates[edge.dst]
+            states[edge.dst].changed = (before != after) & (before >= 0) & (after >= 0)
     return states, edges, metadata
 
 
@@ -589,13 +600,15 @@ def audit_capture(root: Path, args) -> dict:
     rows_by_arm = {name: [] for name in names}
     ablation_rows: dict[str, list[dict]] = {}
     for seed in args.seeds:
+        _seed(seed)
         print(f"[train] seed={seed} edges train/val/test="
               f"{len(train_edges)}/{len(val_edges)}/{len(test_edges)}", flush=True)
         models = {
-            "rich_direct_h1": DirectPredictor(in_dim, 256, content_dim),
-            "latent_direct_h1": DirectPredictor(in_dim, 128, content_dim),
+            "rich_direct_h1": ActionDirectPredictor(in_dim, 256, content_dim),
+            "latent_direct_h1": ActionDirectPredictor(in_dim, 128, content_dim),
             "latent_dynamics_h1_h3": LatentDynamics(in_dim, content_dim, latent_dim=128),
         }
+        models["latent_dynamics_h1_h3"].content_loss_mode = "cosine"
         seed_result = {}
         for name in ("rich_direct_h1", "latent_direct_h1"):
             model, logs = _fit_direct(
@@ -677,6 +690,7 @@ def audit_capture(root: Path, args) -> dict:
         "transition_gap": "latent_direct_h1 vs latent_dynamics_h1 at H1",
         "rollout_gap": "latent_dynamics H1 vs H2 vs H3, separately for R and E destinations",
         "semantic_tokens": "candidate-content is learned Fast-dLLM input-embedding space, never random IDs",
+        "objective": "content cosine loss; all predictors receive the same R/E action",
         "not_claimed": "No exact token generation, verifier acceptance, optimal action, or latency-policy claim",
     }
     report["feature_ablation"] = {
