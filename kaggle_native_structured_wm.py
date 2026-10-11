@@ -13,6 +13,7 @@ MAX_CONTEXT_TOKENS = int(globals().get("MAX_CONTEXT_TOKENS", 4096))
 UPDATES_PER_TRANSITION = int(globals().get("UPDATES_PER_TRANSITION", 1))
 LATENT_DIM = int(globals().get("LATENT_DIM", 512))
 REPLAY_STATES = int(globals().get("REPLAY_STATES", 2048))
+RESUME_ARCHIVE = globals().get("RESUME_ARCHIVE")
 STOP_WEIGHT = EXTEND_WEIGHT = REFINE_WEIGHT = 1.0
 url = (f"https://raw.githubusercontent.com/HoangMaizzz/failfasttesting/"
        f"{SOURCE_REF}/kaggle_world_model_pretrain.py")

@@ -2,6 +2,7 @@
 from pathlib import Path
 import copy
 import json
+import random
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,8 @@ from world_model_environment import (MASK_ID, NativeTrainingEnvironment, native_
 from native_elysia_graph import NativeEosWithoutSnapshot
 from world_model_hindsight import HindsightLabeler
 from pretrain_acceptance_world_model import (ExperienceWriter, explore_questions,
-    action_probabilities, evaluate, package, parse_args, load_resume_archive)
+    action_probabilities, evaluate, package, parse_args, load_resume_archive,
+    _shadow_probe_due)
 
 torch.set_num_threads(1)
 
@@ -85,6 +87,19 @@ class FakeTokenizer:
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_native_environment_never_schedules_unsupported_shadow_probe(self):
+        env = NativeTrainingEnvironment(FakeRunner(), FakeVerifier(), 0, 4,
+                                        settings(), None)
+        rng = random.Random(0)
+        self.assertFalse(_shadow_probe_due(True, env, rng, 1.0))
+
+        class ShadowEnvironment:
+            def shadow(self, *args):
+                return 0.0
+
+        self.assertTrue(_shadow_probe_due(True, ShadowEnvironment(), rng, 1.0))
+        self.assertFalse(_shadow_probe_due(False, ShadowEnvironment(), rng, 1.0))
+
     def test_pretraining_defaults_to_sharded_fp16_verifier(self):
         args = parse_args(["--dllm_dir", "unused", "--output_dir", "unused",
                            "--dataset", "math", "--num_questions", "10",
@@ -448,6 +463,32 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(resumed["summary"]["resumed_from_questions_completed"], 1)
             self.assertEqual(resumed["completed_questions"][0]["question_id"], "gsm8k:1")
             self.assertTrue((output / "checkpoint.pt").is_file())
+
+    def test_resume_accepts_native_structured_partial_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            mounted = root / "native_partial"
+            mounted.mkdir()
+            args = parse_args(["--dllm_dir", "unused", "--output_dir", "unused",
+                "--model_architecture", "native_structured", "--num_questions", "10",
+                "--validation_questions", "2", "--latent_dim", "64", "--raw_top_k", "2"])
+            config = {key: str(value) if isinstance(value, Path) else value
+                      for key, value in vars(args).items()}
+            (mounted / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            (mounted / "summary.json").write_text(
+                json.dumps(dict(status="partial", elapsed_seconds=12)), encoding="utf-8")
+            (mounted / "questions.jsonl").write_text(
+                json.dumps(dict(question_id="gsm8k:1", split="train", episode=0,
+                                prompt="q")) + "\n", encoding="utf-8")
+            torch.save(dict(model={}, optimizer={}), mounted / "checkpoint.pt")
+            args.resume_archive = mounted
+            args.source_revision = "patched"
+            output = root / "resumed"
+            output.mkdir()
+            resumed = load_resume_archive(mounted, output, args)
+            self.assertEqual(resumed["summary"]["status"], "resuming")
+            self.assertEqual(resumed["summary"]["resumed_from_questions_completed"], 1)
+            self.assertEqual(resumed["completed_questions"][0]["question_id"], "gsm8k:1")
 
 
 if __name__ == "__main__":

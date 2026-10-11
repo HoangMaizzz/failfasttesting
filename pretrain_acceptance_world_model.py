@@ -438,6 +438,13 @@ def action_probabilities(actions, args):
     return {a: weights[a]/total for a in actions}
 
 
+def _shadow_probe_due(detailed, environment, rng, probability):
+    """Only environments that implement shadow verification may schedule it."""
+    if not detailed or not callable(getattr(environment, "shadow", None)):
+        return False
+    return rng.random() < probability
+
+
 def explore_questions(args, questions, tokenizer, environment, learner, writer, summary, resume=None):
     rng = random.Random(args.seed)
     if resume and resume.get("exploration_rng") is not None:
@@ -535,7 +542,12 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                     train_available()
                 else:
                     buffer.add_node(o)
-                if detailed and shadow_rng.random() < args.shadow_verify_probability:
+                # Shadow verifier probes belong to the two-source teacher
+                # experiment only. Native structured rollouts intentionally
+                # use the real verifier solely at sampled STOP actions; their
+                # environment has no shadow() API.
+                if _shadow_probe_due(detailed, environment, shadow_rng,
+                                     args.shadow_verify_probability):
                     elapsed = environment.shadow(state, args.max_proposal_tokens+1)
                     writer.teacher(state, source='shadow_forward')
                     labeler.mark_direct(state, 'shadow_verifier')
@@ -739,8 +751,8 @@ def load_resume_archive(archive, output, args):
     for key in expected_keys:
         if old_config.get(key) != getattr(args, key):
             raise ValueError(f"Resume config mismatch for {key}: archive={old_config.get(key)!r}, run={getattr(args,key)!r}")
-    if old_config.get("model_architecture") != "two_source":
-        raise ValueError("Only two_source archives are supported for resume")
+    if old_config.get("model_architecture") not in ("two_source", "native_structured"):
+        raise ValueError("Only two_source/native_structured archives are supported for resume")
     checkpoint_path = output / "checkpoint.pt"
     if not checkpoint_path.is_file():
         raise FileNotFoundError("Resume ZIP has no checkpoint.pt")

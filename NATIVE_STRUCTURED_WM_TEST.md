@@ -68,9 +68,14 @@ Interpretation gates:
 
 ## Kaggle setup
 
-Enable Internet and GPU T4 x2. No data ZIP or GitHub secret is required. Run the
-cell below in a fresh notebook. It will download the source and model checkpoints,
-run CPU unit tests, execute the 100-question experiment and put a verified ZIP in
-`/kaggle/working` after each completed question. The 100-question uncapped-to-EOS
-run can take many hours and may exceed one Kaggle session; the partial ZIP is kept
-on failure/timeout when the process can package it.
+Enable Internet and GPU T4 x2. No data ZIP or GitHub secret is required for a
+fresh run. It downloads the source, GSM8K, and model checkpoints, runs CPU unit
+tests, executes the experiment and puts a verified ZIP in `/kaggle/working` after
+each completed question. The 100-question uncapped-to-EOS run can take many hours
+and may exceed one Kaggle session; a question-boundary partial ZIP is kept.
+
+To resume a partial run, attach its ZIP as a Kaggle input or keep it at its
+original `/kaggle/working` path, then set `RESUME_ARCHIVE` to that ZIP's path in
+the notebook cell. Resume restores the last atomic model/optimizer checkpoint
+and completed-question ledger, then restarts the interrupted question. Runs with
+no completed-question ledger cannot be resumed safely.
