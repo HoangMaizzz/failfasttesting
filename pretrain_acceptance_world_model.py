@@ -461,7 +461,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
     try:
         episodes = getattr(args,"episodes_per_question",1)
         itinerary = [(i,episode,q) for i,q in enumerate(questions) for episode in range(episodes)]
-        detailed = getattr(args, 'model_architecture', '') == 'two_source'
+        detailed = getattr(args, 'model_architecture', '') in ('two_source', 'native_structured')
         itinerary = [item for item in itinerary
                      if (str(item[2]["question_id"]), int(item[1])) not in completed]
         if detailed:
@@ -521,7 +521,7 @@ def explore_questions(args, questions, tokenizer, environment, learner, writer, 
                 writer.add(state, parent, action, timing, split)
                 labeler.register(state)
                 o = state.observation
-                if getattr(args,"model_architecture","legacy") in ("token_dual", "two_source"):
+                if getattr(args,"model_architecture","legacy") in ("token_dual", "two_source", "native_structured"):
                     learner.model.eval()
                     with torch.no_grad():
                         b=pack_observations([o],learner.token_table,learner.device)
@@ -788,7 +788,8 @@ def run(args):
         config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
         atomic_json(args.output_dir / "config.json", config)
     if resume is None:
-        summary = dict(schema=("interactive_acceptance_two_source_v1" if args.model_architecture=='two_source' else
+        summary = dict(schema=("native_structured_acceptance_v1" if args.model_architecture=='native_structured' else
+                          "interactive_acceptance_two_source_v1" if args.model_architecture=='two_source' else
                           "interactive_acceptance_probe_v3" if args.model_architecture=="token_dual"
                            else "interactive_acceptance_pretrain_v2_hindsight"), status="running",
         questions_completed=0, updates=0, nodes=0, edges=0, source_revision=args.source_revision,
@@ -855,7 +856,12 @@ def run(args):
         draft_vocab = {k: v for k, v in draft_tokenizer.get_vocab().items() if v != MASK_ID}
         if target_vocab != draft_vocab:
             raise RuntimeError("Drafter/verifier token ID mappings differ")
-        if args.model_architecture=='two_source':
+        if args.model_architecture == 'native_structured':
+            from native_structured_world_model import NativeStructuredWorldModel
+            model = NativeStructuredWorldModel(drafter.config.hidden_size, table.shape[-1],
+                args.raw_top_k, dim=args.latent_dim,
+                num_hidden_layers=len(args.hidden_layers), dropout=args.dropout)
+        elif args.model_architecture=='two_source':
             from world_model_twosource import TwoSourceWorldModel, configure_losses
             model = TwoSourceWorldModel(drafter.config.hidden_size, table.shape[-1], args.raw_top_k,
                 dim=args.latent_dim, num_hidden_layers=len(args.hidden_layers), dropout=args.dropout)
@@ -879,6 +885,15 @@ def run(args):
         verifier = FullContextVerifier(target, tokenizer, args)
         environment = NativeTrainingEnvironment(NativeElysiaRunner(drafter, tokenizer, args),
             verifier, tokenizer.eos_token_id, drafter.config.hidden_size, args, None)
+        if args.model_architecture == 'native_structured':
+            summary['prototype_limits'] = (
+                'Frozen native Fast-dLLM shell generates every real state; learned latent uses '
+                'native hidden layers/content/mask/geometry and separate R/E dynamics. '
+                'This is a feasibility model, not a replacement drafter or latency benchmark.')
+            summary['verifier_teacher'] = 'actual chosen STOP + verified greedy hindsight; no verifier feature input'
+            summary['verifier'] = 'full context, KV disabled; invoked only on chosen STOP'
+            summary['representation'] = 'native hidden layers 7/14/28 + pretrained dLLM token embeddings + top-k/logit/mask/prefix'
+            summary['horizon'] = 3
         if args.model_architecture == 'two_source':
             from world_model_teacher_environment import TeacherVerifier, TeacherTrainingEnvironment
             configure_losses(learner, 'full')
@@ -913,7 +928,19 @@ def run(args):
             summary['verifier'] = 'full context, KV disabled; actual S and random shadow probes'
             summary['labels'] = 'actual STOP, shadow verifier and hindsight verified greedy stream; unresolved is missing'
             summary['teacher_capture_probability'] = args.shadow_verify_probability
+        if args.model_architecture == 'native_structured':
+            summary['prototype_limits'] = (
+                'Frozen native Fast-dLLM shell supplies real states; learned latent predicts '
+                'acceptance, next mask state and next unmask event. Not a replacement drafter or latency benchmark.')
+            summary['verifier_teacher'] = 'none as model input; actual STOP and greedy hindsight provide labels'
+            summary['verifier'] = 'full context, KV disabled; invoked only on chosen STOP'
+            summary['representation'] = ('native hidden layers 7/14/28 + pretrained dLLM token embeddings + '
+                'top-k/logit/mask/event/geometry/prefix')
+            summary['labels'] = 'actual STOP + verified greedy hindsight; censored labels remain unknown'
         explore_questions(args, questions, tokenizer, environment, learner, writer, summary, resume=resume)
+        if args.model_architecture == 'native_structured':
+            from world_model_training_audit import run_native_structured_sensitivity
+            summary['feature_sensitivity'] = run_native_structured_sensitivity(args, learner)
         if args.model_architecture == 'two_source':
             # Release both large models before matched small-model ablations.
             environment.on_state = None
@@ -938,6 +965,9 @@ def run(args):
         if args.model_architecture == 'two_source':
             for name in ('world_model_twosource.py', 'world_model_teacher_environment.py', 'world_model_training_audit.py'):
                 summary['source_sha256'][name] = hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+        if args.model_architecture == 'native_structured':
+            for name in ('native_structured_world_model.py', 'world_model_training_audit.py'):
+                summary['source_sha256'][name] = hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
         package(args.output_dir, archive, summary)
 
 
@@ -947,7 +977,7 @@ def parse_args(argv=None):
     parser.add_argument("--num_questions", type=int, default=10)
     parser.add_argument("--validation_questions", type=int, default=2)
     parser.add_argument("--episodes_per_question",type=int,default=1)
-    parser.add_argument("--model_architecture",choices=["legacy","token_dual","two_source"],default="legacy")
+    parser.add_argument("--model_architecture",choices=["legacy","token_dual","two_source","native_structured"],default="legacy")
     parser.add_argument('--shadow_verify_probability', type=float, default=.15)
     parser.add_argument('--audit_milestones', nargs='+', type=int, default=[10,20,40,60,80])
     parser.add_argument('--audit_states_per_question', type=int, default=32)
@@ -992,11 +1022,13 @@ def parse_args(argv=None):
     parser.add_argument("--horizon_warmup_updates", type=int, default=24)
     args = parser.parse_args(argv)
     if args.hidden_layers is None:
-        args.hidden_layers = [7,14,28] if args.model_architecture in ("token_dual", 'two_source') else [14,28]
+        args.hidden_layers = [7,14,28] if args.model_architecture in ("token_dual", 'two_source', 'native_structured') else [14,28]
     if args.model_architecture=="legacy" and len(args.hidden_layers)!=2:
         parser.error("Legacy architecture needs exactly 2 hidden layers")
     if args.model_architecture=="token_dual" and args.latent_dim%8:
         parser.error("Dual latent dimension must be divisible by 8")
+    if args.model_architecture=="native_structured" and (args.latent_dim < 64 or args.latent_dim % 8):
+        parser.error("Native structured model requires latent_dim>=64 divisible by 8")
     args.capture_verifier_teacher = args.model_architecture in ("token_dual", 'two_source')
     if not 0 <= args.shadow_verify_probability <= 1:
         parser.error('shadow_verify_probability must be within [0,1]')

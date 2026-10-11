@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from world_model_core import (AcceptanceWorldModel, ExperienceReplay, WorldModelLearner,
     acceptance_nll, expected_acceptance, prefix_log_distribution, pack_observations)
 from world_model_environment import (MASK_ID, NativeTrainingEnvironment, native_observation)
+from native_elysia_graph import NativeEosWithoutSnapshot
 from world_model_hindsight import HindsightLabeler
 from pretrain_acceptance_world_model import (ExperienceWriter, explore_questions,
     action_probabilities, evaluate, package, parse_args, load_resume_archive)
@@ -161,6 +162,16 @@ class NativeTests(unittest.TestCase):
         root = env.start("q", 0, [10, 11, 12], 128)
         with self.assertRaisesRegex(RuntimeError, "drift"):
             env.step(root, "R", 128)
+
+    def test_eos_without_next_snapshot_disables_R_without_failing_run(self):
+        env = self.make_env()
+        root = env.start("q", 0, [10, 11, 12], 128)
+        def eos(*args, **kwargs):
+            raise NativeEosWithoutSnapshot([0], {"native_termination_reason": "eos"})
+        env.segment = eos
+        self.assertIsNone(env.step(root, "R", 128))
+        self.assertNotIn("R", env.actions(root))
+        self.assertEqual(env.stats["eos_without_snapshot_refine"], 1)
 
     def test_partial_capture_offsets_and_eos(self):
         snapshot = snap()

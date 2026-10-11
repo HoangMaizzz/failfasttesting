@@ -38,7 +38,7 @@ temporary.mkdir(parents=True, exist_ok=True)
 os.chdir(working)
 if DATASET not in ("gsm8k", "math") or not 0 < VALIDATION_QUESTIONS < NUM_QUESTIONS:
     raise ValueError("Choose gsm8k/math and nonempty training + validation splits")
-if MODEL_ARCHITECTURE not in ("legacy","token_dual", 'two_source'):
+if MODEL_ARCHITECTURE not in ("legacy","token_dual", 'two_source', 'native_structured'):
     raise ValueError("Unknown world-model architecture")
 if RESUME_ARCHIVE is not None:
     RESUME_ARCHIVE = Path(RESUME_ARCHIVE)
@@ -93,9 +93,12 @@ subprocess.run([sys.executable, str(repo / "tests/test_world_model_pretraining.p
                cwd=repo, env=environment, check=True)
 subprocess.run([sys.executable, str(repo / "tests/test_native_elysia_graph.py")],
                cwd=repo, env=environment, check=True)
-if MODEL_ARCHITECTURE in ("token_dual", 'two_source'):
+if MODEL_ARCHITECTURE in ("token_dual", 'two_source', 'native_structured'):
     subprocess.run([sys.executable,str(repo/"tests/test_world_model_probe.py")],
                    cwd=repo,env=environment,check=True)
+if MODEL_ARCHITECTURE == 'native_structured':
+    subprocess.run([sys.executable, str(repo/'tests/test_native_structured_world_model.py')],
+                   cwd=repo, env=environment, check=True)
 if MODEL_ARCHITECTURE=='two_source':
     subprocess.run([sys.executable,str(repo/'tests/test_world_model_twosource.py')],
                    cwd=repo,env=environment,check=True)
@@ -140,7 +143,7 @@ command = [sys.executable, "-u", str(repo / "pretrain_acceptance_world_model.py"
 if RESUME_ARCHIVE is not None:
     command += ["--resume_archive", str(RESUME_ARCHIVE)]
 command += ['--source_revision',commit]
-if MODEL_ARCHITECTURE in ("token_dual", 'two_source'):
+if MODEL_ARCHITECTURE in ("token_dual", 'two_source', 'native_structured'):
     command += ["--package_every_question","--warmup_updates","16","--horizon_warmup_updates","64"]
 if MODEL_ARCHITECTURE=='two_source':
     command += ['--horizon','3','--shadow_verify_probability',str(globals().get('SHADOW_VERIFY_PROBABILITY', .15)),
@@ -150,6 +153,10 @@ if MODEL_ARCHITECTURE=='two_source':
         '--audit_seeds',*[str(s) for s in globals().get('AUDIT_SEEDS',[42,43])]]
     if globals().get('AUDIT_VARIANTS'):
         command += ['--audit_variants',*globals()['AUDIT_VARIANTS']]
+if MODEL_ARCHITECTURE == 'native_structured':
+    command += ["--horizon", "3", "--hidden_layers", "7", "14", "28",
+        "--batch_sequences", str(int(globals().get('BATCH_SEQUENCES', 4))),
+        "--audit_states_per_question", str(int(globals().get('AUDIT_STATES_PER_QUESTION', 24)))]
 print("Running:", " ".join(command), flush=True)
 print("Memory layout: verifier FP16 sharded across GPU 0+1 (8 GiB placement cap/card); "
       "dLLM FP16 + world model also on GPU 1", flush=True)
@@ -164,6 +171,10 @@ print("Random legal S/E/R; E includes first unmask, max 3 extra R. "
 if MODEL_ARCHITECTURE=='two_source':
     print('Fixed heldout collected first; curves at 0/10/20/40/60/80 training questions. '
           'Feature sensitivity + independently retrained removals reuse saved data; no extra LLM forwards.',flush=True)
+if MODEL_ARCHITECTURE == 'native_structured':
+    print('Native structured latent: frozen dLLM generates real states; pretrained token embeddings + '
+          'native layers 7/14/28 feed separate R/E dynamics. Learning curve uses fixed validation; '
+          'feature lesions run afterward with no extra verifier/drafter calls.', flush=True)
 print(f"Architecture={MODEL_ARCHITECTURE}; episodes/question={EPISODES_PER_QUESTION}; updates/transition={UPDATES_PER_TRANSITION}; replay capacity={REPLAY_STATES}",flush=True)
 completed = subprocess.run(command, cwd=repo, env=environment, check=False)
 archive = output.with_suffix(".zip")

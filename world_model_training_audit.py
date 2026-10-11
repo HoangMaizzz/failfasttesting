@@ -141,10 +141,12 @@ def summarize(rows):
         result['predicted_persistence_mae'] = float(np.mean([abs(r['persistence_K']-r['K']) for r in known]))
     if all('train_length_mean' in r and r['train_length_mean'] is not None for r in known):
         result['train_length_mean_mae'] = float(np.mean([abs(r['train_length_mean']-r['K']) for r in known]))
-    latent = [r['latent_cosine_distance'] for r in known if r.get('latent_cosine_distance') is not None]
+    latent = [r['latent_cosine_distance'] for r in rows if r.get('latent_cosine_distance') is not None]
     if latent: result['latent_cosine_distance'] = float(np.mean(latent))
-    mask = [r['mask_brier'] for r in known if r.get('mask_brier') is not None]
+    mask = [r['mask_brier'] for r in rows if r.get('mask_brier') is not None]
     if mask: result['mask_brier'] = float(np.mean(mask))
+    event = [r['unmask_event_brier'] for r in rows if r.get('unmask_event_brier') is not None]
+    if event: result['unmask_event_brier'] = float(np.mean(event))
     return result
 
 
@@ -176,6 +178,8 @@ def detailed_rows(learner, replay, horizon=3, baseline_replay=None):
             b = learner.pack([target]); truth = learner.target_encoder(b)
             row['latent_cosine_distance'] = float((1-F.cosine_similarity(z.tokens,truth.tokens,-1))[0,:target.length].mean())
             row['mask_brier'] = float((z.mask_probs[0,:target.length]-b['scalars'][0,:,0]).square().mean())
+            if hasattr(z, 'event_probs'):
+                row['unmask_event_brier'] = float((z.event_probs[0,:target.length]-b['scalars'][0,:,2]).square().mean())
             row['persistence_K'] = baseline
         if train_by_length:
             row['train_length_mean'] = float(np.mean(train_by_length[target.length])) if train_by_length[target.length] else float(np.mean(overall))
@@ -274,6 +278,45 @@ def audit_learning_stage(learner, replay, output, train_questions, horizon=3, st
           f"metrics={ {h:report['groups'].get(h,{}) .get('mae') for h in ('h0','h1','h2','h3')} }",flush=True)
     return dict(train_questions=train_questions,updates=learner.updates,
                 groups={h:report['groups'].get(h,{'n':0}) for h in ('h0','h1','h2','h3')})
+
+
+def run_native_structured_sensitivity(args, learner):
+    """Matched inference lesions on the fixed validation roots; no extra LLM calls.
+
+    This is sensitivity analysis, not a causal ablation: the model is not
+    retrained after a feature group is removed.
+    """
+    output = args.output_dir / 'factor_audit'
+    output.mkdir(exist_ok=True)
+    replay = learner._fixed_audit_holdout
+    full_encoder = learner.model.encoder.variant
+    full_dynamics = learner.model.dynamics.variant
+    baseline_rows = detailed_rows(learner, replay, args.horizon)
+    results = {}
+    try:
+        for name in learner.model.encoder.VARIANTS:
+            if name == 'full':
+                continue
+            learner.model.encoder.variant = name
+            rows = detailed_rows(learner, replay, args.horizon)
+            results[name] = dict(report=detailed_report(rows),
+                paired_delta=paired_question_ci(baseline_rows, rows),
+                interpretation='same trained model, input lesion only; not retrained')
+        learner.model.encoder.variant = 'full'
+        learner.model.dynamics.variant = 'shared_no_action'
+        rows = detailed_rows(learner, replay, args.horizon)
+        results['shared_no_action_dynamics'] = dict(report=detailed_report(rows),
+            paired_delta=paired_question_ci(baseline_rows, rows),
+            interpretation='same trained model, shared R/E transition with no action embedding; not retrained')
+    finally:
+        learner.model.encoder.variant = full_encoder
+        learner.model.dynamics.variant = full_dynamics
+    write_json(output/'native_structured_sensitivity.json', dict(
+        status='complete', validation_questions=len({o.question for o in replay.nodes.values()}),
+        roots=replay.audit_sampling, variants=results,
+        warning='Inference-only lesions indicate reliance/sensitivity, not causal feature value.'))
+    return dict(path='factor_audit/native_structured_sensitivity.json',
+        variants=list(results), warning='inference-only; not causal/retrained')
 
 
 def paired_question_ci(full_rows, other_rows, seed=72, repetitions=500):

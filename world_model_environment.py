@@ -236,7 +236,25 @@ class NativeTrainingEnvironment:
             snapshot, index = snapshots[0], 0
         else:
             prior = state.prior
-            snapshots = self.segment(state.prefix + prior, state.snapshot_index + 2)
+            try:
+                snapshots = self.segment(state.prefix + prior, state.snapshot_index + 2)
+            except NativeEosWithoutSnapshot:
+                # A replay may discover that native generation terminated at
+                # EOS before the requested next R boundary. That means R is
+                # unavailable here, not a malformed edge or a zero-yield label.
+                state.refine_exhausted = True
+                self.stats["unavailable_R"] += 1
+                self.stats["eos_without_snapshot_refine"] = (
+                    self.stats.get("eos_without_snapshot_refine", 0) + 1)
+                return None
+            except RuntimeError as error:
+                if not str(error).startswith(
+                    "Native Elysia generator returned no oracle refinement snapshots"
+                ):
+                    raise
+                state.refine_exhausted = True
+                self.stats["unavailable_R"] += 1
+                return None
             if len(snapshots) <= state.snapshot_index:
                 raise RuntimeError("Native replay lost the source snapshot")
             replayed = snapshots[state.snapshot_index]

@@ -423,6 +423,7 @@ class WorldModelLearner:
                     auxiliary_losses.append(self.model.teacher_loss(actual, future))
                     if getattr(self.model, 'teach_imagined', False):
                         auxiliary_losses.append(self.model.teacher_loss(imagined, future))
+                if hasattr(self.model, "structural_loss"):
                     structural_losses.append(self.model.structural_loss(imagined, future))
                 current_losses.append(acceptance_nll(self.model.acceptance(actual),
                                                        actual.lengths, future["labels"]))
