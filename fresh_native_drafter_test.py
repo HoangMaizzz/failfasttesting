@@ -74,6 +74,30 @@ class ShardWriter:
             "topk_token_ids": np.stack([row["topk_token_ids"] for row in self.rows]).astype(np.int32),
             "topk_logits": np.stack([row["topk_logits"] for row in self.rows]).astype(np.float16),
         }
+        if all("native_latent_block" in row for row in self.rows):
+            payload.update({
+                "native_latent_block": np.stack(
+                    [row["native_latent_block"] for row in self.rows]
+                ).astype(np.float16),
+                "physical_mask": np.stack(
+                    [row["physical_mask"] for row in self.rows]
+                ).astype(np.bool_),
+                "physical_event": np.stack(
+                    [row["physical_event"] for row in self.rows]
+                ).astype(np.bool_),
+                "active_region": np.stack(
+                    [row["active_region"] for row in self.rows]
+                ).astype(np.bool_),
+                "prefix_kv_summary": np.stack(
+                    [row["prefix_kv_summary"] for row in self.rows]
+                ).astype(np.float16),
+                "prefix_kv_valid": np.asarray(
+                    [row["prefix_kv_valid"] for row in self.rows], dtype=np.bool_
+                ),
+                "wm_v2_context": np.stack(
+                    [row["wm_v2_context"] for row in self.rows]
+                ).astype(np.float32),
+            })
         np.savez_compressed(self.feature_dir / name, **payload)
         with self.index.open("a", encoding="utf-8") as handle:
             for offset, row in enumerate(self.rows):
@@ -241,7 +265,7 @@ def _state_row(snapshot: dict, model, context_len: int, block_index: int,
     valid = feature_valid.copy()
     if eos_id in native:
         valid[int(np.flatnonzero(native == eos_id)[0]) + 1:] = False
-    return dict(
+    row = dict(
         x=x.astype(np.float16), mask=mask, valid=valid,
         confidence=confidence, changed=np.zeros(width, dtype=np.bool_),
         content=candidate_top1_embedding.astype(np.float16),
@@ -252,6 +276,33 @@ def _state_row(snapshot: dict, model, context_len: int, block_index: int,
         masks_remaining=int(mask.sum()), feature_valid=feature_valid,
         hidden_offset=hidden_offset, topk_offset=top_offset,
     )
+    if "wm_v2_native_latent_block" in snapshot:
+        latent = np.asarray(snapshot["wm_v2_native_latent_block"], dtype=np.float32)
+        physical_mask = np.asarray(snapshot["wm_v2_physical_mask"], dtype=np.bool_)
+        physical_event = np.asarray(snapshot["wm_v2_physical_event"], dtype=np.bool_)
+        active_region = np.asarray(snapshot["wm_v2_active_region"], dtype=np.bool_)
+        memory = np.asarray(snapshot["wm_v2_prefix_kv_summary"], dtype=np.float32)
+        if latent.ndim != 2 or latent.shape[0] != 32:
+            raise ValueError(f"V2 native block must be [32, hidden], got {latent.shape}")
+        if any(value.shape != (32,) for value in
+               (physical_mask, physical_event, active_region)):
+            raise ValueError("V2 physical mask/event/active vectors must have length 32")
+        if memory.shape != (4, 2, 2, 2, 128):
+            raise ValueError(f"V2 suffix prefix-KV summary has unexpected shape: {memory.shape}")
+        row.update(
+            native_latent_block=latent.astype(np.float16),
+            physical_mask=physical_mask,
+            physical_event=physical_event,
+            active_region=active_region,
+            prefix_kv_summary=memory.astype(np.float16),
+            prefix_kv_valid=bool(snapshot.get("wm_v2_prefix_kv_valid", False)),
+            wm_v2_context=np.asarray(
+                list(snapshot["wm_v2_context"])
+                + [float(eos_id in native), float(eos_id in filled)],
+                dtype=np.float32,
+            ),
+        )
+    return row
 
 
 def _make_edge(src: dict, dst: dict, action: str, states: dict[str, State]) -> Edge:
@@ -291,6 +342,10 @@ def collect(args) -> dict:
         raw_top_k=args.raw_top_k, physical_block_size=args.physical_block_size,
         small_block_size=args.small_block_size, extend_size=args.extend_size,
         drafter_threshold=args.threshold, max_refinement_steps=args.max_refinement_steps,
+        wm_v2_capture_native_latent=bool(getattr(args, "wm_v2_capture_native_latent", False)),
+        wm_v2_cut_layer=int(getattr(args, "wm_v2_cut_layer", 24)),
+        wm_v2_suffix_layers=int(getattr(args, "wm_v2_suffix_layers", 4)),
+        wm_v2_memory_window=int(getattr(args, "wm_v2_memory_window", 128)),
     ))()
     runner = NativeElysiaRunner(model, tokenizer, native_args)
     writer = ShardWriter(out, args.shard_rows)
@@ -371,6 +426,12 @@ def collect(args) -> dict:
                         hidden_state_source=snapshot.get("hidden_state_source",
                                                          "native_refinement_forward_output"),
                         hidden_layer_indices=snapshot.get("hidden_layer_indices", []),
+                        native_cut_layer=snapshot.get("wm_v2_cut_layer"),
+                        native_latent_stage=snapshot.get("wm_v2_native_latent_stage"),
+                        physical_block_start=snapshot.get("wm_v2_physical_block_start"),
+                        active_region_offset=snapshot.get("wm_v2_active_region_offset"),
+                        prefix_kv_length=snapshot.get("wm_v2_prefix_kv_length"),
+                        prefix_kv_valid=bool(snapshot.get("wm_v2_prefix_kv_valid", False)),
                         native_hidden_start_offset=raw["hidden_offset"],
                         native_topk_start_offset=raw["topk_offset"],
                         feature_valid_positions=np.flatnonzero(raw["feature_valid"]).tolist(),

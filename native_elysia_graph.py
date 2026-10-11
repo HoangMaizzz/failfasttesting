@@ -78,6 +78,14 @@ class NativeElysiaRunner:
                 collector_parent_native_length=0,
                 collector_parent_fill_tokens=[],
                 collector_max_oracle_snapshots=snapshot_limit,
+                # V2 learns native latent-feature dynamics only.  It does not
+                # consume token IDs, token probabilities, or verifier labels.
+                wm_v2_capture_native_latent=bool(
+                    getattr(args, "wm_v2_capture_native_latent", False)
+                ),
+                wm_v2_cut_layer=int(getattr(args, "wm_v2_cut_layer", 24)),
+                wm_v2_suffix_layers=int(getattr(args, "wm_v2_suffix_layers", 4)),
+                wm_v2_memory_window=int(getattr(args, "wm_v2_memory_window", 128)),
             )
             return self.model.generate_draft_tokens_arbitrary_length(
                 inputs,

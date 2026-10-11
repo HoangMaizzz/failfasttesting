@@ -3306,6 +3306,146 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                     )
                                                     raw_snapshot_fields["collector_full_topk_token_ids"] = full_indices.detach().cpu().tolist()
                                                     raw_snapshot_fields["collector_full_topk_logits"] = full_values.detach().to(torch.float16).cpu().tolist()
+                                        if bool(getattr(args, "wm_v2_capture_native_latent", False)):
+                                            cut_layer = int(getattr(args, "wm_v2_cut_layer", 24))
+                                            suffix_layers = int(getattr(args, "wm_v2_suffix_layers", 4))
+                                            memory_window = int(getattr(args, "wm_v2_memory_window", 128))
+                                            if not hidden or cut_layer < 0 or cut_layer >= len(hidden) - 1:
+                                                raise RuntimeError(
+                                                    f"V2 cut layer {cut_layer} is unavailable in native hidden states"
+                                                )
+                                            if len(self.model.layers) - cut_layer != suffix_layers:
+                                                raise RuntimeError(
+                                                    "V2 requires the selected cut layer to leave exactly "
+                                                    f"{suffix_layers} native suffix layers"
+                                                )
+                                            cut_rows = hidden[cut_layer][0]
+                                            if int(cut_rows.shape[0]) != int(block_size):
+                                                raise RuntimeError(
+                                                    "V2 capture requires the full physical block forward; "
+                                                    f"got {int(cut_rows.shape[0])} rows, expected {block_size}"
+                                                )
+                                            physical_block_start = int(block_abs_start)
+                                            physical_mask = (
+                                                x_t[0, physical_block_start:physical_block_start + block_size]
+                                                .eq(mask_id)
+                                            )
+                                            if int(physical_mask.numel()) != int(block_size):
+                                                raise RuntimeError("V2 physical-block mask is not fully observable")
+                                            physical_event = torch.zeros(
+                                                block_size, dtype=torch.bool, device=x_t.device
+                                            )
+                                            for absolute_pos in newly_unmasked_absolute_positions:
+                                                relative = int(absolute_pos) - physical_block_start
+                                                if 0 <= relative < block_size:
+                                                    physical_event[relative] = True
+                                            active_region = torch.zeros_like(physical_mask)
+                                            remaining_active = (
+                                                x_t[0, draft_token_start_idx:draft_end_idx] == mask_id
+                                            ).nonzero(as_tuple=False).flatten()
+                                            active_abs_start = -1
+                                            if remaining_active.numel():
+                                                first_remaining_abs = (
+                                                    int(draft_token_start_idx)
+                                                    + int(remaining_active[0].item())
+                                                )
+                                                next_small_start = (
+                                                    (first_remaining_abs - physical_block_start)
+                                                    // int(small_block_size)
+                                                ) * int(small_block_size)
+                                                active_abs_start = max(
+                                                    physical_block_start + next_small_start,
+                                                    int(draft_token_start_idx),
+                                                )
+                                                active_abs_end = min(
+                                                    physical_block_start + next_small_start
+                                                    + int(small_block_size),
+                                                    int(draft_end_idx),
+                                                )
+                                                if active_abs_end > active_abs_start:
+                                                    active_region[
+                                                        active_abs_start - physical_block_start:
+                                                        active_abs_end - physical_block_start
+                                                    ] = True
+                                            raw_snapshot_fields.update({
+                                                "wm_v2_native_latent_block": cut_rows.detach()
+                                                    .to(torch.float16).cpu().tolist(),
+                                                "wm_v2_native_latent_stage": (
+                                                    "native_hidden_states_24_pre_layer24_from_forward_that_selected_commit"
+                                                ),
+                                                "wm_v2_cut_layer": cut_layer,
+                                                "wm_v2_physical_block_start": physical_block_start,
+                                                "wm_v2_active_region_offset": int(
+                                                    -1 if active_abs_start < 0 else
+                                                    active_abs_start - physical_block_start
+                                                ),
+                                                "wm_v2_physical_mask": physical_mask.cpu().tolist(),
+                                                "wm_v2_physical_event": physical_event.cpu().tolist(),
+                                                "wm_v2_active_region": active_region.cpu().tolist(),
+                                            })
+                                            cache = getattr(output, "past_key_values", None)
+                                            if cache is None:
+                                                cache = past_key_values
+                                            hidden_size = int(cut_rows.shape[-1])
+                                            config = self.config
+                                            n_kv_heads = int(config.num_key_value_heads)
+                                            head_dim = int(getattr(
+                                                config, "head_dim",
+                                                config.hidden_size // config.num_attention_heads,
+                                            ))
+                                            memory = torch.zeros(
+                                                (suffix_layers, 2, 2, n_kv_heads, head_dim),
+                                                dtype=torch.float16,
+                                            )
+                                            cache_length = 0
+                                            cache_valid = cache is not None
+                                            if cache is not None:
+                                                try:
+                                                    cache_length = int(cache.get_seq_length())
+                                                except (AttributeError, TypeError):
+                                                    cache_length = int(cache[0][0].shape[-2])
+                                                first_layer = len(self.model.layers) - suffix_layers
+                                                for local_layer, layer_idx in enumerate(
+                                                    range(first_layer, len(self.model.layers))
+                                                ):
+                                                    try:
+                                                        key_states, value_states = cache[layer_idx]
+                                                    except (IndexError, TypeError, KeyError):
+                                                        cache_valid = False
+                                                        break
+                                                    if (
+                                                        key_states.ndim != 4
+                                                        or value_states.shape != key_states.shape
+                                                        or key_states.shape[1] != n_kv_heads
+                                                        or key_states.shape[-1] != head_dim
+                                                    ):
+                                                        cache_valid = False
+                                                        break
+                                                    seq_len = int(key_states.shape[-2])
+                                                    if seq_len <= 0:
+                                                        cache_valid = False
+                                                        break
+                                                    for kind, tensor in enumerate((key_states, value_states)):
+                                                        recent = tensor[0, :, max(0, seq_len - memory_window):, :].float()
+                                                        final = tensor[0, :, max(0, seq_len - 8):, :].float()
+                                                        memory[local_layer, kind, 0] = recent.mean(1).cpu().to(torch.float16)
+                                                        memory[local_layer, kind, 1] = final.mean(1).cpu().to(torch.float16)
+                                            if not cache_valid:
+                                                memory.zero_()
+                                            raw_snapshot_fields.update({
+                                                "wm_v2_prefix_kv_summary": memory.tolist(),
+                                                "wm_v2_prefix_kv_valid": bool(cache_valid and cache_length > 0),
+                                                "wm_v2_prefix_kv_length": int(cache_length),
+                                                "wm_v2_context": [
+                                                    min(float(draft_token_start_idx) / 4096.0, 1.0),
+                                                    float(block_idx) / max(1, num_blocks - 1),
+                                                    float(denoising_forward_passes) / 16.0,
+                                                    float(current_step) / 16.0,
+                                                    (-1.0 if active_abs_start < 0 else
+                                                     float(active_abs_start - physical_block_start)
+                                                     / max(1, block_size - 1)),
+                                                ],
+                                            })
                                     frontier_stats["oracle_refinement_snapshots"].append({
                                         "step": current_step,
                                         "target_len": int(target_len),
