@@ -85,9 +85,15 @@ print("Downloading Fast-dLLM 1.5B weights; GSM8K test split is fetched by the co
 snapshot_download(
     "Efficient-Large-Model/Fast_dLLM_v2_1.5B",
     local_dir=str(DLLM_DIR),
-    # Keep the repository's instrumented modeling.py; fetch model weights/config only.
-    allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja"],
+    # Keep the repository's instrumented modeling.py; fetch weights plus the
+    # custom config module required by the checkpoint's auto_map metadata.
+    allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja", "configuration.py"],
 )
+if not (DLLM_DIR / "configuration.py").is_file():
+    raise FileNotFoundError(
+        f"Fast-dLLM custom config was not downloaded: {DLLM_DIR / 'configuration.py'}. "
+        "Check the Hub snapshot and allow_patterns before starting GPU capture."
+    )
 
 command = [
     sys.executable, "-u", str(REPO / "drafter_feature_dynamics_test.py"),
