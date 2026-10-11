@@ -77,6 +77,8 @@ if EXPECTED_COMMIT and commit != EXPECTED_COMMIT:
 
 run_live([sys.executable, "-m", "unittest", "discover", "-s", str(REPO / "tests"),
           "-p", "test_native_latent_dynamics_v2.py"], cwd=REPO)
+run_live([sys.executable, "-m", "unittest", "discover", "-s", str(REPO / "tests"),
+          "-p", "test_native_latent_assets_v2.py"], cwd=REPO)
 
 from huggingface_hub import snapshot_download
 DLLM_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,6 +90,18 @@ snapshot_download(
 )
 if not (DLLM_DIR / "configuration.py").is_file():
     raise FileNotFoundError(f"Missing custom Fast-dLLM config at {DLLM_DIR / 'configuration.py'}")
+
+# The model directory is separate from the Git checkout. AutoModel loads its
+# custom code from beside config.json, so install the pinned instrumented
+# modeling.py there rather than downloading the uninstrumented Hub version.
+run_live([
+    sys.executable, "-c",
+    "from pathlib import Path; import sys; "
+    "from native_latent_assets_v2 import prepare_native_model_assets; "
+    "digest = prepare_native_model_assets(Path(sys.argv[1]), Path(sys.argv[2])); "
+    "print('[assets-ready] instrumented modeling.py sha256=' + digest, flush=True)",
+    str(REPO), str(DLLM_DIR),
+], cwd=REPO)
 
 command = [
     sys.executable, "-u", str(REPO / "native_latent_dynamics_v2.py"),

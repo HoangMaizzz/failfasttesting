@@ -84,3 +84,9 @@ Use a Kaggle session with Internet and GPU T4 x2. The launcher downloads the
 repo, Fast-dLLM 1.5B weights and GSM8K test split, runs its focused unit tests,
 captures fresh trajectories on GPU 0, trains/evaluates on GPU 1, and creates a
 sanitized ZIP under `/kaggle/working`.
+
+The weights directory is separate from the Git checkout. After downloading
+weights/config, the launcher copies the pinned checkout's instrumented
+`modeling.py` beside `config.json`, checks its SHA-256 and all custom modules
+referenced by `auto_map`, then starts capture. This also replaces stale model
+code on a notebook rerun. Missing custom-code files fail before GPU model load.
