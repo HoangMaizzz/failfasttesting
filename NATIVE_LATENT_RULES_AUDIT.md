@@ -36,6 +36,7 @@ reconstruction, and unknown dynamics were conflated in the evaluation.
 | Feature comparison | Same initialization and minibatch seeds, same question split; checkpoint selection uses validation only |
 | Readout | Proposal wrong-position/exact-mask measures, full event FP including illegal positions, sequences and frame crossings, EOS-positive coverage |
 | Delta evaluation | Score mapped overlaps only; new-frame residual error reported separately |
+| Normalization | Train-only mean/std; do not clip target tails and then call their error native-unit RMSE |
 | Data integrity | Missing endpoints/unknown actions fail; native contract checked before training |
 | Recovery | Save sanitized reusable capture before training; partial ZIP includes features/status/full traceback |
 | Packaging | Self-contained checkpoint config/scalers; corrected-folder replay; old V2 schema rejected |

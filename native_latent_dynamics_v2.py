@@ -264,8 +264,10 @@ def fit_scalers(states, split):
 def pack_state(state, scalers, device):
     if any(x is None for x in (state.geometry, state.mask_before, state.native_active, state.forward_active, state.valid)):
         raise ValueError("Fresh native-rules capture required; old V2 omitted full physical events/geometry")
-    u = np.clip((state.u - scalers["u_mean"]) / scalers["u_std"], -12, 12)
-    memory = np.clip((state.memory - scalers["memory_mean"]) / scalers["memory_std"], -12, 12)
+    # Do not clip targets: native-unit RMSE must include the real hidden/KV
+    # tails rather than measure agreement against artificially truncated data.
+    u = (state.u - scalers["u_mean"]) / scalers["u_std"]
+    memory = (state.memory - scalers["memory_mean"]) / scalers["memory_std"]
     return {
         "u": torch.as_tensor(u[None], dtype=torch.float32, device=device),
         "memory": torch.as_tensor(memory[None], dtype=torch.float32, device=device),
@@ -897,7 +899,7 @@ def train_and_audit(args, states, edges, split, out):
         "split_by_question": split,
         "config": {"dim": args.latent_dim, "layers": args.model_layers,
                    "updates_per_variant": args.updates, "batch_size": args.batch_size,
-                   "horizon": args.horizon, "seed": args.seed},
+                   "horizon": args.horizon, "seed": args.seed, "target_clipping": None},
         "source_commit": __import__("os").environ.get("WM_V2_SOURCE_COMMIT"),
         "variants": {},
         "native_contract_audit": audit_native_contract(states, edges),

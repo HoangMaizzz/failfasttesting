@@ -150,6 +150,13 @@ class NativeLatentDynamicsV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Fresh native-rules"):
             pack_state(s, {}, "cpu")
 
+    def test_native_target_tails_are_not_silently_clipped(self):
+        s = make_state("a", "q")
+        s.u[:] = 20
+        scales = {"u_mean": np.zeros(8), "u_std": np.ones(8),
+                  "memory_mean": np.zeros(4096), "memory_std": np.ones(4096)}
+        self.assertEqual(pack_state(s, scales, "cpu")["u"].max().item(), 20.)
+
     def test_tiny_train_package_all_variants(self):
         states, edges = fixture()
         split = split_questions([s.qid for s in states.values()], 9)
