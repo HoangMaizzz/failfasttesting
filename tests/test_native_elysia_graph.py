@@ -1,5 +1,4 @@
 import json
-import json
 from pathlib import Path
 import sys
 import tempfile
@@ -13,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from native_elysia_graph import (NativeElysiaGraphCollector, NativeElysiaRunner,
-                                 NativeEosWithoutSnapshot)
+                                 NativeEosWithoutSnapshot, _validate_v2_native_snapshot)
 from structured_sparse_collector import collect, identity
 from sparse_extend_world_model_collector import MASK_ID
 
@@ -51,6 +50,28 @@ def snapshot(pass_index):
         topk_token_ids=[[i + 1] for i in range(8)],
         topk_logits=[[1.0] for _ in range(8)],
     )
+
+
+def v2_snapshot(pass_index):
+    row = snapshot(pass_index)
+    before = np.arange(32) >= 3 + pass_index - 1
+    after = np.arange(32) >= 3 + pass_index
+    region = np.arange(32) < 8
+    row.update(
+        wm_v2_native_latent_block=np.ones((32, 4)).tolist(),
+        wm_v2_proposal_start=3, wm_v2_proposal_length=8,
+        wm_v2_physical_block_start=0, wm_v2_prefix_kv_length=0,
+        wm_v2_prefix_kv_summary=np.zeros((4, 2, 2, 2, 128)).tolist(),
+        wm_v2_prefix_kv_valid=False, wm_v2_native_refine_available=True,
+        wm_v2_memory_layer_indices=[0, 7, 15, 23], wm_v2_valid_positions=[True] * 32,
+        wm_v2_native_eos_ready=False,
+        wm_v2_mask_before_forward=before.tolist(), wm_v2_physical_mask=after.tolist(),
+        wm_v2_physical_event=(before & ~after).tolist(),
+        wm_v2_proposal_span=((np.arange(32) >= 3) & (np.arange(32) < 11)).tolist(),
+        wm_v2_native_active_region=region.tolist(), wm_v2_forward_region=region.tolist(),
+        hidden_state_forward_pass=pass_index,
+    )
+    return row
 
 
 class FakeNativeRunner:
@@ -91,6 +112,35 @@ class FakeVerifier:
 
 
 class NativeGraphTests(unittest.TestCase):
+    def test_v2_adjacent_snapshots_have_exactly_one_forward_and_stable_prefix(self):
+        args = SimpleNamespace(physical_block_size=32, extend_size=8)
+        _validate_v2_native_snapshot(v2_snapshot(1), None, 3, args)
+        _validate_v2_native_snapshot(v2_snapshot(2), v2_snapshot(1), 3, args)
+        altered = v2_snapshot(2)
+        altered["wm_v2_prefix_kv_length"] = 32
+        with self.assertRaisesRegex(RuntimeError, "prefix KV changed"):
+            _validate_v2_native_snapshot(altered, v2_snapshot(1), 3, args)
+        altered = v2_snapshot(2)
+        altered["wm_v2_mask_before_forward"][5] = False
+        with self.assertRaisesRegex(RuntimeError, "full physical mask delta"):
+            _validate_v2_native_snapshot(altered, v2_snapshot(1), 3, args)
+
+    def test_v2_runner_rejects_missing_correction_and_extra_bridge_between_r(self):
+        args = SimpleNamespace(raw_top_k=1, physical_block_size=32, small_block_size=8,
+            extend_size=8, drafter_threshold=0.5, max_refinement_steps=3,
+            wm_v2_capture_native_latent=True)
+        model = FakeNativeModel()
+        with self.assertRaisesRegex(RuntimeError, "missing corrected physical fields"):
+            NativeElysiaRunner(model, SimpleNamespace(), args).segment([11, 12, 13])
+        second = v2_snapshot(2)
+        second["draft_passes_elapsed"] = 3
+        second["hidden_state_forward_pass"] = 3
+        model.generate_draft_tokens_arbitrary_length = lambda inputs, **kwargs: (
+            None, None, None, None, None,
+            dict(oracle_refinement_snapshots=[v2_snapshot(1), second]))
+        with self.assertRaisesRegex(RuntimeError, "exactly one actual native forward"):
+            NativeElysiaRunner(model, SimpleNamespace(), args).segment([11, 12, 13])
+
     def test_runner_calls_native_generator_and_keeps_sequential_snapshots(self):
         model = FakeNativeModel()
         args = SimpleNamespace(raw_top_k=32, physical_block_size=32,
@@ -150,6 +200,22 @@ class NativeGraphTests(unittest.TestCase):
         with self.assertRaises(NativeEosWithoutSnapshot) as raised:
             NativeElysiaRunner(model, tokenizer, args).segment([11, 12, 13], 1)
         self.assertEqual(raised.exception.candidate_token_ids, [42, 151645])
+
+    def test_eos_without_snapshot_still_retries_when_earlier_mask_unresolved(self):
+        model = FakeNativeModel()
+        attempts = []
+        def retry_eos(inputs, **kwargs):
+            attempts.append(kwargs["max_denoising_passes"])
+            rows = [] if len(attempts) == 1 else [snapshot(1)]
+            return (torch.tensor([[11, 12, 13, MASK_ID, 151645]], device=inputs.device),
+                    8, None, 1, [1.0], dict(oracle_refinement_snapshots=rows,
+                                          native_termination_reason="eos"))
+        model.generate_draft_tokens_arbitrary_length = retry_eos
+        args = SimpleNamespace(raw_top_k=32, physical_block_size=32,
+            small_block_size=8, extend_size=8, drafter_threshold=.5, max_refinement_steps=3)
+        rows = NativeElysiaRunner(model, SimpleNamespace(eos_token_id=151645), args).segment([11, 12, 13])
+        self.assertEqual(attempts, [11, 15])
+        self.assertEqual(len(rows), 1)
 
     def test_native_forward_can_leave_proposal_mask_unchanged(self):
         model = FakeNativeModel()

@@ -116,7 +116,8 @@ class NativeElysiaRunner:
                 eos_id = self.tokenizer.eos_token_id
                 if eos_id in generated:
                     eos_pos = generated.index(eos_id)
-                    raise NativeEosWithoutSnapshot(generated[:eos_pos + 1], first_attempt)
+                    if MASK_ID not in generated[:eos_pos]:
+                        raise NativeEosWithoutSnapshot(generated[:eos_pos + 1], first_attempt)
             result = run_generator(retry_pass_limit)
             stats = result[-1]
             snapshots = sorted(stats.get("oracle_refinement_snapshots", []),
@@ -134,7 +135,8 @@ class NativeElysiaRunner:
                     eos_id = self.tokenizer.eos_token_id
                     if eos_id in generated:
                         eos_pos = generated.index(eos_id)
-                        raise NativeEosWithoutSnapshot(generated[:eos_pos + 1], brief(stats))
+                        if MASK_ID not in generated[:eos_pos]:
+                            raise NativeEosWithoutSnapshot(generated[:eos_pos + 1], brief(stats))
                 raise RuntimeError(
                     "Native Elysia generator returned no oracle refinement snapshots "
                     f"after retry (prefix_len={len(prompt)}, base_pass_limit={base_pass_limit}, "
@@ -143,6 +145,7 @@ class NativeElysiaRunner:
                 )
         previous = None
         previous_forward = None
+        previous_v2 = None
         for snap in snapshots:
             native = [int(x) for x in snap["proposal_token_ids_before_fill"]]
             filled = [int(x) for x in snap["proposal_token_ids_after_fill"]]
@@ -153,8 +156,14 @@ class NativeElysiaRunner:
                 raise RuntimeError("Native snapshot has unresolved STOP or invalid forward index")
             if previous_forward is not None and forward_index != previous_forward + 1:
                 raise RuntimeError("Nonconsecutive native snapshots cannot form a one-step R edge")
-            if not snap.get("hidden_states") or not snap.get("topk_token_ids") or not snap.get("topk_logits"):
+            v2_capture = bool(getattr(args, "wm_v2_capture_native_latent", False))
+            if not v2_capture and (
+                not snap.get("hidden_states") or not snap.get("topk_token_ids") or not snap.get("topk_logits")
+            ):
                 raise RuntimeError("Native snapshot lacks raw hidden/top-k features")
+            if v2_capture:
+                _validate_v2_native_snapshot(snap, previous_v2, len(prompt), args)
+                previous_v2 = snap
             if any(a != MASK_ID and a != b for a, b in zip(native, filled)):
                 raise RuntimeError("STOP fill modified a committed token")
             if previous is not None:
@@ -169,6 +178,64 @@ class NativeElysiaRunner:
             previous = native
             previous_forward = forward_index
         return snapshots
+
+
+def _validate_v2_native_snapshot(snapshot, previous, proposal_start, args):
+    """Audit actual native forwards rather than infer one-step R from mask counts."""
+    required = (
+        "wm_v2_native_latent_block", "wm_v2_physical_mask", "wm_v2_physical_event",
+        "wm_v2_mask_before_forward", "wm_v2_proposal_span", "wm_v2_native_active_region",
+        "wm_v2_forward_region", "wm_v2_proposal_start", "wm_v2_proposal_length",
+        "wm_v2_physical_block_start", "wm_v2_prefix_kv_length", "wm_v2_prefix_kv_summary",
+        "wm_v2_memory_layer_indices", "wm_v2_valid_positions",
+        "wm_v2_prefix_kv_valid", "wm_v2_native_refine_available", "wm_v2_native_eos_ready",
+        "hidden_state_forward_pass", "draft_passes_elapsed",
+    )
+    missing = [key for key in required if key not in snapshot]
+    if missing:
+        raise RuntimeError(f"V2 native capture missing corrected physical fields: {missing}")
+    if int(snapshot["wm_v2_proposal_start"]) != int(proposal_start):
+        raise RuntimeError("V2 proposal absolute start differs from real native prefix")
+    if int(snapshot["wm_v2_proposal_length"]) != int(args.extend_size):
+        raise RuntimeError("V2 proposal geometry changed requested native segment length")
+    # A usable same-forward STOP snapshot crossing a physical boundary can only
+    # observe the final physical block; the earlier proposal part is committed.
+    expected_frame = (proposal_start + int(args.extend_size) - 1) // int(args.physical_block_size)
+    if int(snapshot["wm_v2_physical_block_start"]) != expected_frame * int(args.physical_block_size):
+        raise RuntimeError("V2 observable native frame differs from final proposal block")
+    if int(snapshot["hidden_state_forward_pass"]) != int(snapshot["draft_passes_elapsed"]):
+        raise RuntimeError("V2 residual and postcommit structure do not share a native forward")
+    if snapshot["wm_v2_memory_layer_indices"] != [0, 7, 15, 23]:
+        raise RuntimeError("V2 prefix memory must summarize upstream layers [0,7,15,23]")
+    before = torch.as_tensor(snapshot["wm_v2_mask_before_forward"], dtype=torch.bool)
+    after = torch.as_tensor(snapshot["wm_v2_physical_mask"], dtype=torch.bool)
+    event = torch.as_tensor(snapshot["wm_v2_physical_event"], dtype=torch.bool)
+    region = torch.as_tensor(snapshot["wm_v2_forward_region"], dtype=torch.bool)
+    if any(vector.shape != (int(args.physical_block_size),) for vector in (before, after, event, region)):
+        raise RuntimeError("V2 native physical structural arrays have wrong shape")
+    if (after & ~before).any() or not torch.equal(event, before & ~after):
+        raise RuntimeError("V2 native commit event is not the full physical mask delta")
+    if not event.any() or (event & ~region).any():
+        raise RuntimeError("V2 native commit escaped its actual scheduler sub-block")
+    if previous is None:
+        return
+    if not bool(previous["wm_v2_native_refine_available"]):
+        raise RuntimeError("V2 R edge follows a native terminal proposal")
+    if int(snapshot["draft_passes_elapsed"]) != int(previous["draft_passes_elapsed"]) + 1:
+        raise RuntimeError("V2 one-step R must correspond to exactly one actual native forward")
+    if int(snapshot["wm_v2_physical_block_start"]) != int(previous["wm_v2_physical_block_start"]):
+        raise RuntimeError("V2 R changed physical frame")
+    if not torch.equal(before, torch.as_tensor(previous["wm_v2_physical_mask"], dtype=torch.bool)):
+        raise RuntimeError("V2 next native forward input mask differs from prior postcommit mask")
+    if not torch.equal(region, torch.as_tensor(previous["wm_v2_native_active_region"], dtype=torch.bool)):
+        raise RuntimeError("V2 next native forward did not execute the recorded NEXT R region")
+    if (
+        int(snapshot["wm_v2_prefix_kv_length"]) != int(previous["wm_v2_prefix_kv_length"])
+        or bool(snapshot["wm_v2_prefix_kv_valid"]) != bool(previous["wm_v2_prefix_kv_valid"])
+        or not torch.equal(torch.as_tensor(snapshot["wm_v2_prefix_kv_summary"]),
+                           torch.as_tensor(previous["wm_v2_prefix_kv_summary"]))
+    ):
+        raise RuntimeError("V2 native prefix KV changed during one-step R")
 
 
 class NativeElysiaGraphCollector(GraphCollector):

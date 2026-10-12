@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from IPython.display import FileLink, display
 
@@ -13,14 +14,15 @@ SOURCE_REF = globals().get("SOURCE_REF", "codex/factorized-wm-feasibility")
 EXPECTED_COMMIT = globals().get("EXPECTED_COMMIT")
 NUM_QUESTIONS = int(globals().get("NUM_QUESTIONS", 100))
 SEED = int(globals().get("SEED", 42))
-UPDATES = int(globals().get("UPDATES", 300))
+UPDATES = int(globals().get("UPDATES", 600))
 
 WORK = Path("/kaggle/working")
 TEMP = Path("/kaggle/temp")
-REPO = TEMP / "native_latent_dynamics_v2_repo"
+TEMP.mkdir(parents=True, exist_ok=True)
+REPO = Path(tempfile.mkdtemp(prefix="native_latent_rules_v3_repo_", dir=TEMP))
 DLLM_DIR = TEMP / "native_latent_dynamics_v2_fast_dllm"
 OUT_DIR = WORK / (
-    "native_latent_dynamics_v2_gsm8k_"
+    "native_latent_rules_v3_gsm8k_"
     + str(NUM_QUESTIONS) + "q_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 )
 
@@ -60,10 +62,6 @@ run_live([sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir",
           "transformers==4.53.1", "accelerate>=1,<2", "datasets",
           "einops", "sentencepiece", "huggingface_hub"])
 
-TEMP.mkdir(parents=True, exist_ok=True)
-if REPO.exists():
-    shutil.rmtree(REPO)
-REPO.mkdir(parents=True)
 run_live(["git", "init", str(REPO)], cwd=TEMP)
 run_live(["git", "-C", str(REPO), "remote", "add", "origin",
           "https://github.com/HoangMaizzz/failfasttesting.git"], cwd=TEMP)
@@ -79,6 +77,8 @@ run_live([sys.executable, "-m", "unittest", "discover", "-s", str(REPO / "tests"
           "-p", "test_native_latent_dynamics_v2.py"], cwd=REPO)
 run_live([sys.executable, "-m", "unittest", "discover", "-s", str(REPO / "tests"),
           "-p", "test_native_latent_assets_v2.py"], cwd=REPO)
+for pattern in ("test_fresh_native_drafter_test.py", "test_native_elysia_graph.py", "test_native_latent_generator_rules_v2.py"):
+    run_live([sys.executable, "-m", "unittest", "discover", "-s", str(REPO / "tests"), "-p", pattern], cwd=REPO)
 
 from huggingface_hub import snapshot_download
 DLLM_DIR.mkdir(parents=True, exist_ok=True)
@@ -115,7 +115,7 @@ command = [
     "--updates", str(UPDATES), "--batch-size", "12",
     "--drafter-device", "0", "--train-device", "cuda:1",
 ]
-print("\nRun V2: fresh native dLLM capture + latent feature-dynamics training; no verifier/token target.", flush=True)
+print("\nRun native-rules V3: fresh native capture + constrained latent dynamics; no verifier/token target.", flush=True)
 env["WM_V2_SOURCE_COMMIT"] = commit
 return_code = run_live(command, cwd=REPO, check=False)
 result_zip = OUT_DIR.with_suffix(".zip")

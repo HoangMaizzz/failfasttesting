@@ -61,7 +61,10 @@ class ShardWriter:
         if not self.rows:
             return
         name = f"shard_{self.serial:05d}.npz"
-        payload = {
+        v2_only = all(row.get("v2_only", False) for row in self.rows)
+        if any(row.get("v2_only", False) for row in self.rows) and not v2_only:
+            raise RuntimeError("Cannot mix V1 and V2 native capture rows in a shard")
+        payload = {} if v2_only else {
             "x": np.stack([row["x"] for row in self.rows]).astype(np.float16),
             "mask": np.stack([row["mask"] for row in self.rows]).astype(np.bool_),
             "valid": np.stack([row["valid"] for row in self.rows]).astype(np.bool_),
@@ -84,6 +87,30 @@ class ShardWriter:
                 ).astype(np.bool_),
                 "physical_event": np.stack(
                     [row["physical_event"] for row in self.rows]
+                ).astype(np.bool_),
+                "mask_before_forward": np.stack(
+                    [row["mask_before_forward"] for row in self.rows]
+                ).astype(np.bool_),
+                "proposal_span": np.stack(
+                    [row["proposal_span"] for row in self.rows]
+                ).astype(np.bool_),
+                "native_active_region": np.stack(
+                    [row["native_active_region"] for row in self.rows]
+                ).astype(np.bool_),
+                "forward_region": np.stack(
+                    [row["forward_region"] for row in self.rows]
+                ).astype(np.bool_),
+                "forward_active_region": np.stack(
+                    [row["forward_active_region"] for row in self.rows]
+                ).astype(np.bool_),
+                "geometry": np.stack(
+                    [row["geometry"] for row in self.rows]
+                ).astype(np.int64),
+                "wm_v2_geometry": np.stack(
+                    [row["geometry"] for row in self.rows]
+                ).astype(np.int64),
+                "wm_v2_valid_positions": np.stack(
+                    [row["wm_v2_valid_positions"] for row in self.rows]
                 ).astype(np.bool_),
                 "active_region": np.stack(
                     [row["active_region"] for row in self.rows]
@@ -165,6 +192,88 @@ def _aligned_row(rows, offset: int, local_index: int):
     return rows[row_index]
 
 
+def _v2_state_row(snapshot, native, filled, mask, block_index, eos_id, hidden_size):
+    """Capture only native feature dynamics; top-1 IDs remain transient E bookkeeping."""
+    latent = np.asarray(snapshot["wm_v2_native_latent_block"], dtype=np.float32)
+    field_names = (
+        "physical_mask", "physical_event", "mask_before_forward", "proposal_span",
+        "native_active_region", "forward_region",
+    )
+    vectors = {name: np.asarray(snapshot["wm_v2_" + name], dtype=np.bool_)
+               for name in field_names}
+    if latent.shape != (32, hidden_size) or not np.isfinite(latent).all():
+        raise ValueError(f"V2 requires a finite [32,{hidden_size}] native residual, got {latent.shape}")
+    if any(value.shape != (32,) for value in vectors.values()):
+        raise ValueError("V2 physical vectors must have length 32")
+    before, after, event = (vectors[key] for key in
+                            ("mask_before_forward", "physical_mask", "physical_event"))
+    if np.any(after & ~before) or not np.array_equal(event, before & ~after):
+        raise ValueError("V2 native physical event must equal same-forward mask resolution")
+    if not event.any() or np.any(event & ~vectors["forward_region"]):
+        raise ValueError("V2 native event is outside its executing scheduler region")
+    proposal_start = int(snapshot["wm_v2_proposal_start"])
+    physical_start = int(snapshot["wm_v2_physical_block_start"])
+    proposal_length = int(snapshot["wm_v2_proposal_length"])
+    if proposal_length != len(native):
+        raise ValueError("V2 exact geometry proposal length disagrees with native tokens")
+    positions = physical_start + np.arange(32)
+    expected_span = (positions >= proposal_start) & (positions < proposal_start + proposal_length)
+    if not np.array_equal(expected_span, vectors["proposal_span"]):
+        raise ValueError("V2 proposal span disagrees with absolute geometry")
+    local_positions = positions[expected_span] - proposal_start
+    if not np.array_equal(after[expected_span], mask[local_positions]):
+        raise ValueError("V2 physical mask disagrees with observed logical proposal")
+    missing_positions = np.ones(proposal_length, dtype=np.bool_)
+    missing_positions[local_positions] = False
+    if np.any(mask[missing_positions]):
+        raise ValueError("V2 unobserved proposal positions must already be committed")
+    memory = np.asarray(snapshot["wm_v2_prefix_kv_summary"], dtype=np.float32)
+    if memory.shape != (4, 2, 2, 2, 128) or not np.isfinite(memory).all():
+        raise ValueError(f"V2 upstream prefix-KV summary has unexpected shape: {memory.shape}")
+    if snapshot.get("wm_v2_memory_layer_indices") != [0, 7, 15, 23]:
+        raise ValueError("V2 requires upstream memory layers [0,7,15,23] for native cut24")
+    context = np.asarray(list(snapshot["wm_v2_context"])
+                         + [float(snapshot.get("wm_v2_eos_present", eos_id in native)),
+                            float(eos_id in filled)], np.float32)
+    if context.shape != (7,) or not np.isfinite(context).all():
+        raise ValueError("V2 scheduler context must have seven finite features")
+    refine_available = bool(snapshot["wm_v2_native_refine_available"])
+    valid_positions = np.asarray(snapshot["wm_v2_valid_positions"], dtype=np.bool_)
+    if valid_positions.shape != (32,):
+        raise ValueError("V2 post-EOS validity frame must contain 32 positions")
+    active = vectors["native_active_region"]
+    if refine_available:
+        remaining = np.flatnonzero(after)
+        if not len(remaining):
+            raise ValueError("V2 unresolved proposal has no observable native masks")
+        start = int(remaining[0]) // 8 * 8
+        expected_active = (np.arange(32) >= start) & (np.arange(32) < start + 8)
+    else:
+        expected_active = np.zeros(32, dtype=np.bool_)
+    if not np.array_equal(active, expected_active):
+        raise ValueError("V2 NEXT R region differs from native full small-block scheduler")
+    hidden_offset = int(snapshot.get("native_hidden_start_offset", 0))
+    feature_valid = ~missing_positions
+    return dict(
+        v2_only=True, native_latent_block=latent.astype(np.float16), **vectors,
+        active_region=active.copy(), prefix_kv_summary=memory.astype(np.float16),
+        forward_active_region=vectors["forward_region"].copy(),
+        wm_v2_valid_positions=valid_positions,
+        prefix_kv_valid=bool(snapshot.get("wm_v2_prefix_kv_valid", False)),
+        geometry=np.asarray([proposal_start, physical_start,
+                             int(snapshot["wm_v2_prefix_kv_length"]), proposal_length,
+                             int(block_index)], dtype=np.int64),
+        wm_v2_context=context, native_token_ids=native.astype(np.int32),
+        filled=filled.astype(np.int64), mask=mask, valid=feature_valid,
+        feature_valid=feature_valid, hidden_offset=hidden_offset,
+        topk_offset=int(snapshot.get("native_topk_start_offset", 0)),
+        masks_remaining=int(mask.sum()), eos_in_native=bool(eos_id in native),
+        eos_in_filled=bool(eos_id in filled),
+        native_eos_ready=bool(snapshot["wm_v2_native_eos_ready"]),
+        native_refine_available=refine_available,
+    )
+
+
 @torch.inference_mode()
 def _state_row(snapshot: dict, model, context_len: int, block_index: int,
                max_blocks: int, eos_id: int, hidden_size: int) -> dict:
@@ -176,6 +285,10 @@ def _state_row(snapshot: dict, model, context_len: int, block_index: int,
     mask = np.asarray(snapshot["proposal_mask_before_fill"], dtype=np.bool_)
     if len(mask) != width or not np.array_equal(mask, native == MASK_ID):
         raise ValueError("Native mask does not match proposal token IDs")
+    if np.any(filled == MASK_ID) or np.any((~mask) & (native != filled)):
+        raise ValueError("Native STOP must fill all masks and preserve committed tokens")
+    if "wm_v2_native_latent_block" in snapshot:
+        return _v2_state_row(snapshot, native, filled, mask, block_index, eos_id, hidden_size)
 
     hidden_rows = snapshot.get("hidden_states") or []
     if not hidden_rows:
@@ -276,32 +389,6 @@ def _state_row(snapshot: dict, model, context_len: int, block_index: int,
         masks_remaining=int(mask.sum()), feature_valid=feature_valid,
         hidden_offset=hidden_offset, topk_offset=top_offset,
     )
-    if "wm_v2_native_latent_block" in snapshot:
-        latent = np.asarray(snapshot["wm_v2_native_latent_block"], dtype=np.float32)
-        physical_mask = np.asarray(snapshot["wm_v2_physical_mask"], dtype=np.bool_)
-        physical_event = np.asarray(snapshot["wm_v2_physical_event"], dtype=np.bool_)
-        active_region = np.asarray(snapshot["wm_v2_active_region"], dtype=np.bool_)
-        memory = np.asarray(snapshot["wm_v2_prefix_kv_summary"], dtype=np.float32)
-        if latent.ndim != 2 or latent.shape[0] != 32:
-            raise ValueError(f"V2 native block must be [32, hidden], got {latent.shape}")
-        if any(value.shape != (32,) for value in
-               (physical_mask, physical_event, active_region)):
-            raise ValueError("V2 physical mask/event/active vectors must have length 32")
-        if memory.shape != (4, 2, 2, 2, 128):
-            raise ValueError(f"V2 suffix prefix-KV summary has unexpected shape: {memory.shape}")
-        row.update(
-            native_latent_block=latent.astype(np.float16),
-            physical_mask=physical_mask,
-            physical_event=physical_event,
-            active_region=active_region,
-            prefix_kv_summary=memory.astype(np.float16),
-            prefix_kv_valid=bool(snapshot.get("wm_v2_prefix_kv_valid", False)),
-            wm_v2_context=np.asarray(
-                list(snapshot["wm_v2_context"])
-                + [float(eos_id in native), float(eos_id in filled)],
-                dtype=np.float32,
-            ),
-        )
     return row
 
 
@@ -352,6 +439,7 @@ def collect(args) -> dict:
     questions_path = out / "questions.jsonl"
     edges: list[dict] = []
     state_objects: dict[str, State] = {}
+    terminal_transitions = []
     question_rows = []
     terminal_counts = {}
     total_start = time.time()
@@ -378,11 +466,24 @@ def collect(args) -> dict:
                     snapshots = runner.segment(prompt, max_snapshots=selected_refines + 1)
                 except NativeEosWithoutSnapshot as exc:
                     termination = "eos_before_observable_snapshot"
-                    terminal_counts[termination] = terminal_counts.get(termination, 0) + 1
+                    candidate = list(exc.candidate_token_ids)
+                    if tokenizer.eos_token_id in candidate:
+                        candidate = candidate[:candidate.index(tokenizer.eos_token_id) + 1]
+                    completion.extend(candidate)
+                    terminal_transitions.append(dict(
+                        question_id=qid, source_question_index=int(source_index),
+                        src_state_id=(None if previous_state is None else previous_state["state_id"]),
+                        action=("START" if previous_state is None else "E"), segment_index=block_index,
+                        terminal_reason=termination, candidate_contains_eos=bool(
+                            tokenizer.eos_token_id in candidate),
+                        candidate_length=len(candidate), context_len=len(prompt),
+                        hidden_available=False, hidden_unavailable_reason="native_eos_before_snapshot",
+                        forward_pass_breakdown=exc.stats.get("forward_pass_breakdown"),
+                        native_stats=exc.stats,
+                    ))
                     break
                 if not snapshots:
                     termination = "no_native_snapshot"
-                    terminal_counts[termination] = terminal_counts.get(termination, 0) + 1
                     break
                 snapshots = snapshots[:selected_refines + 1]
                 segment_states = []
@@ -401,15 +502,17 @@ def collect(args) -> dict:
                         actual_action_taken=(
                             "E" if previous_state is not None and refine_index == 0 else
                             ("R" if refine_index > 0 else None)),
-                        stop_available=not raw["eos_in_native"],
+                        stop_available=(True if raw.get("v2_only", False) else not raw["eos_in_native"]),
                         refine_available=bool(
-                            not raw["eos_in_native"] and raw["masks_remaining"] > 0
+                            raw.get("native_refine_available", not raw["eos_in_native"]
+                                    and raw["masks_remaining"] > 0)
                             and refine_index < args.max_refinement_steps
                         ),
                         refinement_probe_budget_remaining=max(0, selected_refines - refine_index),
                         extend_available=bool(
                             block_index + 1 < args.max_proposal_tokens // args.extend_size
-                            and not raw["eos_in_native"] and not raw["eos_in_filled"]
+                            and not raw.get("native_eos_ready", raw["eos_in_native"])
+                            and not raw["eos_in_filled"]
                         ),
                         parent_state_id=(
                             previous_state["state_id"] if refine_index == 0 and previous_state is not None
@@ -428,27 +531,61 @@ def collect(args) -> dict:
                         hidden_layer_indices=snapshot.get("hidden_layer_indices", []),
                         native_cut_layer=snapshot.get("wm_v2_cut_layer"),
                         native_latent_stage=snapshot.get("wm_v2_native_latent_stage"),
+                        structural_stage=snapshot.get("wm_v2_structural_stage"),
+                        mask_before_forward_stage=snapshot.get("wm_v2_mask_before_stage"),
+                        native_refine_available=raw.get("native_refine_available"),
+                        native_eos_ready=raw.get("native_eos_ready"),
+                        eos_present=snapshot.get("wm_v2_eos_present", raw["eos_in_native"]),
+                        native_terminal=snapshot.get("wm_v2_native_terminal", raw["eos_in_native"]),
+                        masks_before_eos=snapshot.get("wm_v2_masks_before_eos"),
                         physical_block_start=snapshot.get("wm_v2_physical_block_start"),
+                        proposal_start=snapshot.get("wm_v2_proposal_start"),
+                        proposal_length=args.extend_size,
+                        segment_index=block_index,
+                        proposal_covered_positions=snapshot.get("wm_v2_proposal_covered_positions"),
+                        proposal_coverage_complete=snapshot.get("wm_v2_proposal_coverage_complete"),
                         active_region_offset=snapshot.get("wm_v2_active_region_offset"),
                         prefix_kv_length=snapshot.get("wm_v2_prefix_kv_length"),
                         prefix_kv_valid=bool(snapshot.get("wm_v2_prefix_kv_valid", False)),
+                        memory_layer_indices=snapshot.get("wm_v2_memory_layer_indices"),
+                        memory_stage=snapshot.get("wm_v2_memory_stage"),
+                        native_forward_pass_breakdown=snapshot.get("wm_v2_forward_pass_breakdown"),
+                        segment_micro_forward_counts=snapshot.get("wm_v2_forward_pass_breakdown"),
+                        native_hidden_forward_index=snapshot.get("hidden_state_forward_pass"),
                         native_hidden_start_offset=raw["hidden_offset"],
                         native_topk_start_offset=raw["topk_offset"],
                         feature_valid_positions=np.flatnonzero(raw["feature_valid"]).tolist(),
                         newly_unmasked_positions=list(snapshot.get("newly_unmasked_positions", [])),
                         num_masked_positions=raw["masks_remaining"],
                         snapshot_forward_index=int(snapshot["unmask_forward_index"]),
-                        termination_reason=("eos_committed" if raw["eos_in_native"] else None),
+                        termination_reason=("eos_committed" if raw.get(
+                            "native_eos_ready", raw["eos_in_native"]) else None),
                     )
-                    state = State(
-                        sid=sid, qid=qid, x=raw["x"], mask=raw["mask"],
-                        eligible=raw["valid"], confidence=raw["confidence"],
-                        changed=np.zeros(args.extend_size, dtype=np.bool_),
-                        content=raw["content"].astype(np.float32), proposal_len=args.extend_size,
-                    )
-                    state_objects[sid] = state
+                    if not raw.get("v2_only", False):
+                        state = State(
+                            sid=sid, qid=qid, x=raw["x"], mask=raw["mask"],
+                            eligible=raw["valid"], confidence=raw["confidence"],
+                            changed=np.zeros(args.extend_size, dtype=np.bool_),
+                            content=raw["content"].astype(np.float32), proposal_len=args.extend_size,
+                        )
+                        state_objects[sid] = state
                     entry = {**meta, **raw}
-                    if refine_index == 0 and previous_state is not None:
+                    parent = previous_state if refine_index == 0 else segment_states[-1]
+                    if raw.get("v2_only", False) and parent is not None:
+                        action = "E" if refine_index == 0 else "R"
+                        previous_passes = parent["draft_passes_elapsed"] if action == "R" else 0
+                        action_forward_count = int(snapshot["draft_passes_elapsed"]) - previous_passes
+                        if action_forward_count < 1:
+                            raise RuntimeError("Native action has no actual model forward")
+                        edges.append(dict(
+                            src_state_id=parent["state_id"], dst_state_id=sid, action=action,
+                            action_forward_count=action_forward_count,
+                            action_denoising_forward_count=int(snapshot["unmask_forward_index"])
+                            - (parent["native_unmask_forward_index"] if action == "R" else 0),
+                            forward_count_source="actual_native_generator_counters",
+                            pre_extension_fill_source=("parent_same_forward_top1" if action == "E" else None),
+                        ))
+                    elif refine_index == 0 and previous_state is not None:
                         edge = _make_edge(previous_state, entry, "E", state_objects)
                         edges.append(dict(src_state_id=edge.src, dst_state_id=edge.dst,
                                           action="E", valid=edge.valid.tolist(),
@@ -462,26 +599,29 @@ def collect(args) -> dict:
                                           new_suffix=edge.new_suffix.tolist()))
                     # Serialize only after the incoming R edge has computed
                     # candidate changes; the writer may flush immediately.
-                    raw["changed"] = state.changed.copy()
+                    if not raw.get("v2_only", False):
+                        raw["changed"] = state.changed.copy()
                     writer.append({**raw, "meta": meta})
                     segment_states.append(entry)
                     question_state_ids.append(sid)
-                    if raw["eos_in_native"]:
+                    if raw.get("native_eos_ready", raw["eos_in_native"]):
                         break
                 last = segment_states[-1]
                 previous_state = last
-                if last["eos_in_native"]:
+                # The collected completion includes the terminal segment too.
+                # E still receives exactly the selected snapshot's own top-1 fill.
+                filled_for_extension = [int(x) for x in last["filled"]]
+                if tokenizer.eos_token_id in filled_for_extension:
+                    filled_for_extension = filled_for_extension[
+                        :filled_for_extension.index(tokenizer.eos_token_id) + 1]
+                completion.extend(filled_for_extension)
+                if last.get("native_eos_ready", last["eos_in_native"]):
                     termination = "eos_committed"
                     break
                 # E is unavailable if native top-1 STOP fill already contains EOS.
                 if last["eos_in_filled"]:
                     termination = "eos_in_stop_fill"
                     break
-                filled_for_extension = [int(x) for x in last["filled"]]
-                if tokenizer.eos_token_id in filled_for_extension:
-                    filled_for_extension = filled_for_extension[
-                        :filled_for_extension.index(tokenizer.eos_token_id) + 1]
-                completion.extend(filled_for_extension)
                 if len(completion) >= args.max_proposal_tokens:
                     termination = "max_proposal_tokens"
                     break
@@ -497,6 +637,15 @@ def collect(args) -> dict:
             )
             question_rows.append(question_meta)
             question_handle.write(json.dumps(question_meta, ensure_ascii=False) + "\n")
+            question_handle.flush()
+            # Persist linkage with each completed question, not only after the
+            # entire GPU collection. A later native failure must not strand
+            # already flushed feature shards without their action edges.
+            for name, rows in (("edges.jsonl", edges), ("terminal_transitions.jsonl", terminal_transitions)):
+                target = out / name
+                temporary = target.with_suffix(".jsonl.tmp")
+                temporary.write_text("".join(json.dumps(item) + "\n" for item in rows), encoding="utf-8")
+                temporary.replace(target)
             print(f"[capture] q={local_q + 1}/{len(selected)} states={len(question_state_ids)} "
                   f"edges={len(edges) - question_edge_start} completion={len(completion)} "
                   f"stop={termination}", flush=True)
@@ -509,12 +658,17 @@ def collect(args) -> dict:
 
     (out / "edges.jsonl").write_text(
         "".join(json.dumps(edge) + "\n" for edge in edges), encoding="utf-8")
+    (out / "terminal_transitions.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in terminal_transitions), encoding="utf-8")
     manifest = dict(
-        schema_version=SCHEMA, status="complete", created_utc=datetime.now(timezone.utc).isoformat(),
+        schema_version=("fresh_native_drafter_latent_v2_native_rules" if bool(
+            getattr(args, "wm_v2_capture_native_latent", False)) else SCHEMA),
+        status="complete", created_utc=datetime.now(timezone.utc).isoformat(),
         dataset="openai/gsm8k:test", selected_question_indices=selected.tolist(),
         question_count=len(question_rows), state_count=sum(q["state_count"] for q in question_rows),
         edge_count=len(edges), action_counts={a: sum(e["action"] == a for e in edges) for a in ("R", "E")},
         terminal_counts=terminal_counts,
+        terminal_transition_count=len(terminal_transitions),
         config=dict(num_questions=args.num_questions, seed=args.seed,
                     model_id="Efficient-Large-Model/Fast_dLLM_v2_1.5B",
                     tokenizer_id=args.tokenizer_name,
@@ -541,6 +695,22 @@ def collect(args) -> dict:
         ),
         elapsed_capture_seconds=time.time() - total_start,
     )
+    if bool(getattr(args, "wm_v2_capture_native_latent", False)):
+        manifest["protocol"].update(
+            observation="native cut24 precommit residual with same-forward postcommit physical structure",
+            input_feature_layout=["native_cut24_residual", "upstream_prefix_kv_summary",
+                                  "physical_mask_before_forward", "physical_mask_after_commit",
+                                  "full_physical_commit_event", "next_native_scheduler_region",
+                                  "actual_forward_scheduler_region", "logical_proposal_span",
+                                  "exact_absolute_geometry", "scheduler_context", "post_eos_validity"],
+            target="native latent-feature dynamics only; no token/probability/verifier targets",
+            split="assigned question-disjoint by the V2 learner",
+            memory_layer_indices=[0, 7, 15, 23],
+            hidden_stage="pre_native_commit_same_forward_input_to_decoder_layer24",
+            structural_stage="post_native_commit_pre_counterfactual_fill",
+            eos_rule="native terminal only when every mask preceding generated EOS is resolved",
+            missing_hidden="record terminal transition metadata without fabricated hidden features",
+        )
     (out / "capture_manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     return manifest

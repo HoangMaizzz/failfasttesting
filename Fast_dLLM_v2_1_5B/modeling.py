@@ -77,6 +77,68 @@ def materialize_stop_candidate(
     return candidate, fill_tokens, missing_positions
 
 
+def native_v2_physical_structure(
+    tokens, mask_before_forward, *, physical_block_start, proposal_start,
+    proposal_length, block_size, small_block_size, scheduler_start,
+    generated_start, mask_id, stop_token,
+):
+    """Describe a native postcommit boundary in unshifted physical coordinates.
+
+    The hidden residual belongs to the input of the same forward; mask/event
+    belong to its output commitment. No probability or token target is produced.
+    """
+    physical_block_start = int(physical_block_start)
+    proposal_start = int(proposal_start)
+    proposal_end = proposal_start + int(proposal_length)
+    before = mask_before_forward.to(dtype=torch.bool)
+    after = tokens[physical_block_start:physical_block_start + block_size].eq(mask_id)
+    if before.shape != (block_size,) or after.shape != before.shape:
+        raise RuntimeError("V2 requires fully observed physical pre/post masks")
+    if (after & ~before).any():
+        raise RuntimeError("Native forward remasked a committed physical position")
+    # A proposal spanning two blocks has only the current block's residual.
+    # Its older part must already be committed, never represented by padding.
+    if proposal_start < physical_block_start and tokens[
+        proposal_start:min(proposal_end, physical_block_start)
+    ].eq(mask_id).any():
+        raise RuntimeError("V2 missing proposal positions still contain native masks")
+    physical_positions = torch.arange(block_size, device=tokens.device)
+    proposal_span = (physical_positions + physical_block_start >= proposal_start) & (
+        physical_positions + physical_block_start < proposal_end
+    )
+    event = before & ~after
+    forward_region = (physical_positions >= int(scheduler_start)) & (
+        physical_positions < int(scheduler_start) + int(small_block_size)
+    )
+    if (event & ~forward_region).any() or not event.any():
+        raise RuntimeError("Native commit must resolve at least one mask in its scheduler region")
+    eos_positions = tokens[int(generated_start):].eq(stop_token).nonzero().flatten()
+    eos_ready = False
+    eos_abs = -1
+    masks_before_eos = -1
+    if eos_positions.numel():
+        eos_abs = int(generated_start) + int(eos_positions[0].item())
+        masks_before_eos = int(tokens[int(generated_start):eos_abs].eq(mask_id).sum().item())
+        eos_ready = masks_before_eos == 0
+    refine_available = bool(tokens[proposal_start:proposal_end].eq(mask_id).any()) and not eos_ready
+    active = torch.zeros_like(after)
+    if refine_available:
+        remaining = after.nonzero().flatten()
+        if not remaining.numel():
+            raise RuntimeError("V2 proposal unresolved outside current observable physical block")
+        next_start = int(remaining[0].item()) // int(small_block_size) * int(small_block_size)
+        if next_start < int(scheduler_start):
+            raise RuntimeError("Native scheduler has unresolved masks in an earlier sub-block")
+        active[next_start:next_start + int(small_block_size)] = True
+    valid_positions = torch.ones_like(after)
+    if eos_ready:
+        valid_positions = physical_positions + physical_block_start <= eos_abs
+    return dict(mask=after, event=event, mask_before=before, proposal_span=proposal_span,
+                active=active, forward_region=forward_region, eos_ready=eos_ready,
+                refine_available=refine_available, eos_present=bool(eos_positions.numel()),
+                masks_before_eos=masks_before_eos, valid_positions=valid_positions)
+
+
 class Colors:
     YELLOW = '\033[93m'
     CYAN = '\033[96m'
@@ -1567,6 +1629,11 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                         adaptive_full_block_logits = None
                         raw_logits_offset = 0
                         raw_hidden_offset = 0
+                        wm_v2_mask_before_forward = (
+                            mask_idx[0].detach().clone()
+                            if bool(getattr(args, "wm_v2_capture_native_latent", False))
+                            else None
+                        )
                         if use_block_cache:
                             if (
                                 block_past_key_values is None
@@ -3216,7 +3283,7 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                         local_start = max(0, int(draft_token_start_idx - block_abs_start))
                                         local_end = min(int(target_len), int(block_size - local_start))
                                         hidden = getattr(locals().get("output"), "hidden_states", None)
-                                        if hidden:
+                                        if hidden and not bool(getattr(args, "wm_v2_capture_native_latent", False)):
                                             depth = len(hidden)
                                             selected = sorted(set([
                                                 0,
@@ -3246,7 +3313,9 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             raw_snapshot_fields["hidden_state_forward_pass"] = int(
                                                 num_forward_passes
                                             )
-                                        if adaptive_full_block_logits is not None:
+                                        if adaptive_full_block_logits is not None and not bool(
+                                            getattr(args, "wm_v2_capture_native_latent", False)
+                                        ):
                                             k = min(raw_top_k, int(adaptive_full_block_logits.shape[-1]))
                                             logit_start = max(0, local_start - raw_logits_offset)
                                             logit_end = min(int(adaptive_full_block_logits.shape[1]), logit_start + int(target_len))
@@ -3326,62 +3395,70 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                     f"got {int(cut_rows.shape[0])} rows, expected {block_size}"
                                                 )
                                             physical_block_start = int(block_abs_start)
-                                            physical_mask = (
-                                                x_t[0, physical_block_start:physical_block_start + block_size]
-                                                .eq(mask_id)
+                                            structure = native_v2_physical_structure(
+                                                x_t[0], wm_v2_mask_before_forward,
+                                                physical_block_start=physical_block_start,
+                                                proposal_start=draft_token_start_idx,
+                                                proposal_length=target_len,
+                                                block_size=int(block_size),
+                                                small_block_size=int(small_block_size),
+                                                scheduler_start=int(small_block_start_idx),
+                                                generated_start=original_input_length,
+                                                mask_id=mask_id, stop_token=stop_token,
                                             )
-                                            if int(physical_mask.numel()) != int(block_size):
-                                                raise RuntimeError("V2 physical-block mask is not fully observable")
-                                            physical_event = torch.zeros(
-                                                block_size, dtype=torch.bool, device=x_t.device
-                                            )
-                                            for absolute_pos in newly_unmasked_absolute_positions:
-                                                relative = int(absolute_pos) - physical_block_start
-                                                if 0 <= relative < block_size:
-                                                    physical_event[relative] = True
-                                            active_region = torch.zeros_like(physical_mask)
-                                            remaining_active = (
-                                                x_t[0, draft_token_start_idx:draft_end_idx] == mask_id
-                                            ).nonzero(as_tuple=False).flatten()
-                                            active_abs_start = -1
-                                            if remaining_active.numel():
-                                                first_remaining_abs = (
-                                                    int(draft_token_start_idx)
-                                                    + int(remaining_active[0].item())
-                                                )
-                                                next_small_start = (
-                                                    (first_remaining_abs - physical_block_start)
-                                                    // int(small_block_size)
-                                                ) * int(small_block_size)
-                                                active_abs_start = max(
-                                                    physical_block_start + next_small_start,
-                                                    int(draft_token_start_idx),
-                                                )
-                                                active_abs_end = min(
-                                                    physical_block_start + next_small_start
-                                                    + int(small_block_size),
-                                                    int(draft_end_idx),
-                                                )
-                                                if active_abs_end > active_abs_start:
-                                                    active_region[
-                                                        active_abs_start - physical_block_start:
-                                                        active_abs_end - physical_block_start
-                                                    ] = True
+                                            active_region = structure["active"]
+                                            active_positions = active_region.nonzero().flatten()
+                                            active_abs_start = (-1 if not active_positions.numel() else
+                                                physical_block_start + int(active_positions[0].item()))
                                             raw_snapshot_fields.update({
+                                                "hidden_state_stage": "native_forward_input_pre_commit_pre_counterfactual_fill",
+                                                "hidden_state_source": "native_refinement_forward_output",
+                                                "hidden_state_forward_pass": int(num_forward_passes),
+                                                "native_hidden_start_offset": int(
+                                                    max(0, physical_block_start - int(draft_token_start_idx))
+                                                ),
+                                                "native_topk_start_offset": int(
+                                                    max(0, physical_block_start - int(draft_token_start_idx))
+                                                ),
                                                 "wm_v2_native_latent_block": cut_rows.detach()
                                                     .to(torch.float16).cpu().tolist(),
                                                 "wm_v2_native_latent_stage": (
-                                                    "native_hidden_states_24_pre_layer24_from_forward_that_selected_commit"
+                                                    f"native_hidden_states_{cut_layer}_pre_layer{cut_layer}"
+                                                    "_from_forward_that_selected_commit"
                                                 ),
+                                                "wm_v2_structural_stage": "post_native_commit_pre_counterfactual_fill",
+                                                "wm_v2_mask_before_stage": "same_native_forward_input",
                                                 "wm_v2_cut_layer": cut_layer,
                                                 "wm_v2_physical_block_start": physical_block_start,
+                                                "wm_v2_proposal_start": int(draft_token_start_idx),
+                                                "wm_v2_proposal_length": int(target_len),
+                                                "wm_v2_small_block_size": int(small_block_size),
                                                 "wm_v2_active_region_offset": int(
                                                     -1 if active_abs_start < 0 else
                                                     active_abs_start - physical_block_start
                                                 ),
-                                                "wm_v2_physical_mask": physical_mask.cpu().tolist(),
-                                                "wm_v2_physical_event": physical_event.cpu().tolist(),
+                                                "wm_v2_physical_mask": structure["mask"].cpu().tolist(),
+                                                "wm_v2_physical_event": structure["event"].cpu().tolist(),
+                                                "wm_v2_mask_before_forward": structure["mask_before"].cpu().tolist(),
+                                                "wm_v2_proposal_span": structure["proposal_span"].cpu().tolist(),
+                                                "wm_v2_forward_region": structure["forward_region"].cpu().tolist(),
+                                                "wm_v2_forward_active_region": structure["forward_region"].cpu().tolist(),
                                                 "wm_v2_active_region": active_region.cpu().tolist(),
+                                                "wm_v2_native_active_region": active_region.cpu().tolist(),
+                                                "wm_v2_native_refine_available": structure["refine_available"],
+                                                "wm_v2_native_eos_ready": structure["eos_ready"],
+                                                "wm_v2_native_terminal": structure["eos_ready"],
+                                                "wm_v2_eos_present": structure["eos_present"],
+                                                "wm_v2_masks_before_eos": structure["masks_before_eos"],
+                                                "wm_v2_valid_positions": structure["valid_positions"].cpu().tolist(),
+                                                "wm_v2_proposal_covered_positions": int(structure["proposal_span"].sum().item()),
+                                                "wm_v2_proposal_coverage_complete": bool(
+                                                    int(structure["proposal_span"].sum().item()) == int(target_len)
+                                                ),
+                                                "wm_v2_forward_pass_breakdown": {
+                                                    **frontier_stats["forward_pass_breakdown"],
+                                                    "total": int(num_forward_passes),
+                                                },
                                             })
                                             cache = getattr(output, "past_key_values", None)
                                             if cache is None:
@@ -3399,15 +3476,21 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                             )
                                             cache_length = 0
                                             cache_valid = cache is not None
+                                            # U is the input to layer cut_layer. Its upstream
+                                            # dynamics depend on prefix memory in those earlier
+                                            # layers, not exclusively the discarded native tail.
+                                            memory_layer_indices = [0,
+                                                max(0, cut_layer // 3 - 1),
+                                                max(0, 2 * cut_layer // 3 - 1),
+                                                cut_layer - 1]
+                                            if suffix_layers != len(memory_layer_indices) or cut_layer < 1:
+                                                raise RuntimeError("V2 memory summary needs four upstream layer groups")
                                             if cache is not None:
                                                 try:
                                                     cache_length = int(cache.get_seq_length())
                                                 except (AttributeError, TypeError):
                                                     cache_length = int(cache[0][0].shape[-2])
-                                                first_layer = len(self.model.layers) - suffix_layers
-                                                for local_layer, layer_idx in enumerate(
-                                                    range(first_layer, len(self.model.layers))
-                                                ):
+                                                for local_layer, layer_idx in enumerate(memory_layer_indices):
                                                     try:
                                                         key_states, value_states = cache[layer_idx]
                                                     except (IndexError, TypeError, KeyError):
@@ -3434,6 +3517,8 @@ class Fast_dLLM_QwenForCausalLM(Fast_dLLM_QwenPreTrainedModel, GenerationMixin):
                                                 memory.zero_()
                                             raw_snapshot_fields.update({
                                                 "wm_v2_prefix_kv_summary": memory.tolist(),
+                                                "wm_v2_memory_layer_indices": memory_layer_indices,
+                                                "wm_v2_memory_stage": "native_prefix_kv_upstream_of_cut_layer",
                                                 "wm_v2_prefix_kv_valid": bool(cache_valid and cache_length > 0),
                                                 "wm_v2_prefix_kv_length": int(cache_length),
                                                 "wm_v2_context": [
