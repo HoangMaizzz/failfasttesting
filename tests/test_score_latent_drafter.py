@@ -82,7 +82,9 @@ class ScoreLatentDrafterTests(unittest.TestCase):
             refined, refine_aux = transition(state, torch.tensor([0]))
             self.assertTrue(torch.equal(refined["geometry"], batch["geometry"]))
             self.assertTrue(torch.all(refined["mask"] <= batch["mask"] + 1e-6))
-            self.assertGreaterEqual(float(refined["event"].sum()), 1.0)
+            # The hard rule forces one commit, but summing float32 straight-through
+            # values can round a few ulps below exactly 1.0.
+            self.assertGreaterEqual(float(refined["event"].sum()), 1.0 - 1e-6)
             self.assertEqual(float((refined["event"] * (1 - refine_aux["eligible"])).sum()), 0.0)
 
             extended, extend_aux = transition(state, torch.tensor([1]))
