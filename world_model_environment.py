@@ -157,9 +157,14 @@ class NativeTrainingEnvironment:
             if action == "E":
                 if proposal[:previous.length] != previous.ids[:, 1].tolist():
                     raise RuntimeError("E failed to commit the parent's STOP candidate")
-            elif any(a != MASK_ID and a != b for a, b in
-                     zip(previous.ids[:, 0].tolist(), observation.ids[:, 0].tolist())):
-                raise RuntimeError("R changed a committed token")
+            elif action == "R":
+                if (observation.length != previous.length or index != parent.snapshot_index + 1
+                        or int(snapshot["unmask_forward_index"]) !=
+                        int(parent.snapshot["unmask_forward_index"]) + 1):
+                    raise RuntimeError("R must advance exactly one native forward at unchanged length")
+                if any(a != MASK_ID and a != b for a, b in
+                       zip(previous.ids[:, 0].tolist(), observation.ids[:, 0].tolist())):
+                    raise RuntimeError("R changed a committed token")
         if action in ("R", "E"):
             self.stats[f"executed_{action}"] += 1
         self.on_state(state, parent, action, dict(native_replay_wall_seconds=wall_seconds,

@@ -272,6 +272,94 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "replay drift in hidden_states"):
             env.step(state, "R", 65)
 
+    def test_fully_unmasked_state_never_calls_R_or_reunmasks_old_E_prefix(self):
+        from test_world_model_pretraining import FakeRunner, FakeVerifier, settings, snap
+        from world_model_environment import NativeTrainingEnvironment
+        class CompleteRunner(FakeRunner):
+            def segment(self, prompt, max_snapshots):
+                self.calls.append((list(prompt), max_snapshots))
+                row = snap()
+                row["proposal_token_ids_before_fill"] = list(row["proposal_token_ids_after_fill"])
+                row["masks_remaining"] = 0
+                row["newly_unmasked_positions"] = list(range(8))
+                return [row]
+        runner = CompleteRunner()
+        captured = []
+        env = NativeTrainingEnvironment(runner, FakeVerifier(), 0, 4, settings(),
+                                        lambda *x: captured.append(x))
+        source = env.start("q", 0, [10, 11, 12], 65)
+        self.assertNotIn("R", env.actions(source))
+        calls = len(runner.calls)
+        with self.assertRaises(ValueError): env.step(source, "R", 65)
+        self.assertEqual(len(runner.calls), calls)
+        child = env.step(source, "E", 65)
+        self.assertTrue(torch.equal(child.observation.ids[:8, 0], source.observation.ids[:, 1]))
+        self.assertNotIn("R", env.actions(child))
+        self.assertNotIn("E", env.actions(child))  # max proposal length = 16
+        env.submit(child, 65)
+        self.assertEqual(env.actions(child), [])
+        calls = len(runner.calls)
+        for action in ("R", "E"):
+            with self.assertRaises(ValueError): env.step(child, action, 65)
+        with self.assertRaises(ValueError): env.submit(child, 65)
+        self.assertEqual(len(runner.calls), calls)
+        self.assertEqual(len(captured), 2)
+
+    def test_collector_does_not_fabricate_R_pairs_for_complete_or_exhausted_states(self):
+        from test_world_model_pretraining import FakeRunner, FakeVerifier, FakeTokenizer, snap
+        from world_model_environment import NativeTrainingEnvironment
+        class Tokenizer(FakeTokenizer): eos_token_id = 0
+        class Verifier(FakeVerifier):
+            def score(self, prefix, proposal, remaining):
+                expected = list(proposal)
+                self.last_teacher = dict(argmax_ids=expected, margin=[1.]*len(proposal),
+                    candidate_logit=[1.]*len(proposal), rival_logit=[0.]*len(proposal))
+                return len(proposal), len(proposal)+1, list(proposal)+[1], 1.
+        args = parse_args(["--output_dir", "unused", "--num_questions", "8",
+            "--validation_questions", "2", "--test_questions", "2",
+            "--max_rounds_per_question", "1", "--segments_per_round", "2",
+            "--states_per_question", "16", "--max_proposal_tokens", "16",
+            "--raw_top_k", "2", "--hidden_layers", "14", "28", "--device", "cpu"])
+        class Runner(FakeRunner):
+            complete = False
+            def segment(self, prompt, max_snapshots):
+                self.calls.append((list(prompt), max_snapshots))
+                row = snap()
+                if self.complete:
+                    row["proposal_token_ids_before_fill"] = list(row["proposal_token_ids_after_fill"])
+                    row["masks_remaining"] = 0
+                return [row]  # no next snapshot when incomplete
+        for complete in (False, True):
+            runner = Runner(); runner.complete = complete
+            verifier = Verifier()
+            env = NativeTrainingEnvironment(runner, verifier, 0, 4, args, lambda *x: None)
+            rows, edges, ledger = collect_question(dict(question_id="q", prompt="problem"),
+                "train", Tokenizer(), env, verifier, torch.randn(120, 4), args)
+            self.assertEqual([row.length for row in rows], [8, 16])
+            self.assertEqual(edges, [])
+            self.assertEqual(ledger["R_edges"], 0)
+            self.assertEqual(env.stats["executed_R"], 0)
+            self.assertEqual(len(runner.calls), 2 if complete else 4)
+            self.assertTrue(np.array_equal(rows[1].native[:8], rows[0].candidate))
+
+    def test_duplicate_native_boundary_is_rejected_before_child_is_published(self):
+        from test_world_model_pretraining import FakeRunner, FakeVerifier, settings
+        from world_model_environment import NativeTrainingEnvironment
+        class Runner(FakeRunner):
+            def segment(self, prompt, max_snapshots):
+                rows = super().segment(prompt, max_snapshots)
+                if len(rows) > 1:
+                    rows[1]["unmask_forward_index"] = rows[0]["unmask_forward_index"]
+                return rows
+        captured = []
+        env = NativeTrainingEnvironment(Runner(), FakeVerifier(), 0, 4, settings(),
+                                        lambda *x: captured.append(x))
+        source = env.start("q", 0, [10], 65)
+        with self.assertRaisesRegex(RuntimeError, "exactly one native forward"):
+            env.step(source, "R", 65)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(env.stats["executed_R"], 0)
+
     def test_offline_complete_ABC_and_oof_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "input"
