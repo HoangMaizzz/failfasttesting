@@ -148,15 +148,29 @@ class ScoreEncoder(nn.Module):
         self.z_out = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim))
         self.memory_out = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim))
 
-    def forward(self, batch):
-        h = self.u_in(self.u_norm(batch["u"])) + self.position
+    def forward(self, batch, ablate_features=()):
+        ablate_features = set(ablate_features)
+        residual = self.u_in(self.u_norm(batch["u"]))
+        if "native_residual" in ablate_features:
+            residual = torch.zeros_like(residual)
+        h = residual + (0.0 if "position_embedding" in ablate_features else self.position)
         if self.feature_set != "native_only":
-            h = h + self.structure_in(structural_features(batch))
-            global_input = torch.cat((batch["context"], geometry_features(batch["geometry"])), dim=-1)
+            if "scheduler_structure" not in ablate_features:
+                h = h + self.structure_in(structural_features(batch))
+            context = batch["context"]
+            geometry = geometry_features(batch["geometry"])
+            if "scheduler_context" in ablate_features:
+                context = torch.zeros_like(context)
+            if "geometry_embedding" in ablate_features:
+                geometry = torch.zeros_like(geometry)
+            global_input = torch.cat((context, geometry), dim=-1)
             h = h + self.global_in(global_input)[:, None]
         if self.feature_set == "full_context":
-            m = self.memory_in(batch["memory"])
-            m = m * batch["memory_valid"][:, None]
+            if "prefix_kv" in ablate_features:
+                m = torch.zeros((len(h), self.dim), dtype=h.dtype, device=h.device)
+            else:
+                m = self.memory_in(batch["memory"])
+                m = m * batch["memory_valid"][:, None]
             h = h + m[:, None]
         valid = batch["valid"].bool().clone()
         all_invalid = ~valid.any(dim=1)
@@ -165,8 +179,11 @@ class ScoreEncoder(nn.Module):
         h = self.context(h, src_key_padding_mask=~valid)
         z = self.z_out(h) * batch["valid"][..., None]
         if self.feature_set == "full_context":
-            memory_z = self.memory_out(self.memory_in(batch["memory"]))
-            memory_z = memory_z * batch["memory_valid"][:, None]
+            if "prefix_kv" in ablate_features:
+                memory_z = torch.zeros((len(z), self.dim), dtype=z.dtype, device=z.device)
+            else:
+                memory_z = self.memory_out(self.memory_in(batch["memory"]))
+                memory_z = memory_z * batch["memory_valid"][:, None]
         else:
             memory_z = torch.zeros((len(z), self.dim), dtype=z.dtype, device=z.device)
         return z, memory_z
@@ -204,22 +221,35 @@ class ScoreTransition(nn.Module):
         self.terminal_out = nn.Linear(dim, 1)
         nn.init.constant_(self.terminal_out.bias, -3.0)
 
-    def forward(self, state, action):
+    def forward(self, state, action, ablate_features=()):
+        ablate_features = set(ablate_features)
         geometry = next_geometry(state["geometry"], action)
         aligned, overlap = align_frame(state["z"], state["geometry"], geometry)
         action_embed = self.action(action)
         scale, shift = self.action_film(action).chunk(2, dim=-1)
-        global_features = (self.geometry_in(geometry_features(geometry))
-                           + self.context_in(state["context"]) + action_embed)
+        if "action_conditioning" in ablate_features:
+            action_embed = torch.zeros_like(action_embed)
+            scale = torch.zeros_like(scale)
+            shift = torch.zeros_like(shift)
+        geometry_embedding = geometry_features(geometry)
+        context_input = state["context"]
+        if "geometry_embedding" in ablate_features:
+            geometry_embedding = torch.zeros_like(geometry_embedding)
+        if "scheduler_context" in ablate_features:
+            context_input = torch.zeros_like(context_input)
+        global_features = (self.geometry_in(geometry_embedding)
+                           + self.context_in(context_input) + action_embed)
         query = aligned * (1.0 + 0.1 * torch.tanh(scale[:, None])) + shift[:, None]
-        query = query + self.position + global_features[:, None]
-        if self.feature_set != "native_only":
+        if "position_embedding" not in ablate_features:
+            query = query + self.position
+        query = query + global_features[:, None]
+        if self.feature_set != "native_only" and "scheduler_structure" not in ablate_features:
             source_struct = torch.stack((state["mask"], state["event"], state["active"],
                                          state["mask_before"], state["native_active"],
                                          state["forward_active"], state["span"],
                                          state["valid"]), dim=-1)
             query = query + self.structure_in(source_struct)
-        if self.feature_set == "full_context":
+        if self.feature_set == "full_context" and "prefix_kv" not in ablate_features:
             query = query + self.memory_in(state["memory_z"])[:, None]
         source_valid = state["valid"].bool().clone()
         all_invalid = ~source_valid.any(dim=1)
@@ -257,10 +287,19 @@ class ScoreTransition(nn.Module):
         terminal_logit = self.terminal_out(pooled_h).squeeze(-1)
         terminal_prob = terminal_logit.sigmoid()
         active = active * (terminal_prob < 0.5)[:, None]
-        memory_candidate = state["memory_z"] + self.memory_delta(
-            torch.cat((pooled_h, state["memory_z"]), dim=-1))
-        memory_z = torch.where(action_extend[:, None], memory_candidate, state["memory_z"])
-        context_input = torch.cat((pooled_h, state["context"], action.float()[:, None]), dim=-1)
+        if "prefix_kv" in ablate_features:
+            memory_z = torch.zeros_like(state["memory_z"])
+        else:
+            memory_candidate = state["memory_z"] + self.memory_delta(
+                torch.cat((pooled_h, state["memory_z"]), dim=-1))
+            memory_z = torch.where(action_extend[:, None], memory_candidate, state["memory_z"])
+        context_state = state["context"]
+        action_context = action.float()[:, None]
+        if "scheduler_context" in ablate_features:
+            context_state = torch.zeros_like(context_state)
+        if "action_conditioning" in ablate_features:
+            action_context = torch.zeros_like(action_context)
+        context_input = torch.cat((pooled_h, context_state, action_context), dim=-1)
         next_context = self.context_out(context_input)
         next_state = {
             "z": z_next, "memory_z": memory_z, "mask": mask,
