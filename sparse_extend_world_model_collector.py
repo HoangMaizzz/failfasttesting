@@ -196,7 +196,8 @@ def _load_backbone_rows(backbone_path: Path, dataset: str, num_questions: int,
 
 
 def _load_models(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_name)
+    revision = getattr(args, "target_model_revision", None)
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_name, revision=revision)
     single_target = getattr(args, "target_placement", "auto") == "single"
     placement = ({"device_map": {"": args.target_device}} if single_target else {
         "device_map": "auto",
@@ -206,6 +207,7 @@ def _load_models(args):
     })
     target = AutoModelForCausalLM.from_pretrained(
         args.target_model_name,
+        revision=revision,
         torch_dtype=torch.float16,
         **placement,
         attn_implementation="sdpa",

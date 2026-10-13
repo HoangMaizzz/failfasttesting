@@ -465,6 +465,9 @@ class FullContextVerifier:
                 torch.ones_like(candidate_rank, dtype=torch.float32))
             top1_probability = probabilities.gather(1, scores.argmax(-1, keepdim=True)).squeeze(1)
             self.last_teacher = dict(margin=(candidate_scores-rival).cpu().tolist(),
+                                     argmax_ids=predictions[:len(proposal)].cpu().tolist(),
+                                     candidate_logit=candidate_scores.cpu().tolist(),
+                                     rival_logit=rival.cpu().tolist(),
                                      topk_ids=teacher_ids.cpu(),
                                      topk_logits=teacher_values.half().cpu(),
                                      logsumexp=log_normalizer.cpu(),
