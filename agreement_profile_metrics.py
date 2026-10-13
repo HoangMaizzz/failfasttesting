@@ -55,6 +55,9 @@ def prediction_row(source, target, margin, K_head=None, parent=None):
         first = int(where[0]) if len(where) else target.length
         influenced = np.arange(target.length) >= first
         row.update(candidate_changed=changed.tolist(), prefix_affected=influenced.tolist(),
+                   yield_group=("blocked_before_active_segment" if parent.accepted <
+                                parent.meta.get("segment_start", 0) else
+                                "first_rejection_reachable_in_active_segment"),
                    change_group="changed" if changed.any() else "unchanged",
                    delta_K_true=target.accepted - parent.accepted,
                    source_margin_true=parent.margin.tolist(),
@@ -95,7 +98,7 @@ def score_rows(rows):
             macro_K_head_mae=float(np.mean(list(byq.values()))),
             K_head_exact=float(np.mean(np.asarray(errors) == 0)),
             K_head_bias=float(np.mean(errors)), margin_metrics="not_applicable_K_only_head",
-            future_gain=_future_gain(rows, "K_head"))
+            future_gain=_future_gain(rows, "K_head"), yield_groups=_yield_groups(rows))
     per_position = defaultdict(lambda: ([], []))
     y, pred = [], []
     K_errors, all_accepted, signed_errors = [], [], []
@@ -148,7 +151,26 @@ def score_rows(rows):
                 future_gain_K_head=_future_gain(rows, "K_head") if k_head else None,
                 regions={name: dict(tokens=len(errors), margin_mae=float(np.mean(errors)) if errors else None,
                     sign_accuracy=float(np.mean(signs)) if signs else None)
-                    for name, (errors, signs) in per_position.items()}, groups=groups)
+                    for name, (errors, signs) in per_position.items()}, groups=groups,
+                yield_groups=_yield_groups(rows))
+
+
+def _yield_groups(rows):
+    """Teacher-derived evaluation strata; never inputs or collection filters."""
+    result = {}
+    for group in sorted({r["yield_group"] for r in rows if "yield_group" in r}):
+        subset = [r for r in rows if r.get("yield_group") == group]
+        value = dict(states=len(subset), prompts=len({r["question"] for r in subset}))
+        for metric in ("K_head_mae", "K_mae", "affected_margin_mae"):
+            if metric != "K_head_mae" and all(r.get("margin_supervised") is False for r in subset):
+                continue
+            byq = per_prompt(subset, metric)
+            if byq:
+                value["macro_" + metric] = float(np.mean(list(byq.values())))
+        key = "K_head" if all(r.get("margin_supervised") is False for r in subset) else "K_margin"
+        value["future_gain"] = _future_gain(subset, key)
+        result[group] = value
+    return result
 
 
 def _future_gain(rows, K_key):
@@ -156,16 +178,22 @@ def _future_gain(rows, K_key):
               and r.get(K_key) is not None]
     if not subset:
         return None
-    errors, truth, predicted = defaultdict(list), [], []
+    errors, baseline_errors, truth, predicted, deltas = defaultdict(list), defaultdict(list), [], [], []
     for r in subset:
         delta = r[K_key] - r["source_K_pred"]
         errors[r["question"]].append(abs(delta - r["delta_K_true"]))
+        baseline_errors[r["question"]].append(abs(r["delta_K_true"]))
+        deltas.append(r["delta_K_true"])
         truth.append(r["delta_K_true"] > 0)
         predicted.append(delta)
     binary = binary_metrics(truth, np.asarray(predicted) - .5)
     return dict(prompts=len(errors), macro_delta_K_mae=float(np.mean([np.mean(v) for v in errors.values()])),
                 gain_accuracy=binary["accuracy"], gain_balanced_accuracy=binary["balanced_accuracy"],
                 gain_auroc=binary["auroc"], gain_count=int(np.sum(truth)),
+                loss_count=int(np.sum(np.asarray(deltas) < 0)),
+                same_count=int(np.sum(np.asarray(deltas) == 0)),
+                zero_delta_baseline_macro_mae=float(np.mean([np.mean(v) for v in baseline_errors.values()])),
+                always_no_gain_accuracy=float(np.mean(~np.asarray(truth, bool))),
                 scope="yield_change_prediction_no_cost_or_policy")
 
 

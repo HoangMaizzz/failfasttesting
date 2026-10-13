@@ -147,6 +147,27 @@ class ContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mismatched"):
             paired_comparison([x], [y], draws=20)
 
+    def test_yield_strata_and_zero_change_baseline_are_evaluation_only(self):
+        a, b = pair(1, "test")
+        active = prediction_row(a, b, b.margin, b.accepted, parent=a)
+        active["source_K_pred"] = a.accepted
+        c = copy.deepcopy(a); c.uid = "blocked_a"; c.question = "other"
+        c.meta["segment_start"] = 2
+        d = copy.deepcopy(c); d.uid = "blocked_b"
+        blocked = prediction_row(c, d, d.margin, d.accepted, parent=c)
+        blocked["source_K_pred"] = c.accepted
+        result = score_rows([active, blocked])
+        self.assertEqual(result["future_gain"]["gain_count"], 1)
+        self.assertEqual(result["future_gain"]["same_count"], 1)
+        self.assertEqual(result["future_gain"]["always_no_gain_accuracy"], .5)
+        self.assertEqual(result["future_gain"]["zero_delta_baseline_macro_mae"], 1.5)
+        self.assertEqual(result["yield_groups"]["blocked_before_active_segment"]["states"], 1)
+        self.assertEqual(result["yield_groups"]["first_rejection_reachable_in_active_segment"]["states"], 1)
+        active["margin_supervised"] = blocked["margin_supervised"] = False
+        result = score_rows([active, blocked])
+        self.assertNotIn("macro_K_mae", result["yield_groups"]["blocked_before_active_segment"])
+        self.assertEqual(result["yield_groups"]["blocked_before_active_segment"]["macro_K_head_mae"], 0)
+
     def test_storage_copy_and_archive_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "corpus"

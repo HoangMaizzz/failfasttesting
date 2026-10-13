@@ -180,12 +180,17 @@ def save_reports(output, reports):
 def corpus_audit(records, edges, manifest):
     result = dict(states=len(records), R_edges=len(edges), splits={}, ties=0,
                   profile_target="raw Qwen candidate-vs-best-rival margin",
-                  R_groups=dict(changed=0, gain=0, loss=0, same=0))
+                  R_groups=dict(changed=0, gain=0, loss=0, same=0,
+                                blocked_before_active_segment=0, native_tokens_unchanged=0))
     for split in ("train", "validation", "test"):
         values = [r for r in records.values() if r.split == split]
         pair_values = [e for e in edges if records[e["source"]].split == split]
         result["splits"][split] = dict(states=len(values), prompts=len({r.question for r in values}),
-                                       R_edges=len(pair_values), R_prompts=len({records[e["source"]].question for e in pair_values}))
+                                       R_edges=len(pair_values), R_prompts=len({records[e["source"]].question for e in pair_values}),
+                                       K_histogram={str(k): sum(r.accepted == k for r in values)
+                                                    for k in sorted({r.accepted for r in values})},
+                                       K_zero_fraction=float(np.mean([r.accepted == 0 for r in values])) if values else None,
+                                       fully_unmasked_states=sum(not np.any(r.native == 151665) for r in values))
         if not values:
             raise ValueError(f"No observed states in {split}; increase capture coverage")
     for record in records.values():
@@ -195,6 +200,8 @@ def corpus_audit(records, edges, manifest):
     for edge in edges:
         a, b = records[edge["source"]], records[edge["child"]]
         result["R_groups"]["changed"] += int(np.any(a.candidate != b.candidate))
+        result["R_groups"]["blocked_before_active_segment"] += int(a.accepted < a.meta.get("segment_start", 0))
+        result["R_groups"]["native_tokens_unchanged"] += int(np.array_equal(a.native, b.native))
         result["R_groups"]["gain" if b.accepted > a.accepted else
                             "loss" if b.accepted < a.accepted else "same"] += 1
     return result
