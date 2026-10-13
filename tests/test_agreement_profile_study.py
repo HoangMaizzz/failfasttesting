@@ -233,6 +233,45 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([r.candidate.tolist() for r in rows], [r.candidate.tolist() for r in other_rows])
         self.assertNotEqual([r.accepted for r in rows], [r.accepted for r in other_rows])
 
+    def test_provisional_EOS_keeps_R_and_replay_features_must_match(self):
+        from test_world_model_pretraining import FakeRunner, FakeVerifier, settings
+        from world_model_environment import MASK_ID, NativeTrainingEnvironment
+        class EosRunner(FakeRunner):
+            def segment(self, prompt, max_snapshots):
+                rows = super().segment(prompt, max_snapshots)
+                rows[0]["proposal_token_ids_after_fill"][-1] = 0
+                return rows
+        env = NativeTrainingEnvironment(EosRunner(), FakeVerifier(), 0, 4,
+                                        settings(), lambda *x: None)
+        state = env.start("q", 0, [10, 11, 12], 65)
+        self.assertIsNone(state.terminal_reason)
+        self.assertIn("R", env.actions(state))
+        self.assertNotIn("E", env.actions(state))
+        child = env.step(state, "R", 65)
+        self.assertIsNotNone(child)
+        self.assertNotIn(0, child.observation.ids[:, 1].tolist())
+        # Even committed EOS cannot terminate while an earlier position is MASK.
+        from test_world_model_pretraining import snap
+        row = snap()
+        row["proposal_token_ids_before_fill"][-1] = 0
+        row["proposal_token_ids_after_fill"][-1] = 0
+        pending = env.make_state("q", 0, [10], [], row, 0, None, 65, None, 0.)
+        self.assertIn("R", env.actions(pending))
+        row["proposal_token_ids_before_fill"] = list(row["proposal_token_ids_after_fill"])
+        terminal = env.make_state("q", 0, [10], [], row, 0, None, 65, None, 0.)
+        self.assertEqual(env.actions(terminal), ["S"])
+        class FeatureDrift(FakeRunner):
+            def segment(self, prompt, max_snapshots):
+                rows = super().segment(prompt, max_snapshots)
+                if max_snapshots > 1:
+                    rows[0]["hidden_states"][0][0][0] += .1
+                return rows
+        env = NativeTrainingEnvironment(FeatureDrift(), FakeVerifier(), 0, 4,
+                                        settings(), lambda *x: None)
+        state = env.start("q", 0, [10], 65)
+        with self.assertRaisesRegex(RuntimeError, "replay drift in hidden_states"):
+            env.step(state, "R", 65)
+
     def test_offline_complete_ABC_and_oof_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "input"

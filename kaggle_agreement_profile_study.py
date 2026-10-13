@@ -65,7 +65,7 @@ def launch(settings):
         raise RuntimeError("Pinned source commit mismatch")
     print("SOURCE COMMIT:", commit, flush=True)
     for test in ("test_agreement_profile_study.py", "test_world_model_probe.py",
-                 "test_native_elysia_graph.py"):
+                 "test_native_elysia_graph.py", "test_native_unmask_contract.py"):
         subprocess.run([sys.executable, str(repo / "tests" / test)], cwd=repo, env=env, check=True)
     dllm = temporary / "agreement_fast_dllm_1_5b"
     if mode != "train":

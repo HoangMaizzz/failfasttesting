@@ -143,7 +143,13 @@ class NativeTrainingEnvironment:
             prefix, prior, snapshot, None if parent is None else parent.observation,
             self.hidden_dim, self.args.raw_top_k, self.args, index)
         proposal = observation.ids[:, 1].tolist()
-        terminal = "candidate_eos" if self.eos_id in proposal else None
+        # STOP may predict EOS at a position that is still MASK. Native R can
+        # change that prediction; termination requires a fully committed prefix.
+        native = observation.ids[:, 0].tolist()
+        terminal = None
+        if self.eos_id in native:
+            if MASK_ID not in native[:native.index(self.eos_id)]:
+                terminal = "native_committed_eos"
         state = NativeState(observation, list(prefix), list(prior), snapshot, index,
                             [], terminal)
         if parent is not None:
@@ -176,6 +182,7 @@ class NativeTrainingEnvironment:
                 and bool(state.observation.ids[:, 0].eq(MASK_ID).any())):
             actions.append("R")
         if (not state.extend_exhausted and
+                self.eos_id not in state.observation.ids[:, 1].tolist() and
                 state.observation.length + self.args.extend_size <= self.args.max_proposal_tokens):
             actions.append("E")
         return actions
@@ -262,6 +269,13 @@ class NativeTrainingEnvironment:
                         "unmask_forward_index"):
                 if replayed[key] != state.snapshot[key]:
                     raise RuntimeError(f"Native predecessor replay drift in {key}; refusing false R edge")
+            for key in ("hidden_layer_indices", "native_hidden_start_offset",
+                        "native_topk_start_offset", "hidden_states", "topk_token_ids",
+                        "topk_logits", "confidences", "newly_unmasked_positions"):
+                if key in state.snapshot or key in replayed:
+                    if key not in state.snapshot or key not in replayed or not torch.equal(
+                            torch.as_tensor(replayed[key]), torch.as_tensor(state.snapshot[key])):
+                        raise RuntimeError(f"Native predecessor replay drift in {key}; refusing false R edge")
             if len(snapshots) <= state.snapshot_index + 1:
                 self.stats["unavailable_R"] += 1
                 state.refine_exhausted = True
